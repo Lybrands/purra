@@ -17,6 +17,12 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
 ]
 
+[project.optional-dependencies]
+test = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
+]
+
 [project.urls]
 Repository = "https://github.com/Lybrands/purra"
 Issues = "https://github.com/Lybrands/purra/issues"
