@@ -1,0 +1,182 @@
+from __future__ import annotations
+
+import pytest
+
+from purra.contracts import (
+    AgentMessage,
+    ExecutionState,
+    ModelCompletion,
+    ModelFinishReason,
+    ModelInvocation,
+    ModelRequest,
+    ModelStream,
+    ModelStreamChunk,
+    ToolBatchRequest,
+    ToolCall,
+    ToolCallDelta,
+    ToolHandlerResult,
+    ToolPolicy,
+    ToolSchema,
+)
+from purra.ports import ToolRegistration
+from purra.testing import (
+    assert_model_gateway_conforms,
+    assert_tool_execution_gateway_conforms,
+)
+from purra.tools.executor import CoreToolExecutor
+from purra.tools.registry import InMemoryToolCatalog
+
+
+def _tool() -> ToolSchema:
+    return ToolSchema(
+        name="readThing",
+        description="Read a portable thing",
+        parameters={
+            "type": "object",
+            "properties": {"id": {"type": "string"}},
+            "required": ["id"],
+            "additionalProperties": False,
+        },
+    )
+
+
+def _invocation() -> ModelInvocation:
+    return ModelInvocation(
+        request=ModelRequest(provider="portable", model="portable-model"),
+        tools=(_tool(),),
+        tool_choice="required",
+    )
+
+
+class _PortableModelGateway:
+    async def stream(self, messages, invocation, signal=None):
+        del messages, invocation, signal
+
+        async def chunks():
+            yield ModelStreamChunk(tool_call_deltas=(ToolCallDelta(
+                index=0,
+                id="call-1",
+                name="readThing",
+                arguments_fragment='{"id":',
+            ),))
+            yield ModelStreamChunk(
+                tool_call_deltas=(ToolCallDelta(
+                    index=0,
+                    arguments_fragment='"thing-1"}',
+                ),),
+                finish_reason=ModelFinishReason.TOOL_CALLS,
+            )
+
+        return ModelStream(chunks=chunks(), model="portable-model")
+
+    async def complete(self, messages, invocation, signal=None):
+        del messages, invocation, signal
+        return ModelCompletion(
+            message=AgentMessage(
+                role="assistant",
+                tool_calls=(ToolCall(
+                    id="call-2",
+                    name="readThing",
+                    arguments_json='{"id":"thing-2"}',
+                ),),
+            ),
+            model="portable-model",
+            finish_reason=ModelFinishReason.TOOL_CALLS,
+        )
+
+
+@pytest.mark.asyncio
+async def test_model_gateway_passes_stream_and_tool_call_conformance():
+    chunks, completion = await assert_model_gateway_conforms(
+        gateway=_PortableModelGateway(),
+        messages=(AgentMessage(role="user", content="read it"),),
+        invocation=_invocation(),
+        expected_model="portable-model",
+        expected_tool_names=("readThing",),
+    )
+
+    assert len(chunks) == 2
+    assert completion.message.tool_calls[0].arguments_json == '{"id":"thing-2"}'
+
+
+@pytest.mark.asyncio
+async def test_model_gateway_probe_rejects_stream_without_terminal_reason():
+    class InterruptedGateway(_PortableModelGateway):
+        async def stream(self, messages, invocation, signal=None):
+            del messages, invocation, signal
+
+            async def chunks():
+                yield ModelStreamChunk(content_delta="unfinished")
+
+            return ModelStream(chunks=chunks(), model="portable-model")
+
+    with pytest.raises(AssertionError):
+        await assert_model_gateway_conforms(
+            gateway=InterruptedGateway(),
+            messages=(),
+            invocation=_invocation(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_model_gateway_probe_rejects_incomplete_tool_call():
+    class IncompleteToolGateway(_PortableModelGateway):
+        async def stream(self, messages, invocation, signal=None):
+            del messages, invocation, signal
+
+            async def chunks():
+                yield ModelStreamChunk(
+                    tool_call_deltas=(ToolCallDelta(
+                        index=0,
+                        name="readThing",
+                        arguments_fragment='{"id":"thing-1"}',
+                    ),),
+                    finish_reason=ModelFinishReason.TOOL_CALLS,
+                )
+
+            return ModelStream(chunks=chunks(), model="portable-model")
+
+    with pytest.raises(AssertionError, match="missing_tool_call_id"):
+        await assert_model_gateway_conforms(
+            gateway=IncompleteToolGateway(),
+            messages=(),
+            invocation=_invocation(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_core_tool_executor_passes_shared_host_conformance():
+    calls = 0
+
+    async def read_thing(state, arguments, signal=None):
+        nonlocal calls
+        del signal
+        calls += 1
+        state.domain["read"] = arguments["id"]
+        return ToolHandlerResult('{"ok":true}')
+
+    executor = CoreToolExecutor(InMemoryToolCatalog((ToolRegistration(
+        schema=_tool(),
+        handler=read_thing,
+        policy=ToolPolicy(mode="read", title="Read thing"),
+    ),)))
+    state = ExecutionState()
+    result, events = await assert_tool_execution_gateway_conforms(
+        gateway=executor,
+        request=ToolBatchRequest(
+            run_id="run-conformance",
+            invocation_id="invocation-conformance",
+            calls=(ToolCall(
+                id="call-read",
+                name="readThing",
+                arguments_json='{"id":"thing-1"}',
+            ),),
+            allowed_tool_names=frozenset({"readThing"}),
+            state=state,
+        ),
+    )
+
+    assert calls == 1
+    assert state.domain == {"read": "thing-1"}
+    assert result.results[0].content == '{"ok":true}'
+    assert events[-1].payload["toolCallId"] == "call-read"
