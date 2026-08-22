@@ -19,13 +19,17 @@ from purra.contracts import (
     DomainContext,
     ExecutionPlan,
     MessageRole,
+    ModelCompletion,
+    ModelFinishReason,
     ModelRequest,
     PlanningCapabilities,
     PlanningConstraints,
+    PlannerLimits,
     StepExecutor,
     StepStatus,
     StepType,
     TaskStep,
+    TaskSpec,
     ToolPolicy,
     ToolSchema,
     WorkPlan,
@@ -36,6 +40,7 @@ from purra.model_protocol import generic_capability_snapshot
 from purra.plan_compiler import compile_work_plan
 from purra.ports import ToolRegistration
 from purra.planner import (
+    AgentPlanner,
     PLANNER_SYSTEM_PROMPT,
     build_planner_messages,
     normalize_work_plan,
@@ -54,6 +59,24 @@ class _Gateway:
 
     async def complete(self, messages, invocation, signal=None):
         raise AssertionError("constructor contract test must not complete")
+
+
+class _ScriptedPlannerGateway:
+    def __init__(self, outputs):
+        self.outputs = list(outputs)
+        self.message_rounds = []
+
+    async def stream(self, messages, invocation, signal=None):
+        raise AssertionError("planner must use complete")
+
+    async def complete(self, messages, invocation, signal=None):
+        del invocation, signal
+        self.message_rounds.append(tuple(messages))
+        return ModelCompletion(
+            message=AgentMessage(role="assistant", content=self.outputs.pop(0)),
+            model="test-model",
+            finish_reason=ModelFinishReason.STOP,
+        )
 
 
 class _AlwaysPlan:
@@ -75,6 +98,7 @@ def _request() -> AgentRunRequest:
             capability_snapshot=replace(
                 generic_capability_snapshot(),
                 profile_id="test:model",
+                max_output_tokens=4_096,
             ),
         ),
         domain_context=DomainContext(namespace="test.domain"),
@@ -126,6 +150,84 @@ def test_planner_receives_only_budgeted_planning_context_blocks():
     assert "hostContext" not in payload
     assert "Plan with a concise and calm style." in system.content
     assert "agent composition instructions are trusted" in system.content
+
+
+@pytest.mark.asyncio
+async def test_planner_repairs_a_host_rejected_normalized_result():
+    domain_invalid = {
+        "needsTodos": True,
+        "title": "Answer",
+        "goal": "Answer the question",
+        "taskSpec": {
+            "goal": "Answer the question",
+            "operation": "answer",
+            "deliverable": "must not exist",
+        },
+        "todos": [{
+            "id": "answer",
+            "title": "Answer",
+            "type": "review",
+            "executor": "model",
+            "riskLevel": "read",
+        }],
+    }
+    repaired = {
+        **domain_invalid,
+        "taskSpec": {
+            "goal": "Answer the question",
+            "operation": "answer",
+        },
+    }
+    partially_repaired = {
+        **domain_invalid,
+        "taskSpec": {
+            "goal": "Answer the question",
+            "operation": "answer",
+            "deliverable": "none",
+        },
+    }
+    generic_invalid = {
+        **domain_invalid,
+        "todos": [{
+            **domain_invalid["todos"][0],
+            "riskLevel": "review",
+        }],
+    }
+    gateway = _ScriptedPlannerGateway([
+        json.dumps(generic_invalid),
+        json.dumps(domain_invalid),
+        json.dumps(partially_repaired),
+        json.dumps(repaired),
+    ])
+
+    result = await AgentPlanner(
+        gateway,
+        limits=PlannerLimits(max_repair_attempts=3),
+        result_validator=lambda _request, planning: (
+            "answer taskSpec must omit deliverable"
+            if planning.work_plan.task_spec
+            and planning.work_plan.task_spec.deliverable
+            else None
+        ),
+    ).create_plan(_request(), PlanningCapabilities())
+
+    assert result.work_plan.task_spec == TaskSpec(
+        goal="Answer the question",
+        operation="answer",
+    )
+    assert len(gateway.message_rounds) == 4
+    assert (
+        "planner step 'answer' has unsupported riskLevel 'review'; "
+        "allowed values: read, write, destructive"
+    ) in (
+        gateway.message_rounds[1][-1].content
+    )
+    assert "answer taskSpec must omit deliverable" in (
+        gateway.message_rounds[2][-1].content
+    )
+    assert "answer taskSpec must omit deliverable" in (
+        gateway.message_rounds[3][-1].content
+    )
 
 
 def test_diagnostics_cannot_be_smuggled_into_planning_capabilities():
