@@ -16,6 +16,7 @@ from purra.engine import (
 )
 from purra.adapters import InMemoryAgentAdapters, InMemoryDurableAdapters
 from purra.agent_presets import (
+    AgentComponentBinding,
     AgentPreset,
     AgentPresetSnapshot,
     PromptSection,
@@ -57,6 +58,7 @@ from purra.run_state import canonicalize_execution_plan
 
 __all__ = [
     "AgentCore",
+    "AgentComponentBinding",
     "AgentPreset",
     "AgentPresetSnapshot",
     "InMemoryAgentAdapters",

@@ -5,7 +5,15 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable
 from typing import Any, TypeAlias
 
-from purra.contracts import ToolCall, ToolExecutionLimits
+from purra.contracts import (
+    ToolCall,
+    ToolExecutionLimits,
+    ToolPolicy,
+    ToolSchema,
+)
+from purra.errors import ContractViolationError
+from purra.ports import ToolRegistration
+from purra.tools.registry import InMemoryToolCatalog
 from purra.tools.security import (
     parse_tool_arguments,
     preflight_tool_calls,
@@ -55,6 +63,11 @@ def get_core_security_redteam_cases() -> tuple[SecurityRedTeamCase, ...]:
             is not None,
         ),
         (
+            "RT4-unsupported-nested-schema",
+            "Unsupported nested schema types are rejected during registration.",
+            _rejects_unsupported_nested_schema,
+        ),
+        (
             "RT5-sensitive-error-redaction",
             "Known secret and filesystem patterns are redacted from tool errors.",
             lambda: "supersecret" not in sanitize_error_message(
@@ -62,6 +75,30 @@ def get_core_security_redteam_cases() -> tuple[SecurityRedTeamCase, ...]:
             ),
         ),
     )
+
+
+def _rejects_unsupported_nested_schema() -> bool:
+    async def handler(state, arguments, signal=None):
+        del state, arguments, signal
+
+    try:
+        InMemoryToolCatalog((ToolRegistration(
+            schema=ToolSchema(
+                name="redTeamSchema",
+                description="Exercise recursive schema admission.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "payload": {"type": "unsupported-red-team-type"},
+                    },
+                },
+            ),
+            handler=handler,
+            policy=ToolPolicy(mode="read", title="Red-team schema"),
+        ),))
+    except ContractViolationError:
+        return True
+    return False
 
 
 def run_security_redteam_cases(

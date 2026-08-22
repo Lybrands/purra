@@ -27,8 +27,10 @@ class CodedAgentCoreError(AgentCoreError):
         self.details = MappingProxyType(dict(details or {}))
 
 
-class ContractViolationError(AgentCoreError):
+class ContractViolationError(CodedAgentCoreError):
     """A registered capability violates a Core contract."""
+
+    default_code = "contract_violation"
 
 
 class RunCancellationConflictError(ContractViolationError):

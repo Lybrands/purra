@@ -220,7 +220,7 @@ def test_run_recovery_snapshot_is_the_only_continuation_plan_authority():
     assert not hasattr(continuation, "source_root_run_id")
 
 
-def test_continuation_cannot_change_the_source_agent_preset():
+def test_continuation_preserves_source_agent_preset_for_core_validation():
     continuation = DurableTaskContinuation(
         source=RunRecoverySnapshot(
             run_id="source-run",
@@ -236,8 +236,12 @@ def test_continuation_cannot_change_the_source_agent_preset():
         ),
     )
 
-    with pytest.raises(ValueError, match="source AgentPreset"):
-        AgentCoreRunOptions(durable_continuation=continuation)
+    options = AgentCoreRunOptions(durable_continuation=continuation)
+
+    assert (
+        options.durable_continuation.source.agent_preset_snapshot
+        == {"id": "persisted-preset"}
+    )
 
 
 def test_run_plan_replacement_cannot_drop_execution_lineage():

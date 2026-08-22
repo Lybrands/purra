@@ -5,15 +5,21 @@ from dataclasses import replace
 import pytest
 
 from purra.agent_presets import (
+    AgentComponentBinding,
     AgentPreset,
     AgentPresetSnapshot,
     PromptSection,
+)
+from purra.context_orchestration import (
+    ContextCompressionCoordinator,
+    ContextCompressionSettings,
 )
 from purra.contracts import (
     AgentMessage,
     AgentRunRequest,
     ContextBundle,
     DomainContext,
+    ExecutionState,
     MessageOrigin,
     MessageRole,
     ModelRequest,
@@ -25,6 +31,7 @@ from purra.contracts import (
 )
 from purra.model_protocol import generic_capability_snapshot
 from purra.ports import ToolRegistration
+from purra.delegation import DelegationPolicy
 from purra.recovery import RecoveryCause, RecoveryPolicy
 from purra.tools import InMemoryToolCatalog
 
@@ -33,6 +40,12 @@ class _ContextProvider:
     async def build_context(self, request, budget, signal=None):
         del request, budget, signal
         return ContextBundle()
+
+
+class _ExecutionStateFactory:
+    def create(self, request):
+        del request
+        return ExecutionState()
 
 
 def _request() -> AgentRunRequest:
@@ -56,6 +69,9 @@ def test_preset_applies_ordered_trusted_prompt_sections():
         revision="1",
         tool_catalog=InMemoryToolCatalog(()),
         context_provider=_ContextProvider(),
+        component_bindings={
+            "contextProvider": AgentComponentBinding("test.context", "1"),
+        },
         prompt_sections=(
             PromptSection(name="rules", order=100, text="Use evidence."),
             PromptSection(name="identity", order=-100, text="You are PurrA."),
@@ -81,6 +97,7 @@ def test_preset_applies_ordered_trusted_prompt_sections():
             revision="1",
             tool_catalog=InMemoryToolCatalog(()),
             context_provider=_ContextProvider(),
+            component_bindings=preset.component_bindings,
             prompt_sections=(PromptSection(name="identity", text="Other."),),
         ).apply(request)
 
@@ -120,6 +137,9 @@ def test_preset_snapshot_detects_prompt_or_tool_drift():
         revision="1",
         tool_catalog=InMemoryToolCatalog(()),
         context_provider=context,
+        component_bindings={
+            "contextProvider": AgentComponentBinding("test.context", "1"),
+        },
         prompt_sections=(PromptSection(name="identity", text="Be calm."),),
     )
     snapshot = preset.snapshot(_request())
@@ -132,23 +152,135 @@ def test_preset_snapshot_detects_prompt_or_tool_drift():
         revision="1",
         tool_catalog=InMemoryToolCatalog(()),
         context_provider=context,
+        component_bindings=preset.component_bindings,
         prompt_sections=(PromptSection(name="identity", text="Be terse."),),
     )
     with pytest.raises(ValueError, match="persisted snapshot"):
         changed.require_snapshot(snapshot, _request())
 
 
-def test_preset_snapshot_has_no_delegation_configuration():
-    root = AgentPreset(
+def test_preset_snapshot_covers_delegation_configuration():
+    disabled = AgentPreset(
         id="root",
         revision="1",
         tool_catalog=InMemoryToolCatalog(()),
     )
+    enabled = AgentPreset(
+        id="root",
+        revision="1",
+        tool_catalog=InMemoryToolCatalog(()),
+        delegation_policy=DelegationPolicy(max_agents_per_call=2, max_parallel=1),
+    )
 
-    visible = root.snapshot(_request()).composition
+    disabled_snapshot = disabled.snapshot(_request())
+    enabled_snapshot = enabled.snapshot(_request())
 
-    assert "delegatedAgents" not in visible
-    assert "maxParallelDelegations" not in visible
+    assert disabled_snapshot.composition["delegation"] == {"enabled": False}
+    assert enabled_snapshot.composition["delegation"] == {
+        "enabled": True,
+        "maxAgentsPerCall": 2,
+        "maxParallel": 1,
+        "maxAgentNameChars": 64,
+        "maxTitleChars": 120,
+        "maxInstructionChars": 4_000,
+        "maxObjectiveChars": 4_000,
+        "contextMode": "isolated",
+        "toolMode": "read",
+        "allowsRecursiveDelegation": False,
+    }
+    assert disabled_snapshot.fingerprint != enabled_snapshot.fingerprint
+
+
+def test_preset_snapshot_requires_and_uses_opaque_component_bindings():
+    with pytest.raises(ValueError, match="contextProvider"):
+        AgentPreset(
+            id="portable",
+            revision="1",
+            tool_catalog=InMemoryToolCatalog(()),
+            context_provider=_ContextProvider(),
+        ).snapshot(_request())
+    with pytest.raises(ValueError, match="executionStateFactory"):
+        AgentPreset(
+            id="portable",
+            revision="1",
+            tool_catalog=InMemoryToolCatalog(()),
+            execution_state_factory=_ExecutionStateFactory(),
+        )
+
+    first = AgentPreset(
+        id="portable",
+        revision="1",
+        tool_catalog=InMemoryToolCatalog(()),
+        context_provider=_ContextProvider(),
+        component_bindings={
+            "contextProvider": AgentComponentBinding(
+                id="host.context",
+                revision="1",
+                config_digest="sha256:first",
+            ),
+        },
+    )
+    second = replace(
+        first,
+        component_bindings={
+            "contextProvider": AgentComponentBinding(
+                id="host.context",
+                revision="2",
+                config_digest="sha256:second",
+            ),
+        },
+    )
+
+    assert first.snapshot(_request()).fingerprint != second.snapshot(
+        _request()
+    ).fingerprint
+    assert first.snapshot(_request()).fingerprint != replace(
+        first,
+        revision="2",
+    ).snapshot(_request()).fingerprint
+
+
+def test_preset_snapshot_derives_builtin_compaction_settings():
+    first = AgentPreset(
+        id="portable",
+        revision="1",
+        tool_catalog=InMemoryToolCatalog(()),
+        conversation_compactor=ContextCompressionCoordinator(
+            settings=ContextCompressionSettings(trigger_ratio=0.85),
+        ),
+    )
+    second = replace(
+        first,
+        conversation_compactor=ContextCompressionCoordinator(
+            settings=ContextCompressionSettings(trigger_ratio=0.5),
+        ),
+    )
+
+    first_snapshot = first.snapshot(_request())
+    second_snapshot = second.snapshot(_request())
+
+    assert first_snapshot.fingerprint != second_snapshot.fingerprint
+    assert first_snapshot.composition["conversationCompactor"]["settings"] == {
+        "triggerRatio": 0.85,
+        "defaultKeepRecentMessages": 20,
+    }
+
+
+def test_snapshot_v2_round_trip_rejects_legacy_or_incomplete_values():
+    snapshot = AgentPreset(
+        id="portable",
+        revision="1",
+        tool_catalog=InMemoryToolCatalog(()),
+    ).snapshot(_request())
+
+    assert snapshot.snapshot_version == 2
+    assert snapshot.to_mapping()["snapshotVersion"] == 2
+    assert AgentPresetSnapshot.from_mapping(snapshot.to_mapping()) == snapshot
+
+    legacy = snapshot.to_mapping()
+    legacy.pop("snapshotVersion")
+    with pytest.raises(ValueError, match="snapshot version"):
+        AgentPresetSnapshot.from_mapping(legacy)
 
 
 async def _tool_handler(state, arguments, signal=None):
@@ -177,6 +309,9 @@ def test_preset_snapshot_covers_operational_capability_drift():
         revision="1",
         tool_catalog=_catalog(ToolExecutionMode.READ),
         context_provider=_ContextProvider(),
+        component_bindings={
+            "contextProvider": AgentComponentBinding("test.context", "1"),
+        },
         runtime_limits=RuntimeLimits(max_model_rounds=4),
         recovery_policy=RecoveryPolicy().with_overrides({
             RecoveryCause.EMPTY_MODEL_RESPONSE: 1,
@@ -195,6 +330,7 @@ def test_preset_snapshot_covers_operational_capability_drift():
         revision="1",
         tool_catalog=_catalog(ToolExecutionMode.CONFIRM),
         context_provider=_ContextProvider(),
+        component_bindings=original.component_bindings,
         runtime_limits=RuntimeLimits(max_model_rounds=4),
         recovery_policy=original.recovery_policy,
     )

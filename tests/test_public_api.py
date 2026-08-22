@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import importlib
+from types import ModuleType
+
 def test_complete_run_api_is_importable_from_the_package_boundary():
     from purra.api import (
         AgentCore,
         AgentCoreRunOptions,
+        AgentComponentBinding,
         AgentPreset,
         AgentPresetSnapshot,
         AgentPlanner,
@@ -38,6 +42,7 @@ def test_complete_run_api_is_importable_from_the_package_boundary():
     )
 
     assert AgentCore.__module__.startswith("purra.")
+    assert AgentComponentBinding("host.context", "1").revision == "1"
     assert AgentPreset.__module__.startswith("purra.")
     assert AgentPresetSnapshot.__module__.startswith("purra.")
     assert PromptSection.__module__.startswith("purra.")
@@ -132,3 +137,43 @@ def test_facades_do_not_reexport_private_implementation_helpers():
     assert not hasattr(runtime, "_stream_tool_batch")
     assert not hasattr(engine, "_validate_planning_constraints")
     assert not hasattr(engine, "_validate_task_constraint_refinement")
+
+
+def test_public_facades_have_explicit_non_module_exports():
+    facade_names = (
+        "adapters",
+        "api",
+        "artifacts",
+        "context_orchestration",
+        "contracts",
+        "delegation",
+        "engine",
+        "evaluation",
+        "execution",
+        "long_tasks",
+        "model_invocation",
+        "model_protocol",
+        "observability",
+        "operations",
+        "output",
+        "ports",
+        "recovery",
+        "runtime",
+        "task_admission",
+        "tools",
+    )
+
+    for name in facade_names:
+        module = importlib.import_module(f"purra.{name}")
+        exports = tuple(module.__all__)
+        assert len(exports) == len(set(exports)), name
+        assert all(
+            exported and not exported.startswith("_")
+            for exported in exports
+        ), name
+        assert all(hasattr(module, exported) for exported in exports), name
+        assert not [
+            exported
+            for exported in exports
+            if isinstance(getattr(module, exported), ModuleType)
+        ], name

@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from purra.agent_presets import AgentPresetSnapshot
+from purra.errors import ContractViolationError
 from purra.contracts import (
     ContextBudgetClaim,
     ReasoningMode,
@@ -22,7 +23,10 @@ from purra.output.contracts import (
     ResponseTransactionMode,
     ResponseTransactionPolicy,
 )
-from purra.output.ports import CommittedResultFactsProvider
+from purra.output.ports import (
+    AgentOutputRepository,
+    CommittedResultFactsProvider,
+)
 from purra.ports import ResponseJudge, ResponseJudgePolicy, ResponseValidator
 from purra.run_recovery import RunRecoverySnapshot
 from purra.task_admission import LongTaskDispatchReceipt
@@ -171,12 +175,11 @@ class AgentCoreRunOptions:
             raise TypeError(
                 "agent preset snapshot must be an AgentPresetSnapshot"
             )
-        if self.durable_continuation is not None:
-            selected_preset = (
-                self.agent_preset_snapshot.to_mapping()
-                if self.agent_preset_snapshot is not None
-                else {}
-            )
+        if (
+            self.durable_continuation is not None
+            and self.agent_preset_snapshot is not None
+        ):
+            selected_preset = self.agent_preset_snapshot.to_mapping()
             if (
                 self.durable_continuation.source.agent_preset_snapshot
                 != selected_preset
@@ -225,3 +228,54 @@ class AgentCoreRunOptions:
                 else ResponseTransactionMode.DIRECT_LIVE
             )
         )
+
+
+async def restore_continuation_preset(
+    options: AgentCoreRunOptions,
+    output_repository: AgentOutputRepository | None,
+) -> AgentCoreRunOptions:
+    """Restore and validate the source Run's versioned composition authority."""
+
+    continuation = options.durable_continuation
+    if continuation is None:
+        return options
+    source = continuation.source
+    stored = source.agent_preset_snapshot
+    if not stored:
+        if output_repository is None:
+            raise ContractViolationError(
+                "durable continuation cannot load its AgentPreset snapshot"
+            )
+        events = await output_repository.list_events(
+            source.run_id,
+            after_sequence=0,
+            limit=1,
+        )
+        stored = events[0].payload.get("agentPreset", {}) if events else {}
+    if not stored:
+        raise ContractViolationError(
+            "durable continuation source has no AgentPreset snapshot"
+        )
+    try:
+        snapshot = AgentPresetSnapshot.from_mapping(stored)
+    except (TypeError, ValueError) as error:
+        raise ContractViolationError(
+            "durable continuation requires a complete AgentPreset snapshot version 2",
+            code="agent_preset_snapshot_unsupported",
+        ) from error
+    if (
+        options.agent_preset_snapshot is not None
+        and options.agent_preset_snapshot != snapshot
+    ):
+        raise ContractViolationError(
+            "durable continuation selected a different AgentPreset snapshot"
+        )
+    restored = replace(
+        source,
+        agent_preset_snapshot=snapshot.to_mapping(),
+    )
+    return replace(
+        options,
+        agent_preset_snapshot=snapshot,
+        durable_continuation=replace(continuation, source=restored),
+    )

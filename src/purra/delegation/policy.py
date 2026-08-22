@@ -44,5 +44,19 @@ class DelegationPolicy:
     def allows_recursive_delegation(self) -> bool:
         return False
 
+    def snapshot_mapping(self) -> dict[str, object]:
+        return {
+            "enabled": True,
+            "maxAgentsPerCall": self.max_agents_per_call,
+            "maxParallel": self.max_parallel,
+            "maxAgentNameChars": self.max_agent_name_chars,
+            "maxTitleChars": self.max_title_chars,
+            "maxInstructionChars": self.max_instruction_chars,
+            "maxObjectiveChars": self.max_objective_chars,
+            "contextMode": self.context_mode.value,
+            "toolMode": self.tool_mode.value,
+            "allowsRecursiveDelegation": self.allows_recursive_delegation,
+        }
+
 
 __all__ = ["DelegationPolicy"]

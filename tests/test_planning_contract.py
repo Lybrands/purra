@@ -5,7 +5,7 @@ from dataclasses import replace
 
 import pytest
 
-from purra.agent_presets import AgentPreset, PromptSection
+from purra.agent_presets import AgentComponentBinding, AgentPreset, PromptSection
 from purra.api import (
     AgentCore,
     ContextStrategy,
@@ -281,6 +281,13 @@ def test_preset_snapshot_includes_planning_behavior():
             planning_policy=_AlwaysPlan(),
             context_strategy=ContextStrategy.STAGED,
         ),
+        component_bindings={
+            "planner": AgentComponentBinding("test.planner", "1"),
+            "planningPolicy": AgentComponentBinding(
+                "test.planning-policy",
+                "1",
+            ),
+        },
     )
 
     profile = preset.snapshot(_request()).composition["executionProfile"]
@@ -289,8 +296,11 @@ def test_preset_snapshot_includes_planning_behavior():
     assert profile["contextStrategy"] == "staged"
     assert "maxParallelAgents" not in profile
     assert "agentRoleGuidance" not in profile
-    assert profile["plannerType"].endswith("._Planner")
-    assert profile["planningPolicyType"].endswith("._AlwaysPlan")
+    assert profile["planner"]["binding"]["id"] == "test.planner"
+    assert (
+        profile["planningPolicy"]["binding"]["id"]
+        == "test.planning-policy"
+    )
 
 
 def test_work_plan_must_be_compiled_before_it_can_drive_a_run():

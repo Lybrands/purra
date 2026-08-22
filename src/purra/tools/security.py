@@ -218,7 +218,7 @@ def validate_tool_arguments_schema(
     Provider-side function schemas guide generation but are not an authority
     boundary. Core validates the normalized value again before scope checks or
     side effects. The supported keywords cover the schemas registered by the
-    built-in domains; unknown annotation keywords remain harmless metadata.
+    built-in domains; admission rejects unsupported keywords before runtime.
     """
 
     violation = _schema_violation(parsed.arguments, parameters, path="$")
@@ -243,7 +243,10 @@ def _schema_violation(
     path: str,
 ) -> tuple[str, dict[str, Any]] | None:
     if not isinstance(schema, Mapping):
-        return None
+        return (
+            f"argument {path} cannot be checked against a malformed schema.",
+            {"path": path, "keyword": "schema"},
+        )
 
     any_of = schema.get("anyOf")
     if _is_json_array(any_of):
@@ -392,15 +395,16 @@ def _schema_violation(
                     "maxItems": max_items,
                 },
             )
-        item_schema = schema.get("items")
-        for index, item in enumerate(value):
-            violation = _schema_violation(
-                item,
-                item_schema,
-                path=f"{path}[{index}]",
-            )
-            if violation is not None:
-                return violation
+        if "items" in schema:
+            item_schema = schema.get("items")
+            for index, item in enumerate(value):
+                violation = _schema_violation(
+                    item,
+                    item_schema,
+                    path=f"{path}[{index}]",
+                )
+                if violation is not None:
+                    return violation
 
     if isinstance(value, Mapping):
         properties = schema.get("properties")
@@ -483,7 +487,7 @@ def _matches_json_schema_type(value: Any, expected: Any) -> bool:
         "number": _is_json_number(value),
         "boolean": isinstance(value, bool),
         "null": value is None,
-    }.get(expected_name, True)
+    }.get(expected_name, False)
 
 
 def _json_type_name(value: Any) -> str:

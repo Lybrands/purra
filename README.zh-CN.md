@@ -18,7 +18,7 @@ PurrA 不提供一个“万能 Host 对象”；宿主按需组合现有公共�
 
 | 宿主需求 | 公共导入面 | 所有权 |
 | --- | --- | --- |
-| 装配并提交 Run | `purra.api`（`AgentCore`、`AgentPreset`、`AgentCoreRunOptions`、`PromptSection`） | 提交后由 PurrA 拥有执行。 |
+| 装配并提交 Run | `purra.api`（`AgentCore`、`AgentPreset`、`AgentComponentBinding`、`AgentCoreRunOptions`、`PromptSection`） | 提交后由 PurrA 拥有执行。 |
 | 描述输入与不透明的领域关联 | `purra.contracts`（`AgentRunRequest`、`RunBinding`、`ExecutionRecipe`） | 宿主映射产品输入，并解释自己的关联。 |
 | 实现运行期依赖 | `purra.ports`（模型、上下文、工具、Run/输出持久化、Projector） | 宿主提供具体适配器。 |
 | 选择可选能力 | `purra.task_admission`、`purra.long_tasks`、`purra.artifacts`、`purra.delegation`、`purra.output` | 宿主选择并配置；PurrA 强制执行契约。 |
@@ -26,9 +26,9 @@ PurrA 不提供一个“万能 Host 对象”；宿主按需组合现有公共�
 
 `purra.api` 是完整 Run 的唯一入口。宿主不得通过 `purra.engine`、`purra.runtime` 或其他实现模块启动 Run。产品请求映射、传输、凭据、业务查询和领域投影始终位于 PurrA 外部。`RunBinding`、`ExecutionRecipe` 与 `DomainEventProjector` 只不透明地携带宿主语义，PurrA 从不解释其中的业务字段。
 
-### 0.1 兼容边界
+### 0.2 兼容边界
 
-在 `0.1.x` 系列中，`purra.api` 以及上表列出的能力所属公共模块构成受支持的宿主契约。兼容性新增和修复可以发布 patch 版本；PurrA 在 1.0 之前删除或改变现有公共契约时必须升级 minor 版本。`purra.engine`、`purra.runtime` 及其实现子模块不属于宿主兼容面。CI 会同时构建 wheel 与 sdist，在干净环境安装 wheel，并只通过公共导入运行一个 Agent。
+在 `0.2.x` 系列中，`purra.api` 以及上表列出的能力所属公共模块构成受支持的宿主契约。兼容性新增和修复可以发布 patch 版本；PurrA 在 1.0 之前删除或改变现有公共契约时必须升级 minor 版本。`purra.engine`、`purra.runtime` 及其实现子模块不属于宿主兼容面。CI 会同时构建 wheel 与 sdist，在干净环境安装 wheel，并只通过公共导入运行一个 Agent。
 
 本系列受支持的顶层宿主模块为：`api`、`artifacts`、`cancellation`、
 `context_budget`、`context_orchestration`、`context_strategies`、`contracts`、
@@ -73,7 +73,9 @@ Core 通过三个业务无关契约支持产品宿主：`RunBinding` 保存不�
 
 `AgentPreset` 是 PurrA 完整且已经解析完成的 Agent 装配契约。它只拥有稳定 ID/revision、有序可信 `PromptSection`、Context/Tool 端口、`ExecutionProfile`、压缩策略、运行限制和恢复策略。产品路由、请求补水、Repository、数据库查询、Provider 凭据与进程清理不得进入 Preset。
 
-`AgentCore(preset=...)` 会在 Run 发布前物化可信 Prompt，并在 `run.started` 中写入 `AgentPresetSnapshot`：包括 Preset ID/revision，以及 Prompt Section、上下文与压缩绑定、执行形态、已启用工具的 Schema 和授权契约、委派、运行限制与恢复策略的确定性指纹。持久任务续跑会从源 Run 的规范日志自动恢复 Preset 快照，并在新的模型或工具调用开始前拒绝能力漂移；宿主也可以主动调用 `AgentPreset.require_snapshot()` 做同样的失败关闭校验。
+`AgentCore(preset=...)` 会在 Run 发布前物化可信 Prompt，并在 `run.started` 中写入 schema version 2 的 `AgentPresetSnapshot`。指纹覆盖 Preset ID/revision、Prompt Section、上下文与压缩绑定、执行形态、实际启用工具的 Schema 和授权契约、委派策略、运行限制与恢复策略。PurrA 只为无状态内置实现和不可变压缩参数推导稳定记录；每个影响行为的宿主组件或工厂都必须通过 `AgentComponentBinding` 声明稳定 ID、revision 和可选配置摘要，Core 不反射任意对象状态，也不使用 `repr()` 生成指纹。持久任务续跑会在任何新 Provider、工具、调度器或委派执行前拒绝能力漂移。version 1 或字段不完整的历史快照无法证明有效组合，会以 `agent_preset_snapshot_unsupported` 失败关闭，不会用当前进程配置猜测升级。
+
+显式散装参数形式仍可用于普通 Run，但持久续跑必须配置 `AgentPreset`，否则 Core 无法重算并比对 version 2 权威快照。
 
 ## 执行形态
 
@@ -145,7 +147,13 @@ Kernel 负责模型协议、上下文硬预算、工具执行安全、授权审�
 `tests/test_standalone_agent_conformance.py` 是可执行的第三方宿主样例。它不导入任何产品 Application、Domain、Infrastructure 或模型 SDK；样例装配 PurrA 官方、仅依赖标准库的 `InMemoryAgentAdapters`，然后通过 `AgentCore.submit()` 分别跑通 Reactive、Planned + Staged Context 与 Durable handoff。包边界门禁会禁止样例退回私有 `_execute_run`。
 
 ```python
-from purra.api import AgentCore, AgentPreset, InMemoryAgentAdapters, PromptSection
+from purra.api import (
+    AgentComponentBinding,
+    AgentCore,
+    AgentPreset,
+    InMemoryAgentAdapters,
+    PromptSection,
+)
 from purra.tools import InMemoryToolCatalog
 
 adapters = InMemoryAgentAdapters()
@@ -159,6 +167,12 @@ agent = AgentCore(
         revision="1",
         tool_catalog=InMemoryToolCatalog(()),
         context_provider=context_provider,
+        component_bindings={
+            "contextProvider": AgentComponentBinding(
+                "host.portable-context",
+                "1",
+            ),
+        },
         prompt_sections=(PromptSection(
             name="identity",
             order=-100,
@@ -358,6 +372,8 @@ Runtime 只有在模型本轮确实发起工具调用时，才把同轮经过完
 
 `ToolExecutionLimits.max_argument_chars` 现在只表示可配置的原始 JSON 传输安全包络，不是上下文分配，也不是领域数据预算。JSON 解码及受限的结构恢复完成后，Core 会再次强制执行注册 Schema 的必填字段、类型、枚举、文本长度、数组数量、数值范围和额外字段规则。因此，空白和 Unicode 转义不再消耗一个无关的 32K 工作流预算；领域仍通过版本化 Schema 决定有用语义数据的大小。校验失败会返回工具名、失败阶段、Schema 路径、实际测量值和允许上限，但不会回显被拒绝的正文。
 
+Core 只准入以下递归 JSON Schema 子集：`type`（`object`、`array`、`string`、`integer`、`number`、`boolean`、`null` 或这些名称组成的非空列表）、`properties`、`required`、布尔值 `additionalProperties`、`items`、`anyOf`、`oneOf`、`enum`、`const`、`minLength`、`maxLength`、`minItems`、`maxItems`、`minimum`、`maximum`，以及字符串注解 `title`、`description`。结构错误或其他断言关键字会在 Tool Catalog 装配时被拒绝；运行时仍以失败关闭方式做纵深校验，整批拒绝时不会启动任何处理器。
+
 ## 受控恢复策略
 
 `recovery` 是 Runtime 内所有自动恢复的统一决策层。供应商兼容降级、流中断、截断、缺失或越权工具调用、空回答、回答修复及工具输入修正不再各自维护布尔开关；每次候选动作都必须经过同一个 Run 级恢复账本，检查取消状态、剩余模型轮次、按根因配置的尝试额度、正文是否已经对用户可见，以及工具副作用是否可能已经开始。
@@ -416,7 +432,7 @@ Artifact 维护契约与存储无关：过期或失效 claim 可以回收，open
 
 ## 单 Run 多 Agent 委派
 
-配置委派持久化后，PurrA 会把 `delegateToAgents` 暴露为一个普通的模型工具。父模型在每次调用中通过 `agentName`、`title`、`instruction`、`objective` 和可选输入定义任务专用 Agent。创建、调用、取消、结果收集和聚合都在这一次工具生命周期内完成。每次调用只在同一个 Root Run 内创建委派批次，不会创建第二个 Run、Run 树、执行租约或独立事件流。
+只有 `AgentPreset` 显式选择 `DelegationPolicy` 且宿主提供所需委派基础设施时，PurrA 才会把 `delegateToAgents` 暴露为普通模型工具；`None` 表示禁用。完整策略与实际委派工具 Schema 会进入 version 2 快照，Repository 和 Executor 仍是不会被序列化的 Kernel 基础设施。父模型在每次调用中通过 `agentName`、`title`、`instruction`、`objective` 和可选输入定义任务专用 Agent。创建、调用、取消、结果收集和聚合都在这一次工具生命周期内完成。每次调用只在同一个 Root Run 内创建委派批次，不会创建第二个 Run、Run 树、执行租约或独立事件流。
 
 `DelegationCoordinator` 负责有界并发、取消、持久化和生命周期事件；`DynamicDelegatedAgentExecutor` 在进程内执行模型定义的 Agent。模型只拥有 Agent 的语义定义，权限由 PurrA 固定：子 Agent 使用隔离会话，继承 Root Run 有界的 Domain Context 和 ContextProvider，只获得父 Agent 当前启用的只读工具；它看不到父 Agent 身份和私有对话，不能获得写工具，也不能递归调用 `delegateToAgents`。宿主仍可替换执行器端口，但 Core 始终只暴露一个 Root Run 身份。结果只在原始 `batch_id` 内聚合，所有事件仍归属于 Root Run。
 
