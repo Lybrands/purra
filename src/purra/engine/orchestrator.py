@@ -10,7 +10,6 @@ from typing import Any, AsyncIterator, Callable, Iterable, Mapping, Sequence
 
 from purra.agent_presets import (
     AgentPreset,
-    AgentPresetSnapshot,
 )
 from purra.cancellation import (
     OperationCanceled,
@@ -25,15 +24,8 @@ from purra.context_budget import (
     resolve_task_context_budget_claims,
 )
 from purra.context_strategies import ContextStrategy
-from purra.context_orchestration.contracts import (
-    ConversationCompactionResult,
-)
 from purra.context_orchestration.compaction import (
     ContextCompressionCoordinator,
-)
-from purra.context_orchestration.ledger import (
-    ContextCompactionBudget,
-    ContextCompactionPhase,
 )
 from purra.contracts import (
     AgentMessage,
@@ -80,6 +72,10 @@ from purra.engine.context_phase import (
     validate_context_allocations as _validate_context_allocations,
 )
 from purra.engine.context_capability import ContextCapability
+from purra.engine.compaction_phase import (
+    compact_after_planning,
+    compact_before_planning,
+)
 from purra.engine.canonical_sink import (
     BufferedEventSink as _BufferedEventSink,
     runtime_output_event as _runtime_output_event,
@@ -87,21 +83,16 @@ from purra.engine.canonical_sink import (
 from purra.engine.durable_execution import (
     bind_event_to_run as _bind_event_to_run,
 )
-from purra.engine.options import AgentCoreRunOptions
+from purra.engine.options import AgentCoreRunOptions, restore_continuation_preset
 from purra.engine.planning_phase import PlanningCapability, PlanningPhaseResult
 from purra.engine.task_orchestration import TaskOrchestrationCapability
-from purra.delegation import (
-    DelegatedAgentExecutor,
-    DelegationCoordinator,
-    DelegationPolicy,
-    build_delegation_tool_registration,
-)
+from purra.delegation import DelegatedAgentExecutor, DelegationCoordinator, DelegationPolicy
+from purra.engine.delegation_assembly import assemble_delegation
 from purra.delegation.dynamic_executor import DynamicDelegatedAgentExecutor
 from purra.execution import AgentRunHandle, AgentRunSupervisor
 from purra.engine.planning_validation import (
     effective_registrations as _effective_registrations,
 )
-from purra.engine.tool_catalog import AugmentedToolCatalog as _AugmentedToolCatalog
 from purra.execution_profiles import ExecutionProfile
 from purra.host_planned_tool_gateway import HostPlannedToolGateway
 from purra.json_values import thaw_json_mapping
@@ -160,7 +151,17 @@ from purra.task_admission import (
     TaskAdmissionEvaluator,
 )
 from purra.timing import duration_ms as _duration_ms
-from purra.operations import AgentOperationController, OperationScope
+from purra.operations import AgentOperationController
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedRuntimePhase:
+    request: AgentRunRequest
+    prepared_request: AgentRunRequest
+    budget: ContextBudget
+    state: ExecutionState
+    events: tuple[AgentEvent, ...]
+    delegation_bound: bool
 
 
 class AgentCore:
@@ -184,16 +185,12 @@ class AgentCore:
         planning_policy: PlanningPolicy | None = None,
         context_strategy: ContextStrategy | str | None = None,
         context_provider: ContextProvider | None = None,
-        context_provider_factory: (
-            Callable[[AgentModelTaskRunner], ContextProvider] | None
-        ) = None,
+        context_provider_factory: Callable[[AgentModelTaskRunner], ContextProvider] | None = None,
         conversation_compactor: ConversationCompactor | None = None,
-        conversation_compactor_factory: (
-            Callable[[AgentModelTaskRunner], ConversationCompactor] | None
-        ) = None,
+        conversation_compactor_factory: Callable[[AgentModelTaskRunner], ConversationCompactor] | None = None,
         execution_state_factory: ExecutionStateFactory | None = None,
         tool_catalog: ToolCatalog | None = None,
-        delegation_policy: DelegationPolicy = DelegationPolicy(),
+        delegation_policy: DelegationPolicy | None = None,
         task_admission_evaluator: TaskAdmissionEvaluator | None = None,
         long_task_dispatcher: LongTaskDispatcher | None = None,
         approval_gateway: ApprovalGateway | None = None,
@@ -225,6 +222,7 @@ class AgentCore:
                 conversation_compactor_factory is not None,
                 execution_state_factory is not None,
                 tool_catalog is not None,
+                delegation_policy is not None,
                 task_admission_evaluator is not None,
                 long_task_dispatcher is not None,
                 runtime_limits != RuntimeLimits(),
@@ -240,64 +238,43 @@ class AgentCore:
             conversation_compactor_factory = preset.conversation_compactor_factory
             execution_state_factory = preset.execution_state_factory
             tool_catalog = preset.tool_catalog
+            delegation_policy = preset.delegation_policy
             runtime_limits = preset.runtime_limits
             recovery_policy = preset.recovery_policy
-        if not isinstance(delegation_policy, DelegationPolicy):
-            raise TypeError("delegation_policy must be a DelegationPolicy")
+        if delegation_policy is not None and not isinstance(
+            delegation_policy,
+            DelegationPolicy,
+        ):
+            raise TypeError(
+                "delegation_policy must be a DelegationPolicy or None"
+            )
         self._preset = preset
         self._model_gateway = model_gateway
         self._output_repository = output_repository
         self._runtime_limits = runtime_limits
         self._recovery_policy = recovery_policy
-        if (output_repository is None) != (output_publisher is None):
-            raise ValueError(
-                "canonical output repository and publisher must be configured together"
-            )
-        self._output_processor = output_processor or (
-            AgentOutputProcessor(output_repository, output_publisher)
-            if output_repository is not None and output_publisher is not None
-            else None
-        )
-        self._repository = (
-            CanonicalRunRepository(run_repository, self._output_processor)
-            if self._output_processor is not None
-            else run_repository
-        )
-        self._operations = operation_controller or (
-            AgentOperationController(self._output_processor)
-            if self._output_processor is not None
-            else None
-        )
-        self._model_invocations = AgentModelInvocationManager(
+        (
+            self._output_processor,
+            self._repository,
+            self._operations,
+            self._model_invocations,
+        ) = _configure_output_runtime(
             model_gateway,
-            output_observer=self._output_processor,
-            operation_controller=self._operations,
+            run_repository,
+            output_processor=output_processor,
+            output_repository=output_repository,
+            output_publisher=output_publisher,
+            operation_controller=operation_controller,
         )
-        if context_provider is not None and context_provider_factory is not None:
-            raise ValueError(
-                "context provider and context provider factory are mutually exclusive"
-            )
-        if (
-            conversation_compactor is not None
-            and conversation_compactor_factory is not None
-        ):
-            raise ValueError(
-                "conversation compactor and compactor factory are mutually exclusive"
-            )
         self._context_provider_factory = context_provider_factory
         self._conversation_compactor_factory = conversation_compactor_factory
-        if isinstance(conversation_compactor, ContextCompressionCoordinator):
-            self._conversation_compactor = ContextCompressionCoordinator(
-                conversation_compactor.hook,
-                conversation_compactor.settings,
-                operation_controller=self._operations,
-            )
-        else:
-            self._conversation_compactor = conversation_compactor or (
-                ContextCompressionCoordinator(
-                    operation_controller=self._operations,
-                )
-            )
+        self._conversation_compactor = _resolve_conversation_compactor(
+            context_provider,
+            context_provider_factory,
+            conversation_compactor,
+            conversation_compactor_factory,
+            self._operations,
+        )
         if execution_profile is not None and any((
             planner is not None,
             planning_policy is not None,
@@ -352,65 +329,31 @@ class AgentCore:
             execution_state_factory or _DefaultExecutionStateFactory()
         )
         self._approval_gateway = approval_gateway or InMemoryApprovalGateway()
-        self._delegation_coordinator: DelegationCoordinator | None = None
-        self._dynamic_delegated_executor: DynamicDelegatedAgentExecutor | None = None
         base_tool_catalog = tool_catalog or InMemoryToolCatalog(())
-        if delegation_repository is not None:
-            if tool_idempotency_gateway is None:
-                raise ValueError(
-                    "delegated Agents require a tool idempotency gateway"
-                )
-            if self._output_processor is None or self._operations is None:
-                raise ValueError(
-                    "delegation requires canonical output infrastructure"
-                )
-            if delegated_agent_executor is None:
-                self._dynamic_delegated_executor = DynamicDelegatedAgentExecutor(
-                    tool_catalog=base_tool_catalog,
-                    model_gateway=self._model_gateway,
-                    model_manager=self._model_invocations,
-                    output_processor=self._output_processor,
-                    operation_controller=self._operations,
-                    approval_gateway=self._approval_gateway,
-                    tool_idempotency_gateway=tool_idempotency_gateway,
-                    policy=delegation_policy,
-                    context_provider=context_provider,
-                    context_provider_factory=context_provider_factory,
-                    conversation_compactor=conversation_compactor,
-                    conversation_compactor_factory=(
-                        conversation_compactor_factory
-                    ),
-                    execution_state_factory=execution_state_factory,
-                    runtime_limits=runtime_limits,
-                    recovery_policy=recovery_policy,
-                    tool_execution_limits=tool_execution_limits,
-                )
-                delegated_agent_executor = self._dynamic_delegated_executor
-            self._delegation_coordinator = DelegationCoordinator(
-                repository=delegation_repository,
-                executor=delegated_agent_executor,
-                output_processor=self._output_processor,
-                operation_controller=self._operations,
-                max_parallel=delegation_policy.max_parallel,
-            )
-        elif delegated_agent_executor is not None:
-            raise ValueError(
-                "delegated Agent executor requires a delegation repository"
-            )
-        elif delegation_policy != DelegationPolicy():
-            raise ValueError(
-                "delegation policy requires a delegation repository"
-            )
-        if self._delegation_coordinator is not None:
-            self._tool_catalog = _AugmentedToolCatalog(
-                base_tool_catalog,
-                (build_delegation_tool_registration(
-                    self._delegation_coordinator,
-                    delegation_policy,
-                ),),
-            )
-        else:
-            self._tool_catalog = base_tool_catalog
+        (
+            self._delegation_coordinator,
+            self._dynamic_delegated_executor,
+            self._tool_catalog,
+        ) = assemble_delegation(
+            base_tool_catalog=base_tool_catalog,
+            policy=delegation_policy,
+            repository=delegation_repository,
+            executor=delegated_agent_executor,
+            idempotency=tool_idempotency_gateway,
+            output=self._output_processor,
+            operations=self._operations,
+            model_gateway=self._model_gateway,
+            model_manager=self._model_invocations,
+            approval=self._approval_gateway,
+            context_provider=context_provider,
+            context_provider_factory=context_provider_factory,
+            conversation_compactor=conversation_compactor,
+            conversation_compactor_factory=conversation_compactor_factory,
+            execution_state_factory=execution_state_factory,
+            runtime_limits=runtime_limits,
+            recovery_policy=recovery_policy,
+            tool_execution_limits=tool_execution_limits,
+        )
         self._registrations = tuple(self._tool_catalog.registrations())
         # This is deliberately not replaceable by a domain ``execute`` hook:
         # every registered handler crosses the same Core policy boundary.
@@ -421,25 +364,15 @@ class AgentCore:
             tool_idempotency_gateway,
             self._operations,
         )
-        self._run_supervisor = None
-        if output_repository is not None and output_publisher is not None:
-            owner_id = (
-                execution_owner_id
-                or getattr(run_repository, "owner_id", None)
-            )
-            lease_duration_ms = (
-                execution_lease_duration_ms
-                or getattr(run_repository, "lease_duration_ms", None)
-                or 30_000
-            )
-            self._run_supervisor = AgentRunSupervisor(
-                output_repository=output_repository,
-                output_publisher=output_publisher,
-                execution_factory=self._supervised_execution,
-                lease_store=execution_lease_store,
-                owner_id=owner_id,
-                lease_duration_ms=lease_duration_ms,
-            )
+        self._run_supervisor = _build_run_supervisor(
+            run_repository=run_repository,
+            output_repository=output_repository,
+            output_publisher=output_publisher,
+            execution_factory=self._supervised_execution,
+            lease_store=execution_lease_store,
+            owner_id=execution_owner_id,
+            lease_duration_ms=execution_lease_duration_ms,
+        )
 
     async def resolve_approval(
         self,
@@ -480,7 +413,10 @@ class AgentCore:
                 resolved_options
             )
             request = self._preset.apply(request)
-            snapshot = self._preset.snapshot(request)
+            snapshot = self._preset.snapshot(
+                request,
+                tool_catalog=self._tool_catalog,
+            )
             persisted = resolved_options.agent_preset_snapshot
             if persisted is not None and persisted != snapshot:
                 raise ContractViolationError(
@@ -489,6 +425,11 @@ class AgentCore:
             resolved_options = replace(
                 resolved_options,
                 agent_preset_snapshot=snapshot,
+            )
+        elif resolved_options.durable_continuation is not None:
+            raise ContractViolationError(
+                "durable continuation requires a configured AgentPreset",
+                code="agent_preset_snapshot_unsupported",
             )
         elif resolved_options.agent_preset_snapshot is not None:
             raise ContractViolationError(
@@ -503,49 +444,9 @@ class AgentCore:
         self,
         options: AgentCoreRunOptions,
     ) -> AgentCoreRunOptions:
-        continuation = options.durable_continuation
-        if continuation is None:
-            return options
-        source = continuation.source
-        stored = source.agent_preset_snapshot
-        if not stored:
-            if self._output_repository is None:
-                raise ContractViolationError(
-                    "durable continuation cannot load its AgentPreset snapshot"
-                )
-            events = await self._output_repository.list_events(
-                source.run_id,
-                after_sequence=0,
-                limit=1,
-            )
-            stored = (
-                events[0].payload.get("agentPreset", {})
-                if events
-                else {}
-            )
-        if not stored:
-            raise ContractViolationError(
-                "durable continuation source has no AgentPreset snapshot"
-            )
-        snapshot = AgentPresetSnapshot.from_mapping(stored)
-        if (
-            options.agent_preset_snapshot is not None
-            and options.agent_preset_snapshot != snapshot
-        ):
-            raise ContractViolationError(
-                "durable continuation selected a different AgentPreset snapshot"
-            )
-        restored = replace(
-            source,
-            agent_preset_snapshot=snapshot.to_mapping(),
-        )
-        return replace(
+        return await restore_continuation_preset(
             options,
-            agent_preset_snapshot=snapshot,
-            durable_continuation=replace(
-                continuation,
-                source=restored,
-            ),
+            self._output_repository,
         )
 
     def _supervised_execution(
@@ -588,7 +489,6 @@ class AgentCore:
             repository=self._repository,
             event_sink=sink,
         )
-        runtime_stream = None
         delegation_bound = False
         compaction_source_request = request
         pre_planning_compaction: dict[str, Any] = {
@@ -733,174 +633,24 @@ class AgentCore:
                     runtime_reserve_tokens=options.runtime_reserve_tokens,
                     minimum_message_tokens=options.minimum_message_tokens,
                 )
-                compactor = conversation_compactor
-                if compactor is not None and context_capability.uses_staged_context:
-                    compaction_started = asyncio.Event()
-                    compaction_started_payload: dict[str, Any] = {}
-
-                    async def notify_compaction_started(
-                        payload: Mapping[str, Any],
-                    ) -> None:
-                        compaction_started_payload.update(dict(payload))
-                        compaction_started.set()
-
-                    compaction_task = asyncio.create_task(
-                        await_with_cancellation(
-                            compactor.prepare(
-                                compaction_source_request,
-                                signal,
-                                on_compaction_started=(
-                                    notify_compaction_started
-                                ),
-                                budget=ContextCompactionBudget(
-                                    phase=(
-                                        ContextCompactionPhase.PRE_PLANNING
-                                    ),
-                                    provider_input_tokens=(
-                                        reserved_budget.provider_input_tokens
-                                    ),
-                                    context_tokens=sum(
-                                        reserved_budget.context_allocations.values()
-                                    ),
-                                    context_tokens_are_resolved=False,
-                                    output_reserve_tokens=(
-                                        reserved_budget.output_reserve_tokens
-                                    ),
-                                ),
-                                operation_scope=OperationScope(
-                                    run_id=controller.run_id,
-                                ),
-                            ),
-                            signal,
-                        )
+                if (
+                    conversation_compactor is not None
+                    and context_capability.uses_staged_context
+                ):
+                    (
+                        request,
+                        pre_planning_compaction,
+                        compaction_events,
+                    ) = await compact_before_planning(
+                        compactor=conversation_compactor,
+                        request=compaction_source_request,
+                        budget=reserved_budget,
+                        controller=controller,
+                        publish=self._publish_runtime_event,
+                        signal=signal,
                     )
-                    compaction_started_wait = asyncio.create_task(
-                        compaction_started.wait()
-                    )
-                    compaction_result: ConversationCompactionResult | None = None
-                    try:
-                        await asyncio.wait(
-                            (compaction_task, compaction_started_wait),
-                            return_when=asyncio.FIRST_COMPLETED,
-                        )
-                        if compaction_started.is_set():
-                            started_event = AgentEvent(
-                                type="conversation.compaction.started",
-                                run_id=controller.run_id,
-                                payload={
-                                    "status": "running",
-                                    "phase": "pre_planning",
-                                    "postPlanning": False,
-                                    **compaction_started_payload,
-                                },
-                            )
-                            await self._publish_runtime_event(
-                                controller.run_id,
-                                started_event,
-                            )
-                            yield started_event
-                        candidate = await compaction_task
-                        if not isinstance(
-                            candidate,
-                            ConversationCompactionResult,
-                        ):
-                            raise ContractViolationError(
-                                "conversation compactor returned an invalid result"
-                            )
-                        compaction_result = candidate
-                    except OperationCanceled:
-                        raise
-                    except Exception as error:
-                        pre_planning_compaction = {
-                            "outcome": "failed_open",
-                            "phase": "pre_planning",
-                        }
-                        await _record_safe_exception(
-                            controller,
-                            stage="conversation_compaction",
-                            outcome="failed_open",
-                            error=error,
-                            safe_details={"phase": "pre_planning"},
-                        )
-                    finally:
-                        if not compaction_started_wait.done():
-                            compaction_started_wait.cancel()
-                        if not compaction_task.done():
-                            compaction_task.cancel()
-                        with suppress(asyncio.CancelledError):
-                            await compaction_started_wait
-                        with suppress(asyncio.CancelledError, Exception):
-                            await compaction_task
-
-                    if compaction_result is not None:
-                        request = compaction_result.request
-                        pre_planning_compaction = {
-                            **thaw_json_mapping(
-                                compaction_result.diagnostics
-                            ),
-                            "outcome": compaction_result.outcome,
-                            "phase": "pre_planning",
-                            "compactedTurnCount": (
-                                compaction_result.compacted_turn_count
-                            ),
-                            "retainedRawTurnCount": (
-                                compaction_result.retained_raw_turn_count
-                            ),
-                            "summaryVersion": (
-                                compaction_result.compression_state_version
-                            ),
-                        }
-                        await controller.record_trace(TraceRecord(
-                            stage="conversation_compaction",
-                            outcome=compaction_result.outcome,
-                            details={
-                                key: value
-                                for key, value in pre_planning_compaction.items()
-                                if key != "outcome"
-                            },
-                        ))
-                    if compaction_started.is_set():
-                        completed_event = AgentEvent(
-                            type="conversation.compaction.completed",
-                            run_id=controller.run_id,
-                            payload={
-                                "status": (
-                                    "completed"
-                                    if compaction_result is not None
-                                    and compaction_result.outcome.startswith(
-                                        "compacted"
-                                    )
-                                    else "failed"
-                                ),
-                                "phase": "pre_planning",
-                                "postPlanning": False,
-                                "outcome": (
-                                    compaction_result.outcome
-                                    if compaction_result is not None
-                                    else "failed_open"
-                                ),
-                                "compactedTurnCount": (
-                                    compaction_result.compacted_turn_count
-                                    if compaction_result is not None
-                                    else 0
-                                ),
-                                "retainedRawTurnCount": (
-                                    compaction_result.retained_raw_turn_count
-                                    if compaction_result is not None
-                                    else 0
-                                ),
-                                "summaryVersion": (
-                                    compaction_result.compression_state_version
-                                    if compaction_result is not None
-                                    else None
-                                ),
-                            },
-                        )
-                        await self._publish_runtime_event(
-                            controller.run_id,
-                            completed_event,
-                        )
-                        yield completed_event
+                    for event in compaction_events:
+                        yield event
                 planning_bundle = await await_with_cancellation(
                     context_capability.build_initial(
                         request,
@@ -1032,412 +782,32 @@ class AgentCore:
 
             setup_started = perf_counter()
             try:
-                task_context: TaskContextRequest | None = None
-                task_context_claims: tuple[ContextBudgetClaim, ...] = ()
-                if (
-                    context_capability.staged_provider is not None
-                    and plan is not None
-                    and plan.task_spec is not None
-                ):
-                    task_context = _compile_task_context_request(
-                        plan,
-                        selected_registrations,
-                        run_id=controller.run_id,
-                    )
-                    if isinstance(
-                        context_capability.staged_provider,
-                        TaskContextDemandProvider,
-                    ):
-                        task_context_claims = await await_with_cancellation(
-                            resolve_task_context_budget_claims(
-                                context_capability.staged_provider,
-                                request,
-                                task_context,
-                                signal,
-                            ),
-                            signal,
-                        )
-                effective_context_claims = _merge_context_claims(
-                    context_claims,
-                    task_context_claims,
+                prepared = await self._prepare_runtime_phase(
+                    request=request,
+                    compaction_source_request=compaction_source_request,
+                    options=options,
+                    controller=controller,
+                    context_capability=context_capability,
+                    conversation_compactor=conversation_compactor,
+                    planning_bundle=planning_bundle,
+                    bundle=bundle,
+                    plan=plan,
+                    selected_registrations=selected_registrations,
+                    schemas=schemas,
+                    selected_names=selected_names,
+                    context_claims=context_claims,
+                    reserved_budget=reserved_budget,
+                    pre_planning_compaction=pre_planning_compaction,
+                    output_limit=output_limit,
+                    signal=signal,
                 )
-                budget = allocate_context_budget(
-                    window_tokens=(
-                        request.context_window
-                        or options.default_context_window_tokens
-                    ),
-                    output_reserve_tokens=output_limit.max_tokens,
-                    tools=schemas,
-                    claims=effective_context_claims,
-                    safety_reserve_tokens=options.safety_reserve_tokens,
-                    runtime_reserve_tokens=options.runtime_reserve_tokens,
-                    minimum_message_tokens=options.minimum_message_tokens,
-                )
-                context_mode = "single_pass"
-                if context_capability.staged_provider is not None:
-                    retrieval_started = perf_counter()
-                    bundle, context_mode = await await_with_cancellation(
-                        context_capability.build_execution(
-                            request,
-                            budget,
-                            planning_bundle,
-                            task_context,
-                            signal,
-                        ),
-                        signal,
-                    )
-                    await controller.record_trace(TraceRecord(
-                        stage="context_retrieval",
-                        outcome=context_mode,
-                        details={
-                            "postPlanning": context_mode == "task_spec",
-                            "plannedToolCount": len(
-                                _planned_tool_names(plan)
-                                if plan is not None
-                                else ()
-                            ),
-                            "requiredContextBlockCount": (
-                                len(task_context.required_context_blocks)
-                                if context_mode == "task_spec"
-                                else 0
-                            ),
-                            "evidenceKindCount": (
-                                len(task_context.evidence_kinds)
-                                if context_mode == "task_spec"
-                                else 0
-                            ),
-                        },
-                        duration_ms=_duration_ms(retrieval_started),
-                    ))
-                _validate_context_allocations(bundle, budget)
-                post_planning_diagnostics: dict[str, Any] = {
-                    "outcome": "not_configured",
-                    "plannedStepCount": len(plan.steps) if plan is not None else 0,
-                    "plannedToolCount": (
-                        sum(
-                            step.executor is StepExecutor.TOOL
-                            for step in plan.steps
-                        )
-                        if plan is not None
-                        else 0
-                    ),
-                    "selectedToolCount": len(selected_names),
-                }
-                compactor = conversation_compactor
-                if compactor is not None and context_capability.uses_staged_context:
-                    resolved_context_tokens = estimate_agent_messages_tokens(
-                        _assemble_messages((), bundle.blocks, plan)
-                    )
-                    optimization_started = asyncio.Event()
-                    optimization_started_payload: dict[str, Any] = {}
-
-                    async def notify_optimization_started(
-                        payload: Mapping[str, Any],
-                    ) -> None:
-                        optimization_started_payload.update(dict(payload))
-                        optimization_started.set()
-
-                    async def run_context_optimization(
-                    ) -> ConversationCompactionResult:
-                        source_request = replace(
-                            compaction_source_request,
-                            metadata={
-                                **compaction_source_request.metadata,
-                                **request.metadata,
-                            },
-                        )
-                        compacted = await await_with_cancellation(
-                            compactor.prepare(
-                                source_request,
-                                signal,
-                                budget=ContextCompactionBudget(
-                                    phase=ContextCompactionPhase.POST_PLANNING,
-                                    provider_input_tokens=(
-                                        budget.provider_input_tokens
-                                    ),
-                                    context_tokens=resolved_context_tokens,
-                                    context_tokens_are_resolved=True,
-                                    output_reserve_tokens=(
-                                        budget.output_reserve_tokens
-                                    ),
-                                    planned_step_count=(
-                                        post_planning_diagnostics[
-                                            "plannedStepCount"
-                                        ]
-                                    ),
-                                    planned_tool_count=(
-                                        post_planning_diagnostics[
-                                            "plannedToolCount"
-                                        ]
-                                    ),
-                                    selected_tool_count=len(selected_names),
-                                ),
-                                on_compaction_started=(
-                                    notify_optimization_started
-                                ),
-                                operation_scope=OperationScope(
-                                    run_id=controller.run_id,
-                                ),
-                            ),
-                            signal,
-                        )
-                        if not isinstance(
-                            compacted,
-                            ConversationCompactionResult,
-                        ):
-                            raise ContractViolationError(
-                                "conversation compactor returned an invalid "
-                                "post-planning result"
-                            )
-                        return replace(
-                            compacted,
-                            request=replace(
-                                compacted.request,
-                                metadata={
-                                    **request.metadata,
-                                    **compacted.request.metadata,
-                                },
-                            ),
-                        )
-
-                    optimization_task = asyncio.create_task(
-                        run_context_optimization()
-                    )
-                    optimization_started_wait = asyncio.create_task(
-                        optimization_started.wait()
-                    )
-                    optimization_result: (
-                        ConversationCompactionResult | None
-                    ) = None
-                    optimization_failed = False
-                    try:
-                        await asyncio.wait(
-                            (optimization_task, optimization_started_wait),
-                            return_when=asyncio.FIRST_COMPLETED,
-                        )
-                        if optimization_started.is_set():
-                            started_event = AgentEvent(
-                                type="conversation.compaction.started",
-                                run_id=controller.run_id,
-                                payload={
-                                    "status": "running",
-                                    "phase": "post_planning",
-                                    "postPlanning": True,
-                                    **optimization_started_payload,
-                                },
-                            )
-                            await self._publish_runtime_event(
-                                controller.run_id,
-                                started_event,
-                            )
-                            yield started_event
-                        candidate = await optimization_task
-                        if not isinstance(
-                            candidate,
-                            ConversationCompactionResult,
-                        ):
-                            raise ContractViolationError(
-                                "conversation compactor returned an invalid "
-                                "post-planning result"
-                            )
-                        optimization_result = candidate
-                    except OperationCanceled:
-                        raise
-                    except Exception as error:
-                        optimization_failed = True
-                        await _record_safe_exception(
-                            controller,
-                            stage="post_planning_context_optimization",
-                            outcome="failed_open",
-                            error=error,
-                        )
-                    finally:
-                        if not optimization_started_wait.done():
-                            optimization_started_wait.cancel()
-                        if not optimization_task.done():
-                            optimization_task.cancel()
-                        with suppress(asyncio.CancelledError):
-                            await optimization_started_wait
-                        with suppress(asyncio.CancelledError, Exception):
-                            await optimization_task
-
-                    if optimization_result is not None:
-                        request = optimization_result.request
-                        post_planning_diagnostics = {
-                            **post_planning_diagnostics,
-                            **thaw_json_mapping(
-                                optimization_result.diagnostics
-                            ),
-                            "outcome": optimization_result.outcome,
-                            "postPlanning": True,
-                            "resolvedContextTokens": resolved_context_tokens,
-                            "compactedTurnCount": (
-                                optimization_result.compacted_turn_count
-                            ),
-                            "retainedRawTurnCount": (
-                                optimization_result.retained_raw_turn_count
-                            ),
-                            "summaryVersion": (
-                                optimization_result.compression_state_version
-                            ),
-                        }
-                        await controller.record_trace(TraceRecord(
-                            stage="post_planning_context_optimization",
-                            outcome=optimization_result.outcome,
-                            details=post_planning_diagnostics,
-                        ))
-                    elif optimization_failed:
-                        post_planning_diagnostics = {
-                            **post_planning_diagnostics,
-                            "outcome": "failed_open",
-                            "postPlanning": True,
-                            "resolvedContextTokens": resolved_context_tokens,
-                        }
-
-                    if optimization_started.is_set():
-                        completed_event = AgentEvent(
-                            type="conversation.compaction.completed",
-                            run_id=controller.run_id,
-                            payload={
-                                "status": (
-                                    "completed"
-                                    if optimization_result is not None
-                                    and optimization_result.outcome.startswith(
-                                        "compacted"
-                                    )
-                                    else "failed"
-                                ),
-                                "phase": "post_planning",
-                                "postPlanning": True,
-                                "outcome": (
-                                    optimization_result.outcome
-                                    if optimization_result is not None
-                                    else "failed_open"
-                                ),
-                                "compactedTurnCount": (
-                                    optimization_result.compacted_turn_count
-                                    if optimization_result is not None
-                                    else 0
-                                ),
-                                "retainedRawTurnCount": (
-                                    optimization_result.retained_raw_turn_count
-                                    if optimization_result is not None
-                                    else 0
-                                ),
-                                "summaryVersion": (
-                                    optimization_result.compression_state_version
-                                    if optimization_result is not None
-                                    else None
-                                ),
-                            },
-                        )
-                        await self._publish_runtime_event(
-                            controller.run_id,
-                            completed_event,
-                        )
-                        yield completed_event
-                prepared_request = replace(
-                    request,
-                    messages=_assemble_messages(request.messages, bundle.blocks, plan),
-                    context_window=budget.window_tokens,
-                )
-                if self._dynamic_delegated_executor is not None:
-                    self._dynamic_delegated_executor.bind_run(
-                        controller.run_id,
-                        request,
-                        prepared_request.messages,
-                    )
-                    delegation_bound = True
-                estimated_input_tokens = estimate_agent_messages_tokens(
-                    prepared_request.messages
-                )
-                dropped_message_count = 0
-                overflow_tokens = max(
-                    0,
-                    estimated_input_tokens - budget.provider_input_tokens,
-                )
-                if overflow_tokens:
-                    raise ContextOverflowError(
-                        "required messages exceed the initial provider input budget",
-                        reason_code="required_messages_exceed_provider_budget",
-                        details={
-                            "providerInputTokens": budget.provider_input_tokens,
-                            "estimatedInputTokens": estimated_input_tokens,
-                            "overflowTokens": overflow_tokens,
-                        },
-                    )
-                state = self._execution_state_factory.create(request)
-                if not isinstance(state, ExecutionState):
-                    raise ContractViolationError(
-                        "execution state factory must return ExecutionState"
-                    )
-                state.run_id = controller.run_id
-                await controller.record_trace(TraceRecord(
-                    stage="context_budget",
-                    outcome="within_budget",
-                    details={
-                        "windowTokens": budget.window_tokens,
-                        "providerInputTokens": budget.provider_input_tokens,
-                        "toolSchemaTokens": budget.tool_schema_tokens,
-                        "reservedToolSchemaTokens": (
-                            reserved_budget.tool_schema_tokens
-                        ),
-                        "contextMode": context_mode,
-                        "contextDemands": _context_demand_diagnostics(
-                            effective_context_claims,
-                            budget,
-                        ),
-                        "droppedMessages": dropped_message_count,
-                        "prePlanningCompaction": pre_planning_compaction,
-                        "postPlanningOptimization": post_planning_diagnostics,
-                    },
-                    duration_ms=_duration_ms(setup_started),
-                ))
-                budget_event = AgentEvent(
-                    type=CoreEventType.CONTEXT_BUDGETED,
-                    run_id=controller.run_id,
-                    payload={
-                        "windowTokens": budget.window_tokens,
-                        "providerInputTokens": budget.provider_input_tokens,
-                        "estimatedInputTokens": estimated_input_tokens,
-                        "outputReserveTokens": budget.output_reserve_tokens,
-                        "outputLimit": output_limit.to_mapping(),
-                        "runtimeReserveTokens": budget.runtime_reserve_tokens,
-                        "safetyReserveTokens": budget.safety_reserve_tokens,
-                        "toolSchemaTokens": budget.tool_schema_tokens,
-                        "reservedToolSchemaTokens": (
-                            reserved_budget.tool_schema_tokens
-                        ),
-                        "contextMode": context_mode,
-                        "droppedMessages": dropped_message_count,
-                        "projectedTotalTokens": (
-                            estimated_input_tokens
-                            + budget.tool_schema_tokens
-                            + budget.output_reserve_tokens
-                            + budget.runtime_reserve_tokens
-                            + budget.safety_reserve_tokens
-                        ),
-                        "overflowTokens": 0,
-                        "contextAllocations": thaw_json_mapping(
-                            budget.context_allocations
-                        ),
-                        "diagnostics": {
-                            **thaw_json_mapping(bundle.diagnostics),
-                            "contextDemands": _context_demand_diagnostics(
-                                effective_context_claims,
-                                budget,
-                            ),
-                            "prePlanningCompaction": (
-                                pre_planning_compaction
-                            ),
-                            "postPlanningOptimization": (
-                                post_planning_diagnostics
-                            ),
-                        },
-                    },
-                )
-                await self._publish_runtime_event(controller.run_id, budget_event)
-                yield budget_event
+                request = prepared.request
+                prepared_request = prepared.prepared_request
+                budget = prepared.budget
+                state = prepared.state
+                delegation_bound = prepared.delegation_bound
+                for event in prepared.events:
+                    yield event
             except OperationCanceled:
                 await controller.cancel("request_canceled")
                 for event in sink.drain():
@@ -1471,204 +841,33 @@ class AgentCore:
                 yield _run_result(controller)
                 return
 
-            host_planned_arguments = {
-                registration.schema.name: thaw_json_mapping(
-                    registration.host_planned_arguments
-                )
-                for registration in registrations
-                if registration.host_planned_arguments is not None
-            }
-            runtime_model_gateway: ModelGateway = self._model_gateway
-            runtime_model_manager = self._model_invocations
-            if host_planned_arguments:
-                runtime_model_gateway = HostPlannedToolGateway(
-                    self._model_gateway,
-                    host_planned_arguments,
-                )
-                runtime_model_manager = AgentModelInvocationManager(
-                    runtime_model_gateway,
-                    output_observer=self._output_processor,
-                    operation_controller=self._operations,
-                )
-            runtime = AgentRuntime(
-                model_gateway=runtime_model_gateway,
-                tool_execution_gateway=self._tool_executor,
-                observer=controller,
-                context_compressor=conversation_compactor,
-                limits=self._runtime_limits,
-                recovery_policy=self._recovery_policy,
-                operation_controller=self._operations,
-                output_observer=self._output_processor,
-                model_manager=runtime_model_manager,
+            runtime_result, runtime_events = await self._drive_runtime(
+                request=request,
+                prepared_request=prepared_request,
+                options=options,
+                controller=controller,
+                sink=sink,
+                conversation_compactor=conversation_compactor,
+                model_tasks=model_tasks,
+                schemas=schemas,
+                registrations=registrations,
+                selected_names=selected_names,
+                planning_hook=planning_hook,
+                plan=plan,
+                state=state,
+                budget=budget,
+                output_limit=output_limit,
+                signal=signal,
             )
-            runtime_result: AgentRuntimeResult | None = None
-            try:
-                runtime_stream = runtime.run(
-                    prepared_request,
-                    tools=schemas,
-                    response_constraints=options.response_constraints,
-                    response_validators=options.response_validators,
-                    response_judges=(
-                        *options.response_judges,
-                        *(
-                            AgentModelResponseJudge(
-                                model_tasks=model_tasks,
-                                model_request=request.model,
-                                policy=policy,
-                            )
-                            for policy in options.response_judge_policies
-                        ),
-                    ),
-                    response_transaction_mode=(
-                        options.resolved_response_transaction_policy.mode
-                    ),
-                    execution_state=state,
-                    run_id=controller.run_id,
-                    turn_id=options.turn_id,
-                    context_budget=budget,
-                    output_limit=output_limit,
-                    scope_tools_to_observer=(plan is not None),
-                    force_tool_choice=bool(
-                        plan is not None
-                        and selected_names
-                        and options.force_planned_tool_choice
-                    ),
-                    reasoning_mode=options.reasoning_mode,
-                    require_tool_call=(
-                        options.require_tool_call
-                        if options.require_tool_call is not None
-                        else bool(plan is not None and selected_names)
-                    ),
-                    tools_executable=True,
-                    planning_hook=planning_hook,
-                    tool_context_contracts={
-                        registration.schema.name: registration.context_contract
-                        for registration in registrations
-                    },
-                    stage_context_projection_enabled=bool(
-                        plan is not None and plan.task_spec is not None
-                    ),
-                    signal=signal,
-                )
-                async with aclosing(runtime_stream) as updates:
-                    async for update in updates:
-                        for event in sink.drain():
-                            yield event
-                        if isinstance(update, AgentEvent):
-                            event = _bind_event_to_run(update, controller.run_id)
-                            await self._publish_runtime_event(
-                                controller.run_id,
-                                event,
-                            )
-                            yield event
-                        else:
-                            runtime_result = update
-                runtime_stream = None
-            except OperationCanceled:
-                runtime_result = AgentRuntimeResult(
-                    run_id=controller.run_id,
-                    outcome=RuntimeOutcome.CANCELED,
-                    final_response="",
-                    model=request.model.model,
-                    round_count=0,
-                    error_code="request_canceled",
-                )
-            except Exception as error:
-                await _record_safe_exception(
-                    controller,
-                    stage="runtime",
-                    outcome="exception",
-                    error=error,
-                )
-                runtime_result = AgentRuntimeResult(
-                    run_id=controller.run_id,
-                    outcome=RuntimeOutcome.FAILED,
-                    final_response="",
-                    model=request.model.model,
-                    round_count=0,
-                    error_code="runtime_exception",
-                )
-
-            for event in sink.drain():
+            for event in runtime_events:
                 yield event
-            if runtime_result is None:
-                await controller.fail("runtime_returned_no_result")
-            elif runtime_result.outcome is RuntimeOutcome.COMPLETED:
-                try:
-                    final_response = runtime_result.final_response
-                    validated_result: str | None = None
-                    transaction_policy = (
-                        options.resolved_response_transaction_policy
-                    )
-                    if (
-                        transaction_policy.mode
-                        is ResponseTransactionMode.VALIDATED_RESULT
-                    ):
-                        validated_result = final_response
-                        final_response = ""
-                        if (
-                            transaction_policy.public_presentation
-                            is PublicPresentationMode.MODEL_LIVE
-                        ):
-                            transaction = AgentResponseTransaction(
-                                AgentModelInvocationManager(
-                                    self._model_gateway,
-                                    output_observer=self._output_processor,
-                                    operation_controller=self._operations,
-                                ),
-                                policy=transaction_policy,
-                                facts_provider=(
-                                    options.committed_result_facts_provider
-                                ),
-                                operation_controller=self._operations,
-                            )
-                            final_response = await transaction.present(
-                                AgentRunResult(
-                                    run_id=controller.run_id,
-                                    status=RunStatus.DONE,
-                                    final_response=(
-                                        runtime_result.final_response
-                                    ),
-                                    model=runtime_result.model,
-                                ),
-                                request=request.model,
-                                context=ModelInvocationContext(
-                                    run_id=controller.run_id,
-                                    turn_id=options.turn_id,
-                                ),
-                                signal=signal,
-                            )
-                    if validated_result is None:
-                        await controller.complete(final_response)
-                    else:
-                        await controller.complete_validated_result(
-                            validated_result,
-                            final_response=final_response,
-                        )
-                except Exception as error:
-                    # A host projector participates in the terminal repository
-                    # transaction. Rejection means the result was not durably
-                    # committed, so the Run must fail instead of leaking a
-                    # false completed state.
-                    await _record_safe_exception(
-                        controller,
-                        stage="completion_projection",
-                        outcome="failed",
-                        error=error,
-                    )
-                    code = str(
-                        getattr(error, "code", "")
-                        or "completion_projection_failed"
-                    ).strip()
-                    await controller.fail(code)
-            elif runtime_result.outcome is RuntimeOutcome.CANCELED:
-                await controller.cancel(
-                    runtime_result.error_code or "request_canceled"
-                )
-            else:
-                await controller.fail(
-                    runtime_result.error_code or "runtime_failed"
-                )
+            await self._settle_runtime_result(
+                request=request,
+                options=options,
+                controller=controller,
+                result=runtime_result,
+                signal=signal,
+            )
             for event in sink.drain():
                 yield event
             yield _run_result(
@@ -1676,9 +875,6 @@ class AgentCore:
                 model=(runtime_result.model if runtime_result is not None else request.model.model),
             )
         finally:
-            if runtime_stream is not None:
-                with suppress(asyncio.CancelledError, Exception):
-                    await runtime_stream.aclose()
             run_id = controller.run_id
             if run_id is not None:
                 with suppress(Exception):
@@ -1692,6 +888,431 @@ class AgentCore:
                 # itself is shutting down; subscriber disposal never reaches
                 # this path.
                 await controller.cancel("execution_owner_stopped")
+
+    async def _prepare_runtime_phase(
+        self,
+        *,
+        request: AgentRunRequest,
+        compaction_source_request: AgentRunRequest,
+        options: AgentCoreRunOptions,
+        controller: AgentRunController,
+        context_capability: ContextCapability,
+        conversation_compactor: ConversationCompactor | None,
+        planning_bundle: ContextBundle,
+        bundle: ContextBundle,
+        plan: ExecutionPlan | None,
+        selected_registrations: Sequence[ToolRegistration],
+        schemas,
+        selected_names: frozenset[str],
+        context_claims: Sequence[ContextBudgetClaim],
+        reserved_budget: ContextBudget,
+        pre_planning_compaction: Mapping[str, Any],
+        output_limit,
+        signal: CancellationSignal | None,
+    ) -> _PreparedRuntimePhase:
+        setup_started = perf_counter()
+        task_context: TaskContextRequest | None = None
+        task_context_claims: tuple[ContextBudgetClaim, ...] = ()
+        if (
+            context_capability.staged_provider is not None
+            and plan is not None
+            and plan.task_spec is not None
+        ):
+            task_context = _compile_task_context_request(
+                plan,
+                selected_registrations,
+                run_id=controller.run_id,
+            )
+            if isinstance(
+                context_capability.staged_provider,
+                TaskContextDemandProvider,
+            ):
+                task_context_claims = await await_with_cancellation(
+                    resolve_task_context_budget_claims(
+                        context_capability.staged_provider,
+                        request,
+                        task_context,
+                        signal,
+                    ),
+                    signal,
+                )
+        effective_context_claims = _merge_context_claims(
+            context_claims,
+            task_context_claims,
+        )
+        budget = allocate_context_budget(
+            window_tokens=(
+                request.context_window or options.default_context_window_tokens
+            ),
+            output_reserve_tokens=output_limit.max_tokens,
+            tools=schemas,
+            claims=effective_context_claims,
+            safety_reserve_tokens=options.safety_reserve_tokens,
+            runtime_reserve_tokens=options.runtime_reserve_tokens,
+            minimum_message_tokens=options.minimum_message_tokens,
+        )
+        context_mode = "single_pass"
+        if context_capability.staged_provider is not None:
+            retrieval_started = perf_counter()
+            bundle, context_mode = await await_with_cancellation(
+                context_capability.build_execution(
+                    request,
+                    budget,
+                    planning_bundle,
+                    task_context,
+                    signal,
+                ),
+                signal,
+            )
+            await controller.record_trace(TraceRecord(
+                stage="context_retrieval",
+                outcome=context_mode,
+                details={
+                    "postPlanning": context_mode == "task_spec",
+                    "plannedToolCount": len(
+                        _planned_tool_names(plan) if plan is not None else ()
+                    ),
+                    "requiredContextBlockCount": (
+                        len(task_context.required_context_blocks)
+                        if context_mode == "task_spec"
+                        else 0
+                    ),
+                    "evidenceKindCount": (
+                        len(task_context.evidence_kinds)
+                        if context_mode == "task_spec"
+                        else 0
+                    ),
+                },
+                duration_ms=_duration_ms(retrieval_started),
+            ))
+        _validate_context_allocations(bundle, budget)
+        diagnostics: dict[str, Any] = {
+            "outcome": "not_configured",
+            "plannedStepCount": len(plan.steps) if plan is not None else 0,
+            "plannedToolCount": (
+                sum(step.executor is StepExecutor.TOOL for step in plan.steps)
+                if plan is not None
+                else 0
+            ),
+            "selectedToolCount": len(selected_names),
+        }
+        events: tuple[AgentEvent, ...] = ()
+        if (
+            conversation_compactor is not None
+            and context_capability.uses_staged_context
+        ):
+            request, diagnostics, events = await compact_after_planning(
+                compactor=conversation_compactor,
+                source_request=compaction_source_request,
+                request=request,
+                budget=budget,
+                context_blocks=bundle.blocks,
+                plan=plan,
+                selected_names=selected_names,
+                controller=controller,
+                publish=self._publish_runtime_event,
+                signal=signal,
+            )
+        prepared_request = replace(
+            request,
+            messages=_assemble_messages(request.messages, bundle.blocks, plan),
+            context_window=budget.window_tokens,
+        )
+        estimated_input_tokens = estimate_agent_messages_tokens(
+            prepared_request.messages
+        )
+        overflow_tokens = max(
+            0,
+            estimated_input_tokens - budget.provider_input_tokens,
+        )
+        if overflow_tokens:
+            raise ContextOverflowError(
+                "required messages exceed the initial provider input budget",
+                reason_code="required_messages_exceed_provider_budget",
+                details={
+                    "providerInputTokens": budget.provider_input_tokens,
+                    "estimatedInputTokens": estimated_input_tokens,
+                    "overflowTokens": overflow_tokens,
+                },
+            )
+        state = self._execution_state_factory.create(request)
+        if not isinstance(state, ExecutionState):
+            raise ContractViolationError(
+                "execution state factory must return ExecutionState"
+            )
+        state.run_id = controller.run_id
+        await controller.record_trace(TraceRecord(
+            stage="context_budget",
+            outcome="within_budget",
+            details={
+                "windowTokens": budget.window_tokens,
+                "providerInputTokens": budget.provider_input_tokens,
+                "toolSchemaTokens": budget.tool_schema_tokens,
+                "reservedToolSchemaTokens": reserved_budget.tool_schema_tokens,
+                "contextMode": context_mode,
+                "contextDemands": _context_demand_diagnostics(
+                    effective_context_claims,
+                    budget,
+                ),
+                "droppedMessages": 0,
+                "prePlanningCompaction": pre_planning_compaction,
+                "postPlanningOptimization": diagnostics,
+            },
+            duration_ms=_duration_ms(setup_started),
+        ))
+        budget_event = AgentEvent(
+            type=CoreEventType.CONTEXT_BUDGETED,
+            run_id=controller.run_id,
+            payload={
+                "windowTokens": budget.window_tokens,
+                "providerInputTokens": budget.provider_input_tokens,
+                "estimatedInputTokens": estimated_input_tokens,
+                "outputReserveTokens": budget.output_reserve_tokens,
+                "outputLimit": output_limit.to_mapping(),
+                "runtimeReserveTokens": budget.runtime_reserve_tokens,
+                "safetyReserveTokens": budget.safety_reserve_tokens,
+                "toolSchemaTokens": budget.tool_schema_tokens,
+                "reservedToolSchemaTokens": reserved_budget.tool_schema_tokens,
+                "contextMode": context_mode,
+                "droppedMessages": 0,
+                "projectedTotalTokens": (
+                    estimated_input_tokens
+                    + budget.tool_schema_tokens
+                    + budget.output_reserve_tokens
+                    + budget.runtime_reserve_tokens
+                    + budget.safety_reserve_tokens
+                ),
+                "overflowTokens": 0,
+                "contextAllocations": thaw_json_mapping(
+                    budget.context_allocations
+                ),
+                "diagnostics": {
+                    **thaw_json_mapping(bundle.diagnostics),
+                    "contextDemands": _context_demand_diagnostics(
+                        effective_context_claims,
+                        budget,
+                    ),
+                    "prePlanningCompaction": pre_planning_compaction,
+                    "postPlanningOptimization": diagnostics,
+                },
+            },
+        )
+        await self._publish_runtime_event(controller.run_id, budget_event)
+        delegation_bound = self._dynamic_delegated_executor is not None
+        if self._dynamic_delegated_executor is not None:
+            self._dynamic_delegated_executor.bind_run(
+                controller.run_id,
+                request,
+                prepared_request.messages,
+            )
+        return _PreparedRuntimePhase(
+            request=request,
+            prepared_request=prepared_request,
+            budget=budget,
+            state=state,
+            events=(*events, budget_event),
+            delegation_bound=delegation_bound,
+        )
+
+    async def _settle_runtime_result(
+        self,
+        *,
+        request: AgentRunRequest,
+        options: AgentCoreRunOptions,
+        controller: AgentRunController,
+        result: AgentRuntimeResult | None,
+        signal: CancellationSignal | None,
+    ) -> None:
+        if result is None:
+            await controller.fail("runtime_returned_no_result")
+            return
+        if result.outcome is RuntimeOutcome.CANCELED:
+            await controller.cancel(result.error_code or "request_canceled")
+            return
+        if result.outcome is not RuntimeOutcome.COMPLETED:
+            await controller.fail(result.error_code or "runtime_failed")
+            return
+        try:
+            final_response = result.final_response
+            validated_result: str | None = None
+            policy = options.resolved_response_transaction_policy
+            if policy.mode is ResponseTransactionMode.VALIDATED_RESULT:
+                validated_result = final_response
+                final_response = ""
+                if policy.public_presentation is PublicPresentationMode.MODEL_LIVE:
+                    transaction = AgentResponseTransaction(
+                        AgentModelInvocationManager(
+                            self._model_gateway,
+                            output_observer=self._output_processor,
+                            operation_controller=self._operations,
+                        ),
+                        policy=policy,
+                        facts_provider=options.committed_result_facts_provider,
+                        operation_controller=self._operations,
+                    )
+                    final_response = await transaction.present(
+                        AgentRunResult(
+                            run_id=controller.run_id,
+                            status=RunStatus.DONE,
+                            final_response=result.final_response,
+                            model=result.model,
+                        ),
+                        request=request.model,
+                        context=ModelInvocationContext(
+                            run_id=controller.run_id,
+                            turn_id=options.turn_id,
+                        ),
+                        signal=signal,
+                    )
+            if validated_result is None:
+                await controller.complete(final_response)
+            else:
+                await controller.complete_validated_result(
+                    validated_result,
+                    final_response=final_response,
+                )
+        except Exception as error:
+            await _record_safe_exception(
+                controller,
+                stage="completion_projection",
+                outcome="failed",
+                error=error,
+            )
+            code = str(
+                getattr(error, "code", "") or "completion_projection_failed"
+            ).strip()
+            await controller.fail(code)
+
+    async def _drive_runtime(
+        self,
+        *,
+        request: AgentRunRequest,
+        prepared_request: AgentRunRequest,
+        options: AgentCoreRunOptions,
+        controller: AgentRunController,
+        sink: _BufferedEventSink,
+        conversation_compactor: ConversationCompactor | None,
+        model_tasks: AgentModelTaskRunner,
+        schemas,
+        registrations: Sequence[ToolRegistration],
+        selected_names: frozenset[str],
+        planning_hook,
+        plan: ExecutionPlan | None,
+        state: ExecutionState,
+        budget: ContextBudget,
+        output_limit,
+        signal: CancellationSignal | None,
+    ) -> tuple[AgentRuntimeResult | None, tuple[AgentEvent, ...]]:
+        host_arguments = {
+            item.schema.name: thaw_json_mapping(item.host_planned_arguments)
+            for item in registrations
+            if item.host_planned_arguments is not None
+        }
+        gateway: ModelGateway = self._model_gateway
+        manager = self._model_invocations
+        if host_arguments:
+            gateway = HostPlannedToolGateway(self._model_gateway, host_arguments)
+            manager = AgentModelInvocationManager(
+                gateway,
+                output_observer=self._output_processor,
+                operation_controller=self._operations,
+            )
+        runtime = AgentRuntime(
+            model_gateway=gateway,
+            tool_execution_gateway=self._tool_executor,
+            observer=controller,
+            context_compressor=conversation_compactor,
+            limits=self._runtime_limits,
+            recovery_policy=self._recovery_policy,
+            operation_controller=self._operations,
+            output_observer=self._output_processor,
+            model_manager=manager,
+        )
+        result: AgentRuntimeResult | None = None
+        events: list[AgentEvent] = []
+        try:
+            stream = runtime.run(
+                prepared_request,
+                tools=schemas,
+                response_constraints=options.response_constraints,
+                response_validators=options.response_validators,
+                response_judges=(
+                    *options.response_judges,
+                    *(
+                        AgentModelResponseJudge(
+                            model_tasks=model_tasks,
+                            model_request=request.model,
+                            policy=policy,
+                        )
+                        for policy in options.response_judge_policies
+                    ),
+                ),
+                response_transaction_mode=(
+                    options.resolved_response_transaction_policy.mode
+                ),
+                execution_state=state,
+                run_id=controller.run_id,
+                turn_id=options.turn_id,
+                context_budget=budget,
+                output_limit=output_limit,
+                scope_tools_to_observer=plan is not None,
+                force_tool_choice=bool(
+                    plan is not None
+                    and selected_names
+                    and options.force_planned_tool_choice
+                ),
+                reasoning_mode=options.reasoning_mode,
+                require_tool_call=(
+                    options.require_tool_call
+                    if options.require_tool_call is not None
+                    else bool(plan is not None and selected_names)
+                ),
+                tools_executable=True,
+                planning_hook=planning_hook,
+                tool_context_contracts={
+                    item.schema.name: item.context_contract
+                    for item in registrations
+                },
+                stage_context_projection_enabled=bool(
+                    plan is not None and plan.task_spec is not None
+                ),
+                signal=signal,
+            )
+            async with aclosing(stream) as updates:
+                async for update in updates:
+                    events.extend(sink.drain())
+                    if isinstance(update, AgentEvent):
+                        event = _bind_event_to_run(update, controller.run_id)
+                        await self._publish_runtime_event(controller.run_id, event)
+                        events.append(event)
+                    else:
+                        result = update
+        except OperationCanceled:
+            result = AgentRuntimeResult(
+                run_id=controller.run_id,
+                outcome=RuntimeOutcome.CANCELED,
+                final_response="",
+                model=request.model.model,
+                round_count=0,
+                error_code="request_canceled",
+            )
+        except Exception as error:
+            await _record_safe_exception(
+                controller,
+                stage="runtime",
+                outcome="exception",
+                error=error,
+            )
+            result = AgentRuntimeResult(
+                run_id=controller.run_id,
+                outcome=RuntimeOutcome.FAILED,
+                final_response="",
+                model=request.model.model,
+                round_count=0,
+                error_code="runtime_exception",
+            )
+        events.extend(sink.drain())
+        return result, tuple(events)
 
     async def _publish_runtime_event(
         self,
@@ -1712,6 +1333,92 @@ class AgentCore:
             await self._output_processor.accept_runtime_event(
                 _runtime_output_event(event, run_id)
             )
+
+
+def _resolve_conversation_compactor(
+    context_provider: ContextProvider | None,
+    context_provider_factory,
+    compactor: ConversationCompactor | None,
+    compactor_factory,
+    operations: AgentOperationController | None,
+) -> ConversationCompactor:
+    if context_provider is not None and context_provider_factory is not None:
+        raise ValueError(
+            "context provider and context provider factory are mutually exclusive"
+        )
+    if compactor is not None and compactor_factory is not None:
+        raise ValueError(
+            "conversation compactor and compactor factory are mutually exclusive"
+        )
+    if isinstance(compactor, ContextCompressionCoordinator):
+        return ContextCompressionCoordinator(
+            compactor.hook,
+            compactor.settings,
+            operation_controller=operations,
+        )
+    return compactor or ContextCompressionCoordinator(
+        operation_controller=operations,
+    )
+
+
+def _configure_output_runtime(
+    model_gateway: ModelGateway,
+    run_repository: RunRepository,
+    *,
+    output_processor: AgentOutputProcessor | None,
+    output_repository: AgentOutputRepository | None,
+    output_publisher: AgentOutputPublisher | None,
+    operation_controller: AgentOperationController | None,
+):
+    if (output_repository is None) != (output_publisher is None):
+        raise ValueError(
+            "canonical output repository and publisher must be configured together"
+        )
+    processor = output_processor or (
+        AgentOutputProcessor(output_repository, output_publisher)
+        if output_repository is not None and output_publisher is not None
+        else None
+    )
+    repository = (
+        CanonicalRunRepository(run_repository, processor)
+        if processor is not None
+        else run_repository
+    )
+    operations = operation_controller or (
+        AgentOperationController(processor) if processor is not None else None
+    )
+    invocations = AgentModelInvocationManager(
+        model_gateway,
+        output_observer=processor,
+        operation_controller=operations,
+    )
+    return processor, repository, operations, invocations
+
+
+def _build_run_supervisor(
+    *,
+    run_repository: RunRepository,
+    output_repository: AgentOutputRepository | None,
+    output_publisher: AgentOutputPublisher | None,
+    execution_factory,
+    lease_store: ExecutionLeaseStore | None,
+    owner_id: str | None,
+    lease_duration_ms: int | None,
+) -> AgentRunSupervisor | None:
+    if output_repository is None or output_publisher is None:
+        return None
+    return AgentRunSupervisor(
+        output_repository=output_repository,
+        output_publisher=output_publisher,
+        execution_factory=execution_factory,
+        lease_store=lease_store,
+        owner_id=owner_id or getattr(run_repository, "owner_id", None),
+        lease_duration_ms=(
+            lease_duration_ms
+            or getattr(run_repository, "lease_duration_ms", None)
+            or 30_000
+        ),
+    )
 
 
 class _EmptyContextProvider:

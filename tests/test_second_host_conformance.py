@@ -8,9 +8,11 @@ from dataclasses import replace
 import pytest
 
 from purra.api import (
+    AgentComponentBinding,
     AgentCore,
     AgentCoreRunOptions,
     AgentPreset,
+    DelegationPolicy,
     DurableTaskContinuation,
     InMemoryAgentAdapters,
     PromptSection,
@@ -78,6 +80,12 @@ You are PurrA, a calm incident-triage agent.
 Separate observed facts from inference. Use available tools before causal claims.
 Answer with current status, evidence, and the smallest safe next action.
 """
+
+
+def _context_binding():
+    return {
+        "contextProvider": AgentComponentBinding("operations.context", "1"),
+    }
 
 
 class _IncidentDurableRunner:
@@ -153,6 +161,7 @@ def test_preset_cannot_mix_with_low_level_agent_composition_arguments():
         revision="1",
         tool_catalog=InMemoryToolCatalog(()),
         context_provider=_IncidentContext(),
+        component_bindings=_context_binding(),
     )
     with pytest.raises(ValueError, match="cannot be mixed"):
         AgentCore(
@@ -211,6 +220,7 @@ async def test_recovery_rejects_a_different_preset_composition_before_run_start(
         revision="1",
         tool_catalog=catalog,
         context_provider=_IncidentContext(),
+        component_bindings=_context_binding(),
         prompt_sections=(PromptSection(name="identity", text="Original."),),
     )
     changed = AgentPreset(
@@ -218,6 +228,7 @@ async def test_recovery_rejects_a_different_preset_composition_before_run_start(
         revision="1",
         tool_catalog=catalog,
         context_provider=_IncidentContext(),
+        component_bindings=_context_binding(),
         prompt_sections=(PromptSection(name="identity", text="Changed."),),
     )
     core = AgentCore(
@@ -237,6 +248,110 @@ async def test_recovery_rejects_a_different_preset_composition_before_run_start(
             )
     finally:
         await core.close()
+
+
+@pytest.mark.asyncio
+async def test_legacy_snapshot_continuation_fails_before_provider_invocation():
+    plan = ExecutionPlan(
+        title="Resume",
+        task_spec=TaskSpec(goal="Resume safely"),
+        steps=(TaskStep(
+            id="resume",
+            title="Resume",
+            type=StepType.WRITE,
+            executor=StepExecutor.MODEL,
+        ),),
+    )
+    decision = TaskAdmissionDecision(
+        mode=ExecutionMode.DURABLE,
+        reason_code="resume",
+        covered_step_ids=("resume",),
+        execution_recipe=ExecutionRecipe(
+            kind="operations.resume",
+            steps=(ExecutionRecipeStep(
+                id="resume",
+                kind="model",
+                plan_step_id="resume",
+            ),),
+        ),
+    )
+    continuation = DurableTaskContinuation(
+        source=RunRecoverySnapshot(
+            run_id="legacy-run",
+            status=RunStatus.DONE,
+            execution_plan=plan,
+            agent_preset_snapshot={
+                "id": "operations",
+                "revision": "1",
+                "fingerprint": "legacy",
+                "composition": {},
+            },
+        ),
+        continuation_command="resume-legacy",
+        receipt=LongTaskDispatchReceipt(
+            task_id="task-legacy",
+            message="Resume.",
+            admission=decision,
+        ),
+    )
+    gateway = _OperationsGateway()
+    adapters = InMemoryAgentAdapters()
+    core = AgentCore(
+        model_gateway=gateway,
+        run_repository=adapters.runs,
+        output_repository=adapters.outputs,
+        output_publisher=adapters.publisher,
+        preset=AgentPreset(
+            id="operations",
+            revision="2",
+            tool_catalog=InMemoryToolCatalog(()),
+        ),
+    )
+    try:
+        with pytest.raises(ContractViolationError) as captured:
+            await core.submit(
+                _request(),
+                options=AgentCoreRunOptions(
+                    durable_continuation=continuation,
+                ),
+            )
+    finally:
+        await core.close()
+
+    assert captured.value.code == "agent_preset_snapshot_unsupported"
+    assert gateway.rounds == []
+
+    valid_snapshot = AgentPreset(
+        id="operations",
+        revision="2",
+        tool_catalog=InMemoryToolCatalog(()),
+    ).snapshot(_request()).to_mapping()
+    loose_continuation = replace(
+        continuation,
+        source=replace(
+            continuation.source,
+            agent_preset_snapshot=valid_snapshot,
+        ),
+    )
+    loose_core = AgentCore(
+        model_gateway=gateway,
+        run_repository=adapters.runs,
+        output_repository=adapters.outputs,
+        output_publisher=adapters.publisher,
+    )
+    try:
+        with pytest.raises(ContractViolationError) as loose_error:
+            await loose_core.submit(
+                _request(),
+                options=AgentCoreRunOptions(
+                    durable_continuation=loose_continuation,
+                ),
+            )
+    finally:
+        await loose_core.close()
+
+    assert loose_error.value.code == "agent_preset_snapshot_unsupported"
+    assert gateway.rounds == []
 
 
 @pytest.mark.asyncio
@@ -531,6 +646,7 @@ async def test_non_writing_host_keeps_identity_context_and_tool_authority_separa
             revision="1",
             tool_catalog=catalog,
             context_provider=_IncidentContext(),
+            component_bindings=_context_binding(),
             prompt_sections=(PromptSection(
                 name="identity",
                 order=-100,
@@ -603,6 +719,8 @@ async def test_native_delegation_uses_model_defined_isolated_agent():
             revision="1",
             tool_catalog=InMemoryToolCatalog(()),
             context_provider=incident_context,
+            component_bindings=_context_binding(),
+            delegation_policy=DelegationPolicy(),
             prompt_sections=(PromptSection(
                 name="identity",
                 text=OPERATIONS_IDENTITY,
@@ -632,6 +750,12 @@ async def test_native_delegation_uses_model_defined_isolated_agent():
     )
     assert not hasattr(delegations[0], "child_run_id")
     assert all(event.run_id == handle.run_id for event in events)
+    started_snapshot = events[0].payload["agentPreset"]
+    assert started_snapshot["snapshotVersion"] == 2
+    assert started_snapshot["composition"]["delegation"]["enabled"] is True
+    assert [
+        tool["name"] for tool in started_snapshot["composition"]["tools"]
+    ] == ["delegateToAgents"]
 
     reviewer_rounds = [
         messages

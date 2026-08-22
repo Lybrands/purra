@@ -7,6 +7,7 @@ from dataclasses import replace
 import pytest
 
 from purra.api import (
+    AgentComponentBinding,
     AgentCore,
     AgentModelTaskRunner,
     AgentPreset,
@@ -238,6 +239,20 @@ def _request() -> AgentRunRequest:
 
 def _core(*, gateway, context, profile=None):
     adapters = InMemoryAgentAdapters()
+    resolved_profile = profile or ExecutionProfile()
+    bindings = {
+        "contextProvider": AgentComponentBinding("portable.context", "1"),
+    }
+    for role, value in (
+        ("planner", resolved_profile.planner),
+        ("planningPolicy", resolved_profile.planning_policy),
+        ("taskAdmissionEvaluator", resolved_profile.task_admission_evaluator),
+        ("longTaskDispatcher", resolved_profile.long_task_dispatcher),
+    ):
+        if value is not None and (
+            role != "planningPolicy" or resolved_profile.planning_enabled
+        ):
+            bindings[role] = AgentComponentBinding(f"portable.{role}", "1")
     return AgentCore(
         model_gateway=gateway,
         run_repository=adapters.runs,
@@ -248,7 +263,8 @@ def _core(*, gateway, context, profile=None):
             revision="1",
             tool_catalog=InMemoryToolCatalog(()),
             context_provider=context,
-            execution_profile=profile or ExecutionProfile(),
+            execution_profile=resolved_profile,
+            component_bindings=bindings,
             prompt_sections=(PromptSection(
                 name="identity",
                 order=-100,
@@ -290,6 +306,12 @@ async def test_preset_context_factory_is_resolved_once_per_run():
             revision="1",
             tool_catalog=InMemoryToolCatalog(()),
             context_provider_factory=factory,
+            component_bindings={
+                "contextProvider": AgentComponentBinding(
+                    "portable.context-factory",
+                    "1",
+                ),
+            },
         ),
     )
     try:

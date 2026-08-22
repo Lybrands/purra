@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 from purra.context_strategies import ContextStrategy
 from purra.planning_policies import ReactivePlanningPolicy
 from purra.ports import PlanningPolicy, WorkPlanner
 from purra.task_admission import LongTaskDispatcher, TaskAdmissionEvaluator
+
+
+ComponentBindingResolver = Callable[[str, object | None], Mapping[str, Any]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,16 +46,26 @@ class ExecutionProfile:
     def planning_enabled(self) -> bool:
         return not isinstance(self.planning_policy, ReactivePlanningPolicy)
 
-    def snapshot_mapping(self) -> dict[str, Any]:
+    def snapshot_mapping(
+        self,
+        binding_resolver: ComponentBindingResolver | None = None,
+    ) -> dict[str, Any]:
         """Return the deterministic orchestration surface owned by the host."""
 
+        bind = binding_resolver or _legacy_component_binding
         return {
             "planningEnabled": self.planning_enabled,
-            "plannerType": _component_type(self.planner),
-            "planningPolicyType": _component_type(self.planning_policy),
+            "planner": bind("planner", self.planner),
+            "planningPolicy": bind("planningPolicy", self.planning_policy),
             "contextStrategy": self.context_strategy.value,
-            "taskAdmissionType": _component_type(self.task_admission_evaluator),
-            "longTaskDispatcherType": _component_type(self.long_task_dispatcher),
+            "taskAdmission": bind(
+                "taskAdmissionEvaluator",
+                self.task_admission_evaluator,
+            ),
+            "longTaskDispatcher": bind(
+                "longTaskDispatcher",
+                self.long_task_dispatcher,
+            ),
         }
 
 
@@ -60,6 +74,14 @@ def _component_type(value: object | None) -> str | None:
         return None
     kind = type(value)
     return f"{kind.__module__}.{kind.__qualname__}"
+
+
+def _legacy_component_binding(
+    role: str,
+    value: object | None,
+) -> Mapping[str, Any]:
+    del role
+    return {"type": _component_type(value)} if value is not None else {"kind": "none"}
 
 
 __all__ = ["ExecutionProfile"]
