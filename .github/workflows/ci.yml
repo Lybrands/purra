@@ -10,16 +10,24 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.python-version }}
           cache: pip
       - run: python -m pip install ".[test]" build
-      - run: python -m pytest
-      - run: python -m build --sdist --wheel
+      - run: python -m coverage run -m pytest
+      - run: python -m coverage report
+      - run: git diff --check
+      - if: matrix.python-version == '3.11'
+        run: python -m build --sdist --wheel
       - name: Verify installed wheel
+        if: matrix.python-version == '3.11'
         run: |
           python -m venv "$RUNNER_TEMP/purra-smoke"
           "$RUNNER_TEMP/purra-smoke/bin/python" -m pip install --no-deps dist/*.whl

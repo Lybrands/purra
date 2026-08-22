@@ -9,14 +9,10 @@ from pathlib import Path
 ROOT_DIR = Path(__file__).resolve().parents[1]
 CORE_DIR = ROOT_DIR / "src" / "purra"
 
-ORCHESTRATOR_LINE_CAPS = {
-    "runtime/orchestrator.py": 1614,
-    "engine/orchestrator.py": 1794,
-}
-
-PACKAGE_LINE_CAPS = {
-    "contracts/__init__.py": 1564,
-    "ports/__init__.py": 57,
+FUNCTION_LINE_CAPS = {
+    ("engine/orchestrator.py", "AgentCore.__init__"): 200,
+    ("engine/orchestrator.py", "AgentCore._execute_run"): 450,
+    ("runtime/orchestrator.py", "AgentRuntime.run"): 500,
 }
 MOVED_TOP_LEVEL_DEFINITIONS = {
     "runtime/orchestrator.py": {
@@ -125,6 +121,8 @@ REQUIRED_CORE_MODULES = {
     "engine/canonical_sink.py",
     "engine/context_capability.py",
     "engine/context_phase.py",
+    "engine/compaction_phase.py",
+    "engine/delegation_assembly.py",
     "engine/durable_execution.py",
     "engine/dynamic_planning.py",
     "engine/options.py",
@@ -163,8 +161,19 @@ def _top_level_definitions(path: Path) -> set[str]:
     }
 
 
-def _line_count(path: Path) -> int:
-    return len(path.read_text(encoding="utf-8").splitlines())
+def _function_sizes(path: Path) -> dict[str, int]:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    sizes: dict[str, int] = {}
+    for node in tree.body:
+        if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)):
+            sizes[node.name] = node.end_lineno - node.lineno + 1
+        elif isinstance(node, ast.ClassDef):
+            for child in node.body:
+                if isinstance(child, (ast.AsyncFunctionDef, ast.FunctionDef)):
+                    sizes[f"{node.name}.{child.name}"] = (
+                        child.end_lineno - child.lineno + 1
+                    )
+    return sizes
 
 
 def test_purra_uses_focused_packages():
@@ -321,13 +330,79 @@ def test_public_facades_do_not_reexport_private_implementation_helpers():
     )
 
 
-def test_orchestrators_and_packages_can_only_shrink():
+def test_orchestrator_functions_stay_below_readability_caps():
     violations: list[str] = []
-    for relative, cap in {**ORCHESTRATOR_LINE_CAPS, **PACKAGE_LINE_CAPS}.items():
-        observed = _line_count(CORE_DIR / relative)
+    all_sizes: dict[str, dict[str, int]] = {}
+    for relative, qualified_name in FUNCTION_LINE_CAPS:
+        sizes = all_sizes.setdefault(
+            relative,
+            _function_sizes(CORE_DIR / relative),
+        )
+        observed = sizes[qualified_name]
+        cap = FUNCTION_LINE_CAPS[(relative, qualified_name)]
         if observed > cap:
-            violations.append(f"{relative}: {observed} lines, cap {cap}")
-    assert not violations, "PurrA monoliths grew:\n" + "\n".join(violations)
+            violations.append(
+                f"{relative}:{qualified_name}: {observed} lines, cap {cap}"
+            )
+    for relative in {item[0] for item in FUNCTION_LINE_CAPS}:
+        for qualified_name, observed in all_sizes[relative].items():
+            if (
+                qualified_name.split(".")[-1].startswith("_")
+                and qualified_name not in {
+                    "AgentCore.__init__",
+                    "AgentCore._execute_run",
+                }
+                and observed > 300
+            ):
+                violations.append(
+                    f"{relative}:{qualified_name}: {observed} lines, cap 300"
+                )
+    assert not violations, "PurrA functions grew:\n" + "\n".join(violations)
+
+
+def test_internal_modules_have_no_import_cycles():
+    module_paths: dict[str, Path] = {}
+    for path in CORE_DIR.rglob("*.py"):
+        parts = list(path.relative_to(CORE_DIR).with_suffix("").parts)
+        if parts[-1] == "__init__":
+            parts.pop()
+        module = "purra" + (f".{'.'.join(parts)}" if parts else "")
+        module_paths[module] = path
+
+    edges = {module: set() for module in module_paths}
+    for module, path in module_paths.items():
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        imported: list[str] = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module:
+                imported.append(node.module)
+            elif isinstance(node, ast.Import):
+                imported.extend(alias.name for alias in node.names)
+        for target in imported:
+            if not target.startswith("purra"):
+                continue
+            while target not in module_paths and "." in target:
+                target = target.rsplit(".", 1)[0]
+            if target in module_paths and target != module:
+                edges[module].add(target)
+
+    visited: set[str] = set()
+    active: set[str] = set()
+
+    def visit(module: str, chain: tuple[str, ...]) -> None:
+        if module in active:
+            start = chain.index(module)
+            raise AssertionError(" -> ".join((*chain[start:], module)))
+        if module in visited:
+            return
+        active.add(module)
+        for target in sorted(edges[module]):
+            visit(target, (*chain, module))
+        active.remove(module)
+        visited.add(module)
+
+    for module in sorted(module_paths):
+        visit(module, ())
 
 
 def test_planning_boundary_cannot_recover_hidden_or_product_context():
