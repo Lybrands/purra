@@ -36,7 +36,7 @@ PurrA has no universal host object. A host composes existing public contracts:
 
 | Host need | Public import surface | Ownership |
 | --- | --- | --- |
-| Compose and submit a Run | `purra.api` (`AgentCore`, `AgentPreset`, `AgentCoreRunOptions`, `PromptSection`) | PurrA owns execution once submitted. |
+| Compose and submit a Run | `purra.api` (`AgentCore`, `AgentPreset`, `AgentComponentBinding`, `AgentCoreRunOptions`, `PromptSection`) | PurrA owns execution once submitted. |
 | Describe an input or opaque domain association | `purra.contracts` (`AgentRunRequest`, `RunBinding`, `ExecutionRecipe`) | The host maps product input and interprets its own association. |
 | Implement runtime dependencies | `purra.ports` (model, context, tools, Run/output persistence, projectors) | The host provides concrete adapters. |
 | Select optional capabilities | `purra.task_admission`, `purra.long_tasks`, `purra.artifacts`, `purra.delegation`, `purra.output` | The host chooses and configures them; PurrA enforces their contracts. |
@@ -49,9 +49,9 @@ domain projection remain outside PurrA. `RunBinding`, `ExecutionRecipe`, and
 `DomainEventProjector` carry host semantics opaquely; PurrA never interprets
 their business fields.
 
-### 0.1 compatibility boundary
+### 0.2 compatibility boundary
 
-For the `0.1.x` line, `purra.api` and the owning public modules listed in the
+For the `0.2.x` line, `purra.api` and the owning public modules listed in the
 table above are the supported host contract. Compatible additions and fixes
 may ship in a patch release; removing or changing an existing public contract
 requires the next minor release while PurrA remains pre-1.0. `purra.engine`,
@@ -127,16 +127,27 @@ It never owns product routing, request hydration, repositories, database
 queries, provider credentials, or process cleanup.
 
 `AgentCore(preset=...)` materializes the trusted prompt before a Run is
-published. It also records an `AgentPresetSnapshot` in `run.started`: the
-Preset id/revision plus a deterministic fingerprint of the complete declared
-composition: prompt sections, context and compaction bindings, execution
-profile, enabled Tool schemas and authorization contracts, delegation,
-runtime limits, and recovery policy.
+published. It also records an `AgentPresetSnapshot` schema version 2 in
+`run.started`. Its fingerprint covers the Preset id/revision, prompt sections,
+context and compaction bindings, execution profile, effective enabled Tool
+schemas and authorization contracts, delegation policy, runtime limits, and
+recovery policy. PurrA derives stable records only for its stateless built-ins
+and immutable compaction settings. Every behavior-affecting host component or
+factory must have an `AgentComponentBinding` with a stable id, revision, and
+optional configuration digest; arbitrary object state and `repr()` output are
+never fingerprint sources.
 A resumed host can use
 `AgentPreset.require_snapshot()` to fail closed rather than silently run old
 history under a changed composition. Durable continuation automatically
 restores the source Preset snapshot from the canonical Run journal and rejects
-drift before starting another model or tool invocation.
+drift before starting another model, tool, dispatcher, or delegated invocation.
+Version-1 or incomplete snapshots are rejected with
+`agent_preset_snapshot_unsupported`; Core never guesses an upgrade from current
+process state.
+
+The explicit loose-composition `AgentCore(...)` form remains available for
+ordinary Runs, but durable continuation requires a configured `AgentPreset` so
+that version-2 composition authority can be recomputed and compared.
 
 ## Execution styles
 
@@ -214,7 +225,13 @@ Planned-with-staged-context, and Durable handoff compositions. The package
 boundary gate forbids the example from falling back to private `_execute_run`.
 
 ```python
-from purra.api import AgentCore, AgentPreset, InMemoryAgentAdapters, PromptSection
+from purra.api import (
+    AgentComponentBinding,
+    AgentCore,
+    AgentPreset,
+    InMemoryAgentAdapters,
+    PromptSection,
+)
 from purra.tools import InMemoryToolCatalog
 
 adapters = InMemoryAgentAdapters()
@@ -228,6 +245,12 @@ agent = AgentCore(
         revision="1",
         tool_catalog=InMemoryToolCatalog(()),
         context_provider=context_provider,
+        component_bindings={
+            "contextProvider": AgentComponentBinding(
+                "host.portable-context",
+                "1",
+            ),
+        },
         prompt_sections=(PromptSection(
             name="identity",
             order=-100,
@@ -592,6 +615,15 @@ authority over useful semantic size through their versioned schemas. Failures
 carry the tool name, validation stage, schema path, actual measurement, and
 allowed bound without echoing the rejected payload.
 
+Core admits only this recursive JSON Schema subset: `type` (`object`, `array`,
+`string`, `integer`, `number`, `boolean`, `null`, or a non-empty list of those
+names), `properties`, `required`, boolean `additionalProperties`, `items`,
+`anyOf`, `oneOf`, `enum`, `const`, `minLength`, `maxLength`, `minItems`,
+`maxItems`, `minimum`, `maximum`, plus string `title` and `description`
+annotations. Malformed schemas and every other assertion keyword are rejected
+when the Tool Catalog is assembled. Runtime validation remains fail-closed as
+defense in depth, and a rejected batch starts no handler.
+
 ## Stability evaluation
 
 `evaluation.stability` derives content-free reliability signals from the
@@ -726,7 +758,8 @@ Concrete adapters are assembled by the host composition root.
 
 ## One-Run multi-Agent delegation
 
-When delegation persistence is configured, PurrA exposes `delegateToAgents` as
+When an `AgentPreset` selects a `DelegationPolicy` and the required delegation
+infrastructure is configured, PurrA exposes `delegateToAgents` as
 one ordinary model-facing tool. The parent model defines each task-specific
 Agent in that call with `agentName`, `title`, `instruction`, `objective`, and an
 optional input object. Creation, invocation, cancellation, result collection,
@@ -748,6 +781,9 @@ attributed to the Root Run.
 `DelegationPolicy` is the single host-supplied limit contract for maximum
 delegation count, parallelism, and definition field lengths. It cannot grant
 parent context, write tools, or recursive delegation.
+`None` disables delegation. The complete policy and effective delegation Tool
+schema are part of snapshot version 2; repositories and executors remain
+Kernel infrastructure and are not serialized.
 
 Delegation requires both a `DelegationRepository` and a
 `ToolIdempotencyGateway`. Retrying the same parent tool call replays its stored
