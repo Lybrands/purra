@@ -52,7 +52,7 @@ class _Gateway:
 async def _run() -> None:
     package_path = Path(purra.__file__).resolve()
     assert "site-packages" in package_path.parts, package_path
-    assert version("purra") == "0.1.0"
+    assert version("purra") == "0.1.1"
 
     adapters = InMemoryAgentAdapters()
     core = AgentCore(

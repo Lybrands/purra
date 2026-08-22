@@ -464,7 +464,8 @@ coordinator understands only the unit DAG and execution states. Domain code
 owns partitioning, unit inputs, semantic validation, and final merge;
 `RecipeLongTaskDispatcher` materializes that recipe as one Long Task, resolves
 each unit through a host-owned executor registry, and passes the
-completed dependency output references to downstream executors. This supports
+active Run id plus completed dependency output references to downstream
+executors. This supports
 static Map-Reduce DAGs without putting product concepts or artifact loading in
 PurrA. Task reuse is scoped by namespace, owner, operation kind, session, and
 idempotency key; a mismatched recipe fails closed. Pausing releases active
