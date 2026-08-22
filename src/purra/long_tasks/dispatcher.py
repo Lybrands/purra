@@ -88,6 +88,7 @@ class DurableTaskDescriptorResolver(Protocol):
 class DurableUnitExecutionContext:
     task: LongTaskRecord
     unit: LongTaskUnitRecord
+    run_id: str
     dependency_outputs: Mapping[str, str]
     bind_run: Callable[[str], Awaitable[None]] = _unbound_unit_run
 
@@ -96,6 +97,11 @@ class DurableUnitExecutionContext:
             raise TypeError("durable unit context requires a LongTaskRecord")
         if not isinstance(self.unit, LongTaskUnitRecord):
             raise TypeError("durable unit context requires a LongTaskUnitRecord")
+        object.__setattr__(
+            self,
+            "run_id",
+            required_text(self.run_id, "durable unit execution Run id"),
+        )
         outputs = {
             required_text(key, "durable dependency unit id"): required_text(
                 value,
@@ -437,6 +443,7 @@ class _RecipeUnitRunner:
         context = DurableUnitExecutionContext(
             task=task,
             unit=unit,
+            run_id=self._run_id,
             dependency_outputs=await self._dependency_outputs(unit),
             bind_run=bind_run,
         )
@@ -471,6 +478,7 @@ class _RecipeUnitRunner:
             DurableUnitExecutionContext(
                 task=task,
                 unit=unit,
+                run_id=self._run_id,
                 dependency_outputs={},
             ),
             error,

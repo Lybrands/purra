@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import replace
-from typing import Any, Mapping
+from collections.abc import Callable
+from enum import StrEnum
+from typing import Any, Mapping, TypeVar
 from uuid import uuid4
 
 from purra.contracts import (
@@ -120,6 +122,13 @@ If no plan is needed, return:
 {"needsTodos":false,"reason":"short reason"}
 """
 
+
+PlanningResultValidator = Callable[
+    [AgentRunRequest, PlanningResult],
+    str | None,
+]
+_PlannerEnum = TypeVar("_PlannerEnum", bound=StrEnum)
+
 PLANNER_REPAIR_PROMPT = """Your previous JSON plan violated this recoverable contract:
 {reason}
 Re-plan from the original request. Do not mechanically expand every listed
@@ -201,6 +210,7 @@ class AgentPlanner:
         operation_controller: AgentOperationController | None = None,
         output_observer: ModelInvocationOutputObserver | None = None,
         model_manager: AgentModelInvocationManager | None = None,
+        result_validator: PlanningResultValidator | None = None,
     ):
         self._model_manager = model_manager or AgentModelInvocationManager(
             model_gateway,
@@ -208,6 +218,7 @@ class AgentPlanner:
             operation_controller=operation_controller,
         )
         self._limits = limits
+        self._result_validator = result_validator
 
     async def create_plan(
         self,
@@ -288,6 +299,10 @@ class AgentPlanner:
                     limits,
                     turn=turn,
                 )
+                if self._result_validator is not None:
+                    reason = self._result_validator(request, result)
+                    if reason:
+                        raise RepairablePlannerOutputError(str(reason))
                 break
             except InvalidPlannerOutputError as error:
                 if repair_attempt >= limits.max_repair_attempts:
@@ -697,21 +712,31 @@ def normalize_work_plan(
             _clean_text(raw.get("title"), limits.max_title_chars)
             or f"Step {index + 1}"
         )
-        try:
-            step_type = StepType(str(raw.get("type") or StepType.ANALYZE.value))
-            executor = StepExecutor(str(
-                raw.get("executor")
-                or (
-                    StepExecutor.TOOL.value
-                    if step_type is StepType.READ
-                    else StepExecutor.MODEL.value
-                )
-            ))
-            risk = ToolRiskLevel(str(
-                raw.get("riskLevel") or ToolRiskLevel.READ.value
-            ))
-        except ValueError as error:
-            raise InvalidPlannerOutputError("planner step contains an unsupported enum") from error
+        step_type = _planner_step_enum(
+            StepType,
+            raw.get("type"),
+            StepType.ANALYZE,
+            step_id=step_id,
+            field="type",
+        )
+        executor = _planner_step_enum(
+            StepExecutor,
+            raw.get("executor"),
+            (
+                StepExecutor.TOOL
+                if step_type is StepType.READ
+                else StepExecutor.MODEL
+            ),
+            step_id=step_id,
+            field="executor",
+        )
+        risk = _planner_step_enum(
+            ToolRiskLevel,
+            raw.get("riskLevel"),
+            ToolRiskLevel.READ,
+            step_id=step_id,
+            field="riskLevel",
+        )
         if executor in capabilities.constraints.planning_excluded_executors:
             raise RepairablePlannerOutputError(
                 "planner selected an executor excluded by the request: "
@@ -814,6 +839,25 @@ def normalize_work_plan(
         work_plan=plan,
         reason=_optional_text(value.get("reason")),
     )
+
+
+def _planner_step_enum(
+    enum_type: type[_PlannerEnum],
+    raw: Any,
+    default: _PlannerEnum,
+    *,
+    step_id: str,
+    field: str,
+) -> _PlannerEnum:
+    value = str(raw or default.value)
+    try:
+        return enum_type(value)
+    except ValueError as error:
+        allowed = ", ".join(item.value for item in enum_type)
+        raise RepairablePlannerOutputError(
+            f"planner step {step_id!r} has unsupported {field} {value!r}; "
+            f"allowed values: {allowed}"
+        ) from error
 
 
 def _planner_task_spec_value(value: Mapping[str, Any]) -> Any:
