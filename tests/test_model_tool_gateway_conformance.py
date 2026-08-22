@@ -180,3 +180,52 @@ async def test_core_tool_executor_passes_shared_host_conformance():
     assert state.domain == {"read": "thing-1"}
     assert result.results[0].content == '{"ok":true}'
     assert events[-1].payload["toolCallId"] == "call-read"
+
+
+@pytest.mark.asyncio
+async def test_invalid_batch_schema_stops_every_handler_before_side_effects():
+    calls = 0
+
+    async def read_thing(state, arguments, signal=None):
+        nonlocal calls
+        del state, arguments, signal
+        calls += 1
+        return ToolHandlerResult('{"ok":true}')
+
+    executor = CoreToolExecutor(InMemoryToolCatalog((ToolRegistration(
+        schema=_tool(),
+        handler=read_thing,
+        policy=ToolPolicy(mode="read", title="Read thing"),
+    ),)))
+
+    async def sink(event):
+        del event
+
+    result = await executor.execute_batch(
+        ToolBatchRequest(
+            run_id="run-fail-closed",
+            invocation_id="invocation-fail-closed",
+            calls=(
+                ToolCall(
+                    id="call-valid",
+                    name="readThing",
+                    arguments_json='{"id":"thing-1"}',
+                ),
+                ToolCall(
+                    id="call-invalid",
+                    name="readThing",
+                    arguments_json='{"id":42}',
+                ),
+            ),
+            allowed_tool_names=frozenset({"readThing"}),
+            state=ExecutionState(),
+        ),
+        sink,
+    )
+
+    assert calls == 0
+    assert result.outcome.value == "failed"
+    assert all(
+        item.error == "invalid_tool_arguments_schema"
+        for item in result.results
+    )

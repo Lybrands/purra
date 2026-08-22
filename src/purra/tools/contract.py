@@ -7,7 +7,7 @@ import json
 from collections import Counter
 from dataclasses import dataclass
 from graphlib import CycleError, TopologicalSorter
-from typing import Iterable
+from typing import Any, Iterable, Mapping, Sequence
 
 from purra.contracts import (
     ToolDataContract,
@@ -17,6 +17,36 @@ from purra.contracts import (
 from purra.errors import ContractViolationError
 from purra.json_values import thaw_json_mapping
 from purra.ports import ToolRegistration
+
+
+_SCHEMA_TYPES = frozenset({
+    "array",
+    "boolean",
+    "integer",
+    "null",
+    "number",
+    "object",
+    "string",
+})
+_SCHEMA_KEYWORDS = frozenset({
+    "additionalProperties",
+    "anyOf",
+    "const",
+    "description",
+    "enum",
+    "items",
+    "maximum",
+    "maxItems",
+    "maxLength",
+    "minimum",
+    "minItems",
+    "minLength",
+    "oneOf",
+    "properties",
+    "required",
+    "title",
+    "type",
+})
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +117,10 @@ def inspect_tool_contract(
             planning_capabilities[capability_name] = capability
 
         parameters = thaw_json_mapping(registration.schema.parameters)
+        violations.extend(_schema_contract_violations(
+            parameters,
+            path=f"{label}.parameters",
+        ))
         if parameters.get("type") != "object":
             violations.append(f"{label}: parameters schema type must be object")
         properties = parameters.get("properties")
@@ -99,6 +133,18 @@ def inspect_tool_contract(
                 f"{label}: parameters schema is not JSON serializable "
                 f"({type(error).__name__})"
             )
+
+        if capability is not None:
+            capability_parameters = thaw_json_mapping(capability.parameters)
+            violations.extend(_schema_contract_violations(
+                capability_parameters,
+                path=f"{label}.planningCapability.parameters",
+            ))
+            if capability_parameters.get("type") != "object":
+                violations.append(
+                    f"{label}: planning capability parameters schema type "
+                    "must be object"
+                )
 
         data_contract = registration.data_contract
         if not isinstance(data_contract, ToolDataContract):
@@ -187,6 +233,166 @@ def _is_async_callable(value: object) -> bool:
     return inspect.iscoroutinefunction(value) or inspect.iscoroutinefunction(
         getattr(value, "__call__", None)
     )
+
+
+def _schema_contract_violations(
+    schema: object,
+    *,
+    path: str,
+) -> tuple[str, ...]:
+    """Validate the complete JSON-Schema subset enforced by Core."""
+
+    if not isinstance(schema, Mapping):
+        return (f"{path}: schema must be an object",)
+
+    violations: list[str] = []
+    unknown = sorted(str(key) for key in schema if key not in _SCHEMA_KEYWORDS)
+    if unknown:
+        violations.append(
+            f"{path}: unsupported keyword(s): {', '.join(unknown)}"
+        )
+
+    expected_type = schema.get("type")
+    if expected_type is not None:
+        if isinstance(expected_type, str):
+            type_names = (expected_type,)
+        elif _is_schema_array(expected_type):
+            type_names = tuple(expected_type)
+            if not type_names:
+                violations.append(f"{path}.type: type list must be non-empty")
+            if any(not isinstance(item, str) for item in type_names):
+                violations.append(
+                    f"{path}.type: type list must contain only strings"
+                )
+            if len(type_names) != len(set(type_names)):
+                violations.append(
+                    f"{path}.type: type list values must be unique"
+                )
+        else:
+            type_names = ()
+            violations.append(
+                f"{path}.type: type must be a string or non-empty list"
+            )
+        unsupported_types = sorted(
+            str(item) for item in type_names if item not in _SCHEMA_TYPES
+        )
+        if unsupported_types:
+            violations.append(
+                f"{path}.type: unsupported type(s): "
+                + ", ".join(unsupported_types)
+            )
+
+    for keyword in ("title", "description"):
+        value = schema.get(keyword)
+        if value is not None and not isinstance(value, str):
+            violations.append(f"{path}.{keyword}: must be a string")
+
+    properties = schema.get("properties")
+    if properties is not None:
+        if not isinstance(properties, Mapping):
+            violations.append(f"{path}.properties: must be an object")
+        else:
+            for raw_name, child in properties.items():
+                name = str(raw_name)
+                violations.extend(_schema_contract_violations(
+                    child,
+                    path=f"{path}.properties.{name}",
+                ))
+
+    required = schema.get("required")
+    if required is not None:
+        if not _is_schema_array(required):
+            violations.append(f"{path}.required: must be an array of strings")
+        else:
+            names = tuple(required)
+            if any(not isinstance(name, str) or not name for name in names):
+                violations.append(
+                    f"{path}.required: values must be non-empty strings"
+                )
+            if len(names) != len(set(names)):
+                violations.append(f"{path}.required: values must be unique")
+
+    additional = schema.get("additionalProperties")
+    if additional is not None and not isinstance(additional, bool):
+        violations.append(f"{path}.additionalProperties: must be boolean")
+
+    if "items" in schema:
+        violations.extend(_schema_contract_violations(
+            schema.get("items"),
+            path=f"{path}.items",
+        ))
+
+    for keyword in ("anyOf", "oneOf"):
+        branches = schema.get(keyword)
+        if branches is None:
+            continue
+        if not _is_schema_array(branches) or not branches:
+            violations.append(
+                f"{path}.{keyword}: must be a non-empty array of schemas"
+            )
+            continue
+        for index, branch in enumerate(branches):
+            violations.extend(_schema_contract_violations(
+                branch,
+                path=f"{path}.{keyword}[{index}]",
+            ))
+
+    enum = schema.get("enum")
+    if enum is not None and (not _is_schema_array(enum) or not enum):
+        violations.append(f"{path}.enum: must be a non-empty array")
+
+    for minimum_name, maximum_name in (
+        ("minLength", "maxLength"),
+        ("minItems", "maxItems"),
+    ):
+        minimum = schema.get(minimum_name)
+        maximum = schema.get(maximum_name)
+        if minimum is not None and not _is_non_negative_integer(minimum):
+            violations.append(
+                f"{path}.{minimum_name}: must be a non-negative integer"
+            )
+        if maximum is not None and not _is_non_negative_integer(maximum):
+            violations.append(
+                f"{path}.{maximum_name}: must be a non-negative integer"
+            )
+        if (
+            _is_non_negative_integer(minimum)
+            and _is_non_negative_integer(maximum)
+            and minimum > maximum
+        ):
+            violations.append(
+                f"{path}.{minimum_name}: cannot exceed {maximum_name}"
+            )
+
+    minimum = schema.get("minimum")
+    maximum = schema.get("maximum")
+    if minimum is not None and not _is_schema_number(minimum):
+        violations.append(f"{path}.minimum: must be a JSON number")
+    if maximum is not None and not _is_schema_number(maximum):
+        violations.append(f"{path}.maximum: must be a JSON number")
+    if (
+        _is_schema_number(minimum)
+        and _is_schema_number(maximum)
+        and minimum > maximum
+    ):
+        violations.append(f"{path}.minimum: cannot exceed maximum")
+
+    return tuple(violations)
+
+
+def _is_schema_array(value: object) -> bool:
+    return isinstance(value, Sequence) and not isinstance(
+        value,
+        (str, bytes, bytearray),
+    )
+
+
+def _is_non_negative_integer(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _is_schema_number(value: object) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
 def _schema_declares_path(parameters: dict, path: str) -> bool:
