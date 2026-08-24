@@ -1,0 +1,48 @@
+{
+  "name": "@lybrands/purra",
+  "version": "0.1.0-alpha.0",
+  "description": "Business-agnostic, host-embedded Agent runtime for JavaScript and TypeScript",
+  "license": "MIT",
+  "author": "Lybrands",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Lybrands/purra.git",
+    "directory": "typescript"
+  },
+  "bugs": "https://github.com/Lybrands/purra/issues",
+  "homepage": "https://github.com/Lybrands/purra/tree/main/typescript#readme",
+  "publishConfig": {
+    "access": "public"
+  },
+  "type": "module",
+  "sideEffects": false,
+  "engines": {
+    "node": ">=22"
+  },
+  "files": [
+    "dist",
+    "ARCHITECTURE.md",
+    "LICENSE",
+    "README.md"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "clean": "node --eval \"import { rmSync } from 'node:fs'; rmSync('dist', { recursive: true, force: true })\"",
+    "build": "npm run clean && tsc -p tsconfig.json",
+    "test": "node --test test/*.test.mjs",
+    "test:types": "tsc -p test/tsconfig.json",
+    "check": "npm run build && npm run test && npm run test:types",
+    "prepack": "npm run build",
+    "prepublishOnly": "npm run check"
+  },
+  "devDependencies": {
+    "typescript": "7.0.2"
+  }
+}

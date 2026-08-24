@@ -416,3 +416,17 @@ def trim_agent_messages_by_turn(
         token_estimate=actual,
         overflow_tokens=max(0, actual - max(0, int(token_budget))),
     )
+
+
+__all__ = [
+    "TrimmedAgentMessages",
+    "allocate_context_budget",
+    "context_budget_contract_error",
+    "estimate_agent_messages_tokens",
+    "estimate_json_tokens",
+    "estimate_text_tokens",
+    "estimate_tool_schema_tokens",
+    "resolve_context_budget_claims",
+    "resolve_task_context_budget_claims",
+    "trim_agent_messages_by_turn",
+]

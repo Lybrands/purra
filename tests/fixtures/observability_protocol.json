@@ -1,0 +1,131 @@
+{
+  "schemaVersion": 1,
+  "cases": [
+    {
+      "caseId": "successful-content-free-run",
+      "run": { "id": "run-success", "status": "done" },
+      "events": [
+        {
+          "eventType": "agentRunTrace",
+          "payload": {
+            "stage": "planning",
+            "outcome": "skipped",
+            "durationMs": 7,
+            "prompt": "LEAK_PROMPT",
+            "details": { "generatedContent": "LEAK_GENERATED" }
+          }
+        },
+        {
+          "eventType": "agentRunTrace",
+          "payload": {
+            "stage": "context_budget",
+            "outcome": "within_budget",
+            "details": {
+              "estimatedInputTokens": 100,
+              "projectedTotalTokens": 120,
+              "toolSchemaTokens": 20,
+              "windowTokens": 1000,
+              "prompt": "LEAK_CONTEXT"
+            }
+          }
+        },
+        {
+          "eventType": "agentRunTrace",
+          "payload": {
+            "stage": "model_attempt",
+            "outcome": "completed",
+            "durationMs": 11,
+            "round": 1,
+            "reasoning": "LEAK_REASONING"
+          }
+        },
+        { "eventType": "run.completed", "payload": { "output": "LEAK_OUTPUT" } }
+      ],
+      "expected": {
+        "operationalVerdict": "pass",
+        "stabilityVerdict": "pass",
+        "failureCodes": [],
+        "performanceVerdict": "pass"
+      }
+    },
+    {
+      "caseId": "protocol-overflow-and-protected-recovery",
+      "run": { "id": "run-failure", "status": "failed" },
+      "events": [
+        {
+          "eventType": "agentRunTrace",
+          "payload": { "stage": "planning", "outcome": "planned", "durationMs": 5 }
+        },
+        {
+          "eventType": "tool.calls_started",
+          "payload": {
+            "calls": [{ "id": "call-1", "name": "read", "arguments": "LEAK_ARGUMENTS" }]
+          }
+        },
+        {
+          "eventType": "tool.call_completed",
+          "payload": {
+            "toolCallId": "call-1",
+            "outcome": "failed",
+            "errorCode": "invalid_tool_arguments_schema",
+            "result": "LEAK_TOOL_RESULT"
+          }
+        },
+        {
+          "eventType": "agentRunTrace",
+          "payload": {
+            "stage": "tool_round",
+            "outcome": "failed",
+            "durationMs": 9,
+            "round": 1,
+            "details": { "requestedTools": ["read"], "toolResult": "LEAK_TOOL_RESULT" }
+          }
+        },
+        {
+          "eventType": "agentRunTrace",
+          "payload": {
+            "stage": "context_budget",
+            "outcome": "overflow_hard",
+            "details": {
+              "droppedMessages": 3,
+              "estimatedInputTokens": 1200,
+              "projectedTotalTokens": 1400,
+              "toolSchemaTokens": 100,
+              "windowTokens": 1000,
+              "prompt": "LEAK_CONTEXT"
+            }
+          }
+        },
+        {
+          "eventType": "agentRunTrace",
+          "payload": {
+            "stage": "recovery_decision",
+            "outcome": "denied",
+            "details": {
+              "round": 2,
+              "cause": "provider_stream_interrupted",
+              "action": "retry_model",
+              "allowed": false,
+              "reasonCode": "side_effect_state_unknown",
+              "attempt": 1,
+              "maxAttempts": 2,
+              "remainingModelRounds": 3,
+              "effectState": "unknown",
+              "mayRepeatSideEffect": false,
+              "generatedContent": "LEAK_GENERATED"
+            }
+          }
+        },
+        { "eventType": "run.failed", "payload": { "error": "LEAK_ERROR" } }
+      ],
+      "expected": {
+        "operationalVerdict": "fail",
+        "stabilityVerdict": "fail",
+        "failureCodes": ["tool.protocol_invalid_arguments", "context.overflow"],
+        "recoveryDecisionCount": 1,
+        "recoveryRound": 2,
+        "safetyProtectedCount": 1
+      }
+    }
+  ]
+}

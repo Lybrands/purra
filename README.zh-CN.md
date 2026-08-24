@@ -6,6 +6,38 @@
 
 PurrA 的默认执行形态是 Reactive：模型可以直接在已授权工具上完成普通 model/tool loop，不要求 Planner、`TaskSpec`、任务准入、`ExecutionRecipe`、长任务仓储或领域上下文 Provider。规划和持久执行是显式装配的第一方能力，不是所有 Agent 的必经阶段。
 
+## 语言发行物
+
+仓库根目录的 Python 包仍是完整的 `0.2.x` 实现。`typescript/` 下重新建立了一份
+符合 TypeScript 习惯的独立 ESM 包；当前 `0.1.0-alpha.0` 包以有界 Reactive
+model/tool loop、递归工具 Schema 检查、整批授权、审批、作用域、幂等与 effect-state
+安全，以及 `AbortSignal` 取消。`Agent.invoke()` 与 `Agent.stream()` 仍是瞬时便捷 API；
+`Agent.submit()` 增加了内存中的权威 Run/output journal，包括 Preset 指纹、调用 receipt、
+先持久化后发布、有序回放、取消、绝对 deadline、usage/output 预算和原子终态提交。
+消息、usage、能力快照和输出限制保持不可变且与 Provider 无关。
+可选的上下文组合支持硬输入预算、不透明 allocation claim、Single Pass 检索、经过校验的
+请求级裁剪/压缩、Staged 检索契约和绑定到调用的 evidence receipt，并且不会改写权威会话历史。
+模型型上下文与压缩工厂会获得受管、无工具的 runner；在 submitted Run 中，这些扩展调用复用
+同一 Run 的调用 receipt 与预算。
+显式 Planned 装配现已支持语义化 `TaskSpec`/`WorkPlan`、由 Core 编译并持有的当前步骤工具权限、
+公开/私有 capability lowering、Staged 任务上下文、响应校验和受宿主约束的有界重规划。
+宿主既可以继续注入自己的 Planner/Judge，也可以选择 TypeScript 原生的模型型参考实现；其模型调用
+仍受同一 Run 的 receipt、预算与当前步骤权限约束。
+显式 Durable 装配已经覆盖任务准入、Long Task DAG、租约、checkpoint、续跑与孤儿恢复；
+Artifact 作为独立的可恢复输出聚合提供版本批次、claim 和校验；可选的一次 Run 内委派则让
+隔离、受限的 delegated Agent 复用 Root Run 的模型调用、只读工具、取消和生命周期事件权威。
+不包含业务正文的运行、稳定性、恢复、性能、趋势与回归门禁报告现已消费与 Python 相同的
+冻结证据语义；确定性的回归/安全套件和公共适配器探针覆盖当前宿主端口，但诊断不会获得运行时
+控制权。当前 alpha 已加入与 Python 共享决策语义的有界 Provider、工具和响应恢复；仍不包含
+生产级持久化或 Provider SDK。带凭据的 completion/streaming 证据属于本次 npm 发布之外的
+未来宿主项目工作；通过前不会宣称稳定版能力对等。
+两端共享的模型结束原因采用相同的安全语义，但 TypeScript 保留自己的公开 API 和实现结构。
+
+JavaScript 与 TypeScript 使用同一个 npm artifact；发布门禁要求 npm、pnpm、Yarn 与 Bun
+安装同一份精确打包候选物。
+Python 与 npm 在 1.0 前独立演进；版本号相同不代表能力自动对等。npm 支持范围以 TypeScript
+能力矩阵为准，任何不兼容的 npm 公共 API 变更在 1.0 前必须升级 minor 版本。
+
 宿主中有界的模型型 Hook 统一使用 `purra.model_execution`。宿主只声明模型请求、输出策略、工作单元数和推理偏好；实际供应商额度解析、`ModelInvocation` 构造及结束原因判定全部由 PurrA 完成。缺失结束原因或输出截断都会失败关闭，并且不会重放已经产生部分输出的调用。
 
 每次真正请求 Provider 前，PurrA 都会持久化打开输出流，并写入私有的 `stream.opened` receipt。它把调用与输出流身份关联到脱敏调用参数、精确模型可见消息与工具 Schema 的指纹，以及宿主声明的上下文来源；不会把 Prompt 正文复制进输出日志。receipt 持久化失败时，Provider 调用不会发生。
@@ -32,7 +64,7 @@ PurrA 不提供一个“万能 Host 对象”；宿主按需组合现有公共�
 
 本系列受支持的顶层宿主模块为：`api`、`artifacts`、`cancellation`、
 `context_budget`、`context_orchestration`、`context_strategies`、`contracts`、
-`errors`、`evaluation`、`events`、`evidence`、`json_values`、`long_tasks`、
+`delegation`、`errors`、`evaluation`、`events`、`evidence`、`json_values`、`long_tasks`、
 `model_call_parameters`、`model_execution`、`model_invocation`、
 `model_protocol`、`normalization`、`observability`、`orphan_recovery`、
 `output`、`ports`、`recovery`、`run_control`、`stream_ownership`、
@@ -339,7 +371,7 @@ Planner 仍是唯一的模型语义判断入口。它只把用户目标编译成
 
 ## 上下文编排与压缩
 
-PurrA 只负责上下文预算、压缩时机、Hook 调用和技术校验。Core 根据模型窗口、输出与运行时预留、工具 Schema 和 Domain 上下文声明生成统一预算，并在规划边界以及每次模型调用前重新计算压力。默认达到可用输入预算的 85% 时调用应用注入的 `ContextCompressionHook`；Hook 获得完整源视图和硬 Token 限制，所有语义选择均由应用负责。
+PurrA 只负责上下文预算、压缩时机、Hook 调用和技术校验。Core 根据模型窗口、输出与运行时预留、工具 Schema 和 Domain 上下文声明生成统一预算，并在规划边界以及每次模型调用前重新计算压力。Core 每次都会把投影视图交给应用注入的 `ContextCompressionHook`；请求中的 `compression_required` 表示压力是否达到默认 85% 阈值或已经超过消息预算。低于阈值时 Hook 可以复用已有摘要，但 Core 不会宣告一次可见压缩。Hook 获得完整源视图和硬 Token 限制，所有语义选择均由应用负责。
 
 分阶段上下文 Provider 还可以实现 `TaskContextDemandProvider`。规划前的普通需求只为轻量候选清单分配空间；Core 编译出 `TaskSpec` 后，再解析仅属于该任务的附加需求，并在正式检索正文前重新生成最终预算。因此，无关的新问题不会因为存在未完成大产物就被预占一块上下文，领域也不需要写死局部上下文窗口。
 

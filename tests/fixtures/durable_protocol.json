@@ -1,0 +1,67 @@
+{
+  "leaseExpiryCases": [
+    {
+      "name": "before expiry remains owned",
+      "leaseExpiresAtMs": 1010,
+      "nowMs": 1009,
+      "expired": false
+    },
+    {
+      "name": "exact expiry is reclaimable",
+      "leaseExpiresAtMs": 1010,
+      "nowMs": 1010,
+      "expired": true
+    }
+  ],
+  "orphanCases": [
+    {
+      "name": "cancellation wins",
+      "candidate": {
+        "runId": "run-cancel",
+        "cancellationRequestedAtMs": 1
+      },
+      "disposition": "cancel",
+      "reason": "cancellation_requested",
+      "terminalStatus": "canceled"
+    },
+    {
+      "name": "active durable work defers",
+      "candidate": {
+        "runId": "run-active",
+        "activeTasks": [
+          {
+            "taskId": "task-active",
+            "revision": 2
+          }
+        ]
+      },
+      "disposition": "defer_active",
+      "reason": "durable_task_active",
+      "terminalStatus": null
+    },
+    {
+      "name": "interrupted durable work pauses",
+      "candidate": {
+        "runId": "run-paused",
+        "recoverableTasks": [
+          {
+            "taskId": "task-recoverable",
+            "revision": 3
+          }
+        ]
+      },
+      "disposition": "pause_recoverable",
+      "reason": "durable_task_interrupted",
+      "terminalStatus": "canceled"
+    },
+    {
+      "name": "unrecoverable execution fails",
+      "candidate": {
+        "runId": "run-failed"
+      },
+      "disposition": "fail",
+      "reason": "execution_interrupted",
+      "terminalStatus": "failed"
+    }
+  ]
+}

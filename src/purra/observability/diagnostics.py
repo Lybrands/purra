@@ -36,6 +36,40 @@ _PLANNER_FAIL_OUTCOMES = {
     "contract_violation",
     "failed",
 }
+_TRACE_KEYS = ("stage", "outcome", "durationMs", "round")
+_TRACE_DETAIL_KEYS = frozenset({
+    "action",
+    "allowed",
+    "approvalStatus",
+    "approvalStatuses",
+    "approvalWaitMs",
+    "approval_status",
+    "approval_statuses",
+    "approval_wait_ms",
+    "attempt",
+    "cause",
+    "compactedTurnCount",
+    "droppedMessages",
+    "effectState",
+    "estimatedInputTokens",
+    "maxAttempts",
+    "mayRepeatSideEffect",
+    "projectedTotalTokens",
+    "providerAttemptTerminal",
+    "reasonCode",
+    "remainingModelRounds",
+    "requestedTools",
+    "round",
+    "toolSchemaTokens",
+    "windowTokens",
+})
+_CONTEXT_BUDGET_KEYS = frozenset({
+    "droppedMessages",
+    "estimatedInputTokens",
+    "projectedTotalTokens",
+    "toolSchemaTokens",
+    "windowTokens",
+})
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,13 +95,18 @@ def build_canonical_run_observation(
         event_type = str(event.get("eventType") or "")
         payload = _mapping_copy(event.get("payload"))
         if event_type == TRACE_EVENT_TYPE:
+            payload = _sanitize_trace(payload)
             traces.append(payload)
             raw_stage = str(payload.get("stage") or "unknown")
             stage = _CANONICAL_STAGE_NAMES.get(raw_stage, raw_stage)
             by_stage.setdefault(stage, []).append(payload)
             continue
         if event_type == CoreEventType.CONTEXT_BUDGETED.value:
-            core_context = payload
+            core_context = {
+                key: payload[key]
+                for key in _CONTEXT_BUDGET_KEYS
+                if key in payload
+            }
             continue
         terminal_outcome = _CORE_TERMINAL_OUTCOMES.get(event_type)
         if terminal_outcome is not None:
@@ -218,6 +257,27 @@ def evaluate_agent_run(
 
 def _mapping_copy(value: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, Mapping) else {}
+
+
+def _sanitize_trace(value: Mapping[str, Any]) -> dict[str, Any]:
+    trace = {
+        key: value[key]
+        for key in _TRACE_KEYS
+        if key in value and isinstance(value[key], (str, int, float, bool))
+    }
+    details = _mapping_copy(value.get("details"))
+    safe_details: dict[str, Any] = {}
+    for key in _TRACE_DETAIL_KEYS:
+        item = details.get(key)
+        if isinstance(item, (str, int, float, bool)):
+            safe_details[key] = item
+        elif isinstance(item, (list, tuple)) and all(
+            isinstance(entry, str) for entry in item
+        ):
+            safe_details[key] = list(item)
+    if safe_details:
+        trace["details"] = safe_details
+    return trace
 
 
 def generation_attempt_traces(

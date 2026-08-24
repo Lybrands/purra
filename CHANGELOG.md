@@ -1,5 +1,28 @@
 # Changelog
 
+## @lybrands/purra 0.1.0-alpha.0 - 2026-08-25
+
+- Added the TypeScript-native Reactive, Planned, Durable, Artifact, delegation,
+  observability, evaluation, and public adapter-conformance capabilities.
+- Added one ESM package with declarations and clean-consumer installation gates
+  for npm, pnpm, Yarn, and Bun.
+- Added one bounded recovery authority for interrupted Provider streams,
+  malformed or unauthorized tool calls, invalid tool input, failed-step
+  replanning, empty output, and response repair. Submitted Runs persist
+  content-free recovery decisions before the selected action.
+- Added a TypeScript-native canonical Operation lifecycle controller with
+  persist-before-transition start/terminal receipts and monotonic duration.
+- Added a public managed model-task runner and per-execution context/compaction
+  factories; submitted extension calls reuse the same Run receipts and budgets.
+- Added optional TypeScript-native model Planner and response-judge helpers;
+  host Planner/Judge ports remain supported and Reactive stays the default.
+- Re-audited the documented alpha capability matrix and refreshed one exact
+  packed candidate through npm, pnpm, Yarn, Bun, and a strict installed-package
+  consumer covering the managed extension composition path.
+- Production persistence and Provider SDK adapters remain host-owned. Real
+  completion and streaming evidence is future host-project work outside this
+  npm release and remains required before stable parity claims.
+
 ## 0.2.0 - 2026-08-22
 
 - Added fail-closed Agent composition snapshot schema version 2 and explicit

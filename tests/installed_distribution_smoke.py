@@ -9,6 +9,19 @@ from pathlib import Path
 
 import purra
 from purra.api import AgentCore, AgentPreset, InMemoryAgentAdapters
+from purra.artifacts import (
+    ArtifactAccessController,
+    ArtifactAccessMode,
+    ArtifactAccessRequest,
+    ArtifactAppendCommand,
+    ArtifactCreateCommand,
+    ArtifactFinalizeCommand,
+    ArtifactLifecycle,
+    ArtifactMutationLease,
+    ArtifactOwnerRef,
+    ArtifactResumeCandidate,
+    ArtifactStatus,
+)
 from purra.contracts import (
     AgentMessage,
     AgentRunRequest,
@@ -91,6 +104,62 @@ async def _run() -> None:
 
     assert result.status is RunStatus.DONE
     assert result.final_response == "installed PurrA is runnable"
+
+    lifecycle = ArtifactLifecycle(
+        adapters.artifacts,
+        id_factory=lambda: "installed-artifact-smoke",
+    )
+    artifact = await lifecycle.begin(ArtifactCreateCommand(
+        namespace="smoke",
+        kind="report",
+        owner_id="installed-smoke",
+        owner_ref=ArtifactOwnerRef("run", "installed-artifact-run"),
+        created_by_run_id="installed-artifact-run",
+        expected_item_count=1,
+    ))
+    grant = await ArtifactAccessController(adapters.artifact_claims).authorize(
+        ArtifactResumeCandidate(
+            artifact_id=artifact.id,
+            namespace=artifact.namespace,
+            kind=artifact.kind,
+            owner_id=artifact.owner_id,
+            owner_ref=artifact.owner_ref,
+            created_by_run_id=artifact.created_by_run_id,
+            status=artifact.status,
+            revision=artifact.revision,
+        ),
+        ArtifactAccessRequest(
+            artifact_id=artifact.id,
+            run_id=artifact.created_by_run_id,
+            mode=ArtifactAccessMode.WRITE,
+            expected_revision=artifact.revision,
+        ),
+        lease_duration_ms=30_000,
+    )
+    assert grant.write_claim is not None
+    lease = ArtifactMutationLease(
+        run_id=grant.write_claim.run_id,
+        claim_token=grant.write_claim.claim_token,
+    )
+    receipt = await lifecycle.append(ArtifactAppendCommand(
+        artifact_id=artifact.id,
+        expected_revision=artifact.revision,
+        sequence=artifact.next_sequence,
+        batch_id="installed-batch",
+        idempotency_key="installed-append",
+        items=({"installed": True},),
+        write_lease=lease,
+        coverage_keys=("installed",),
+    ))
+    finalized = await lifecycle.finalize(ArtifactFinalizeCommand(
+        artifact_id=artifact.id,
+        expected_revision=receipt.committed_revision,
+        write_lease=lease,
+        expected_item_count=1,
+        expected_coverage_keys=("installed",),
+        resource_ref="memory://installed-artifact",
+    ))
+    assert finalized.status is ArtifactStatus.FINALIZED
 
 
 if __name__ == "__main__":

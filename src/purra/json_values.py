@@ -187,3 +187,14 @@ def canonical_json_digest(value: Any) -> str:
         allow_nan=False,
     )
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+__all__ = [
+    "FrozenDict",
+    "FrozenList",
+    "canonical_json_digest",
+    "freeze_json_mapping",
+    "freeze_json_value",
+    "thaw_json_mapping",
+    "thaw_json_value",
+]

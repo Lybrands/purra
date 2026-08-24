@@ -32,3 +32,80 @@ jobs:
           python -m venv "$RUNNER_TEMP/purra-smoke"
           "$RUNNER_TEMP/purra-smoke/bin/python" -m pip install --no-deps dist/*.whl
           "$RUNNER_TEMP/purra-smoke/bin/python" tests/installed_distribution_smoke.py
+
+  typescript:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [22, 24]
+    defaults:
+      run:
+        working-directory: typescript
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+          cache-dependency-path: typescript/package-lock.json
+      - run: npm ci
+      - run: npm run check
+      - run: npm pack --dry-run
+      - run: git diff --check
+        working-directory: .
+
+  package-installers:
+    needs: typescript
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - installer: npm
+            install-command: npm install --ignore-scripts
+            runtime-command: node
+          - installer: pnpm
+            install-command: pnpm add --ignore-scripts
+            runtime-command: node
+          - installer: yarn
+            install-command: yarn add --mode=skip-build
+            runtime-command: yarn node
+          - installer: bun
+            install-command: bun add --ignore-scripts
+            runtime-command: bun
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: typescript/package-lock.json
+      - if: matrix.installer == 'pnpm'
+        run: |
+          corepack enable pnpm
+          corepack install --global pnpm@11.19.0
+      - if: matrix.installer == 'yarn'
+        run: |
+          corepack enable yarn
+          corepack install --global yarn@4.9.2
+      - if: matrix.installer == 'bun'
+        uses: oven-sh/setup-bun@v2
+      - run: npm ci
+        working-directory: typescript
+      - name: Pack the exact install candidate
+        id: pack
+        run: |
+          tarball="$(npm pack --silent --pack-destination "$RUNNER_TEMP" | tail -n 1)"
+          echo "tarball=$RUNNER_TEMP/$tarball" >> "$GITHUB_OUTPUT"
+        working-directory: typescript
+      - name: Install with ${{ matrix.installer }}
+        run: ${{ matrix.install-command }} "${{ steps.pack.outputs.tarball }}"
+        working-directory: typescript/test/installed-consumer
+      - name: Run installed artifact with ${{ matrix.runtime-command }}
+        run: ${{ matrix.runtime-command }} smoke.mjs
+        working-directory: typescript/test/installed-consumer
+      - name: Compile strict installed-package consumer
+        if: matrix.installer == 'npm'
+        run: ../../node_modules/.bin/tsc -p tsconfig.json
+        working-directory: typescript/test/installed-consumer

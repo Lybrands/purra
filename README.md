@@ -12,6 +12,53 @@ loop without a Planner, `TaskSpec`, task admission, `ExecutionRecipe`, durable
 task repository, or domain context provider. Planning and durable execution
 are explicit first-party capabilities rather than mandatory stages.
 
+## Language distributions
+
+The Python package at the repository root remains the complete `0.2.x`
+implementation. A separate, idiomatic ESM package for JavaScript and
+TypeScript lives under `typescript/`. Its current `0.1.0-alpha.0` package implements
+a bounded Reactive model/tool loop, recursive tool-Schema inspection,
+whole-batch authorization, approval, scope, idempotency and effect-state
+safety, plus `AbortSignal` cancellation. `Agent.invoke()` and `Agent.stream()`
+remain transient convenience APIs. `Agent.submit()` adds an in-memory,
+canonical Run/output journal with preset fingerprints, invocation receipts,
+persist-before-publish ordering, replay, cancellation, absolute deadlines,
+usage/output budgets, and atomic terminal settlement. Messages, usage,
+capability snapshots and output limits remain immutable and Provider-neutral.
+Opt-in context composition adds hard input budgeting, opaque allocation claims,
+Single Pass retrieval, validated request-scoped trimming/compression, staged
+retrieval contracts, and invocation-bound evidence receipts without changing
+canonical conversation history. Model-backed context and compaction factories
+receive a managed, tool-free runner whose submitted calls reuse the same Run
+receipts and budgets. An explicit Planned composition now adds
+semantic `TaskSpec`/`WorkPlan` contracts, Core-owned compilation and
+current-transition tool authority, public/private capability lowering,
+Staged task context, response validation, and bounded host-requested replanning.
+Hosts may inject their own Planner/Judge or use the optional TypeScript-native
+model-backed reference helpers, whose calls remain under the same Run authority.
+Explicit Durable composition adds admission, Long Task DAGs, leases,
+checkpoints, continuation, and orphan recovery. Recoverable Artifacts remain a
+separate versioned output aggregate with claims and validation. Optional
+one-Run delegation adds isolated, bounded delegated Agents whose model calls,
+read tools, cancellation, and lifecycle events stay under the Root Run.
+Content-free operational, stability, recovery, performance, trend, and
+regression-gate reports now consume the same frozen evidence semantics as
+Python. Deterministic regression/security suites and public adapter probes
+cover the shipped host ports without granting diagnostics runtime authority.
+
+Shared model, tool, and recovery fixtures use the Python safety semantics while
+the API stays TypeScript-native. The alpha does not include production
+persistence or Provider SDK adapters. Credentialed completion/streaming evidence
+remains future host-project work outside this npm release and is required before
+a stable parity claim.
+
+JavaScript and TypeScript consume the same npm artifact. npm, pnpm, Yarn, and
+Bun install the same exact packed candidate in the release gate.
+Python and npm versions advance independently before 1.0; matching version
+numbers do not imply capability parity. The TypeScript capability matrix is the
+authority for npm support, and incompatible public npm API changes require a
+new minor version while the package remains pre-1.0.
+
 Hosts with bounded model-backed hooks use `purra.model_execution`. They declare
 the model request, output policy, work-unit count, and reasoning preference;
 PurrA alone resolves the provider allowance, constructs `ModelInvocation`, and
@@ -62,7 +109,7 @@ wheel into a clean environment, and runs one Agent through public imports.
 The supported top-level host modules for this line are `api`, `artifacts`,
 `cancellation`, `context_budget`, `context_orchestration`,
 `context_strategies`, `contracts`, `errors`, `evaluation`, `events`,
-`evidence`, `json_values`, `long_tasks`, `model_call_parameters`,
+`delegation`, `evidence`, `json_values`, `long_tasks`, `model_call_parameters`,
 `model_execution`, `model_invocation`, `model_protocol`, `normalization`,
 `observability`, `orphan_recovery`, `output`, `ports`, `recovery`,
 `run_control`, `stream_ownership`, `structured_output`, `task_admission`,
@@ -518,9 +565,13 @@ options. The source AgentPreset snapshot must also be reused.
 PurrA owns context budgeting, compression timing, hook invocation, and
 technical validation. It derives one budget from the model window,
 output/runtime reserves, tool schemas, and domain context claims, then checks
-pressure at planning boundaries and before every model call. At 85% pressure
-Core invokes the configured `ContextCompressionHook`; the hook receives the
-complete source view and hard token limits and owns every semantic choice.
+pressure at planning boundaries and before every model call. Core offers each
+projection to the configured `ContextCompressionHook`; the request's
+`compression_required` flag reports whether pressure reached the default 85%
+threshold or exceeded the message budget. Below that threshold the Hook may
+reuse an existing summary, but Core does not announce a visible compaction.
+The hook receives the complete source view and hard token limits and owns every
+semantic choice.
 
 Staged providers may additionally implement `TaskContextDemandProvider`.
 Their ordinary demand funds only the lightweight planning manifest; after a

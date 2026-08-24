@@ -1,0 +1,28 @@
+{
+  "jsonTokenCases": [
+    { "value": "abcd", "tokens": 3 },
+    { "value": "猫", "tokens": 2 },
+    { "value": "😀", "tokens": 2 },
+    { "value": { "a": 1, "text": "猫" }, "tokens": 10 },
+    { "value": ["abc", 2, true, null], "tokens": 10 }
+  ],
+  "textTokenCases": [
+    { "value": "abcd", "tokens": 1 },
+    { "value": "猫a", "tokens": 2 },
+    { "value": "😀", "tokens": 1 },
+    { "value": "hello 世界", "tokens": 4 }
+  ],
+  "allocationCase": {
+    "windowTokens": 5000,
+    "outputReserveTokens": 1000,
+    "safetyReserveTokens": 500,
+    "runtimeReserveTokens": 500,
+    "minimumMessageTokens": 500,
+    "claims": [
+      { "name": "primary", "desiredTokens": 2500, "minimumTokens": 500, "priority": 1 },
+      { "name": "secondary", "desiredTokens": 2500, "minimumTokens": 500, "priority": 0 }
+    ],
+    "providerInputTokens": 3000,
+    "allocations": { "primary": 2000, "secondary": 500 }
+  }
+}

@@ -82,3 +82,11 @@ class AgentCommand:
                 raise ValueError("approval.resolve requires decision")
             payload["decision"] = decision.value
         object.__setattr__(self, "payload", freeze_json_mapping(payload))
+
+
+__all__ = [
+    "AgentCommand",
+    "AgentEvent",
+    "CoreCommandType",
+    "CoreEventType",
+]

@@ -531,7 +531,7 @@ class _InMemoryToolIdempotencyGateway:
             receipt = self._state.tool_receipts.get(key)
             if receipt is not None:
                 self._require_same_call(receipt[0], tool_call)
-                return receipt[1]
+                return replace(receipt[1], from_cache=True)
             inflight = self._state.tool_inflight.get(key)
             if inflight is not None:
                 self._require_same_call(inflight[0], tool_call)

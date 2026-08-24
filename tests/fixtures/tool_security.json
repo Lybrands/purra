@@ -1,0 +1,100 @@
+{
+  "argumentSchemaCases": [
+    {
+      "name": "nested-valid",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "rows": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "properties": {
+                "score": { "type": "number", "minimum": 0, "maximum": 1 }
+              },
+              "required": ["score"],
+              "additionalProperties": false
+            }
+          }
+        },
+        "required": ["rows"],
+        "additionalProperties": false
+      },
+      "arguments": { "rows": [{ "score": 0.5 }] },
+      "errorCode": null
+    },
+    {
+      "name": "required-missing",
+      "schema": {
+        "type": "object",
+        "properties": { "query": { "type": "string" } },
+        "required": ["query"],
+        "additionalProperties": false
+      },
+      "arguments": {},
+      "errorCode": "invalid_tool_arguments_schema"
+    },
+    {
+      "name": "additional-property",
+      "schema": {
+        "type": "object",
+        "properties": { "query": { "type": "string" } },
+        "additionalProperties": false
+      },
+      "arguments": { "query": "purr", "secret": true },
+      "errorCode": "invalid_tool_arguments_schema"
+    },
+    {
+      "name": "union-valid",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "value": {
+            "anyOf": [
+              { "type": "string", "minLength": 1 },
+              { "type": "integer", "minimum": 1 }
+            ]
+          }
+        },
+        "required": ["value"],
+        "additionalProperties": false
+      },
+      "arguments": { "value": 2 },
+      "errorCode": null
+    },
+    {
+      "name": "one-of-ambiguous",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "value": {
+            "oneOf": [{ "type": "number" }, { "type": "integer" }]
+          }
+        },
+        "required": ["value"],
+        "additionalProperties": false
+      },
+      "arguments": { "value": 2 },
+      "errorCode": "invalid_tool_arguments_schema"
+    },
+    {
+      "name": "bounded-string",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "minLength": 2,
+            "maxLength": 4,
+            "enum": ["ok", "safe"]
+          }
+        },
+        "required": ["code"],
+        "additionalProperties": false
+      },
+      "arguments": { "code": "unsafe" },
+      "errorCode": "invalid_tool_arguments_schema"
+    }
+  ]
+}

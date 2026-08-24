@@ -1,0 +1,53 @@
+{
+  "policy": {
+    "enabled": true,
+    "maxAgentsPerCall": 3,
+    "maxParallel": 3,
+    "maxAgentNameChars": 64,
+    "maxTitleChars": 120,
+    "maxInstructionChars": 4000,
+    "maxObjectiveChars": 4000,
+    "contextMode": "isolated",
+    "toolMode": "read",
+    "allowsRecursiveDelegation": false
+  },
+  "aggregationCases": [
+    {
+      "name": "completed required work is ready",
+      "rows": [
+        { "agentName": "facts", "status": "done", "required": true, "summary": "verified" }
+      ],
+      "state": "ready",
+      "requiredFailureCount": 0,
+      "resultAgentNames": ["facts"]
+    },
+    {
+      "name": "optional failure does not block",
+      "rows": [
+        { "agentName": "facts", "status": "done", "required": true, "summary": "verified" },
+        { "agentName": "extra", "status": "failed", "required": false }
+      ],
+      "state": "ready",
+      "requiredFailureCount": 0,
+      "resultAgentNames": ["facts"]
+    },
+    {
+      "name": "required cancellation blocks",
+      "rows": [
+        { "agentName": "facts", "status": "canceled", "required": true }
+      ],
+      "state": "blocked",
+      "requiredFailureCount": 1,
+      "resultAgentNames": []
+    },
+    {
+      "name": "queued work remains pending",
+      "rows": [
+        { "agentName": "facts", "status": "queued", "required": true }
+      ],
+      "state": "pending",
+      "requiredFailureCount": 0,
+      "resultAgentNames": []
+    }
+  ]
+}

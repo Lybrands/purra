@@ -194,11 +194,14 @@ async def assert_delegation_repository_conforms(
         batch_id=batch_id,
     )
     assert started is not None and started.status.value == "running"
-    assert await repository.start(
-        "missing",
-        run_id=run_id,
-        batch_id=batch_id,
-    ) is None
+    await _require_failure(
+        repository.start(
+            "missing",
+            run_id=run_id,
+            batch_id=batch_id,
+        ),
+        "a missing delegation id must fail closed",
+    )
     assert await repository.complete(
         high.id,
         run_id=run_id,

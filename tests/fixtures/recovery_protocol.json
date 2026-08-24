@@ -1,0 +1,103 @@
+{
+  "schemaVersion": 1,
+  "cases": [
+    {
+      "caseId": "allowed",
+      "policy": { "empty_model_response": 1 },
+      "request": {
+        "cause": "empty_model_response",
+        "action": "retry_model",
+        "remainingModelRounds": 2
+      },
+      "expected": { "allowed": true, "reasonCode": "allowed", "attempt": 1, "maxAttempts": 1 }
+    },
+    {
+      "caseId": "attempt-exhausted",
+      "policy": { "empty_model_response": 1 },
+      "preconsume": 1,
+      "request": {
+        "cause": "empty_model_response",
+        "action": "retry_model",
+        "remainingModelRounds": 2
+      },
+      "expected": { "allowed": false, "reasonCode": "attempt_budget_exhausted", "attempt": 1, "maxAttempts": 1 }
+    },
+    {
+      "caseId": "round-exhausted",
+      "policy": { "empty_model_response": 1 },
+      "request": {
+        "cause": "empty_model_response",
+        "action": "retry_model",
+        "remainingModelRounds": 0
+      },
+      "expected": { "allowed": false, "reasonCode": "round_budget_exhausted", "attempt": 0, "maxAttempts": 1 }
+    },
+    {
+      "caseId": "canceled",
+      "policy": { "empty_model_response": 1 },
+      "request": {
+        "cause": "empty_model_response",
+        "action": "retry_model",
+        "remainingModelRounds": 2,
+        "cancellationRequested": true
+      },
+      "expected": { "allowed": false, "reasonCode": "request_canceled", "attempt": 0, "maxAttempts": 1 }
+    },
+    {
+      "caseId": "visible-output",
+      "policy": { "provider_stream_interrupted": 1 },
+      "request": {
+        "cause": "provider_stream_interrupted",
+        "action": "retry_model",
+        "remainingModelRounds": 2,
+        "visibleOutputEmitted": true
+      },
+      "expected": { "allowed": false, "reasonCode": "visible_output_already_emitted", "attempt": 0, "maxAttempts": 1 }
+    },
+    {
+      "caseId": "committed-effect",
+      "policy": { "tool_execution_failed_replan": 1 },
+      "request": {
+        "cause": "tool_execution_failed_replan",
+        "action": "replan",
+        "remainingModelRounds": 2,
+        "effectState": "committed",
+        "mayRepeatSideEffect": true
+      },
+      "expected": { "allowed": false, "reasonCode": "side_effect_committed", "attempt": 0, "maxAttempts": 1 }
+    },
+    {
+      "caseId": "unknown-effect",
+      "policy": { "tool_execution_failed_replan": 1 },
+      "request": {
+        "cause": "tool_execution_failed_replan",
+        "action": "replan",
+        "remainingModelRounds": 2,
+        "effectState": "unknown",
+        "mayRepeatSideEffect": true
+      },
+      "expected": { "allowed": false, "reasonCode": "side_effect_state_unknown", "attempt": 0, "maxAttempts": 1 }
+    },
+    {
+      "caseId": "not-retryable",
+      "policy": { "empty_model_response": 1 },
+      "request": {
+        "cause": "empty_model_response",
+        "action": "retry_model",
+        "remainingModelRounds": 2,
+        "retryable": false
+      },
+      "expected": { "allowed": false, "reasonCode": "cause_not_retryable", "attempt": 0, "maxAttempts": 1 }
+    },
+    {
+      "caseId": "policy-disabled",
+      "policy": {},
+      "request": {
+        "cause": "empty_model_response",
+        "action": "retry_model",
+        "remainingModelRounds": 2
+      },
+      "expected": { "allowed": false, "reasonCode": "policy_disabled", "attempt": 0, "maxAttempts": 0 }
+    }
+  ]
+}

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
@@ -31,6 +32,7 @@ from purra.contracts import (
     TaskStep,
     TaskSpec,
     ToolPolicy,
+    ToolContextContract,
     ToolSchema,
     WorkPlan,
     WorkStep,
@@ -385,6 +387,55 @@ def test_private_runtime_tool_must_be_selected_through_public_capability():
 
     compiled = compile_work_plan(_tool_work_plan("inspect"), (registration,))
     assert compiled.lowered_tool_names == ("readInternal",)
+
+
+def test_shared_planning_compiler_cases_match_typescript():
+    fixture_path = Path(__file__).parent / "fixtures" / "planning_protocol.json"
+    fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+    for row in fixture["compileCases"]:
+        registrations = tuple(
+            ToolRegistration(
+                schema=ToolSchema(
+                    name=item["runtimeName"],
+                    description=item["title"],
+                    parameters={"type": "object", "properties": {}},
+                ),
+                handler=_read_tool,
+                policy=ToolPolicy(
+                    mode="read",
+                    title=item["title"],
+                    risk_level=item["riskLevel"],
+                ),
+                context_contract=ToolContextContract(
+                    prerequisite_tools=tuple(item["prerequisiteTools"]),
+                ),
+                planning_capability=(
+                    None
+                    if item.get("planningCapability") is None
+                    else ToolSchema(
+                        name=item["planningCapability"],
+                        description=item["title"],
+                        parameters={"type": "object", "properties": {}},
+                    )
+                ),
+            )
+            for item in row["registrations"]
+        )
+        compiled = compile_work_plan(
+            _tool_work_plan(row["planCapability"]),
+            registrations,
+        )
+
+        assert [
+            step.suggested_tools[0]
+            for step in compiled.execution_plan.steps
+        ] == row["expectedRuntimeTools"], row["name"]
+        assert list(compiled.inserted_tool_names) == row["expectedInsertedTools"]
+        assert list(compiled.lowered_tool_names) == row["expectedLoweredTools"]
+        assert [
+            step.protocol_private
+            for step in compiled.execution_plan.steps
+        ] == row["expectedPrivateSteps"]
 
 
 def test_disabled_runtime_tool_cannot_be_compiled_from_host_plan():

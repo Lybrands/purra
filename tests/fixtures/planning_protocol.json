@@ -1,0 +1,27 @@
+{
+  "compileCases": [
+    {
+      "name": "public capability lowers through a private prerequisite",
+      "registrations": [
+        {
+          "runtimeName": "prepare",
+          "title": "Prepare",
+          "riskLevel": "read",
+          "prerequisiteTools": []
+        },
+        {
+          "runtimeName": "private_write",
+          "title": "Write",
+          "riskLevel": "write",
+          "planningCapability": "public_write",
+          "prerequisiteTools": ["prepare"]
+        }
+      ],
+      "planCapability": "public_write",
+      "expectedRuntimeTools": ["prepare", "private_write"],
+      "expectedInsertedTools": ["prepare"],
+      "expectedLoweredTools": ["private_write"],
+      "expectedPrivateSteps": [true, false]
+    }
+  ]
+}

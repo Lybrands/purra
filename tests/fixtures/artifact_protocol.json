@@ -1,0 +1,88 @@
+{
+  "coverageCases": [
+    {
+      "name": "coverage digest sorts and deduplicates",
+      "keys": ["scene-2", "scene-1", "scene-1"],
+      "digest": "6e3c28cac6170f9a78e8c50abfb928a7afa1c44faae89b48dd03dba7c57a0553"
+    }
+  ],
+  "accessCases": [
+    {
+      "name": "creator reads open artifact",
+      "status": "open",
+      "mode": "read",
+      "runId": "run-1",
+      "expectedRevision": 2,
+      "crossRunAuthorized": false,
+      "allowed": true,
+      "reason": "allowed",
+      "requiresWriteClaim": false
+    },
+    {
+      "name": "cross run is fail closed",
+      "status": "open",
+      "mode": "read",
+      "runId": "run-2",
+      "expectedRevision": 2,
+      "crossRunAuthorized": false,
+      "allowed": false,
+      "reason": "cross_run_not_authorized",
+      "requiresWriteClaim": false
+    },
+    {
+      "name": "authorized cross run writes with claim",
+      "status": "open",
+      "mode": "write",
+      "runId": "run-2",
+      "expectedRevision": 2,
+      "crossRunAuthorized": true,
+      "allowed": true,
+      "reason": "allowed",
+      "requiresWriteClaim": true
+    },
+    {
+      "name": "finalized artifact remains readable",
+      "status": "finalized",
+      "mode": "read",
+      "runId": "run-1",
+      "expectedRevision": 2,
+      "crossRunAuthorized": false,
+      "allowed": true,
+      "reason": "allowed",
+      "requiresWriteClaim": false
+    },
+    {
+      "name": "finalized artifact rejects writes",
+      "status": "finalized",
+      "mode": "write",
+      "runId": "run-1",
+      "expectedRevision": 2,
+      "crossRunAuthorized": false,
+      "allowed": false,
+      "reason": "artifact_finalized",
+      "requiresWriteClaim": false
+    },
+    {
+      "name": "aborted artifact rejects reads",
+      "status": "aborted",
+      "mode": "read",
+      "runId": "run-1",
+      "expectedRevision": 2,
+      "crossRunAuthorized": false,
+      "allowed": false,
+      "reason": "artifact_aborted",
+      "requiresWriteClaim": false
+    },
+    {
+      "name": "revision mismatch rejects access",
+      "status": "open",
+      "mode": "read",
+      "runId": "run-1",
+      "expectedRevision": 1,
+      "crossRunAuthorized": false,
+      "allowed": false,
+      "reason": "artifact_revision_conflict",
+      "requiresWriteClaim": false
+    }
+  ]
+}

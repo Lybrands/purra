@@ -5,3 +5,6 @@ __pycache__/
 build/
 dist/
 docs/plans/
+node_modules/
+typescript/dist/
+typescript/*.tgz

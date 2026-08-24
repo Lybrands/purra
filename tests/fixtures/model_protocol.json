@@ -1,0 +1,120 @@
+{
+  "messageCases": [
+    {
+      "role": "assistant",
+      "content": {
+        "kind": "summary",
+        "items": ["purr", 2, true, null]
+      },
+      "reasoning": "private trace",
+      "attributes": {
+        "provider": "fixture",
+        "nested": { "score": 1.5 }
+      },
+      "toolCalls": [
+        {
+          "id": "call-1",
+          "name": "lookup",
+          "arguments": { "query": "purr", "limit": 2 }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": { "found": true },
+      "toolCallId": "call-1",
+      "attributes": { "source": "fixture" }
+    }
+  ],
+  "terminationCases": [
+    {
+      "finishReason": "stop",
+      "toolCallCount": 0,
+      "incomplete": false,
+      "authorizesToolCalls": false,
+      "errorCode": null
+    },
+    {
+      "finishReason": "stop",
+      "toolCallCount": 1,
+      "incomplete": false,
+      "authorizesToolCalls": true,
+      "errorCode": null
+    },
+    {
+      "finishReason": "tool_calls",
+      "toolCallCount": 1,
+      "incomplete": false,
+      "authorizesToolCalls": true,
+      "errorCode": null
+    },
+    {
+      "finishReason": "length",
+      "toolCallCount": 0,
+      "incomplete": true,
+      "authorizesToolCalls": false,
+      "errorCode": "model_output_truncated"
+    },
+    {
+      "finishReason": "length",
+      "toolCallCount": 1,
+      "incomplete": true,
+      "authorizesToolCalls": false,
+      "errorCode": "tool_call_truncated"
+    },
+    {
+      "finishReason": "filtered",
+      "toolCallCount": 0,
+      "incomplete": true,
+      "authorizesToolCalls": false,
+      "errorCode": "model_output_filtered"
+    },
+    {
+      "finishReason": "other",
+      "toolCallCount": 0,
+      "incomplete": true,
+      "authorizesToolCalls": false,
+      "errorCode": "unsupported_model_finish_reason"
+    }
+  ],
+  "outputLimitCases": [
+    {
+      "profileMaxTokens": 1000,
+      "userOverride": null,
+      "outputLimit": {
+        "maxTokens": 1000,
+        "source": "model_profile",
+        "profileMaxTokens": 1000
+      },
+      "errorCode": null
+    },
+    {
+      "profileMaxTokens": 1000,
+      "userOverride": 200,
+      "outputLimit": {
+        "maxTokens": 200,
+        "source": "user_override",
+        "profileMaxTokens": 1000
+      },
+      "errorCode": null
+    },
+    {
+      "profileMaxTokens": 1000,
+      "userOverride": 1200,
+      "outputLimit": null,
+      "errorCode": "model_output_limit_exceeded"
+    },
+    {
+      "profileMaxTokens": 1000,
+      "userOverride": 0,
+      "outputLimit": null,
+      "errorCode": "model_output_limit_invalid"
+    },
+    {
+      "profileMaxTokens": null,
+      "userOverride": null,
+      "outputLimit": null,
+      "errorCode": "model_output_limit_unknown"
+    }
+  ]
+}

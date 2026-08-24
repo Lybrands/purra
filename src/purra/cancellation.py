@@ -101,3 +101,10 @@ async def await_with_cancellation(
     finally:
         if cancel_waiter is not None:
             await cancel_and_wait(cancel_waiter)
+
+
+__all__ = [
+    "OperationCanceled",
+    "await_with_cancellation",
+    "is_canceled",
+]

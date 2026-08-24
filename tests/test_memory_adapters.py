@@ -8,7 +8,10 @@ from purra.contracts import (
 )
 from purra.events import AgentEvent
 from purra.errors import ContractViolationError
-from purra.testing import assert_host_adapters_conform
+from purra.testing import (
+    assert_delegation_repository_conforms,
+    assert_host_adapters_conform,
+)
 
 
 @pytest.mark.asyncio
@@ -19,6 +22,23 @@ async def test_memory_host_adapters_pass_the_shared_conformance_suite():
         outputs=adapters.outputs,
         publisher=adapters.publisher,
         session_id="portable-session",
+    )
+
+
+@pytest.mark.asyncio
+async def test_memory_delegations_pass_the_shared_conformance_suite():
+    adapters = InMemoryAgentAdapters()
+
+    async def create_run() -> str:
+        begun = await adapters.runs.begin(
+            RunCreateParams(session_id=None, prompt="delegate", mode="agent"),
+            AgentEvent(type="run.started"),
+        )
+        return begun.run_id
+
+    await assert_delegation_repository_conforms(
+        adapters.delegations,
+        create_run,
     )
 
 
@@ -52,7 +72,8 @@ async def test_memory_idempotency_replays_one_tool_result_and_rejects_key_drift(
         operation,
     )
 
-    assert first == replay == ToolHandlerResult("done")
+    assert first == ToolHandlerResult("done")
+    assert replay == ToolHandlerResult("done", from_cache=True)
     assert calls == 1
     with pytest.raises(ContractViolationError, match="different arguments"):
         await adapters.idempotency.execute_once(
