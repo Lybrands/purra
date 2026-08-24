@@ -255,7 +255,12 @@ export class ToolCatalog {
         throw new AgentError("tool_approval_unavailable", `Tool ${call.name} requires approval`);
       }
       let status: ToolApprovalStatus;
-      const timeout = AbortSignal.timeout(this.#approvalTimeoutMs);
+      const timeoutController = new AbortController();
+      const timeoutHandle = globalThis.setTimeout(
+        () => timeoutController.abort(),
+        this.#approvalTimeoutMs,
+      );
+      const timeout = timeoutController.signal;
       const approvalSignal = signal === undefined
         ? timeout
         : AbortSignal.any([signal, timeout]);
@@ -274,6 +279,8 @@ export class ToolCatalog {
         throw new AgentError("tool_approval_unavailable", `Tool ${call.name} approval failed`, {
           cause: error,
         });
+      } finally {
+        globalThis.clearTimeout(timeoutHandle);
       }
       if (status !== "approved") {
         const code = status === "rejected"
