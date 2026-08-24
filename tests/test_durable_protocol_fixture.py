@@ -14,7 +14,7 @@ from purra.run_control import (
 
 
 FIXTURE = json.loads(
-    (Path(__file__).parent / "fixtures" / "durable_protocol.json").read_text()
+    (Path(__file__).parents[1] / "conformance" / "fixtures" / "durable_protocol.json").read_text()
 )
 
 

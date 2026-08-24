@@ -2,10 +2,10 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 
-import { Agent, AgentCanceledError, AgentError } from "@lybrands/purra";
+import { Agent, AgentCanceledError, AgentError } from "purra";
 
 const fixture = JSON.parse(readFileSync(
-  new URL("../../tests/fixtures/model_protocol.json", import.meta.url),
+  new URL("../../conformance/fixtures/model_protocol.json", import.meta.url),
   "utf8",
 ));
 

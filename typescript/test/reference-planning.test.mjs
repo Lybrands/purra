@@ -6,7 +6,7 @@ import {
   ModelResponseJudge,
   ModelWorkPlanner,
   ToolPlanningPolicy,
-} from "@lybrands/purra";
+} from "purra";
 
 test("model Planner repairs invalid JSON inside the submitted Run before executing the plan", async () => {
   let plannerRunId;

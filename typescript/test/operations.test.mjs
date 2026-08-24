@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { AgentError, AgentOperationController } from "@lybrands/purra";
+import { AgentError, AgentOperationController } from "purra";
 
 test("Operation lifecycle persists one start and one monotonic terminal event", async () => {
   const events = [];

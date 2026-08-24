@@ -8,10 +8,10 @@ import {
   InMemoryRunRepository,
   RecoveryLedger,
   RecoveryPolicy,
-} from "@lybrands/purra";
+} from "purra";
 
 const fixture = JSON.parse(readFileSync(
-  new URL("../../tests/fixtures/recovery_protocol.json", import.meta.url),
+  new URL("../../conformance/fixtures/recovery_protocol.json", import.meta.url),
   "utf8",
 ));
 

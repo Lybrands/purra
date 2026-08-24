@@ -99,13 +99,16 @@ jobs:
           tarball="$(npm pack --silent --pack-destination "$RUNNER_TEMP" | tail -n 1)"
           echo "tarball=$RUNNER_TEMP/$tarball" >> "$GITHUB_OUTPUT"
         working-directory: typescript
+      - name: Prepare a clean external consumer
+        run: cp -R typescript/test/installed-consumer "$RUNNER_TEMP/purra-consumer"
       - name: Install with ${{ matrix.installer }}
         run: ${{ matrix.install-command }} "${{ steps.pack.outputs.tarball }}"
-        working-directory: typescript/test/installed-consumer
+        working-directory: ${{ runner.temp }}/purra-consumer
       - name: Run installed artifact with ${{ matrix.runtime-command }}
         run: ${{ matrix.runtime-command }} smoke.mjs
-        working-directory: typescript/test/installed-consumer
+        working-directory: ${{ runner.temp }}/purra-consumer
       - name: Compile strict installed-package consumer
         if: matrix.installer == 'npm'
-        run: ../../node_modules/.bin/tsc -p tsconfig.json
-        working-directory: typescript/test/installed-consumer
+        run: |
+          "${{ github.workspace }}/typescript/node_modules/.bin/tsc" -p tsconfig.json
+        working-directory: ${{ runner.temp }}/purra-consumer

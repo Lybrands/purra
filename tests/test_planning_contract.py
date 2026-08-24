@@ -390,7 +390,7 @@ def test_private_runtime_tool_must_be_selected_through_public_capability():
 
 
 def test_shared_planning_compiler_cases_match_typescript():
-    fixture_path = Path(__file__).parent / "fixtures" / "planning_protocol.json"
+    fixture_path = Path(__file__).parents[1] / "conformance" / "fixtures" / "planning_protocol.json"
     fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
     for row in fixture["compileCases"]:
         registrations = tuple(

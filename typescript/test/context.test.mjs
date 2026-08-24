@@ -10,10 +10,10 @@ import {
   assertContextProviderConforms,
   estimateJsonTokens,
   estimateTextTokens,
-} from "@lybrands/purra";
+} from "purra";
 
 const fixture = JSON.parse(readFileSync(
-  new URL("../../tests/fixtures/context_protocol.json", import.meta.url),
+  new URL("../../conformance/fixtures/context_protocol.json", import.meta.url),
   "utf8",
 ));
 

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { Agent, AgentCanceledError, AgentError } from "@lybrands/purra";
+import { Agent, AgentCanceledError, AgentError } from "purra";
 
 test("Agent completes one validated model/tool loop", async () => {
   const requests = [];
@@ -134,7 +134,7 @@ test("Agent converts malformed Provider messages into a coded boundary error", a
 
 test("internal architecture paths are not public package subpaths", async () => {
   await assert.rejects(
-    import("@lybrands/purra/model/validation"),
+    import("purra/model/validation"),
     (error) => error?.code === "ERR_PACKAGE_PATH_NOT_EXPORTED",
   );
 });

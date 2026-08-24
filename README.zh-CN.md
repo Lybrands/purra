@@ -2,7 +2,29 @@
 
 简体中文 | [English](README.md)
 
-`purra` 是与具体产品无关的独立 Agent 框架包，负责定义通用合约、规划与运行时策略、Run 生命周期、工具授权、人工审批及多 Agent 编排端口。运行时代码必须能够仅依赖 Python 标准库独立导入和运行；产品通过宿主 API 和端口接入，不直接调用内部 Runtime。
+`purra` 是与具体产品无关的 Agent 框架，分别提供独立的 Python 与
+JavaScript/TypeScript 实现。两端共享行为契约与一致性夹具，但任何一端都不会导入或启动
+另一端的运行时。PurrA 负责通用合约、规划与运行时策略、Run 生命周期、工具授权、人工审批及
+多 Agent 编排端口。
+
+## 安装
+
+Python：
+
+```bash
+pip install purra
+```
+
+JavaScript 与 TypeScript 使用同一个 npm 包：
+
+```bash
+npm install purra
+pnpm add purra
+yarn add purra
+bun add purra
+```
+
+npm API 与示例见 [TypeScript 包 README](https://github.com/Lybrands/purra/blob/main/typescript/README.md)。
 
 PurrA 的默认执行形态是 Reactive：模型可以直接在已授权工具上完成普通 model/tool loop，不要求 Planner、`TaskSpec`、任务准入、`ExecutionRecipe`、长任务仓储或领域上下文 Provider。规划和持久执行是显式装配的第一方能力，不是所有 Agent 的必经阶段。
 
@@ -31,7 +53,8 @@ Artifact 作为独立的可恢复输出聚合提供版本批次、claim 和校�
 控制权。当前 alpha 已加入与 Python 共享决策语义的有界 Provider、工具和响应恢复；仍不包含
 生产级持久化或 Provider SDK。带凭据的 completion/streaming 证据属于本次 npm 发布之外的
 未来宿主项目工作；通过前不会宣称稳定版能力对等。
-两端共享的模型结束原因采用相同的安全语义，但 TypeScript 保留自己的公开 API 和实现结构。
+两端共享的模型、工具与恢复夹具位于 `conformance/fixtures/`，采用相同的安全语义，
+但各自保留符合语言习惯的公开 API 和实现结构。
 
 JavaScript 与 TypeScript 使用同一个 npm artifact；发布门禁要求 npm、pnpm、Yarn 与 Bun
 安装同一份精确打包候选物。

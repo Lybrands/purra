@@ -2,10 +2,31 @@
 
 [简体中文](README.zh-CN.md) | English
 
-`purra` is an independently packaged, product-neutral Agent framework. It owns contracts,
-planning/runtime policy, Run lifecycle, tool authorization, approvals, and
-orchestration ports. It must remain independently importable with only the
-Python standard library.
+`purra` is a product-neutral Agent framework with independent Python and
+JavaScript/TypeScript implementations. They share behavioral contracts and
+conformance fixtures, but neither runtime imports or launches the other. PurrA
+owns planning/runtime policy, Run lifecycle, tool authorization, approvals,
+and orchestration ports.
+
+## Install
+
+Python:
+
+```bash
+pip install purra
+```
+
+JavaScript and TypeScript use the same npm package:
+
+```bash
+npm install purra
+pnpm add purra
+yarn add purra
+bun add purra
+```
+
+See the [TypeScript package README](https://github.com/Lybrands/purra/blob/main/typescript/README.md)
+for the npm API and examples.
 
 PurrA defaults to reactive execution: an Agent can run an ordinary model/tool
 loop without a Planner, `TaskSpec`, task admission, `ExecutionRecipe`, durable
@@ -46,8 +67,9 @@ regression-gate reports now consume the same frozen evidence semantics as
 Python. Deterministic regression/security suites and public adapter probes
 cover the shipped host ports without granting diagnostics runtime authority.
 
-Shared model, tool, and recovery fixtures use the Python safety semantics while
-the API stays TypeScript-native. The alpha does not include production
+Shared model, tool, and recovery fixtures live under `conformance/fixtures/`
+and preserve the same safety semantics while each API stays language-native.
+The alpha does not include production
 persistence or Provider SDK adapters. Credentialed completion/streaming evidence
 remains future host-project work outside this npm release and is required before
 a stable parity claim.

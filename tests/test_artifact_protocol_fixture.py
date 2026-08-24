@@ -16,7 +16,7 @@ from purra.artifacts.contracts import coverage_digest
 
 
 FIXTURE = json.loads(
-    (Path(__file__).parent / "fixtures" / "artifact_protocol.json").read_text()
+    (Path(__file__).parents[1] / "conformance" / "fixtures" / "artifact_protocol.json").read_text()
 )
 
 

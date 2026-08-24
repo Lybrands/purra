@@ -13,10 +13,10 @@ import {
   getCoreSecurityRedTeamCases,
   runRuntimeRegressionSuite,
   runSecurityRedTeamCases,
-} from "@lybrands/purra";
+} from "purra";
 
 const fixture = JSON.parse(readFileSync(
-  new URL("../../tests/fixtures/observability_protocol.json", import.meta.url),
+  new URL("../../conformance/fixtures/observability_protocol.json", import.meta.url),
   "utf8",
 ));
 

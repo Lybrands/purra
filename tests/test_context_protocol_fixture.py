@@ -12,7 +12,7 @@ from purra.contracts import ContextBudgetClaim
 
 
 FIXTURE = json.loads(
-    (Path(__file__).parent / "fixtures" / "context_protocol.json").read_text()
+    (Path(__file__).parents[1] / "conformance" / "fixtures" / "context_protocol.json").read_text()
 )
 
 

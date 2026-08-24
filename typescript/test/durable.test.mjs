@@ -13,11 +13,11 @@ import {
   decideOrphanRun,
   OrphanRecoveryCoordinator,
   validateContinuation,
-} from "@lybrands/purra";
+} from "purra";
 
 const SECRET = "phase-six-recovery-secret-has-at-least-32-bytes";
 const durableFixture = JSON.parse(readFileSync(
-  new URL("../../tests/fixtures/durable_protocol.json", import.meta.url),
+  new URL("../../conformance/fixtures/durable_protocol.json", import.meta.url),
   "utf8",
 ));
 

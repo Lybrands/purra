@@ -1,12 +1,12 @@
-# @lybrands/purra
+# purra
 
 Business-agnostic, host-embedded Agent runtime for JavaScript and TypeScript.
 
 ```sh
-npm install @lybrands/purra
-pnpm add @lybrands/purra
-yarn add @lybrands/purra
-bun add @lybrands/purra
+npm install purra
+pnpm add purra
+yarn add purra
+bun add purra
 ```
 
 The npm package is versioned independently from the Python distribution before
@@ -15,7 +15,7 @@ The npm package is versioned independently from the Python distribution before
 npm API changes require a new minor version while the package remains pre-1.0.
 
 ```ts
-import { Agent } from "@lybrands/purra";
+import { Agent } from "purra";
 
 const agent = new Agent({ model: yourModelGateway, tools: yourTools });
 const run = await agent.submit({
@@ -33,7 +33,7 @@ Reactive remains the default. Planned execution is opt-in and requires both a
 Planner and a host policy:
 
 ```ts
-import { Agent, ToolPlanningPolicy } from "@lybrands/purra";
+import { Agent, ToolPlanningPolicy } from "purra";
 
 const agent = new Agent({
   model: yourModelGateway,
@@ -49,7 +49,7 @@ Hosts may keep their own Planner or opt into the Provider-neutral reference
 Planner. A factory binds its private planning calls to the current execution:
 
 ```ts
-import { ModelWorkPlanner } from "@lybrands/purra";
+import { ModelWorkPlanner } from "purra";
 
 const agent = new Agent({
   model: yourModelGateway,
@@ -174,7 +174,7 @@ outside this phase.
 Recovery is explicit at composition time and request-scoped at runtime:
 
 ```ts
-import { Agent, RecoveryPolicy } from "@lybrands/purra";
+import { Agent, RecoveryPolicy } from "purra";
 
 const agent = new Agent({
   model: yourModelGateway,
@@ -194,7 +194,7 @@ import {
   classifyAgentRunFailures,
   evaluateAgentRun,
   evaluateAgentRunStability,
-} from "@lybrands/purra";
+} from "purra";
 
 const operational = evaluateAgentRun(runSnapshot, committedEvents);
 const stability = evaluateAgentRunStability(committedEvents);

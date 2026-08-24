@@ -11,7 +11,7 @@ import {
 } from "../dist/index.js";
 
 const fixture = JSON.parse(await readFile(
-  new URL("../../tests/fixtures/delegation_protocol.json", import.meta.url),
+  new URL("../../conformance/fixtures/delegation_protocol.json", import.meta.url),
   "utf8",
 ));
 

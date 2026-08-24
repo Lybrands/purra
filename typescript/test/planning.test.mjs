@@ -7,10 +7,10 @@ import {
   AgentError,
   ToolPlanningPolicy,
   compileWorkPlan,
-} from "@lybrands/purra";
+} from "purra";
 
 const planningFixture = JSON.parse(readFileSync(
-  new URL("../../tests/fixtures/planning_protocol.json", import.meta.url),
+  new URL("../../conformance/fixtures/planning_protocol.json", import.meta.url),
   "utf8",
 ));
 

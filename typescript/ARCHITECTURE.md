@@ -167,7 +167,7 @@ index
 - `model/` never imports tool handlers; it sees only Provider-facing tool
   specifications.
 - Host callbacks are invoked only through explicit public contracts.
-- Package subpaths are not public. Consumers import from `@lybrands/purra`.
+- Package subpaths are not public. Consumers import from `purra`.
 
 ## Future directories added only with a caller
 

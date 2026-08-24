@@ -12,7 +12,7 @@ import {
   type OutputEvent,
   type RunHandle,
   type ToolDefinition,
-} from "@lybrands/purra";
+} from "purra";
 
 const budget = allocateContextBudget({
   windowTokens: 5_000,

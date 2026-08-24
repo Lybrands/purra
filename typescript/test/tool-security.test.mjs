@@ -2,10 +2,10 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 
-import { Agent, AgentCanceledError, AgentError, RecoveryPolicy } from "@lybrands/purra";
+import { Agent, AgentCanceledError, AgentError, RecoveryPolicy } from "purra";
 
 const sharedFixture = JSON.parse(readFileSync(
-  new URL("../../tests/fixtures/tool_security.json", import.meta.url),
+  new URL("../../conformance/fixtures/tool_security.json", import.meta.url),
   "utf8",
 ));
 

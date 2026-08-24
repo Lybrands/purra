@@ -12,7 +12,7 @@ from purra.events import AgentEvent
 
 
 FIXTURE = json.loads(
-    (Path(__file__).parent / "fixtures" / "delegation_protocol.json").read_text()
+    (Path(__file__).parents[1] / "conformance" / "fixtures" / "delegation_protocol.json").read_text()
 )
 
 

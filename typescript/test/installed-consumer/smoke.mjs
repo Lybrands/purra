@@ -15,7 +15,7 @@ import {
   RecipeLongTaskDispatcher,
   RecoveryPolicy,
   ToolPlanningPolicy,
-} from "@lybrands/purra";
+} from "purra";
 
 let round = 0;
 const events = [];

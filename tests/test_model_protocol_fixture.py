@@ -17,7 +17,7 @@ from purra.model_protocol import (
 
 
 _FIXTURE = json.loads(
-    (Path(__file__).parent / "fixtures" / "model_protocol.json").read_text()
+    (Path(__file__).parents[1] / "conformance" / "fixtures" / "model_protocol.json").read_text()
 )
 
 

@@ -6,7 +6,7 @@ import {
   AgentError,
   AgentOperationController,
   ModelTaskRunner,
-} from "@lybrands/purra";
+} from "purra";
 
 test("standalone model tasks resolve an exact output limit and Operation", async () => {
   const requests = [];

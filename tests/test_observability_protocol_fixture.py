@@ -13,7 +13,7 @@ from purra.observability import (
 
 
 FIXTURE = json.loads(
-    (Path(__file__).parent / "fixtures" / "observability_protocol.json")
+    (Path(__file__).parents[1] / "conformance" / "fixtures" / "observability_protocol.json")
     .read_text(encoding="utf-8")
 )
 

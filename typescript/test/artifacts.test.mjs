@@ -10,10 +10,10 @@ import {
   artifactCoverageDigest,
   InMemoryArtifactStore,
   InMemoryLongTaskRepository,
-} from "@lybrands/purra";
+} from "purra";
 
 const artifactFixture = JSON.parse(readFileSync(
-  new URL("../../tests/fixtures/artifact_protocol.json", import.meta.url),
+  new URL("../../conformance/fixtures/artifact_protocol.json", import.meta.url),
   "utf8",
 ));
 

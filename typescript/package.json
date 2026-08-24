@@ -1,5 +1,5 @@
 {
-  "name": "@lybrands/purra",
+  "name": "purra",
   "version": "0.1.0-alpha.0",
   "description": "Business-agnostic, host-embedded Agent runtime for JavaScript and TypeScript",
   "license": "MIT",

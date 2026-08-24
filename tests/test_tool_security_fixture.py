@@ -9,7 +9,7 @@ from purra.tools.security import ParsedToolCall, validate_tool_arguments_schema
 
 
 _FIXTURE = json.loads(
-    (Path(__file__).parent / "fixtures" / "tool_security.json").read_text()
+    (Path(__file__).parents[1] / "conformance" / "fixtures" / "tool_security.json").read_text()
 )
 
 

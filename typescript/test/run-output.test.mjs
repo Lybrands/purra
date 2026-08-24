@@ -8,7 +8,7 @@ import {
   assertRunRepositoryConforms,
   InMemoryOutputPublisher,
   InMemoryRunRepository,
-} from "@lybrands/purra";
+} from "purra";
 
 test("in-memory Run repository passes the public conformance probe", async () => {
   await assertRunRepositoryConforms(new InMemoryRunRepository());

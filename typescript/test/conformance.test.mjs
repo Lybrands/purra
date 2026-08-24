@@ -13,7 +13,7 @@ import {
   assertRunRepositoryConforms,
   assertToolDefinitionConforms,
   InMemoryAgentAdapters,
-} from "@lybrands/purra";
+} from "purra";
 
 const readTool = {
   name: "lookup",

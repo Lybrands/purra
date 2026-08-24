@@ -14,7 +14,7 @@ from purra.recovery import (
 
 
 _FIXTURE = json.loads(
-    (Path(__file__).parent / "fixtures" / "recovery_protocol.json").read_text()
+    (Path(__file__).parents[1] / "conformance" / "fixtures" / "recovery_protocol.json").read_text()
 )
 
 

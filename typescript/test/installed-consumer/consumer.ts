@@ -23,7 +23,7 @@ import {
   type OutputEvent,
   type RunHandle,
   type ToolDefinition,
-} from "@lybrands/purra";
+} from "purra";
 
 const typedOperationEvents: unknown[] = [];
 const typedOperations = new AgentOperationController({
