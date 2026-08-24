@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
+import time
 
 import pytest
 
@@ -12,9 +14,12 @@ from purra.contracts import (
     ModelStream,
     ModelStreamChunk,
     ReasoningMode,
+    RuntimeLimits,
+    ToolCallDelta,
     ToolSchema,
 )
 from purra.errors import ContractViolationError
+from purra.cancellation import ExecutionDeadlineExceeded
 from purra.model_protocol import generic_capability_snapshot
 from purra.operations import (
     AgentOperationController,
@@ -77,6 +82,40 @@ class _CompletionGateway(_Gateway):
             model="model",
             finish_reason=ModelFinishReason.STOP,
         )
+
+
+class _NeverReturningGateway(_Gateway):
+    async def complete(self, messages, invocation, signal=None):
+        del messages, invocation
+        assert signal is not None
+        await signal.wait()
+        await asyncio.Event().wait()
+
+    async def stream(self, messages, invocation, signal=None):
+        del messages, invocation
+        assert signal is not None
+
+        async def chunks():
+            while True:
+                await signal.wait()
+                yield ModelStreamChunk(content_delta="late")
+
+        return ModelStream(chunks=chunks(), model="model")
+
+
+class _ChunkGateway(_Gateway):
+    def __init__(self, chunks):
+        super().__init__()
+        self._chunks = tuple(chunks)
+
+    async def stream(self, messages, invocation, signal=None):
+        del messages, invocation, signal
+
+        async def chunks():
+            for chunk in self._chunks:
+                yield chunk
+
+        return ModelStream(chunks=chunks(), model="model")
 
 
 class _Observer:
@@ -330,3 +369,157 @@ async def test_private_completion_is_observed_before_stream_commit():
         completed.receipt.output_stream_id,
         ModelFinishReason.STOP,
     )]
+
+
+@pytest.mark.asyncio
+async def test_completion_uses_one_absolute_invocation_deadline():
+    AgentModelCall, AgentModelInvocationManager, ModelInvocationContext = _types()
+    observer = _Observer()
+    manager = AgentModelInvocationManager(
+        _NeverReturningGateway(),
+        output_observer=observer,
+        invocation_timeout_ms=100,
+    )
+
+    with pytest.raises(ExecutionDeadlineExceeded) as exceeded:
+        await manager.complete(
+            (),
+            AgentModelCall(
+                request=_request(),
+                output_intent=AgentOutputIntent.STRUCTURED_PRIVATE,
+                commit_mode=OutputCommitMode.PRIVATE,
+            ),
+            ModelInvocationContext(run_id="run-deadline"),
+        )
+
+    assert exceeded.value.code == "model_invocation_deadline_exceeded"
+    assert len(observer.aborted) == 1
+
+
+@pytest.mark.asyncio
+async def test_stream_chunk_reads_share_the_creation_deadline():
+    AgentModelCall, AgentModelInvocationManager, ModelInvocationContext = _types()
+    observer = _Observer()
+    manager = AgentModelInvocationManager(
+        _NeverReturningGateway(),
+        output_observer=observer,
+        invocation_timeout_ms=100,
+    )
+    managed = await manager.stream(
+        (),
+        AgentModelCall(
+            request=_request(),
+            output_intent=AgentOutputIntent.STRUCTURED_PRIVATE,
+            commit_mode=OutputCommitMode.PRIVATE,
+        ),
+        ModelInvocationContext(run_id="run-stream-deadline"),
+    )
+
+    with pytest.raises(ExecutionDeadlineExceeded) as exceeded:
+        await anext(managed.chunks)
+
+    assert exceeded.value.code == "model_invocation_deadline_exceeded"
+    assert len(observer.aborted) == 1
+
+
+@pytest.mark.asyncio
+async def test_shorter_parent_run_deadline_preserves_its_reason_code():
+    AgentModelCall, AgentModelInvocationManager, ModelInvocationContext = _types()
+    observer = _Observer()
+    manager = AgentModelInvocationManager(
+        _NeverReturningGateway(),
+        output_observer=observer,
+        invocation_timeout_ms=1_000,
+    )
+
+    with pytest.raises(ExecutionDeadlineExceeded) as exceeded:
+        await manager.complete(
+            (),
+            AgentModelCall(
+                request=_request(),
+                output_intent=AgentOutputIntent.STRUCTURED_PRIVATE,
+                commit_mode=OutputCommitMode.PRIVATE,
+            ),
+            ModelInvocationContext(
+                run_id="run-parent-deadline",
+                deadline_at_ms=int(time.time() * 1000) + 50,
+            ),
+        )
+
+    assert exceeded.value.code == "run_deadline_exceeded"
+    assert len(observer.aborted) == 1
+
+
+@pytest.mark.asyncio
+async def test_stream_limit_rejects_the_first_exceeding_fragment_before_output():
+    AgentModelCall, AgentModelInvocationManager, ModelInvocationContext = _types()
+    observer = _Observer()
+    manager = AgentModelInvocationManager(
+        _ChunkGateway((
+            ModelStreamChunk(content_delta="ab"),
+            ModelStreamChunk(content_delta="cd"),
+        )),
+        output_observer=observer,
+        runtime_limits=RuntimeLimits(max_stream_content_chars=3),
+    )
+    managed = await manager.stream(
+        (),
+        AgentModelCall(
+            request=_request(),
+            output_intent=AgentOutputIntent.STRUCTURED_PRIVATE,
+            commit_mode=OutputCommitMode.PRIVATE,
+        ),
+        ModelInvocationContext(run_id="run-stream-limit"),
+    )
+
+    assert (await anext(managed.chunks)).content_delta == "ab"
+    with pytest.raises(Exception) as exceeded:
+        await anext(managed.chunks)
+
+    assert getattr(exceeded.value, "code", None) == "model_stream_limit_exceeded"
+    assert [chunk.content_delta for _, chunk in observer.accepted] == ["ab"]
+
+
+@pytest.mark.asyncio
+async def test_late_tool_name_rechecks_the_registration_specific_limit():
+    AgentModelCall, AgentModelInvocationManager, ModelInvocationContext = _types()
+    observer = _Observer()
+    manager = AgentModelInvocationManager(
+        _ChunkGateway((
+            ModelStreamChunk(tool_call_deltas=(ToolCallDelta(
+                index=0,
+                id="call-1",
+                arguments_fragment="1234",
+            ),)),
+            ModelStreamChunk(tool_call_deltas=(ToolCallDelta(
+                index=0,
+                name="narrow",
+            ),)),
+        )),
+        output_observer=observer,
+        max_tool_argument_chars=10,
+    )
+    managed = await manager.stream(
+        (),
+        AgentModelCall(
+            request=_request(),
+            output_intent=AgentOutputIntent.STRUCTURED_PRIVATE,
+            commit_mode=OutputCommitMode.PRIVATE,
+            tools=(ToolSchema(
+                name="narrow",
+                description="Narrow tool.",
+                parameters={"type": "object", "properties": {}},
+            ),),
+        ),
+        ModelInvocationContext(
+            run_id="run-tool-limit",
+            tool_argument_limits={"narrow": 3},
+        ),
+    )
+
+    await anext(managed.chunks)
+    with pytest.raises(Exception) as exceeded:
+        await anext(managed.chunks)
+
+    assert getattr(exceeded.value, "code", None) == "model_stream_limit_exceeded"
+    assert len(observer.accepted) == 1

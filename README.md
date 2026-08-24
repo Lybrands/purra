@@ -35,9 +35,9 @@ are explicit first-party capabilities rather than mandatory stages.
 
 ## Language distributions
 
-The Python package at the repository root remains the complete `0.2.x`
+The Python package at the repository root is the complete `0.3.x`
 implementation. A separate, idiomatic ESM package for JavaScript and
-TypeScript lives under `typescript/`. Its current `0.1.0-alpha.0` package implements
+TypeScript lives under `typescript/`. Its current `0.3.0` package implements
 a bounded Reactive model/tool loop, recursive tool-Schema inspection,
 whole-batch authorization, approval, scope, idempotency and effect-state
 safety, plus `AbortSignal` cancellation. `Agent.invoke()` and `Agent.stream()`
@@ -69,17 +69,18 @@ cover the shipped host ports without granting diagnostics runtime authority.
 
 Shared model, tool, and recovery fixtures live under `conformance/fixtures/`
 and preserve the same safety semantics while each API stays language-native.
-The alpha does not include production
+The TypeScript package does not include production
 persistence or Provider SDK adapters. Credentialed completion/streaming evidence
 remains future host-project work outside this npm release and is required before
 a stable parity claim.
 
 JavaScript and TypeScript consume the same npm artifact. npm, pnpm, Yarn, and
 Bun install the same exact packed candidate in the release gate.
-Python and npm versions advance independently before 1.0; matching version
-numbers do not imply capability parity. The TypeScript capability matrix is the
-authority for npm support, and incompatible public npm API changes require a
-new minor version while the package remains pre-1.0.
+Python and npm releases use the same repository version and Git tag. Matching
+version numbers identify one release, not automatic capability parity. The
+TypeScript capability matrix is the authority for npm support, and incompatible
+public npm API changes require a new minor version while the package remains
+pre-1.0.
 
 Hosts with bounded model-backed hooks use `purra.model_execution`. They declare
 the model request, output policy, work-unit count, and reasoning preference;
@@ -118,9 +119,9 @@ domain projection remain outside PurrA. `RunBinding`, `ExecutionRecipe`, and
 `DomainEventProjector` carry host semantics opaquely; PurrA never interprets
 their business fields.
 
-### 0.2 compatibility boundary
+### 0.3 compatibility boundary
 
-For the `0.2.x` line, `purra.api` and the owning public modules listed in the
+For the `0.3.x` line, `purra.api` and the owning public modules listed in the
 table above are the supported host contract. Compatible additions and fixes
 may ship in a patch release; removing or changing an existing public contract
 requires the next minor release while PurrA remains pre-1.0. `purra.engine`,
@@ -196,7 +197,7 @@ It never owns product routing, request hydration, repositories, database
 queries, provider credentials, or process cleanup.
 
 `AgentCore(preset=...)` materializes the trusted prompt before a Run is
-published. It also records an `AgentPresetSnapshot` schema version 2 in
+published. It also records an `AgentPresetSnapshot` schema version 3 in
 `run.started`. Its fingerprint covers the Preset id/revision, prompt sections,
 context and compaction bindings, execution profile, effective enabled Tool
 schemas and authorization contracts, delegation policy, runtime limits, and
@@ -210,13 +211,13 @@ A resumed host can use
 history under a changed composition. Durable continuation automatically
 restores the source Preset snapshot from the canonical Run journal and rejects
 drift before starting another model, tool, dispatcher, or delegated invocation.
-Version-1 or incomplete snapshots are rejected with
+Version-1, version-2, or incomplete snapshots are rejected with
 `agent_preset_snapshot_unsupported`; Core never guesses an upgrade from current
 process state.
 
 The explicit loose-composition `AgentCore(...)` form remains available for
 ordinary Runs, but durable continuation requires a configured `AgentPreset` so
-that version-2 composition authority can be recomputed and compared.
+that version-3 composition authority can be recomputed and compared.
 
 ## Execution styles
 
@@ -856,7 +857,7 @@ attributed to the Root Run.
 delegation count, parallelism, and definition field lengths. It cannot grant
 parent context, write tools, or recursive delegation.
 `None` disables delegation. The complete policy and effective delegation Tool
-schema are part of snapshot version 2; repositories and executors remain
+schema are part of snapshot version 3; repositories and executors remain
 Kernel infrastructure and are not serialized.
 
 Delegation requires both a `DelegationRepository` and a

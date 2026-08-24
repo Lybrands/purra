@@ -218,7 +218,9 @@ function normalizePlan(
   let parsed: unknown = content;
   if (typeof content === "string") {
     try {
-      parsed = JSON.parse(content);
+      const text = content.trim();
+      const fenced = /^```(?:json)?\s*([\s\S]*?)\s*```$/iu.exec(text);
+      parsed = JSON.parse(fenced?.[1] ?? text);
     } catch (error) {
       throw new AgentError("invalid_planner_output", "Planner output is not valid JSON", {
         cause: error,

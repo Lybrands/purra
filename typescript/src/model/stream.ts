@@ -19,8 +19,25 @@ import {
 interface ToolCallParts {
   id?: string;
   name?: string;
-  arguments: string;
+  arguments: string[];
+  argumentChars: number;
 }
+
+export interface ModelStreamLimits {
+  readonly invocationTimeoutMs: number | null;
+  readonly maxChunks: number;
+  readonly maxContentChars: number;
+  readonly maxReasoningChars: number;
+  readonly maxToolArgumentChars: number;
+}
+
+const DEFAULT_STREAM_LIMITS: ModelStreamLimits = Object.freeze({
+  invocationTimeoutMs: 120_000,
+  maxChunks: 100_000,
+  maxContentChars: 1_000_000,
+  maxReasoningChars: 1_000_000,
+  maxToolArgumentChars: 1_000_000,
+});
 
 export async function invokeModel(
   gateway: ModelGateway,
@@ -28,25 +45,38 @@ export async function invokeModel(
   signal: AbortSignal | undefined,
   useStream: boolean,
   onChunk?: (chunk: ModelStreamChunk) => Promise<void> | void,
+  limits: ModelStreamLimits = DEFAULT_STREAM_LIMITS,
 ): Promise<ModelTurn> {
+  const stop = invocationSignal(signal, limits.invocationTimeoutMs);
   try {
-    throwIfCanceled(signal);
+    throwIfCanceled(stop.signal);
     if (!useStream) {
-      return validateModelTurn(await awaitWithSignal(gateway.invoke(request, signal), signal));
+      const turn = validateModelTurn(await awaitWithSignal(
+        gateway.invoke(request, stop.signal),
+        stop.signal,
+      ));
+      throwIfCanceled(stop.signal);
+      return turn;
     }
     const stream = await awaitWithSignal(
-      Promise.resolve(gateway.stream!(request, signal)),
-      signal,
+      Promise.resolve(gateway.stream!(request, stop.signal)),
+      stop.signal,
     );
-    return await consumeModelStream(stream, signal, onChunk);
+    throwIfCanceled(stop.signal);
+    return await consumeModelStream(stream, stop.signal, onChunk, limits);
   } catch (error) {
-    if (signal?.aborted === true) throw new AgentCanceledError({ cause: error });
+    if (stop.signal.aborted) {
+      if (stop.signal.reason instanceof AgentError) throw stop.signal.reason;
+      throw new AgentCanceledError({ cause: error });
+    }
     if (error instanceof AgentError) throw error;
     throw new AgentError(
       useStream ? "model_stream_error" : "model_gateway_error",
       useStream ? "Model stream failed" : "Model gateway failed",
       { cause: error },
     );
+  } finally {
+    stop.close();
   }
 }
 
@@ -54,13 +84,17 @@ async function consumeModelStream(
   stream: AsyncIterable<ModelStreamChunk>,
   signal: AbortSignal | undefined,
   onChunk: ((chunk: ModelStreamChunk) => Promise<void> | void) | undefined,
+  limits: ModelStreamLimits,
 ): Promise<ModelTurn> {
   if (stream === null || typeof stream?.[Symbol.asyncIterator] !== "function") {
     throw new AgentError("invalid_model_response", "Model gateway returned an invalid stream");
   }
   const iterator = stream[Symbol.asyncIterator]();
-  let content = "";
-  let reasoning = "";
+  const content: string[] = [];
+  const reasoning: string[] = [];
+  let contentChars = 0;
+  let reasoningChars = 0;
+  let chunkCount = 0;
   let finishReason: ModelStreamChunk["finishReason"];
   let usage: ModelTokenUsage | undefined;
   let malformed: string | undefined;
@@ -70,10 +104,27 @@ async function consumeModelStream(
     while (finishReason === undefined) {
       const step = await nextWithSignal(iterator, signal);
       if (step.done === true) break;
+      throwIfCanceled(signal);
       const chunk = validateModelStreamChunk(step.value);
+      chunkCount += 1;
+      contentChars += chunk.contentDelta?.length ?? 0;
+      reasoningChars += chunk.reasoningDelta?.length ?? 0;
+      requireStreamLimit(chunkCount, limits.maxChunks, "chunk_count");
+      requireStreamLimit(contentChars, limits.maxContentChars, "content_chars");
+      requireStreamLimit(reasoningChars, limits.maxReasoningChars, "reasoning_chars");
+      for (const delta of chunk.toolCallDeltas ?? []) {
+        const current = calls.get(delta.index) ?? { arguments: [], argumentChars: 0 };
+        calls.set(delta.index, current);
+        current.argumentChars += delta.argumentsFragment?.length ?? 0;
+        requireStreamLimit(
+          current.argumentChars,
+          limits.maxToolArgumentChars,
+          "tool_argument_chars",
+        );
+      }
       await onChunk?.(chunk);
-      content += chunk.contentDelta ?? "";
-      reasoning += chunk.reasoningDelta ?? "";
+      if (chunk.contentDelta !== undefined && chunk.contentDelta !== "") content.push(chunk.contentDelta);
+      if (chunk.reasoningDelta !== undefined && chunk.reasoningDelta !== "") reasoning.push(chunk.reasoningDelta);
       usage = chunk.usage ?? usage;
       finishReason = chunk.finishReason;
       for (const delta of chunk.toolCallDeltas ?? []) {
@@ -92,10 +143,12 @@ async function consumeModelStream(
   }
   throwForIncompleteFinish(finishReason, calls.size);
   const toolCalls = buildToolCalls(calls, malformed);
+  const contentText = content.join("");
+  const reasoningText = reasoning.join("");
   const message: Message = {
     role: "assistant",
-    content,
-    ...(reasoning.trim() === "" ? {} : { reasoning }),
+    content: contentText,
+    ...(reasoningText.trim() === "" ? {} : { reasoning: reasoningText }),
     ...(toolCalls.length === 0 ? {} : { toolCalls }),
   };
   return validateModelTurn({
@@ -109,7 +162,7 @@ function mergeToolCallDelta(
   calls: Map<number, ToolCallParts>,
   delta: ToolCallDelta,
 ): string | undefined {
-  const current = calls.get(delta.index) ?? { arguments: "" };
+  const current = calls.get(delta.index) ?? { arguments: [], argumentChars: 0 };
   calls.set(delta.index, current);
   if (delta.id !== undefined) {
     if (current.id !== undefined && current.id !== delta.id) {
@@ -123,7 +176,9 @@ function mergeToolCallDelta(
     }
     current.name = delta.name;
   }
-  current.arguments += delta.argumentsFragment ?? "";
+  if (delta.argumentsFragment !== undefined && delta.argumentsFragment !== "") {
+    current.arguments.push(delta.argumentsFragment);
+  }
   return undefined;
 }
 
@@ -144,7 +199,7 @@ function buildToolCalls(
   return Object.freeze(rows.map(([, parts]) => {
     let parsed: unknown;
     try {
-      parsed = JSON.parse(parts.arguments);
+      parsed = JSON.parse(parts.arguments.join(""));
     } catch (error) {
       throw malformedToolBatch("invalid_tool_arguments_json", error);
     }
@@ -201,5 +256,43 @@ async function closeIterator<T>(iterator: AsyncIterator<T>, canceled: boolean): 
 }
 
 function throwIfCanceled(signal: AbortSignal | undefined): void {
-  if (signal?.aborted === true) throw new AgentCanceledError();
+  if (signal?.aborted !== true) return;
+  if (signal.reason instanceof AgentError) throw signal.reason;
+  throw new AgentCanceledError();
+}
+
+function requireStreamLimit(value: number, limit: number, kind: string): void {
+  if (!Number.isSafeInteger(limit) || limit < 1) throw new TypeError(`${kind} limit must be positive`);
+  if (value > limit) {
+    throw new AgentError(
+      "model_stream_limit_exceeded",
+      `Model stream exceeded the ${kind} limit`,
+    );
+  }
+}
+
+function invocationSignal(
+  parent: AbortSignal | undefined,
+  timeoutMs: number | null,
+): { readonly signal: AbortSignal; close(): void } {
+  if (timeoutMs !== null && (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1)) {
+    throw new TypeError("invocationTimeoutMs must be positive or null");
+  }
+  const controller = new AbortController();
+  const forward = (): void => controller.abort(parent?.reason);
+  parent?.addEventListener("abort", forward, { once: true });
+  if (parent?.aborted === true) forward();
+  const timer = timeoutMs === null ? undefined : globalThis.setTimeout(() => {
+    controller.abort(new AgentError(
+      "model_invocation_deadline_exceeded",
+      "Model invocation deadline has elapsed",
+    ));
+  }, timeoutMs);
+  return {
+    signal: controller.signal,
+    close(): void {
+      if (timer !== undefined) globalThis.clearTimeout(timer);
+      parent?.removeEventListener("abort", forward);
+    },
+  };
 }

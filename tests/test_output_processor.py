@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
 from datetime import datetime, timezone
 
@@ -10,6 +11,7 @@ from purra.contracts import (
     ModelFinishReason,
     ModelRequest,
     ModelStreamChunk,
+    ModelTokenUsage,
 )
 from purra.model_invocation import ModelInvocationReceipt
 from purra.model_protocol import generic_capability_snapshot
@@ -123,6 +125,12 @@ class _Repository:
         self.events.append(event)
         return event
 
+    async def append_batch(self, drafts):
+        events = []
+        for draft in drafts:
+            events.append(await self.append_event(draft))
+        return tuple(events)
+
     async def commit_stream(self, output_stream_id, finish_reason):
         del output_stream_id, finish_reason
         return self.events[-1]
@@ -153,6 +161,8 @@ class _Recovery:
 
 
 async def _opened_processor(spec: OutputStreamSpec):
+    from purra.output.processor import OutputBatchLimits
+
     repository = _Repository()
     publisher = _Publisher()
     recovery = _Recovery()
@@ -160,13 +170,14 @@ async def _opened_processor(spec: OutputStreamSpec):
         repository,
         publisher,
         recovery_observer=recovery,
+        batch_limits=OutputBatchLimits(max_fragments=1),
     )
     await processor.open_model_stream(_receipt(spec), spec)
     return processor, repository, publisher, recovery
 
 
 @pytest.mark.asyncio
-async def test_live_chunk_is_persisted_then_published_without_rechunking():
+async def test_live_chunk_is_persisted_then_published_as_versioned_batch():
     processor, repository, publisher, _recovery = await _opened_processor(_spec())
 
     events = await processor.accept_provider_chunk(
@@ -174,7 +185,9 @@ async def test_live_chunk_is_persisted_then_published_without_rechunking():
         ModelStreamChunk(content_delta="甲乙"),
     )
 
-    assert [event.payload["delta"] for event in events] == ["甲乙"]
+    assert [
+        event.payload["entries"][0]["payload"]["delta"] for event in events
+    ] == ["甲乙"]
     opened, content = repository.events
     assert opened.kind is OutputEventKind.STREAM_OPENED
     assert opened.visibility is OutputVisibility.PRIVATE
@@ -196,7 +209,10 @@ async def test_execution_public_provider_chunk_uses_commentary_channel():
     )
 
     assert publisher.published[-1].channel is OutputChannel.COMMENTARY
-    assert publisher.published[-1].payload == {"delta": "我会先核对当前正文"}
+    assert (
+        publisher.published[-1].payload["entries"][0]["payload"]["delta"]
+        == "我会先核对当前正文"
+    )
 
 
 @pytest.mark.asyncio
@@ -314,9 +330,98 @@ async def test_reasoning_and_usage_are_diagnostic_not_public_text():
         ),
     )
 
-    assert repository.events[-1].kind is OutputEventKind.PROVIDER_REASONING_DELTA
+    assert repository.events[-1].kind is OutputEventKind.PROVIDER_DELTA_BATCH
+    assert (
+        repository.events[-1].payload["entries"][0]["kind"]
+        == OutputEventKind.PROVIDER_REASONING_DELTA.value
+    )
     assert repository.events[-1].visibility is OutputVisibility.DIAGNOSTIC
     assert publisher.published == []
+
+
+@pytest.mark.asyncio
+async def test_ten_thousand_one_character_chunks_coalesce_deterministically():
+    from purra.output.processor import AgentOutputProcessor, OutputBatchLimits
+
+    repository = _Repository()
+    publisher = _Publisher()
+    processor = AgentOutputProcessor(
+        repository,
+        publisher,
+        batch_limits=OutputBatchLimits(
+            max_payload_bytes=1_000_000,
+            max_fragments=64,
+            max_latency_ms=60_000,
+        ),
+    )
+    spec = _spec()
+    await processor.open_model_stream(_receipt(spec), spec)
+    for index in range(10_000):
+        await processor.accept_provider_chunk(
+            spec.output_stream_id,
+            ModelStreamChunk(
+                content_delta="x",
+                usage=(
+                    ModelTokenUsage(input_tokens=0, output_tokens=0)
+                    if index == 9_999
+                    else None
+                ),
+            ),
+        )
+    batches = [
+        event for event in repository.events
+        if event.kind is OutputEventKind.PROVIDER_DELTA_BATCH
+    ]
+    assert len(batches) == 157
+    assert "".join(
+        entry["payload"]["delta"]
+        for event in batches
+        for entry in event.payload["entries"]
+    ) == "x" * 10_000
+
+
+@pytest.mark.asyncio
+async def test_latency_flush_uses_the_injected_clock_and_leaves_no_pending_timer():
+    from purra.output.processor import AgentOutputProcessor, OutputBatchLimits
+
+    gate = asyncio.Event()
+    flushed = asyncio.Event()
+    observed_delays = []
+
+    async def controlled_sleep(delay: float) -> None:
+        observed_delays.append(delay)
+        await gate.wait()
+
+    class TimedRepository(_Repository):
+        async def append_batch(self, drafts):
+            result = await super().append_batch(drafts)
+            flushed.set()
+            return result
+
+    repository = TimedRepository()
+    processor = AgentOutputProcessor(
+        repository,
+        _Publisher(),
+        batch_limits=OutputBatchLimits(
+            max_payload_bytes=1_000_000,
+            max_fragments=100,
+            max_latency_ms=7,
+        ),
+        sleep=controlled_sleep,
+    )
+    spec = _spec()
+    await processor.open_model_stream(_receipt(spec), spec)
+    assert await processor.accept_provider_chunk(
+        spec.output_stream_id,
+        ModelStreamChunk(content_delta="delayed"),
+    ) == ()
+    await asyncio.sleep(0)
+    assert observed_delays == [0.007]
+    assert repository.events[-1].kind is OutputEventKind.STREAM_OPENED
+
+    gate.set()
+    await asyncio.wait_for(flushed.wait(), timeout=1)
+    assert repository.events[-1].kind is OutputEventKind.PROVIDER_DELTA_BATCH
 
 
 @pytest.mark.asyncio

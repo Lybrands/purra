@@ -15,10 +15,13 @@ from purra.testing import (
     assert_long_task_repository_conforms,
 )
 from purra.long_tasks import (
+    LongTaskCoordinator,
     LongTaskCreateCommand,
     LongTaskSplitResult,
+    LongTaskUnitResult,
     LongTaskUnitSpec,
 )
+from purra.errors import ContractViolationError
 from purra.recovery import (
     FailureCategory,
     FailureDecision,
@@ -128,6 +131,7 @@ def test_failed_unit_expansion_does_not_partially_change_manifest():
                 task.id,
                 parent.id,
                 worker_id="worker-1",
+                lease_epoch=parent.lease_epoch,
                 split=LongTaskSplitResult(
                     children=(LongTaskUnitSpec(id="child", position=2),),
                     replacement_dependency_ids=(),
@@ -136,5 +140,211 @@ def test_failed_unit_expansion_does_not_partially_change_manifest():
             )
 
         assert await repository.list_units(task.id) == before
+
+    asyncio.run(scenario())
+
+
+def test_unit_lease_epoch_fences_same_worker_reclaim_and_renews_atomically():
+    async def scenario() -> None:
+        now = 1_000
+        repository = InMemoryDurableAdapters(clock_ms=lambda: now).long_tasks
+        task = await repository.create(
+            "task-lease-epoch",
+            LongTaskCreateCommand(
+                namespace="operations",
+                kind="report",
+                owner_id="incident-42",
+                created_by_run_id="run-1",
+                units=(LongTaskUnitSpec(id="report", position=0),),
+            ),
+        )
+        await repository.start(task.id, expected_revision=task.revision)
+        first = await repository.claim_ready_unit(
+            task.id,
+            worker_id="worker-1",
+            lease_duration_ms=10,
+        )
+        assert first is not None
+
+        now = 1_010
+        second = await repository.claim_ready_unit(
+            task.id,
+            worker_id="worker-1",
+            lease_duration_ms=10,
+        )
+        assert second is not None
+        assert second.lease_epoch == first.lease_epoch + 1
+
+        retry = FailureDecision(
+            category=FailureCategory.TRANSIENT_PROVIDER,
+            code="retry",
+            disposition=FailureDisposition.RETRY_ATTEMPT,
+            attempts_remaining=1,
+            effect_state=RecoveryEffectState.NOT_STARTED,
+            checkpoint_available=False,
+        )
+        split = FailureDecision(
+            category=FailureCategory.BUSINESS_INVARIANT,
+            code="split",
+            disposition=FailureDisposition.SPLIT_PART,
+            attempts_remaining=1,
+            effect_state=RecoveryEffectState.NOT_STARTED,
+            checkpoint_available=False,
+            part_splittable=True,
+        )
+        stale_mutations = (
+            lambda: repository.bind_unit_run(
+                task.id, first.id, worker_id="worker-1",
+                lease_epoch=first.lease_epoch, run_id="run-stale",
+            ),
+            lambda: repository.renew_unit_lease(
+                task.id, first.id, worker_id="worker-1",
+                lease_epoch=first.lease_epoch, lease_duration_ms=20,
+            ),
+            lambda: repository.update_unit_progress(
+                task.id, first.id, worker_id="worker-1",
+                lease_epoch=first.lease_epoch, metadata={"stale": True},
+            ),
+            lambda: repository.complete_unit(
+                task.id,
+                first.id,
+                worker_id="worker-1",
+                lease_epoch=first.lease_epoch,
+                result=LongTaskUnitResult(output_ref="memory://stale"),
+            ),
+            lambda: repository.settle_unit_failure(
+                task.id, first.id, worker_id="worker-1",
+                lease_epoch=first.lease_epoch, decision=retry,
+            ),
+            lambda: repository.expand_unit(
+                task.id, first.id, worker_id="worker-1",
+                lease_epoch=first.lease_epoch,
+                split=LongTaskSplitResult(
+                    children=(LongTaskUnitSpec(id="stale-child", position=1),),
+                    replacement_dependency_ids=("stale-child",),
+                ),
+                decision=split,
+            ),
+            lambda: repository.interrupt_unit(
+                task.id, first.id, worker_id="worker-1",
+                lease_epoch=first.lease_epoch, reason_code="stale",
+            ),
+        )
+        for mutation in stale_mutations:
+            with pytest.raises(ContractViolationError) as stale:
+                await mutation()
+            assert stale.value.code == "long_task_unit_lease_lost"
+
+        renewed = await repository.renew_unit_lease(
+            task.id,
+            second.id,
+            worker_id="worker-1",
+            lease_epoch=second.lease_epoch,
+            lease_duration_ms=20,
+        )
+        assert renewed.lease_expires_at_ms == 1_030
+        result = LongTaskUnitResult(output_ref="memory://current")
+        completed = await repository.complete_unit(
+            task.id,
+            second.id,
+            worker_id="worker-1",
+            lease_epoch=second.lease_epoch,
+            result=result,
+        )
+        assert await repository.complete_unit(
+            task.id,
+            second.id,
+            worker_id="worker-1",
+            lease_epoch=second.lease_epoch,
+            result=result,
+        ) == completed
+
+    asyncio.run(scenario())
+
+
+def test_long_task_deadline_fails_atomically_before_a_new_claim():
+    async def scenario() -> None:
+        now = 5_000
+        repository = InMemoryDurableAdapters(clock_ms=lambda: now).long_tasks
+        task = await repository.create(
+            "task-deadline",
+            LongTaskCreateCommand(
+                namespace="operations",
+                kind="report",
+                owner_id="incident-42",
+                created_by_run_id="run-1",
+                units=(LongTaskUnitSpec(id="report", position=0),),
+                deadline_at_ms=5_010,
+            ),
+        )
+        started = await repository.start(task.id, expected_revision=task.revision)
+        assert started.status.value == "running"
+
+        now = 5_010
+        assert await repository.claim_ready_unit(
+            task.id,
+            worker_id="worker-1",
+            lease_duration_ms=1_000,
+        ) is None
+        expired = await repository.load(task.id)
+        units = await repository.list_units(task.id)
+
+        assert expired is not None and expired.status.value == "failed"
+        assert units[0].error_code == "long_task_deadline_exceeded"
+
+    asyncio.run(scenario())
+
+
+def test_heartbeat_lease_loss_cancels_local_executor_before_any_settlement():
+    async def scenario() -> None:
+        now = 1_000
+        base = InMemoryDurableAdapters(clock_ms=lambda: now).long_tasks
+
+        class LosingRepository:
+            def __getattr__(self, name):
+                return getattr(base, name)
+
+            async def renew_unit_lease(self, *args, **kwargs):
+                nonlocal now
+                now += 3
+                raise ContractViolationError(
+                    "forced lease loss",
+                    code="long_task_unit_lease_lost",
+                )
+
+        class BlockingRunner:
+            cancellations = 0
+
+            async def run_unit(self, task, unit, signal=None):
+                del task, unit, signal
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    self.cancellations += 1
+
+        task = await base.create(
+            "task-heartbeat-loss",
+            LongTaskCreateCommand(
+                namespace="operations",
+                kind="report",
+                owner_id="incident-42",
+                created_by_run_id="run-1",
+                units=(
+                    LongTaskUnitSpec(id="report", position=0, max_attempts=2),
+                ),
+            ),
+        )
+        runner = BlockingRunner()
+        settled = await LongTaskCoordinator(
+            LosingRepository(),
+            worker_id="worker-1",
+            lease_duration_ms=3,
+            idle_poll_ms=1,
+        ).run(task.id, runner)
+        units = await base.list_units(task.id)
+        assert settled.status.value == "paused"
+        assert runner.cancellations == 2
+        assert units[0].status.value == "blocked"
+        assert units[0].output_ref is None
 
     asyncio.run(scenario())

@@ -30,8 +30,8 @@ PurrA 的默认执行形态是 Reactive：模型可以直接在已授权工具�
 
 ## 语言发行物
 
-仓库根目录的 Python 包仍是完整的 `0.2.x` 实现。`typescript/` 下重新建立了一份
-符合 TypeScript 习惯的独立 ESM 包；当前 `0.1.0-alpha.0` 包以有界 Reactive
+仓库根目录的 Python 包是完整的 `0.3.x` 实现。`typescript/` 下是一份
+符合 TypeScript 习惯的独立 ESM 包；当前 `0.3.0` 包实现有界 Reactive
 model/tool loop、递归工具 Schema 检查、整批授权、审批、作用域、幂等与 effect-state
 安全，以及 `AbortSignal` 取消。`Agent.invoke()` 与 `Agent.stream()` 仍是瞬时便捷 API；
 `Agent.submit()` 增加了内存中的权威 Run/output journal，包括 Preset 指纹、调用 receipt、
@@ -50,7 +50,7 @@ Artifact 作为独立的可恢复输出聚合提供版本批次、claim 和校�
 隔离、受限的 delegated Agent 复用 Root Run 的模型调用、只读工具、取消和生命周期事件权威。
 不包含业务正文的运行、稳定性、恢复、性能、趋势与回归门禁报告现已消费与 Python 相同的
 冻结证据语义；确定性的回归/安全套件和公共适配器探针覆盖当前宿主端口，但诊断不会获得运行时
-控制权。当前 alpha 已加入与 Python 共享决策语义的有界 Provider、工具和响应恢复；仍不包含
+控制权。当前 TypeScript 包已加入与 Python 共享决策语义的有界 Provider、工具和响应恢复；仍不包含
 生产级持久化或 Provider SDK。带凭据的 completion/streaming 证据属于本次 npm 发布之外的
 未来宿主项目工作；通过前不会宣称稳定版能力对等。
 两端共享的模型、工具与恢复夹具位于 `conformance/fixtures/`，采用相同的安全语义，
@@ -58,8 +58,9 @@ Artifact 作为独立的可恢复输出聚合提供版本批次、claim 和校�
 
 JavaScript 与 TypeScript 使用同一个 npm artifact；发布门禁要求 npm、pnpm、Yarn 与 Bun
 安装同一份精确打包候选物。
-Python 与 npm 在 1.0 前独立演进；版本号相同不代表能力自动对等。npm 支持范围以 TypeScript
-能力矩阵为准，任何不兼容的 npm 公共 API 变更在 1.0 前必须升级 minor 版本。
+Python 与 npm 发布使用相同的仓库版本和 Git tag；版本号相同标识同一次发布，不代表能力
+自动对等。npm 支持范围以 TypeScript 能力矩阵为准，任何不兼容的 npm 公共 API 变更在
+1.0 前必须升级 minor 版本。
 
 宿主中有界的模型型 Hook 统一使用 `purra.model_execution`。宿主只声明模型请求、输出策略、工作单元数和推理偏好；实际供应商额度解析、`ModelInvocation` 构造及结束原因判定全部由 PurrA 完成。缺失结束原因或输出截断都会失败关闭，并且不会重放已经产生部分输出的调用。
 
@@ -81,9 +82,9 @@ PurrA 不提供一个“万能 Host 对象”；宿主按需组合现有公共�
 
 `purra.api` 是完整 Run 的唯一入口。宿主不得通过 `purra.engine`、`purra.runtime` 或其他实现模块启动 Run。产品请求映射、传输、凭据、业务查询和领域投影始终位于 PurrA 外部。`RunBinding`、`ExecutionRecipe` 与 `DomainEventProjector` 只不透明地携带宿主语义，PurrA 从不解释其中的业务字段。
 
-### 0.2 兼容边界
+### 0.3 兼容边界
 
-在 `0.2.x` 系列中，`purra.api` 以及上表列出的能力所属公共模块构成受支持的宿主契约。兼容性新增和修复可以发布 patch 版本；PurrA 在 1.0 之前删除或改变现有公共契约时必须升级 minor 版本。`purra.engine`、`purra.runtime` 及其实现子模块不属于宿主兼容面。CI 会同时构建 wheel 与 sdist，在干净环境安装 wheel，并只通过公共导入运行一个 Agent。
+在 `0.3.x` 系列中，`purra.api` 以及上表列出的能力所属公共模块构成受支持的宿主契约。兼容性新增和修复可以发布 patch 版本；PurrA 在 1.0 之前删除或改变现有公共契约时必须升级 minor 版本。`purra.engine`、`purra.runtime` 及其实现子模块不属于宿主兼容面。CI 会同时构建 wheel 与 sdist，在干净环境安装 wheel，并只通过公共导入运行一个 Agent。
 
 本系列受支持的顶层宿主模块为：`api`、`artifacts`、`cancellation`、
 `context_budget`、`context_orchestration`、`context_strategies`、`contracts`、
@@ -128,9 +129,9 @@ Core 通过三个业务无关契约支持产品宿主：`RunBinding` 保存不�
 
 `AgentPreset` 是 PurrA 完整且已经解析完成的 Agent 装配契约。它只拥有稳定 ID/revision、有序可信 `PromptSection`、Context/Tool 端口、`ExecutionProfile`、压缩策略、运行限制和恢复策略。产品路由、请求补水、Repository、数据库查询、Provider 凭据与进程清理不得进入 Preset。
 
-`AgentCore(preset=...)` 会在 Run 发布前物化可信 Prompt，并在 `run.started` 中写入 schema version 2 的 `AgentPresetSnapshot`。指纹覆盖 Preset ID/revision、Prompt Section、上下文与压缩绑定、执行形态、实际启用工具的 Schema 和授权契约、委派策略、运行限制与恢复策略。PurrA 只为无状态内置实现和不可变压缩参数推导稳定记录；每个影响行为的宿主组件或工厂都必须通过 `AgentComponentBinding` 声明稳定 ID、revision 和可选配置摘要，Core 不反射任意对象状态，也不使用 `repr()` 生成指纹。持久任务续跑会在任何新 Provider、工具、调度器或委派执行前拒绝能力漂移。version 1 或字段不完整的历史快照无法证明有效组合，会以 `agent_preset_snapshot_unsupported` 失败关闭，不会用当前进程配置猜测升级。
+`AgentCore(preset=...)` 会在 Run 发布前物化可信 Prompt，并在 `run.started` 中写入 schema version 3 的 `AgentPresetSnapshot`。指纹覆盖 Preset ID/revision、Prompt Section、上下文与压缩绑定、执行形态、实际启用工具的 Schema 和授权契约、委派策略、运行限制与恢复策略。PurrA 只为无状态内置实现和不可变压缩参数推导稳定记录；每个影响行为的宿主组件或工厂都必须通过 `AgentComponentBinding` 声明稳定 ID、revision 和可选配置摘要，Core 不反射任意对象状态，也不使用 `repr()` 生成指纹。持久任务续跑会在任何新 Provider、工具、调度器或委派执行前拒绝能力漂移。version 1、version 2 或字段不完整的历史快照无法证明有效组合，会以 `agent_preset_snapshot_unsupported` 失败关闭，不会用当前进程配置猜测升级。
 
-显式散装参数形式仍可用于普通 Run，但持久续跑必须配置 `AgentPreset`，否则 Core 无法重算并比对 version 2 权威快照。
+显式散装参数形式仍可用于普通 Run，但持久续跑必须配置 `AgentPreset`，否则 Core 无法重算并比对 version 3 权威快照。
 
 ## 执行形态
 

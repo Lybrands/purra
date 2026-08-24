@@ -54,9 +54,17 @@ export interface TaskAdmissionEvaluator {
 
 export interface LongTaskUsage {
   readonly invocationCount: number;
+  readonly unreportedUsageAttempts: number;
   readonly inputTokens: number;
   readonly outputTokens: number;
   readonly reasoningTokens: number | null;
+}
+
+export interface LongTaskBudgetLimits {
+  readonly maxInvocationAttempts: number | null;
+  readonly maxInputTokens: number | null;
+  readonly maxOutputTokens: number | null;
+  readonly maxReasoningTokens: number | null;
 }
 
 export interface LongTaskUnitSpec {
@@ -80,8 +88,8 @@ export interface LongTaskCreateCommand {
   readonly idempotencyKey: string;
   readonly units: readonly LongTaskUnitSpec[];
   readonly maxParallelism?: number;
-  readonly deadlineAt: string | null;
-  readonly budgets: RunBudgets;
+  readonly deadlineAtMs: number | null;
+  readonly budgets: LongTaskBudgetLimits;
   readonly metadata?: Readonly<Record<string, JsonValue>>;
 }
 
@@ -98,8 +106,8 @@ export interface LongTaskRecord {
   readonly completedUnits: number;
   readonly failedUnits: number;
   readonly maxParallelism: number;
-  readonly deadlineAt: string | null;
-  readonly budgets: RunBudgets;
+  readonly deadlineAtMs: number | null;
+  readonly budgets: LongTaskBudgetLimits;
   readonly cancellationRequestedAtMs: number | null;
   readonly usage: LongTaskUsage;
   readonly metadata: Readonly<Record<string, JsonValue>>;
@@ -151,7 +159,7 @@ export interface LongTaskCheckpoint {
 export interface LongTaskUnitResult {
   readonly outputRef: string;
   readonly artifactDigest?: string;
-  readonly usage?: ModelTokenUsage;
+  readonly usage?: ModelTokenUsage | null;
   readonly metadata?: Readonly<Record<string, JsonValue>>;
 }
 
@@ -167,6 +175,8 @@ export interface DurableTaskDescriptor {
   readonly ownerId: string;
   readonly idempotencyKey: string;
   readonly message?: string;
+  readonly deadlineAtMs?: number | null;
+  readonly budgets?: LongTaskBudgetLimits;
   readonly metadata?: Readonly<Record<string, JsonValue>>;
 }
 
@@ -184,7 +194,7 @@ export interface DurableUnitExecutionContext {
   readonly dependencyOutputs: Readonly<Record<string, string>>;
   readonly signal?: AbortSignal;
   checkpoint(payload: JsonValue): Promise<LongTaskCheckpoint>;
-  recordUsage(usage: ModelTokenUsage): Promise<void>;
+  recordUsage(usage: ModelTokenUsage | null): Promise<void>;
 }
 
 export interface DurableUnitExecutor {

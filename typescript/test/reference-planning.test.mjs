@@ -80,6 +80,53 @@ test("model Planner stops after its fixed repair budget", async () => {
   assert.equal(mainCalls, 0);
 });
 
+test("model Planner accepts a fully fenced object but rejects surrounding prose", async () => {
+  let plannerCalls = 0;
+  let mainCalls = 0;
+  const accepted = new Agent({
+    model: {
+      capabilities: capabilities(),
+      async invoke(request) {
+        if (isPlannerRequest(request)) {
+          plannerCalls += 1;
+          return finalTurn(`\`\`\`json\n${JSON.stringify({
+            workPlan: directPlan(),
+          })}\n\`\`\``);
+        }
+        mainCalls += 1;
+        return finalTurn("done");
+      },
+    },
+    planning: {
+      policy: alwaysPlanPolicy(),
+      plannerFactory: (tasks) => new ModelWorkPlanner(tasks, { maxRepairAttempts: 0 }),
+    },
+  });
+  assert.equal((await accepted.invoke({ messages: [{ role: "user", content: "plan" }] })).output, "done");
+  assert.equal(plannerCalls, 1);
+  assert.equal(mainCalls, 1);
+
+  const rejected = new Agent({
+    model: {
+      capabilities: capabilities(),
+      async invoke(request) {
+        if (isPlannerRequest(request)) {
+          return finalTurn(`prefix ${JSON.stringify({ workPlan: toolPlan("lookup", "step") })}`);
+        }
+        throw new Error("main model must not run");
+      },
+    },
+    planning: {
+      policy: alwaysPlanPolicy(),
+      plannerFactory: (tasks) => new ModelWorkPlanner(tasks, { maxRepairAttempts: 0 }),
+    },
+  });
+  await assert.rejects(
+    rejected.invoke({ messages: [{ role: "user", content: "plan" }] }),
+    (error) => error?.code === "invalid_planner_output",
+  );
+});
+
 test("model Planner keeps direct execution inside the existing plan compiler", async () => {
   let plannerCalls = 0;
   let mainCalls = 0;

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from hashlib import sha256
 from typing import Any, Sequence
@@ -383,19 +383,48 @@ def _recovery_trace(
 class _ToolCallParts:
     id: str = ""
     name: str = ""
-    arguments: str = ""
+    argument_fragments: list[str] = field(default_factory=list)
+    argument_chars: int = 0
+    _arguments_cache: str | None = None
+
+    @property
+    def arguments(self) -> str:
+        if self._arguments_cache is None:
+            self._arguments_cache = "".join(self.argument_fragments)
+        return self._arguments_cache
+
+    def add_arguments(self, fragment: str) -> None:
+        if not fragment:
+            return
+        self.argument_fragments.append(fragment)
+        self.argument_chars += len(fragment)
+        self._arguments_cache = None
 
 
 class ModelRoundAccumulator:
     """Accumulate one provider stream without making lifecycle decisions."""
 
     def __init__(self) -> None:
-        self.content = ""
-        self.reasoning = ""
+        self._content_fragments: list[str] = []
+        self._reasoning_fragments: list[str] = []
+        self._content_cache: str | None = None
+        self._reasoning_cache: str | None = None
         self.finish_reason: ModelFinishReason | None = None
         self.usage: ModelTokenUsage | None = None
         self._calls: dict[int, _ToolCallParts] = {}
         self._malformed_reason: str | None = None
+
+    @property
+    def content(self) -> str:
+        if self._content_cache is None:
+            self._content_cache = "".join(self._content_fragments)
+        return self._content_cache
+
+    @property
+    def reasoning(self) -> str:
+        if self._reasoning_cache is None:
+            self._reasoning_cache = "".join(self._reasoning_fragments)
+        return self._reasoning_cache
 
     @property
     def tool_call_count(self) -> int:
@@ -403,7 +432,7 @@ class ModelRoundAccumulator:
 
     @property
     def tool_argument_characters(self) -> int:
-        return sum(len(parts.arguments) for parts in self._calls.values())
+        return sum(parts.argument_chars for parts in self._calls.values())
 
     @property
     def tool_call_names(self) -> tuple[str, ...]:
@@ -414,8 +443,12 @@ class ModelRoundAccumulator:
         )
 
     def add(self, chunk) -> None:
-        self.content += chunk.content_delta
-        self.reasoning += chunk.reasoning_delta
+        if chunk.content_delta:
+            self._content_fragments.append(chunk.content_delta)
+            self._content_cache = None
+        if chunk.reasoning_delta:
+            self._reasoning_fragments.append(chunk.reasoning_delta)
+            self._reasoning_cache = None
         if chunk.finish_reason is not None:
             self.finish_reason = chunk.finish_reason
         if chunk.usage is not None:
@@ -434,7 +467,7 @@ class ModelRoundAccumulator:
                     self._malformed_reason = "conflicting_tool_name_for_index"
                 else:
                     current.name = name
-            current.arguments += str(delta.arguments_fragment or "")
+            current.add_arguments(str(delta.arguments_fragment or ""))
 
     def tool_calls(self) -> tuple[tuple[ToolCall, ...], str | None]:
         if self._malformed_reason is not None:

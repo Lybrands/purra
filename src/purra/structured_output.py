@@ -23,7 +23,7 @@ class StructuredOutputParseError(ValueError):
 
 
 def parse_json_object(content: Any) -> Mapping[str, Any]:
-    """Parse a JSON object, tolerating fences or short surrounding prose."""
+    """Parse exactly one JSON object, optionally wrapped by one full fence."""
 
     if isinstance(content, Mapping):
         return content
@@ -39,13 +39,11 @@ def parse_json_object(content: Any) -> Mapping[str, Any]:
     try:
         value = json.loads(candidate)
     except (TypeError, json.JSONDecodeError):
-        value = _first_embedded_object(text)
-        if value is None:
-            raise StructuredOutputParseError(
-                "model output does not contain a complete JSON object",
-                reason_code="invalid_json",
-                output_character_count=len(text),
-            ) from None
+        raise StructuredOutputParseError(
+            "model output is not exactly one complete JSON object",
+            reason_code="invalid_json",
+            output_character_count=len(text),
+        ) from None
     if not isinstance(value, Mapping):
         raise StructuredOutputParseError(
             "model output must be a JSON object",
@@ -53,6 +51,23 @@ def parse_json_object(content: Any) -> Mapping[str, Any]:
             output_character_count=len(text),
         )
     return value
+
+
+def extract_json_object_tolerant(content: Any) -> Mapping[str, Any]:
+    """Extract the first object for non-authoritative import/presentation use."""
+
+    try:
+        return parse_json_object(content)
+    except StructuredOutputParseError:
+        text = str(content or "").strip()
+        value = _first_embedded_object(text)
+        if value is None:
+            raise StructuredOutputParseError(
+                "model output does not contain a complete JSON object",
+                reason_code="invalid_json",
+                output_character_count=len(text),
+            ) from None
+        return value
 
 
 def _first_embedded_object(text: str) -> Mapping[str, Any] | None:
@@ -69,5 +84,6 @@ def _first_embedded_object(text: str) -> Mapping[str, Any] | None:
 
 __all__ = [
     "StructuredOutputParseError",
+    "extract_json_object_tolerant",
     "parse_json_object",
 ]

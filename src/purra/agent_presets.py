@@ -124,12 +124,12 @@ class AgentPresetSnapshot:
     revision: str
     fingerprint: str
     composition: Mapping[str, Any]
-    snapshot_version: int = 2
+    snapshot_version: int = 3
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "id", required_text(self.id, "agent preset id"))
-        if self.snapshot_version != 2:
-            raise ValueError("agent preset snapshot version must be 2")
+        if self.snapshot_version != 3:
+            raise ValueError("agent preset snapshot version must be 3")
         object.__setattr__(
             self,
             "revision",
@@ -159,8 +159,8 @@ class AgentPresetSnapshot:
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "AgentPresetSnapshot":
         snapshot_version = value.get("snapshotVersion")
-        if snapshot_version != 2:
-            raise ValueError("agent preset snapshot version must be 2")
+        if snapshot_version != 3:
+            raise ValueError("agent preset snapshot version must be 3")
         composition = value.get("composition")
         if not isinstance(composition, Mapping):
             raise TypeError("agent preset snapshot composition must be an object")
@@ -392,6 +392,17 @@ class AgentPreset:
             "runtimeLimits": {
                 "maxModelRounds": self.runtime_limits.max_model_rounds,
                 "maxProgressRounds": self.runtime_limits.max_progress_rounds,
+                "providerInvocationTimeoutMs": self.runtime_limits.provider_invocation_timeout_ms,
+                "rootRunTimeoutMs": self.runtime_limits.root_run_timeout_ms,
+                "maxModelInvocationAttempts": self.runtime_limits.max_model_invocation_attempts,
+                "maxInputTokens": self.runtime_limits.max_input_tokens,
+                "maxOutputTokens": self.runtime_limits.max_output_tokens,
+                "maxReasoningTokens": self.runtime_limits.max_reasoning_tokens,
+                "maxProviderOutputEvents": self.runtime_limits.max_provider_output_events,
+                "maxProviderOutputBytes": self.runtime_limits.max_provider_output_bytes,
+                "maxStreamContentChars": self.runtime_limits.max_stream_content_chars,
+                "maxStreamReasoningChars": self.runtime_limits.max_stream_reasoning_chars,
+                "maxStreamChunks": self.runtime_limits.max_stream_chunks,
             },
             "recoveryPolicy": {
                 cause.value: attempts

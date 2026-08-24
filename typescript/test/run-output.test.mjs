@@ -14,6 +14,88 @@ test("in-memory Run repository passes the public conformance probe", async () =>
   await assertRunRepositoryConforms(new InMemoryRunRepository());
 });
 
+test("Run output batches are atomic, replayable, and budgeted before append", async () => {
+  const repository = new InMemoryRunRepository();
+  const begun = await repository.begin({
+    preset: {
+      schemaVersion: 3,
+      presetId: "batch",
+      presetRevision: "1",
+      promptFingerprint: "prompt",
+      toolFingerprint: "tools",
+      capabilityProfileId: null,
+      compositionFingerprint: "composition",
+    },
+    deadlineAt: null,
+    budgets: {
+      maxModelAttempts: 1,
+      maxInputTokens: null,
+      maxOutputTokens: null,
+      maxReasoningTokens: null,
+      maxOutputBytes: 10_000,
+      maxOutputEvents: 1,
+    },
+    metadata: {},
+  });
+  const drafts = ["a", "b"].map((value) => ({
+    sourceKey: `batch:${value}`,
+    kind: "provider.delta_batch",
+    channel: "model",
+    visibility: "private",
+    payload: { value },
+  }));
+  await rejectsCode(
+    repository.appendBatch(begun.snapshot.runId, drafts),
+    "runtime_budget_exceeded",
+  );
+  assert.equal((await repository.listEvents(begun.snapshot.runId, 0)).length, 1);
+  const committed = await repository.appendBatch(begun.snapshot.runId, drafts.slice(0, 1));
+  assert.equal(committed[0].sequence, 2);
+  assert.deepEqual(
+    await repository.appendBatch(begun.snapshot.runId, drafts.slice(0, 1)),
+    committed,
+  );
+  await rejectsCode(
+    repository.appendEvent(begun.snapshot.runId, { ...drafts[0], payload: { value: "drift" } }),
+    "output_source_key_conflict",
+  );
+});
+
+test("ten thousand one-character chunks coalesce deterministically", async () => {
+  const agent = new Agent({
+    outputBatchLimits: {
+      maxPayloadBytes: 1_000_000,
+      maxFragments: 64,
+      maxLatencyMs: 60_000,
+    },
+    model: {
+      async invoke() { throw new Error("stream expected"); },
+      async *stream() {
+        for (let index = 0; index < 10_000; index += 1) {
+          yield {
+            contentDelta: "x",
+            ...(index === 9_999 ? { finishReason: "stop" } : {}),
+          };
+        }
+      },
+    },
+  });
+  const handle = await agent.submit(
+    { messages: [{ role: "user", content: "many" }] },
+    { budgets: { maxOutputBytes: null } },
+  );
+  assert.equal((await handle.result).output.length, 10_000);
+  const events = await collect(handle.events({ visibility: "all" }));
+  const batches = events.filter((event) => event.kind === "provider.delta_batch");
+  assert.equal(batches.length, Math.ceil(10_000 / 64));
+  assert.equal(
+    batches.flatMap((event) => event.payload.entries)
+      .map((entry) => entry.payload.delta)
+      .join("").length,
+    10_000,
+  );
+});
+
 test("submitted Run persists private model evidence and public output in order", async () => {
   const repository = new InMemoryRunRepository();
   let round = 0;
@@ -69,7 +151,10 @@ test("submitted Run persists private model evidence and public output in order",
   assert.deepEqual(all.slice(-2).map((event) => event.kind), ["final", "run.completed"]);
   assert.equal(all.filter((event) => event.kind === "invocation.started").length, 2);
   assert.equal(all.filter((event) => event.kind === "invocation.completed").length, 2);
-  assert.equal(all.some((event) => event.kind === "reasoning.delta"), true);
+  assert.equal(all.some((event) => (
+    event.kind === "provider.delta_batch"
+    && event.payload.entries.some((entry) => entry.kind === "provider.reasoning_delta")
+  )), true);
   assert.equal(all.some((event) => event.kind === "commentary"), true);
   assert.equal(all.some((event) => event.kind === "tool.started"), true);
   assert.equal(all.some((event) => event.kind === "tool.completed"), true);
@@ -93,7 +178,8 @@ test("submitted Run persists private model evidence and public output in order",
   assert.match(receipt.toolFingerprint, /^[a-f0-9]{64}$/);
   assert.match(receipt.evidenceFingerprint, /^[a-f0-9]{64}$/);
   assert.equal(JSON.stringify(receipt).includes("private-prompt"), false);
-  assert.equal((await handle.snapshot()).usage.knownTokens, 26);
+  assert.equal((await handle.snapshot()).usage.inputTokens, 22);
+  assert.equal((await handle.snapshot()).usage.outputTokens, 4);
   assert.equal((await handle.cancel()).accepted, false);
 });
 
@@ -257,7 +343,7 @@ test("attempt budget prevents a second Provider call", async () => {
     { budgets: { maxModelAttempts: 1 } },
   );
 
-  await rejectsCode(handle.result, "run_attempt_budget_exceeded");
+  await rejectsCode(handle.result, "runtime_budget_exceeded");
   assert.equal(modelCalls, 1);
   assert.equal(toolCalls, 1);
   assert.equal((await handle.snapshot()).status, "failed");
@@ -277,18 +363,18 @@ test("reported token budget and final-output budget fail before completion commi
   });
   const tokenRun = await tokenAgent.submit(
     { messages: [{ role: "user", content: "run" }] },
-    { budgets: { maxTotalTokens: 5 } },
+    { budgets: { maxInputTokens: 5 } },
   );
-  await rejectsCode(tokenRun.result, "run_token_budget_exceeded");
-  assert.equal((await tokenRun.snapshot()).usage.knownTokens, 10);
+  await rejectsCode(tokenRun.result, "runtime_budget_exceeded");
+  assert.equal((await tokenRun.snapshot()).usage.inputTokens, 8);
   assert.equal((await tokenRun.snapshot()).status, "failed");
 
   const outputAgent = new Agent({ model: { async invoke() { return finalTurn("answer"); } } });
   const outputRun = await outputAgent.submit(
     { messages: [{ role: "user", content: "run" }] },
-    { budgets: { maxOutputEvents: 1 } },
+    { budgets: { maxOutputBytes: 1 } },
   );
-  await rejectsCode(outputRun.result, "run_output_budget_exceeded");
+  await rejectsCode(outputRun.result, "runtime_budget_exceeded");
   const outputEvents = await collect(outputRun.events({ visibility: "all" }));
   assert.equal(outputEvents.some((event) => event.kind === "final"), false);
   assert.equal(outputEvents.some((event) => event.kind === "run.completed"), false);
@@ -410,6 +496,7 @@ function proxyRepository(base, overrides = {}) {
     begin: overrides.begin ?? ((...args) => base.begin(...args)),
     openInvocation: overrides.openInvocation ?? ((...args) => base.openInvocation(...args)),
     appendEvent: overrides.appendEvent ?? ((...args) => base.appendEvent(...args)),
+    appendBatch: overrides.appendBatch ?? ((...args) => base.appendBatch(...args)),
     settleInvocation: overrides.settleInvocation ?? ((...args) => base.settleInvocation(...args)),
     settleRun: overrides.settleRun ?? ((...args) => base.settleRun(...args)),
     cancel: overrides.cancel ?? ((...args) => base.cancel(...args)),

@@ -9,10 +9,10 @@ yarn add purra
 bun add purra
 ```
 
-The npm package is versioned independently from the Python distribution before
-1.0. Matching version numbers do not imply parity; the capability matrix in
-`ARCHITECTURE.md` defines what this npm version supports. Incompatible public
-npm API changes require a new minor version while the package remains pre-1.0.
+The npm package uses the same repository version and Git tag as the Python
+distribution. Matching versions identify one release, not automatic capability
+parity; the capability matrix in `ARCHITECTURE.md` defines what this npm version
+supports. Incompatible public APIs require a new minor version before 1.0.
 
 ```ts
 import { Agent } from "purra";
@@ -135,7 +135,7 @@ For `Agent.submit()`, those calls persist invocation receipts and consume model
 budgets under the same Run before the Provider is called. A direct provider or
 compression hook and its corresponding factory are mutually exclusive.
 
-Version `0.1.0-alpha.0` covers the Reactive model/tool loop plus
+Version `0.3.0` covers the Reactive model/tool loop plus
 explicit Planned and Durable compositions,
 cancellation, bounded rounds, immutable JSON messages, normalized finish
 reasons, model capability/output-limit contracts, Provider stream consumption,
@@ -220,10 +220,11 @@ published artifact through public exports and cover completion, streaming, a
 read-tool round, cancellation, and a submitted Run. Missing credentials remain
 `NOT RUN`, not a passing result.
 
-The deterministic Phase 12C gate covers the complete documented alpha matrix
-through the package root, including the managed model-task, reference Planner,
-response-judge, and Operation composition path. This is framework closure, not
-a stable parity claim; the external credentialed gate remains outstanding.
+The deterministic Phase 12C gate covers the complete documented capability
+matrix through the package root, including the managed model-task, reference
+Planner, response-judge, and Operation composition path. This is framework
+closure, not a stable parity claim; the external credentialed gate remains
+outstanding.
 
 `ModelGateway.invoke()` is the completion fallback. A gateway may also expose
 `stream()` as an `AsyncIterable`; `Agent.invoke()` then aggregates its content,

@@ -2,6 +2,7 @@ import type { JsonValue, ModelStreamChunk, ModelTurn } from "../model/types.js";
 import { copyJsonValue } from "../model/validation.js";
 import type {
   OutputEvent,
+  OutputBatchLimits,
   OutputEventDraft,
   OutputEventQuery,
   OutputPolicy,
@@ -32,14 +33,36 @@ import type {
 import type { RecoveryDecision } from "../recovery/index.js";
 import { recoveryDecisionDetails } from "../recovery/index.js";
 
+interface PendingProviderDelta {
+  readonly sourceChunkIndex: number;
+  readonly sourcePartIndex: number;
+  readonly kind: "provider.content_delta" | "provider.reasoning_delta" | "provider.tool_call_delta";
+  readonly channel: "model" | "reasoning";
+  readonly visibility: "private";
+  readonly payload: Readonly<Record<string, JsonValue>>;
+}
+
+interface PendingOutputBatch {
+  readonly entries: PendingProviderDelta[];
+  payloadBytes: number;
+  serial: Promise<void>;
+  timer: ReturnType<typeof globalThis.setTimeout> | undefined;
+  error?: unknown;
+}
+
+const OUTPUT_BATCH_SCHEMA = "purra.provider-delta-batch/v1";
+
 export class RunSession {
   readonly #repository: RunRepository;
   readonly #publisher: OutputPublisher;
   readonly #policy: OutputPolicy;
   readonly #controller = new AbortController();
   readonly #runId: string;
+  readonly #batchLimits: OutputBatchLimits;
   #deadlineExceeded = false;
   #deadlineTimer: number | undefined;
+  readonly #batches = new Map<string, PendingOutputBatch>();
+  readonly #receipts = new Map<string, ModelInvocationReceipt>();
 
   private constructor(
     repository: RunRepository,
@@ -47,11 +70,13 @@ export class RunSession {
     policy: OutputPolicy,
     runId: string,
     deadlineAt: string | null,
+    batchLimits: OutputBatchLimits,
   ) {
     this.#repository = repository;
     this.#publisher = publisher;
     this.#policy = policy;
     this.#runId = runId;
+    this.#batchLimits = batchLimits;
     if (deadlineAt !== null) {
       const delay = Math.max(0, Date.parse(deadlineAt) - Date.now());
       this.#deadlineTimer = globalThis.setTimeout(() => {
@@ -66,6 +91,7 @@ export class RunSession {
     publisher: OutputPublisher,
     policy: OutputPolicy,
     params: RunBeginParams,
+    batchLimits: OutputBatchLimits,
   ): Promise<RunSession> {
     const begun = await repository.begin(params);
     await publisher.publishCommitted(begun.event);
@@ -75,6 +101,7 @@ export class RunSession {
       policy,
       begun.snapshot.runId,
       begun.snapshot.deadlineAt,
+      batchLimits,
     );
   }
 
@@ -134,6 +161,7 @@ export class RunSession {
       capabilityProfileId: input.capabilityProfileId,
       outputLimit: input.outputLimit,
     });
+    this.#receipts.set(opened.receipt.invocationId, opened.receipt);
     await this.#publisher.publishCommitted(opened.event);
     return opened.receipt;
   }
@@ -143,32 +171,40 @@ export class RunSession {
     index: number,
     chunk: ModelStreamChunk,
   ): Promise<void> {
-    if (chunk.reasoningDelta !== undefined && chunk.reasoningDelta !== "") {
+    const entries = providerDeltaEntries(index, chunk);
+    await this.#withBatch(receipt, async (batch) => {
+      batch.entries.push(...entries);
+      batch.payloadBytes += entries.reduce(
+        (total, entry) => total + canonicalByteLength(entry),
+        0,
+      );
+      if (
+        chunk.usage !== undefined
+        || chunk.finishReason !== undefined
+        || batch.payloadBytes >= this.#batchLimits.maxPayloadBytes
+        || batch.entries.length >= this.#batchLimits.maxFragments
+      ) {
+        await this.#flushBatch(receipt, batch);
+      } else if (entries.length > 0) {
+        this.#scheduleBatchFlush(receipt, batch);
+      }
+    });
+    if (chunk.usage !== undefined) {
       await this.#persist({
-        sourceKey: `invocation:${receipt.invocationId}:chunk:${index}:reasoning`,
-        kind: "reasoning.delta",
-        channel: "reasoning",
-        visibility: "private",
-        payload: { delta: chunk.reasoningDelta },
-      });
-    }
-    if (
-      chunk.contentDelta !== undefined
-      || chunk.toolCallDeltas !== undefined
-      || chunk.finishReason !== undefined
-      || chunk.usage !== undefined
-    ) {
-      await this.#persist({
-        sourceKey: `invocation:${receipt.invocationId}:chunk:${index}:model`,
-        kind: "model.delta",
+        sourceKey: `invocation:${receipt.invocationId}:chunk:${index}:usage`,
+        kind: "model.usage",
         channel: "model",
         visibility: "private",
-        payload: copyJsonValue({
-          ...(chunk.contentDelta === undefined ? {} : { contentDelta: chunk.contentDelta }),
-          ...(chunk.toolCallDeltas === undefined ? {} : { toolCallDeltas: chunk.toolCallDeltas }),
-          ...(chunk.finishReason === undefined ? {} : { finishReason: chunk.finishReason }),
-          ...(chunk.usage === undefined ? {} : { usage: chunk.usage }),
-        }) as Readonly<Record<string, JsonValue>>,
+        payload: copyJsonValue({ usage: chunk.usage }) as Readonly<Record<string, JsonValue>>,
+      });
+    }
+    if (chunk.finishReason !== undefined) {
+      await this.#persist({
+        sourceKey: `invocation:${receipt.invocationId}:chunk:${index}:finish`,
+        kind: "model.finish",
+        channel: "model",
+        visibility: "private",
+        payload: { finishReason: chunk.finishReason },
       });
     }
   }
@@ -177,6 +213,7 @@ export class RunSession {
     receipt: ModelInvocationReceipt,
     turn: ModelTurn,
   ): Promise<void> {
+    await this.#flushInvocation(receipt);
     await this.#persist({
       sourceKey: `invocation:${receipt.invocationId}:completion`,
       kind: "model.completed",
@@ -198,12 +235,15 @@ export class RunSession {
     turn?: ModelTurn,
     errorCode?: string,
   ): Promise<void> {
+    await this.#flushInvocation(receipt);
     const settled = await this.#repository.settleInvocation(this.#runId, {
       invocationId: receipt.invocationId,
       status,
       ...(turn?.usage === undefined ? {} : { usage: turn.usage }),
       ...(errorCode === undefined ? {} : { errorCode }),
     });
+    this.#receipts.delete(receipt.invocationId);
+    this.#batches.delete(receipt.invocationId);
     await this.#publisher.publishCommitted(settled.event);
     if (settled.budgetError !== undefined) {
       throw new AgentError(settled.budgetError, "Run token budget is exhausted");
@@ -218,6 +258,66 @@ export class RunSession {
       visibility: "public",
       payload: { content },
     });
+  }
+
+  async #withBatch<T>(
+    receipt: ModelInvocationReceipt,
+    operation: (batch: PendingOutputBatch) => Promise<T>,
+  ): Promise<T> {
+    const batch = this.#batches.get(receipt.invocationId) ?? {
+      entries: [],
+      payloadBytes: 0,
+      serial: Promise.resolve(),
+      timer: undefined,
+    };
+    this.#batches.set(receipt.invocationId, batch);
+    const previous = batch.serial;
+    let release!: () => void;
+    batch.serial = new Promise<void>((resolve) => { release = resolve; });
+    await previous;
+    try {
+      if (batch.error !== undefined) throw batch.error;
+      return await operation(batch);
+    } finally {
+      release();
+    }
+  }
+
+  async #flushInvocation(receipt: ModelInvocationReceipt): Promise<void> {
+    await this.#withBatch(receipt, (batch) => this.#flushBatch(receipt, batch));
+    const batch = this.#batches.get(receipt.invocationId);
+    if (batch !== undefined && batch.entries.length === 0) {
+      if (batch.timer !== undefined) globalThis.clearTimeout(batch.timer);
+      this.#batches.delete(receipt.invocationId);
+    }
+  }
+
+  async #flushBatch(receipt: ModelInvocationReceipt, batch: PendingOutputBatch): Promise<void> {
+    if (batch.entries.length === 0) {
+      if (batch.timer !== undefined) globalThis.clearTimeout(batch.timer);
+      batch.timer = undefined;
+      return;
+    }
+    const drafts = await providerBatchDrafts(receipt, batch.entries);
+    const authorized = (await Promise.all(drafts.map((draft) => this.#authorize(draft))))
+      .filter((draft): draft is OutputEventDraft => draft !== null);
+    const events = authorized.length === 0
+      ? []
+      : await this.#repository.appendBatch(this.#runId, authorized);
+    batch.entries.splice(0);
+    batch.payloadBytes = 0;
+    if (batch.timer !== undefined) globalThis.clearTimeout(batch.timer);
+    batch.timer = undefined;
+    for (const event of events) await this.#publisher.publishCommitted(event);
+  }
+
+  #scheduleBatchFlush(receipt: ModelInvocationReceipt, batch: PendingOutputBatch): void {
+    if (batch.timer !== undefined) return;
+    batch.timer = globalThis.setTimeout(() => {
+      batch.timer = undefined;
+      void this.#withBatch(receipt, (current) => this.#flushBatch(receipt, current))
+        .catch((error: unknown) => { batch.error = error; });
+    }, this.#batchLimits.maxLatencyMs);
   }
 
   public async publishTool(event: ToolExecutionEvent, round: number): Promise<void> {
@@ -344,6 +444,7 @@ export class RunSession {
     if (this.#deadlineExceeded) {
       throw new AgentError("run_deadline_exceeded", "Run deadline has elapsed");
     }
+    await this.#flushAllBatches();
     const finalEvent = await this.#authorize({
       sourceKey: `run:${this.#runId}:final`,
       kind: "final",
@@ -365,12 +466,14 @@ export class RunSession {
   public async fail(errorCode: string): Promise<void> {
     const snapshot = await this.#repository.get(this.#runId);
     if (snapshot.status !== "running") return;
+    await this.#flushAllBatches(true);
     const settled = await this.#repository.settleRun(this.#runId, "failed", { errorCode });
     this.#clearDeadline();
     await this.#publishAll(settled.events);
   }
 
   public async cancel(): Promise<RunCancellationReceipt> {
+    await this.#flushAllBatches(true);
     const receipt = await this.#repository.cancel(this.#runId);
     if (!receipt.accepted) return receipt;
     this.#clearDeadline();
@@ -417,10 +520,120 @@ export class RunSession {
     for (const event of events) await this.#publisher.publishCommitted(event);
   }
 
+  async #flushAllBatches(bestEffort = false): Promise<void> {
+    for (const receipt of this.#receipts.values()) {
+      try {
+        await this.#flushInvocation(receipt);
+      } catch (error) {
+        if (!bestEffort) throw error;
+      }
+    }
+    if (bestEffort) {
+      for (const batch of this.#batches.values()) {
+        if (batch.timer !== undefined) globalThis.clearTimeout(batch.timer);
+      }
+      this.#batches.clear();
+      this.#receipts.clear();
+    }
+  }
+
   #clearDeadline(): void {
     if (this.#deadlineTimer !== undefined) globalThis.clearTimeout(this.#deadlineTimer);
     this.#deadlineTimer = undefined;
   }
+}
+
+function providerDeltaEntries(
+  index: number,
+  chunk: ModelStreamChunk,
+): readonly PendingProviderDelta[] {
+  const entries: PendingProviderDelta[] = [];
+  if (chunk.contentDelta !== undefined && chunk.contentDelta !== "") {
+    entries.push(Object.freeze({
+      sourceChunkIndex: index,
+      sourcePartIndex: 0,
+      kind: "provider.content_delta",
+      channel: "model",
+      visibility: "private",
+      payload: Object.freeze({ delta: chunk.contentDelta }),
+    }));
+  }
+  if (chunk.reasoningDelta !== undefined && chunk.reasoningDelta !== "") {
+    entries.push(Object.freeze({
+      sourceChunkIndex: index,
+      sourcePartIndex: 1,
+      kind: "provider.reasoning_delta",
+      channel: "reasoning",
+      visibility: "private",
+      payload: Object.freeze({ delta: chunk.reasoningDelta }),
+    }));
+  }
+  if (chunk.toolCallDeltas !== undefined && chunk.toolCallDeltas.length > 0) {
+    entries.push(Object.freeze({
+      sourceChunkIndex: index,
+      sourcePartIndex: 2,
+      kind: "provider.tool_call_delta",
+      channel: "model",
+      visibility: "private",
+      payload: copyJsonValue({ deltas: chunk.toolCallDeltas }) as Readonly<Record<string, JsonValue>>,
+    }));
+  }
+  return Object.freeze(entries);
+}
+
+async function providerBatchDrafts(
+  receipt: ModelInvocationReceipt,
+  pending: readonly PendingProviderDelta[],
+): Promise<readonly OutputEventDraft[]> {
+  const groups = new Map<string, PendingProviderDelta[]>();
+  for (const entry of pending) {
+    const key = `${entry.channel}\u0000${entry.visibility}`;
+    const group = groups.get(key) ?? [];
+    group.push(entry);
+    groups.set(key, group);
+  }
+  const ordered = [...groups.values()].sort((left, right) => (
+    left[0]!.sourceChunkIndex - right[0]!.sourceChunkIndex
+    || left[0]!.sourcePartIndex - right[0]!.sourcePartIndex
+  ));
+  return Object.freeze(await Promise.all(ordered.map(async (group) => {
+    const normalized = group.map((entry) => Object.freeze({
+      sourceChunkIndex: entry.sourceChunkIndex,
+      sourcePartIndex: entry.sourcePartIndex,
+      kind: entry.kind,
+      payload: entry.payload,
+    }));
+    const start = Math.min(...group.map((entry) => entry.sourceChunkIndex));
+    const end = Math.max(...group.map((entry) => entry.sourceChunkIndex));
+    return Object.freeze({
+      sourceKey: `provider-batch:${receipt.invocationId}:${group[0]!.channel}:${group[0]!.visibility}:${start}:${end}`,
+      kind: "provider.delta_batch" as const,
+      channel: group[0]!.channel,
+      visibility: group[0]!.visibility,
+      payload: copyJsonValue({
+        schemaVersion: OUTPUT_BATCH_SCHEMA,
+        sourceChunkStart: start,
+        sourceChunkEnd: end,
+        entries: normalized,
+        payloadDigest: await stableFingerprint(copyJsonValue(normalized)),
+      }) as Readonly<Record<string, JsonValue>>,
+    });
+  })));
+}
+
+function canonicalByteLength(value: unknown): number {
+  return new TextEncoder().encode(JSON.stringify(sortJson(value))).byteLength;
+}
+
+function sortJson(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sortJson);
+  if (value !== null && typeof value === "object") {
+    const record = value as Readonly<Record<string, unknown>>;
+    return Object.fromEntries(
+      Object.keys(record).sort().map((key) => [key, sortJson(record[key])]),
+    );
+  }
+  return value;
 }
 
 export const allowAllOutput: OutputPolicy = Object.freeze({

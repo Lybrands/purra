@@ -7,9 +7,10 @@ not durable across process restarts and must not be used as production storage.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
+import json
 from typing import Any
 from uuid import uuid4
 
@@ -19,6 +20,7 @@ from purra.contracts import (
     DelegationContextMode,
     DelegationStatus,
     ModelFinishReason,
+    ModelTokenUsage,
     ExecutionPlan,
     RunCreateParams,
     RunId,
@@ -30,6 +32,7 @@ from purra.contracts import (
 )
 from purra.errors import ContractViolationError
 from purra.events import AgentEvent
+from purra.json_values import thaw_json_mapping
 from purra.output import (
     AgentOutputEvent,
     AgentOutputEventDraft,
@@ -51,6 +54,7 @@ from purra.ports.run_lifecycle import (
     validate_run_commit_lifecycle,
 )
 from purra.ports import DelegationRepository, ToolIdempotencyGateway
+from purra.normalization import required_text
 from purra.adapters.durable_memory import InMemoryDurableAdapters
 
 
@@ -73,6 +77,12 @@ class _RunRecord:
     error: str | None = None
     events: list[AgentEvent] = field(default_factory=list)
     traces: list[TraceRecord] = field(default_factory=list)
+    model_attempt_ids: set[str] = field(default_factory=set)
+    model_usage_by_invocation: dict[str, ModelTokenUsage | None] = field(
+        default_factory=dict
+    )
+    provider_output_events: int = 0
+    provider_output_bytes: int = 0
 
 
 @dataclass(slots=True)
@@ -185,16 +195,66 @@ def _existing_event(
     return event
 
 
-def _append_event(
+_PROVIDER_OUTPUT_BUDGET_KINDS = frozenset({
+    OutputEventKind.PROVIDER_CONTENT_DELTA,
+    OutputEventKind.PROVIDER_REASONING_DELTA,
+    OutputEventKind.PROVIDER_TOOL_CALL_DELTA,
+    OutputEventKind.PROVIDER_DELTA_BATCH,
+})
+
+
+def _provider_output_cost(draft: AgentOutputEventDraft) -> tuple[int, int]:
+    if draft.kind not in _PROVIDER_OUTPUT_BUDGET_KINDS:
+        return 0, 0
+    payload = json.dumps(
+        thaw_json_mapping(draft.payload),
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return 1, len(payload)
+
+
+def _batched_provider_entries(event: AgentOutputEvent) -> tuple[Mapping[str, Any], ...]:
+    if event.kind is not OutputEventKind.PROVIDER_DELTA_BATCH:
+        return ()
+    entries = event.payload.get("entries")
+    return (
+        tuple(entries)
+        if isinstance(entries, Sequence)
+        and not isinstance(entries, (str, bytes, bytearray))
+        else ()
+    )
+
+
+def _require_provider_output_budget(
+    run: _RunRecord,
+    event_count: int,
+    payload_bytes: int,
+) -> None:
+    limits = run.params.runtime_limits
+    if run.provider_output_events + event_count > limits.max_provider_output_events:
+        raise ContractViolationError(
+            "Run Provider output event budget was exceeded",
+            code="runtime_budget_exceeded",
+            details={"budgetKind": "provider_output_events"},
+        )
+    if run.provider_output_bytes + payload_bytes > limits.max_provider_output_bytes:
+        raise ContractViolationError(
+            "Run Provider output byte budget was exceeded",
+            code="runtime_budget_exceeded",
+            details={"budgetKind": "provider_output_bytes"},
+        )
+
+
+def _validate_new_event(
     state: _MemoryState,
     draft: AgentOutputEventDraft,
     *,
-    allow_committed_stream: bool = False,
-) -> AgentOutputEvent:
-    _require_run(state, draft.run_id)
-    existing = _existing_event(state, draft)
-    if existing is not None:
-        return existing
+    allow_committed_stream: bool,
+) -> _RunRecord:
+    run = _require_run(state, draft.run_id)
     if draft.output_stream_id is not None:
         try:
             stream = state.streams[draft.output_stream_id]
@@ -221,6 +281,27 @@ def _append_event(
         raise ContractViolationError(
             "domain effect events require domain source and kind"
         )
+    return run
+
+
+def _append_event(
+    state: _MemoryState,
+    draft: AgentOutputEventDraft,
+    *,
+    allow_committed_stream: bool = False,
+    budget_prechecked: bool = False,
+) -> AgentOutputEvent:
+    existing = _existing_event(state, draft)
+    if existing is not None:
+        return existing
+    run = _validate_new_event(
+        state,
+        draft,
+        allow_committed_stream=allow_committed_stream,
+    )
+    event_count, payload_bytes = _provider_output_cost(draft)
+    if not budget_prechecked:
+        _require_provider_output_budget(run, event_count, payload_bytes)
     sequence = state.sequences.get(draft.run_id, 0) + 1
     state.sequences[draft.run_id] = sequence
     event = AgentOutputEvent(
@@ -240,7 +321,39 @@ def _append_event(
     )
     state.output_events.setdefault(draft.run_id, []).append(event)
     state.events_by_source_key[draft.source_event_key] = event
+    run.provider_output_events += event_count
+    run.provider_output_bytes += payload_bytes
     return event
+
+
+def _append_events(
+    state: _MemoryState,
+    drafts: tuple[AgentOutputEventDraft, ...],
+) -> tuple[AgentOutputEvent, ...]:
+    if not drafts:
+        return ()
+    run_ids = {draft.run_id for draft in drafts}
+    if len(run_ids) != 1:
+        raise ContractViolationError("one output batch cannot span Runs")
+    source_keys = [draft.source_event_key for draft in drafts]
+    if len(source_keys) != len(set(source_keys)):
+        raise ContractViolationError("output batch source keys must be unique")
+
+    pending = []
+    for draft in drafts:
+        if _existing_event(state, draft) is None:
+            _validate_new_event(state, draft, allow_committed_stream=False)
+            pending.append(draft)
+    run = _require_run(state, drafts[0].run_id)
+    costs = tuple(_provider_output_cost(draft) for draft in pending)
+    _require_provider_output_budget(
+        run,
+        sum(count for count, _ in costs),
+        sum(size for _, size in costs),
+    )
+    return tuple(
+        _append_event(state, draft, budget_prechecked=True) for draft in drafts
+    )
 
 
 class _InMemoryRunRepository:
@@ -282,6 +395,48 @@ class _InMemoryRunRepository:
     async def append_event(self, run_id: RunId, event: AgentEvent) -> None:
         async with self._state.lock:
             _require_run(self._state, run_id).events.append(event)
+
+    async def reserve_model_attempt(
+        self,
+        run_id: RunId,
+        invocation_id: str,
+    ):
+        invocation = required_text(invocation_id, "model invocation id")
+        async with self._state.lock:
+            run = _require_run(self._state, run_id)
+            if invocation in run.model_attempt_ids:
+                return _run_budget_snapshot(run)
+            limit = run.params.runtime_limits.max_model_invocation_attempts
+            if len(run.model_attempt_ids) >= limit:
+                raise ContractViolationError(
+                    "Run model invocation budget was exceeded",
+                    code="runtime_budget_exceeded",
+                    details={"budgetKind": "model_attempts"},
+                )
+            run.model_attempt_ids.add(invocation)
+            return _run_budget_snapshot(run)
+
+    async def settle_model_attempt(self, run_id, invocation_id, usage):
+        invocation = required_text(invocation_id, "model invocation id")
+        if usage is not None and not isinstance(usage, ModelTokenUsage):
+            raise TypeError("model attempt usage must be ModelTokenUsage")
+        async with self._state.lock:
+            run = _require_run(self._state, run_id)
+            if invocation not in run.model_attempt_ids:
+                raise ContractViolationError(
+                    "model attempt was not reserved",
+                    code="model_attempt_not_reserved",
+                )
+            if invocation in run.model_usage_by_invocation:
+                if run.model_usage_by_invocation[invocation] == usage:
+                    snapshot = _run_budget_snapshot(run)
+                    _require_run_token_budgets(run, snapshot)
+                    return snapshot
+                raise ContractViolationError("model attempt usage conflicts")
+            run.model_usage_by_invocation[invocation] = usage
+            snapshot = _run_budget_snapshot(run)
+            _require_run_token_budgets(run, snapshot)
+            return snapshot
 
     async def append_trace(self, run_id: RunId, trace: TraceRecord) -> None:
         async with self._state.lock:
@@ -643,6 +798,13 @@ class _InMemoryAgentOutputRepository:
         async with self._state.lock:
             return _append_event(self._state, draft)
 
+    async def append_batch(
+        self,
+        drafts: tuple[AgentOutputEventDraft, ...],
+    ) -> tuple[AgentOutputEvent, ...]:
+        async with self._state.lock:
+            return _append_events(self._state, tuple(drafts))
+
     async def commit_run_lifecycle(
         self,
         run_id: RunId,
@@ -867,22 +1029,38 @@ class _InMemoryAgentOutputRepository:
             ]
             if not any(
                 event.kind is OutputEventKind.PROVIDER_TOOL_CALL_DELTA
+                or any(
+                    entry.get("kind")
+                    == OutputEventKind.PROVIDER_TOOL_CALL_DELTA.value
+                    for entry in _batched_provider_entries(event)
+                )
                 for event in scoped
             ):
                 raise ContractViolationError(
                     "commentary publication requires a Provider tool call"
                 )
             content_events = [
-                event
-                for event in scoped
+                event for event in scoped
                 if event.source is OutputSource.PROVIDER
-                and event.kind is OutputEventKind.PROVIDER_CONTENT_DELTA
                 and event.channel is OutputChannel.DIAGNOSTIC
                 and event.visibility is OutputVisibility.PRIVATE
+                and (
+                    event.kind is OutputEventKind.PROVIDER_CONTENT_DELTA
+                    or event.kind is OutputEventKind.PROVIDER_DELTA_BATCH
+                )
             ]
-            content = "".join(
-                str(event.payload.get("delta") or "") for event in content_events
-            )
+            content_parts = []
+            for event in content_events:
+                if event.kind is OutputEventKind.PROVIDER_CONTENT_DELTA:
+                    content_parts.append(str(event.payload.get("delta") or ""))
+                else:
+                    content_parts.extend(
+                        str(entry.get("payload", {}).get("delta") or "")
+                        for entry in _batched_provider_entries(event)
+                        if entry.get("kind")
+                        == OutputEventKind.PROVIDER_CONTENT_DELTA.value
+                    )
+            content = "".join(content_parts)
             if not content.strip():
                 return ()
             commentary = AgentOutputEventDraft.public_text(
@@ -1084,6 +1262,40 @@ def _terminal_stream_abort_events(
                 "terminal stream abort event does not match stream state"
             )
     return events
+
+
+def _run_budget_snapshot(run: _RunRecord):
+    from purra.ports.run_lifecycle import RunBudgetSnapshot
+
+    usages = tuple(
+        usage
+        for usage in run.model_usage_by_invocation.values()
+        if usage is not None
+    )
+    return RunBudgetSnapshot(
+        model_attempts=len(run.model_attempt_ids),
+        unreported_usage_attempts=sum(
+            usage is None for usage in run.model_usage_by_invocation.values()
+        ),
+        input_tokens=sum(usage.input_tokens for usage in usages),
+        output_tokens=sum(usage.output_tokens for usage in usages),
+        reasoning_tokens=sum(usage.reasoning_output_tokens for usage in usages),
+    )
+
+
+def _require_run_token_budgets(run: _RunRecord, snapshot) -> None:
+    limits = run.params.runtime_limits
+    for kind, value, limit in (
+        ("input_tokens", snapshot.input_tokens, limits.max_input_tokens),
+        ("output_tokens", snapshot.output_tokens, limits.max_output_tokens),
+        ("reasoning_tokens", snapshot.reasoning_tokens, limits.max_reasoning_tokens),
+    ):
+        if limit is not None and value > limit:
+            raise ContractViolationError(
+                "Run Provider token budget was exceeded",
+                code="runtime_budget_exceeded",
+                details={"budgetKind": kind},
+            )
 
 
 class InMemoryAgentAdapters:

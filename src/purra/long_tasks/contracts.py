@@ -9,6 +9,8 @@ from typing import Any, Mapping
 
 from purra.normalization import (
     non_negative_int,
+    optional_non_negative_int,
+    optional_positive_int,
     optional_text,
     positive_int,
     required_text,
@@ -81,15 +83,21 @@ class LongTaskUnitStatus(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class LongTaskUsage:
-    """Provider-reported usage accumulated without imposing a task budget."""
+    """Authoritative linked-Run usage accumulated exactly once per Run."""
 
     invocation_count: int = 0
+    unreported_usage_attempts: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
     reasoning_tokens: int | None = 0
 
     def __post_init__(self) -> None:
-        for name in ("invocation_count", "input_tokens", "output_tokens"):
+        for name in (
+            "invocation_count",
+            "unreported_usage_attempts",
+            "input_tokens",
+            "output_tokens",
+        ):
             object.__setattr__(
                 self,
                 name,
@@ -104,13 +112,52 @@ class LongTaskUsage:
                     "long task usage reasoning_tokens",
                 ),
             )
+        if self.unreported_usage_attempts > self.invocation_count:
+            raise ValueError(
+                "unreported usage attempts cannot exceed invocation count"
+            )
 
     def to_mapping(self) -> dict[str, int | None]:
         return {
             "invocationCount": self.invocation_count,
+            "unreportedUsageAttempts": self.unreported_usage_attempts,
             "inputTokens": self.input_tokens,
             "outputTokens": self.output_tokens,
             "reasoningTokens": self.reasoning_tokens,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class LongTaskBudgetLimits:
+    """Persisted task maxima; ``None`` is the explicit unlimited value."""
+
+    max_invocation_attempts: int | None = None
+    max_input_tokens: int | None = None
+    max_output_tokens: int | None = None
+    max_reasoning_tokens: int | None = None
+
+    def __post_init__(self) -> None:
+        for name in (
+            "max_invocation_attempts",
+            "max_input_tokens",
+            "max_output_tokens",
+            "max_reasoning_tokens",
+        ):
+            object.__setattr__(
+                self,
+                name,
+                optional_non_negative_int(
+                    getattr(self, name),
+                    f"long task budget {name}",
+                ),
+            )
+
+    def to_mapping(self) -> dict[str, int | None]:
+        return {
+            "maxInvocationAttempts": self.max_invocation_attempts,
+            "maxInputTokens": self.max_input_tokens,
+            "maxOutputTokens": self.max_output_tokens,
+            "maxReasoningTokens": self.max_reasoning_tokens,
         }
 
 
@@ -174,6 +221,10 @@ class LongTaskCreateCommand:
     created_by_run_id: str
     units: tuple[LongTaskUnitSpec, ...]
     max_parallelism: int = 1
+    deadline_at_ms: int | None = None
+    budget_limits: LongTaskBudgetLimits = field(
+        default_factory=LongTaskBudgetLimits
+    )
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -221,6 +272,13 @@ class LongTaskCreateCommand:
             "max_parallelism",
             positive_int(self.max_parallelism, "long task max_parallelism"),
         )
+        object.__setattr__(
+            self,
+            "deadline_at_ms",
+            optional_positive_int(self.deadline_at_ms, "long task deadline_at_ms"),
+        )
+        if not isinstance(self.budget_limits, LongTaskBudgetLimits):
+            raise TypeError("long task budget_limits must be LongTaskBudgetLimits")
         object.__setattr__(self, "metadata", freeze_json_mapping(self.metadata))
 
 
@@ -237,6 +295,10 @@ class LongTaskRecord:
     completed_units: int
     failed_units: int
     max_parallelism: int
+    deadline_at_ms: int | None = None
+    budget_limits: LongTaskBudgetLimits = field(
+        default_factory=LongTaskBudgetLimits
+    )
     cancellation_requested_at_ms: int | None = None
     usage: LongTaskUsage = field(default_factory=LongTaskUsage)
     metadata: Mapping[str, Any] = field(default_factory=dict)
@@ -274,6 +336,13 @@ class LongTaskRecord:
             )
         if self.completed_units + self.failed_units > self.total_units:
             raise ValueError("long task progress exceeds total units")
+        object.__setattr__(
+            self,
+            "deadline_at_ms",
+            optional_positive_int(self.deadline_at_ms, "long task deadline_at_ms"),
+        )
+        if not isinstance(self.budget_limits, LongTaskBudgetLimits):
+            raise TypeError("long task budget_limits must be LongTaskBudgetLimits")
         if self.cancellation_requested_at_ms is not None:
             requested_at = int(self.cancellation_requested_at_ms)
             if requested_at < 0:
@@ -307,7 +376,9 @@ class LongTaskUnitRecord:
     attempt: int = 0
     max_attempts: int = 3
     worker_id: str | None = None
+    lease_epoch: int = 0
     lease_expires_at_ms: int | None = None
+    settled_by_worker_id: str | None = None
     run_id: str | None = None
     input_ref: str | None = None
     output_ref: str | None = None
@@ -346,7 +417,7 @@ class LongTaskUnitRecord:
             optional_text(self.parent_unit_id),
         )
         object.__setattr__(self, "required", bool(self.required))
-        for name in ("position", "attempt", "max_attempts"):
+        for name in ("position", "attempt", "max_attempts", "lease_epoch"):
             normalizer = positive_int if name == "max_attempts" else non_negative_int
             object.__setattr__(
                 self,
@@ -358,6 +429,7 @@ class LongTaskUnitRecord:
             )
         for name in (
             "worker_id",
+            "settled_by_worker_id",
             "run_id",
             "input_ref",
             "output_ref",
@@ -459,6 +531,7 @@ def _require_acyclic(units: tuple[LongTaskUnitSpec, ...]) -> None:
 
 
 __all__ = [
+    "LongTaskBudgetLimits",
     "LongTaskCreateCommand",
     "LongTaskRecord",
     "LongTaskRunBinding",

@@ -7,7 +7,7 @@ import type {
   ModelStreamChunk,
   ModelTurn,
 } from "../model/types.js";
-import { invokeModel } from "../model/stream.js";
+import { invokeModel, type ModelStreamLimits } from "../model/stream.js";
 import { ModelTaskRunner } from "../extensions/model-tasks.js";
 import {
   copyCapabilitySnapshot,
@@ -42,7 +42,7 @@ import type {
   WorkPlan,
 } from "../planning/types.js";
 import { InMemoryOutputPublisher } from "../output/publisher.js";
-import type { OutputPolicy, OutputPublisher } from "../output/types.js";
+import type { OutputBatchLimits, OutputPolicy, OutputPublisher } from "../output/types.js";
 import { allowAllOutput, RunSession } from "../run/session.js";
 import { InMemoryRunRepository, type RunRepository } from "../run/store.js";
 import type {
@@ -112,6 +112,12 @@ export interface AgentOptions {
   readonly delegation?: DelegationOptions;
   readonly recovery?: RecoveryPolicy;
   readonly operations?: AgentOperationController;
+  readonly runtimeLimits?: Partial<AgentRuntimeLimits>;
+  readonly outputBatchLimits?: Partial<OutputBatchLimits>;
+}
+
+export interface AgentRuntimeLimits extends ModelStreamLimits {
+  readonly runTimeoutMs: number | null;
 }
 
 export interface AgentRunInput {
@@ -134,6 +140,8 @@ export class Agent {
   readonly #model: ModelGateway;
   readonly #tools: ToolCatalog;
   readonly #maxRounds: number;
+  readonly #runtimeLimits: AgentRuntimeLimits;
+  readonly #outputBatchLimits: OutputBatchLimits;
   readonly #capabilities: ModelCapabilitySnapshot | undefined;
   readonly #useStream: boolean;
   readonly #preset: AgentPreset & { readonly promptSections: readonly PromptSection[] };
@@ -161,6 +169,8 @@ export class Agent {
       throw new TypeError("maxRounds must be a positive integer");
     }
     this.#model = options.model;
+    this.#runtimeLimits = resolveRuntimeLimits(options.runtimeLimits);
+    this.#outputBatchLimits = resolveOutputBatchLimits(options.outputBatchLimits);
     if (options.tools !== undefined && !Array.isArray(options.tools)) {
       throw new TypeError("Agent tools must be an array");
     }
@@ -268,8 +278,9 @@ export class Agent {
       stableFingerprint(copyJsonValue(this.#preset.promptSections)),
       stableFingerprint(copyJsonValue(tools)),
       stableFingerprint(copyJsonValue({
-        schemaVersion: 2,
+        schemaVersion: 3,
         maxRounds: this.#maxRounds,
+        runtimeLimits: this.#runtimeLimits,
         contextStrategy: this.#context?.strategy ?? "single_pass",
         planningBinding: this.#planning?.binding ?? null,
         durableBinding: this.#durable?.binding ?? null,
@@ -278,7 +289,7 @@ export class Agent {
       })),
     ]);
     const preset: AgentPresetSnapshot = Object.freeze({
-      schemaVersion: 2,
+      schemaVersion: 3,
       presetId: this.#preset.id,
       presetRevision: this.#preset.revision,
       promptFingerprint,
@@ -287,7 +298,10 @@ export class Agent {
       compositionFingerprint,
     });
     let continuation: DurableRecoverySnapshot | undefined;
-    let deadlineAt = normalizeDeadline(options.deadlineAt);
+    let deadlineAt = normalizeDeadline(
+      options.deadlineAt,
+      this.#runtimeLimits.runTimeoutMs,
+    );
     let budgets = resolveBudgets(options.budgets, this.#maxRounds);
     if (options.durableContinuation !== undefined) {
       if (this.#durable === undefined) {
@@ -313,6 +327,7 @@ export class Agent {
       this.#outputPublisher,
       this.#outputPolicy,
       { preset, deadlineAt, budgets, metadata },
+      this.#outputBatchLimits,
     );
     const runInput: AgentRunInput = Object.freeze({
       messages: Object.freeze([
@@ -550,6 +565,7 @@ export class Agent {
                 emitModelDelta(chunk, emit);
               }
             },
+            this.#runtimeLimits,
           );
           if (session !== undefined && receipt !== undefined && !this.#useStream) {
             await session.persistCompletion(receipt, turn);
@@ -1472,7 +1488,9 @@ function resolveBudgets(
 ): RunBudgets {
   return Object.freeze({
     maxModelAttempts: budgetValue(value?.maxModelAttempts, maxRounds, "maxModelAttempts"),
-    maxTotalTokens: budgetValue(value?.maxTotalTokens, null, "maxTotalTokens"),
+    maxInputTokens: budgetValue(value?.maxInputTokens, null, "maxInputTokens"),
+    maxOutputTokens: budgetValue(value?.maxOutputTokens, null, "maxOutputTokens"),
+    maxReasoningTokens: budgetValue(value?.maxReasoningTokens, null, "maxReasoningTokens"),
     maxOutputBytes: budgetValue(value?.maxOutputBytes, 1_000_000, "maxOutputBytes"),
     maxOutputEvents: budgetValue(value?.maxOutputEvents, 10_000, "maxOutputEvents"),
   });
@@ -1485,11 +1503,88 @@ function budgetValue(value: number | null | undefined, fallback: number | null, 
   return value;
 }
 
-function normalizeDeadline(value: string | undefined): string | null {
-  if (value === undefined) return null;
+function normalizeDeadline(
+  value: string | null | undefined,
+  defaultTimeoutMs: number | null,
+): string | null {
+  if (value === null) return null;
+  if (value === undefined) {
+    return defaultTimeoutMs === null
+      ? null
+      : new Date(Date.now() + defaultTimeoutMs).toISOString();
+  }
   const milliseconds = Date.parse(value);
   if (!Number.isFinite(milliseconds)) throw new TypeError("deadlineAt must be an ISO date-time");
   return new Date(milliseconds).toISOString();
+}
+
+function resolveRuntimeLimits(
+  value: Partial<AgentRuntimeLimits> | undefined,
+): AgentRuntimeLimits {
+  return Object.freeze({
+    runTimeoutMs: nullableLimit(value?.runTimeoutMs, 900_000, "runTimeoutMs"),
+    invocationTimeoutMs: nullableLimit(
+      value?.invocationTimeoutMs,
+      120_000,
+      "invocationTimeoutMs",
+    ),
+    maxChunks: positiveLimit(value?.maxChunks, 100_000, "maxChunks"),
+    maxContentChars: positiveLimit(
+      value?.maxContentChars,
+      1_000_000,
+      "maxContentChars",
+    ),
+    maxReasoningChars: positiveLimit(
+      value?.maxReasoningChars,
+      1_000_000,
+      "maxReasoningChars",
+    ),
+    maxToolArgumentChars: positiveLimit(
+      value?.maxToolArgumentChars,
+      1_000_000,
+      "maxToolArgumentChars",
+    ),
+  });
+}
+
+function resolveOutputBatchLimits(
+  value: Partial<OutputBatchLimits> | undefined,
+): OutputBatchLimits {
+  if (value !== undefined && (value === null || typeof value !== "object")) {
+    throw new TypeError("outputBatchLimits must be an object");
+  }
+  return Object.freeze({
+    maxPayloadBytes: positiveLimit(
+      value?.maxPayloadBytes,
+      16_384,
+      "output batch maxPayloadBytes",
+    ),
+    maxFragments: positiveLimit(
+      value?.maxFragments,
+      64,
+      "output batch maxFragments",
+    ),
+    maxLatencyMs: positiveLimit(
+      value?.maxLatencyMs,
+      25,
+      "output batch maxLatencyMs",
+    ),
+  });
+}
+
+function positiveLimit(value: number | undefined, fallback: number, label: string): number {
+  const resolved = value ?? fallback;
+  if (!Number.isSafeInteger(resolved) || resolved < 1) throw new TypeError(`${label} must be positive`);
+  return resolved;
+}
+
+function nullableLimit(
+  value: number | null | undefined,
+  fallback: number,
+  label: string,
+): number | null {
+  if (value === null) return null;
+  return positiveLimit(value, fallback, label);
 }
 
 function copyMapping(

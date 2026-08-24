@@ -5,16 +5,19 @@ from __future__ import annotations
 import asyncio
 from contextlib import aclosing, suppress
 from dataclasses import dataclass, replace
-from time import perf_counter
+from time import perf_counter, time
 from typing import Any, AsyncIterator, Callable, Iterable, Mapping, Sequence
 
 from purra.agent_presets import (
     AgentPreset,
 )
 from purra.cancellation import (
+    ExecutionDeadlineExceeded,
+    ExecutionStopSignal,
     OperationCanceled,
     await_with_cancellation,
     is_canceled as _is_canceled,
+    stop_reason,
 )
 from purra.context_budget import (
     allocate_context_budget,
@@ -251,7 +254,7 @@ class AgentCore:
         self._preset = preset
         self._model_gateway = model_gateway
         self._output_repository = output_repository
-        self._runtime_limits = runtime_limits
+        self._runtime_limits, self._tool_execution_limits = runtime_limits, tool_execution_limits
         self._recovery_policy = recovery_policy
         (
             self._output_processor,
@@ -265,9 +268,10 @@ class AgentCore:
             output_repository=output_repository,
             output_publisher=output_publisher,
             operation_controller=operation_controller,
+            runtime_limits=runtime_limits,
+            max_tool_argument_chars=tool_execution_limits.max_argument_chars,
         )
-        self._context_provider_factory = context_provider_factory
-        self._conversation_compactor_factory = conversation_compactor_factory
+        self._context_provider_factory, self._conversation_compactor_factory = context_provider_factory, conversation_compactor_factory
         self._conversation_compactor = _resolve_conversation_compactor(
             context_provider,
             context_provider_factory,
@@ -470,7 +474,16 @@ class AgentCore:
         options: AgentCoreRunOptions | None = None,
         signal: CancellationSignal | None = None,
     ) -> AsyncIterator[AgentEvent | AgentRunResult]:
-        options = options or AgentCoreRunOptions()
+        options = _resolve_run_deadline(
+            options or AgentCoreRunOptions(),
+            self._runtime_limits,
+        )
+        owned_stop = ExecutionStopSignal(
+            signal,
+            deadline_at_ms=options.deadline_at_ms,
+            deadline_code="run_deadline_exceeded",
+        )
+        signal = owned_stop
         output_limit = options.output_limit or resolve_invocation_output_limit(
             request.model.capability_snapshot,
             request.model.options.get("max_tokens"),
@@ -501,6 +514,8 @@ class AgentCore:
                     prompt=request.latest_user_text(),
                     mode=request.mode,
                     turn_id=options.turn_id,
+                    deadline_at_ms=options.deadline_at_ms,
+                    runtime_limits=self._runtime_limits,
                     provenance=options.provenance,
                     binding=options.binding,
                     agent_preset_snapshot=(
@@ -515,6 +530,7 @@ class AgentCore:
                 ModelInvocationContext(
                     run_id=controller.run_id,
                     turn_id=options.turn_id,
+                    deadline_at_ms=options.deadline_at_ms,
                 ),
             )
             context_provider = (
@@ -570,7 +586,11 @@ class AgentCore:
                 ))
 
             if _is_canceled(signal):
-                await controller.cancel("request_canceled")
+                reason = stop_reason(signal)
+                if reason == "run_deadline_exceeded":
+                    await controller.fail(reason)
+                else:
+                    await controller.cancel(reason)
                 for event in sink.drain():
                     yield event
                 yield _run_result(controller)
@@ -874,7 +894,15 @@ class AgentCore:
                 controller,
                 model=(runtime_result.model if runtime_result is not None else request.model.model),
             )
+        except ExecutionDeadlineExceeded as error:
+            snapshot = controller.snapshot
+            if snapshot is not None and not snapshot.terminal:
+                await controller.fail(error.code)
+                for event in sink.drain():
+                    yield event
+                yield _run_result(controller)
         finally:
+            owned_stop.close()
             run_id = controller.run_id
             if run_id is not None:
                 with suppress(Exception):
@@ -1145,6 +1173,14 @@ class AgentCore:
                             self._model_gateway,
                             output_observer=self._output_processor,
                             operation_controller=self._operations,
+                            invocation_timeout_ms=(
+                                self._runtime_limits.provider_invocation_timeout_ms
+                            ),
+                            runtime_limits=self._runtime_limits,
+                            max_tool_argument_chars=(
+                                self._tool_execution_limits.max_argument_chars
+                            ),
+                            budget_repository=self._repository,
                         ),
                         policy=policy,
                         facts_provider=options.committed_result_facts_provider,
@@ -1161,6 +1197,7 @@ class AgentCore:
                         context=ModelInvocationContext(
                             run_id=controller.run_id,
                             turn_id=options.turn_id,
+                            deadline_at_ms=options.deadline_at_ms,
                         ),
                         signal=signal,
                     )
@@ -1216,6 +1253,14 @@ class AgentCore:
                 gateway,
                 output_observer=self._output_processor,
                 operation_controller=self._operations,
+                invocation_timeout_ms=(
+                    self._runtime_limits.provider_invocation_timeout_ms
+                ),
+                runtime_limits=self._runtime_limits,
+                max_tool_argument_chars=(
+                    self._tool_execution_limits.max_argument_chars
+                ),
+                budget_repository=self._repository,
             )
         runtime = AgentRuntime(
             model_gateway=gateway,
@@ -1273,6 +1318,11 @@ class AgentCore:
                     item.schema.name: item.context_contract
                     for item in registrations
                 },
+                tool_argument_limits={
+                    item.schema.name: item.max_argument_chars
+                    for item in registrations
+                    if item.max_argument_chars is not None
+                },
                 stage_context_projection_enabled=bool(
                     plan is not None and plan.task_spec is not None
                 ),
@@ -1295,6 +1345,15 @@ class AgentCore:
                 model=request.model.model,
                 round_count=0,
                 error_code="request_canceled",
+            )
+        except ExecutionDeadlineExceeded as error:
+            result = AgentRuntimeResult(
+                run_id=controller.run_id,
+                outcome=RuntimeOutcome.FAILED,
+                final_response="",
+                model=request.model.model,
+                round_count=0,
+                error_code=error.code,
             )
         except Exception as error:
             await _record_safe_exception(
@@ -1369,6 +1428,8 @@ def _configure_output_runtime(
     output_repository: AgentOutputRepository | None,
     output_publisher: AgentOutputPublisher | None,
     operation_controller: AgentOperationController | None,
+    runtime_limits: RuntimeLimits,
+    max_tool_argument_chars: int,
 ):
     if (output_repository is None) != (output_publisher is None):
         raise ValueError(
@@ -1391,8 +1452,28 @@ def _configure_output_runtime(
         model_gateway,
         output_observer=processor,
         operation_controller=operations,
+        invocation_timeout_ms=runtime_limits.provider_invocation_timeout_ms,
+        runtime_limits=runtime_limits,
+        max_tool_argument_chars=max_tool_argument_chars,
+        budget_repository=repository,
     )
     return processor, repository, operations, invocations
+
+
+def _resolve_run_deadline(
+    options: AgentCoreRunOptions,
+    limits: RuntimeLimits,
+) -> AgentCoreRunOptions:
+    if (
+        options.deadline_at_ms is not None
+        or options.durable_continuation is not None
+        or limits.root_run_timeout_ms is None
+    ):
+        return options
+    return replace(
+        options,
+        deadline_at_ms=int(time() * 1000) + limits.root_run_timeout_ms,
+    )
 
 
 def _build_run_supervisor(

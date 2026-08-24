@@ -22,6 +22,7 @@ export interface RunRepository {
     readonly event: OutputEvent;
   }>;
   appendEvent(runId: string, draft: OutputEventDraft): Promise<OutputEvent>;
+  appendBatch(runId: string, drafts: readonly OutputEventDraft[]): Promise<readonly OutputEvent[]>;
   settleInvocation(
     runId: string,
     settlement: InvocationSettlement,
@@ -45,11 +46,17 @@ interface StoredRun {
   readonly events: OutputEvent[];
   readonly bySourceKey: Map<string, OutputEvent>;
   readonly openInvocations: Set<string>;
+  readonly invocationReceipts: Map<string, ModelInvocationReceipt>;
+  readonly invocationSettlements: Map<string, {
+    readonly input: InvocationSettlement;
+    readonly event: OutputEvent;
+    readonly budgetError?: string;
+  }>;
 }
 
 const METERED_KINDS = new Set([
   "model.delta",
-  "model.completed",
+  "provider.delta_batch",
   "reasoning.delta",
   "commentary",
   "final",
@@ -71,7 +78,15 @@ export class InMemoryRunRepository implements RunRepository {
       updatedAt: now,
       deadlineAt: params.deadlineAt,
       budgets: params.budgets,
-      usage: { modelAttempts: 0, knownTokens: 0, outputBytes: 0, outputEvents: 0 },
+      usage: {
+        modelAttempts: 0,
+        unreportedUsageAttempts: 0,
+        inputTokens: 0,
+        outputTokens: 0,
+        reasoningTokens: 0,
+        outputBytes: 0,
+        outputEvents: 0,
+      },
       preset: params.preset,
     });
     const stored: StoredRun = {
@@ -79,6 +94,8 @@ export class InMemoryRunRepository implements RunRepository {
       events: [],
       bySourceKey: new Map(),
       openInvocations: new Set(),
+      invocationReceipts: new Map(),
+      invocationSettlements: new Map(),
     };
     this.#runs.set(runId, stored);
     const event = append(stored, runId, {
@@ -96,13 +113,22 @@ export class InMemoryRunRepository implements RunRepository {
     input: Omit<ModelInvocationReceipt, "attempt" | "openedAt">,
   ) {
     const run = this.#active(runId);
+    const existing = run.invocationReceipts.get(input.invocationId);
+    if (existing !== undefined) {
+      if (!sameInvocationInput(existing, input)) {
+        throw new AgentError("model_invocation_conflict", "Model invocation key has different authority");
+      }
+      return Object.freeze({
+        snapshot: run.snapshot,
+        receipt: existing,
+        event: run.bySourceKey.get(`invocation:${existing.invocationId}:started`)!,
+      });
+    }
+    requireBudgetForNextInvocation(run);
     const nextAttempt = run.snapshot.usage.modelAttempts + 1;
     const limit = run.snapshot.budgets.maxModelAttempts;
     if (limit !== null && nextAttempt > limit) {
-      throw new AgentError("run_attempt_budget_exceeded", "Run model-attempt budget is exhausted");
-    }
-    if (run.openInvocations.has(input.invocationId)) {
-      throw new AgentError("duplicate_model_invocation", "Model invocation is already open");
+      throw new AgentError("runtime_budget_exceeded", "Run model-attempt budget is exhausted");
     }
     const receipt: ModelInvocationReceipt = Object.freeze({
       ...input,
@@ -110,6 +136,7 @@ export class InMemoryRunRepository implements RunRepository {
       openedAt: new Date().toISOString(),
     });
     run.openInvocations.add(receipt.invocationId);
+    run.invocationReceipts.set(receipt.invocationId, receipt);
     updateUsage(run, { modelAttempts: nextAttempt });
     const event = append(run, runId, {
       sourceKey: `invocation:${receipt.invocationId}:started`,
@@ -124,8 +151,32 @@ export class InMemoryRunRepository implements RunRepository {
   public async appendEvent(runId: string, draft: OutputEventDraft): Promise<OutputEvent> {
     const run = this.#active(runId);
     const existing = run.bySourceKey.get(draft.sourceKey);
-    if (existing !== undefined) return existing;
+    if (existing !== undefined) {
+      requireSameEvent(existing, draft);
+      return existing;
+    }
     return append(run, runId, draft, true);
+  }
+
+  public async appendBatch(
+    runId: string,
+    drafts: readonly OutputEventDraft[],
+  ): Promise<readonly OutputEvent[]> {
+    const run = this.#active(runId);
+    if (!Array.isArray(drafts) || drafts.length === 0) return Object.freeze([]);
+    const copied = Object.freeze(drafts.map(copyDraft));
+    if (new Set(copied.map((draft) => draft.sourceKey)).size !== copied.length) {
+      throw new AgentError("output_batch_conflict", "Output batch source keys must be unique");
+    }
+    const pending = copied.filter((draft) => {
+      const existing = run.bySourceKey.get(draft.sourceKey);
+      if (existing !== undefined) requireSameEvent(existing, draft);
+      return existing === undefined;
+    });
+    checkRelatedBudget(run, pending);
+    return Object.freeze(copied.map((draft) => (
+      run.bySourceKey.get(draft.sourceKey) ?? append(run, runId, draft, true)
+    )));
   }
 
   public async settleInvocation(
@@ -133,19 +184,30 @@ export class InMemoryRunRepository implements RunRepository {
     settlement: InvocationSettlement,
   ): Promise<{ readonly event: OutputEvent; readonly budgetError?: string }> {
     const run = this.#active(runId);
+    const replay = run.invocationSettlements.get(settlement.invocationId);
+    if (replay !== undefined) {
+      if (!sameSettlement(replay.input, settlement)) {
+        throw new AgentError("model_invocation_settlement_conflict", "Invocation settlement conflicts");
+      }
+      return Object.freeze({
+        event: replay.event,
+        ...(replay.budgetError === undefined ? {} : { budgetError: replay.budgetError }),
+      });
+    }
     if (!run.openInvocations.delete(settlement.invocationId)) {
       throw new AgentError("model_invocation_not_open", "Model invocation is not open");
     }
-    const addedTokens = settlement.usage?.totalTokens
-      ?? (settlement.usage === undefined
-        ? 0
-        : settlement.usage.inputTokens + (settlement.usage.outputTokens ?? 0));
-    const knownTokens = run.snapshot.usage.knownTokens + addedTokens;
-    updateUsage(run, { knownTokens });
-    const maximum = run.snapshot.budgets.maxTotalTokens;
-    const budgetError = maximum !== null && knownTokens > maximum
-      ? "run_token_budget_exceeded"
-      : undefined;
+    const usage = settlement.usage;
+    updateUsage(run, usage === undefined
+      ? { unreportedUsageAttempts: run.snapshot.usage.unreportedUsageAttempts + 1 }
+      : {
+          inputTokens: run.snapshot.usage.inputTokens + usage.inputTokens,
+          outputTokens: run.snapshot.usage.outputTokens + (usage.outputTokens ?? 0),
+          reasoningTokens: run.snapshot.usage.reasoningTokens + (usage.reasoningOutputTokens ?? 0),
+        });
+    const budgetError = exceededTokenBudget(run) === undefined
+      ? undefined
+      : "runtime_budget_exceeded";
     const status = budgetError === undefined ? settlement.status : "failed";
     const errorCode = budgetError ?? settlement.errorCode;
     const event = append(run, runId, {
@@ -156,10 +218,19 @@ export class InMemoryRunRepository implements RunRepository {
       payload: {
         invocationId: settlement.invocationId,
         status,
-        ...(addedTokens === 0 ? {} : { knownTokens: addedTokens }),
+        ...(usage === undefined ? { usageReported: false } : {
+          inputTokens: usage.inputTokens,
+          outputTokens: usage.outputTokens ?? 0,
+          reasoningTokens: usage.reasoningOutputTokens ?? 0,
+        }),
         ...(errorCode === undefined ? {} : { errorCode }),
       },
     }, false);
+    run.invocationSettlements.set(settlement.invocationId, Object.freeze({
+      input: copySettlement(settlement),
+      event,
+      ...(budgetError === undefined ? {} : { budgetError }),
+    }));
     return Object.freeze({ event, ...(budgetError === undefined ? {} : { budgetError }) });
   }
 
@@ -283,7 +354,7 @@ export class InMemoryRunRepository implements RunRepository {
 export async function assertRunRepositoryConforms(repository: RunRepository): Promise<void> {
   const begun = await repository.begin({
     preset: {
-      schemaVersion: 2,
+      schemaVersion: 3,
       presetId: "conformance",
       presetRevision: "1",
       promptFingerprint: "prompt",
@@ -294,12 +365,26 @@ export async function assertRunRepositoryConforms(repository: RunRepository): Pr
     deadlineAt: null,
     budgets: {
       maxModelAttempts: 1,
-      maxTotalTokens: null,
+      maxInputTokens: null,
+      maxOutputTokens: null,
+      maxReasoningTokens: null,
       maxOutputBytes: 1_000,
       maxOutputEvents: 10,
     },
     metadata: {},
   });
+  const batchDrafts = Object.freeze(["a", "b"].map((value) => Object.freeze({
+    sourceKey: `conformance:batch:${value}`,
+    kind: "provider.delta_batch" as const,
+    channel: "model" as const,
+    visibility: "private" as const,
+    payload: Object.freeze({ value }),
+  })));
+  const batch = await repository.appendBatch(begun.snapshot.runId, batchDrafts);
+  const replay = await repository.appendBatch(begun.snapshot.runId, batchDrafts);
+  if (batch.length !== 2 || replay[0]?.eventId !== batch[0]?.eventId) {
+    throw new AgentError("run_repository_nonconforming", "Run repository batch replay is not atomic");
+  }
   const final = await repository.settleRun(begun.snapshot.runId, "completed", {
     relatedEvents: [{
       sourceKey: "conformance:final",
@@ -311,7 +396,7 @@ export async function assertRunRepositoryConforms(repository: RunRepository): Pr
     finalOutput: "ok",
   });
   const events = await repository.listEvents(begun.snapshot.runId, 0);
-  if (final.snapshot.status !== "completed" || events.length !== 3) {
+  if (final.snapshot.status !== "completed" || events.length !== 5) {
     throw new AgentError("run_repository_nonconforming", "Run repository failed atomic lifecycle probe");
   }
   if (events.some((event, index) => event.sequence !== index + 1)) {
@@ -326,7 +411,10 @@ function append(
   meter: boolean,
 ): OutputEvent {
   const existing = run.bySourceKey.get(rawDraft.sourceKey);
-  if (existing !== undefined) return existing;
+  if (existing !== undefined) {
+    requireSameEvent(existing, rawDraft);
+    return existing;
+  }
   const draft = copyDraft(rawDraft);
   if (meter) applyBudget(run, draft);
   const event: OutputEvent = Object.freeze({
@@ -346,6 +434,17 @@ function append(
   return event;
 }
 
+function requireSameEvent(existing: OutputEvent, draft: OutputEventDraft): void {
+  if (
+    existing.kind !== draft.kind
+    || existing.channel !== draft.channel
+    || existing.visibility !== draft.visibility
+    || canonicalJson(existing.payload) !== canonicalJson(draft.payload ?? {})
+  ) {
+    throw new AgentError("output_source_key_conflict", "Output source key has different content");
+  }
+}
+
 function copyDraft(draft: OutputEventDraft): OutputEventDraft & { readonly payload: Readonly<Record<string, JsonValue>> } {
   return Object.freeze({
     sourceKey: requiredText(draft.sourceKey, "output sourceKey"),
@@ -362,11 +461,42 @@ function checkBudget(run: StoredRun, draft: OutputEventDraft): void {
   const byteLimit = run.snapshot.budgets.maxOutputBytes;
   const eventLimit = run.snapshot.budgets.maxOutputEvents;
   if (byteLimit !== null && run.snapshot.usage.outputBytes + bytes > byteLimit) {
-    throw new AgentError("run_output_budget_exceeded", "Run output-byte budget is exhausted");
+    throw new AgentError("runtime_budget_exceeded", "Run output-byte budget is exhausted");
   }
   if (eventLimit !== null && run.snapshot.usage.outputEvents + 1 > eventLimit) {
-    throw new AgentError("run_output_budget_exceeded", "Run output-event budget is exhausted");
+    throw new AgentError("runtime_budget_exceeded", "Run output-event budget is exhausted");
   }
+}
+
+function requireBudgetForNextInvocation(run: StoredRun): void {
+  const kind = tokenBudgetKind(run, true);
+  if (kind !== undefined) {
+    throw new AgentError("runtime_budget_exceeded", `Run ${kind} budget is exhausted`);
+  }
+}
+
+function exceededTokenBudget(run: StoredRun): string | undefined {
+  return tokenBudgetKind(run, false);
+}
+
+function tokenBudgetKind(run: StoredRun, inclusive: boolean): string | undefined {
+  const { budgets, usage } = run.snapshot;
+  if (
+    usage.unreportedUsageAttempts > 0
+    && (
+      budgets.maxInputTokens !== null
+      || budgets.maxOutputTokens !== null
+      || budgets.maxReasoningTokens !== null
+    )
+  ) return "provider_usage_unreported";
+  const rows = [
+    ["input_tokens", usage.inputTokens, budgets.maxInputTokens],
+    ["output_tokens", usage.outputTokens, budgets.maxOutputTokens],
+    ["reasoning_tokens", usage.reasoningTokens, budgets.maxReasoningTokens],
+  ] as const;
+  return rows.find(([, used, maximum]) => (
+    maximum !== null && (used > maximum || (inclusive && used >= maximum))
+  ))?.[0];
 }
 
 function checkRelatedBudget(run: StoredRun, drafts: readonly OutputEventDraft[]): void {
@@ -375,10 +505,10 @@ function checkRelatedBudget(run: StoredRun, drafts: readonly OutputEventDraft[])
   const byteLimit = run.snapshot.budgets.maxOutputBytes;
   const eventLimit = run.snapshot.budgets.maxOutputEvents;
   if (byteLimit !== null && run.snapshot.usage.outputBytes + addedBytes > byteLimit) {
-    throw new AgentError("run_output_budget_exceeded", "Run output-byte budget is exhausted");
+    throw new AgentError("runtime_budget_exceeded", "Run output-byte budget is exhausted");
   }
   if (eventLimit !== null && run.snapshot.usage.outputEvents + metered.length > eventLimit) {
-    throw new AgentError("run_output_budget_exceeded", "Run output-event budget is exhausted");
+    throw new AgentError("runtime_budget_exceeded", "Run output-event budget is exhausted");
   }
 }
 
@@ -410,7 +540,43 @@ function freezeSnapshot(snapshot: RunSnapshot): RunSnapshot {
 }
 
 function byteLength(value: unknown): number {
-  return new TextEncoder().encode(JSON.stringify(value)).byteLength;
+  return new TextEncoder().encode(canonicalJson(value)).byteLength;
+}
+
+function sameInvocationInput(
+  receipt: ModelInvocationReceipt,
+  input: Omit<ModelInvocationReceipt, "attempt" | "openedAt">,
+): boolean {
+  const { attempt: _attempt, openedAt: _openedAt, ...existing } = receipt;
+  return canonicalJson(existing) === canonicalJson(input);
+}
+
+function copySettlement(value: InvocationSettlement): InvocationSettlement {
+  return Object.freeze({
+    invocationId: value.invocationId,
+    status: value.status,
+    ...(value.usage === undefined ? {} : { usage: Object.freeze({ ...value.usage }) }),
+    ...(value.errorCode === undefined ? {} : { errorCode: value.errorCode }),
+  });
+}
+
+function sameSettlement(left: InvocationSettlement, right: InvocationSettlement): boolean {
+  return canonicalJson(left) === canonicalJson(right);
+}
+
+function canonicalJson(value: unknown): string {
+  return JSON.stringify(sortJson(value));
+}
+
+function sortJson(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sortJson);
+  if (value !== null && typeof value === "object") {
+    const record = value as Readonly<Record<string, unknown>>;
+    return Object.fromEntries(
+      Object.keys(record).sort().map((key) => [key, sortJson(record[key])]),
+    );
+  }
+  return value;
 }
 
 function normalizeCode(value: unknown): string {

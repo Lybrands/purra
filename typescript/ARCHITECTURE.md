@@ -13,21 +13,21 @@ languages, not a source-code template. TypeScript keeps native names, async
 primitives, and package boundaries. A capability is considered aligned when
 the same host scenario reaches the same safe outcome and stable error code.
 
-| Capability | TypeScript alpha | Python authority | Alignment |
+| Capability | TypeScript 0.3.0 | Python authority | Alignment |
 | --- | --- | --- | --- |
 | Reactive entry | `Agent.invoke()`, `Agent.stream()`, and `Agent.submit()` | `purra.api.AgentCore.submit()` | Same bounded model/tool use case; submit owns an in-memory canonical Run while invoke/stream remain transient |
 | Messages | Immutable JSON content, reasoning, attributes, complete tool calls, Prompt sections, and evidence receipts | `purra.contracts.AgentMessage` and `AgentPreset` | Shared model-visible behavior with TS-native composition and fingerprinting |
 | Model termination | `stop`, `tool_calls`, `length`, `filtered`, `other` | `purra.model_protocol.classify_model_termination()` | Same tool authorization and fail-closed error codes |
 | Model capabilities and limits | Versioned snapshots and resolved per-invocation output limits | `purra.model_protocol` | Same wire values and incompatibility errors |
 | Tool batches | Recursive Schema inspection, whole-batch enablement/scope/approval admission, idempotency, effect state, sanitized receipts, and committed lifecycle events | Runtime tool authorization/execution | Same fail-closed batch behavior; submitted Runs persist tool start before invoking a handler |
-| Run and cancellation | `RunHandle`, `RunRepository`, `AbortSignal`, cancellation receipts | Run controller/state and persistence ports | In-memory authority covers ordering, budgets, cancellation races, and atomic terminal settlement; storage-neutral orphan recovery owns restart classification and settlement |
-| Provider streaming and output | Transient invoke/stream plus submitted private/public canonical channels and replay | `ModelGateway.stream()` and canonical output | Chunk, usage, termination, cancellation, persist-before-publish, and close semantics aligned for the implemented Reactive path |
+| Run and cancellation | `RunHandle`, `RunRepository`, `AbortSignal`, cancellation receipts | Run controller/state and persistence ports | In-memory authority covers absolute deadlines, separate attempt/token/output budgets, missing-usage fencing, cancellation races, and atomic terminal settlement |
+| Provider streaming and output | Transient invoke/stream plus submitted private/public canonical channels, atomic delta batches, incremental limits, and replay | `ModelGateway.stream()` and canonical output | Chunk, usage, termination, bounded accumulation/coalescing, persist-before-publish, cancellation, and close semantics aligned |
 | Recovery | Request-scoped policy/ledger consumed by Provider, tool, Planned, and response paths | Python `purra.recovery` and runtime recovery paths | Shared decisions, bounded retries/replans, visible-output fencing, side-effect safety, and submitted content-free traces aligned |
 | Context | Opt-in budget allocator, Single Pass Agent integration, Staged/task-demand resolver, structural trimming, host compression hook, evidence receipts | Context budget/orchestration/strategies/evidence | Planned uses planning context before TaskSpec and task context only after compilation |
 | Managed model tasks | Public standalone runner plus per-execution context/compaction factories; submitted calls reuse Run invocation receipts and budgets | Python `AgentModelTaskRunner` and preset factories | Tool-free completion/streaming, exact output limits, cancellation, empty-output recovery, and optional Operation evidence aligned |
 | Operation lifecycle | Canonical start/terminal receipts with monotonic durations and duplicate-terminal fencing | Python `AgentOperationController` | Model-task Operations are optional and cannot replace Run lifecycle authority |
 | Planned execution | Explicit host Planner or optional `ModelWorkPlanner`, policy, semantic contracts, compiler, Core execution state, response validation, model-backed judge, and bounded explicit replanning | Planner, planning policy/ports, compiler, response validation, Run state | Reference model calls reuse managed Run authority; every direct, planned, revised, and judged result still passes through existing compiler/validation authority |
-| Durable | Explicit admission, Long Task DAG/repository, leases, checkpoints, retries, pause/resume/cancel, recovery snapshots, continuation, orphan recovery | Explicit Python Durable capability | Phase 6 host-facing safety outcomes aligned; built-in storage remains process-local |
+| Durable | Explicit admission, Long Task DAG/repository, lease epochs/renewal, deadlines, budgets, checkpoints, retries, pause/resume/cancel, recovery snapshots, continuation, orphan recovery | Explicit Python Durable capability | Runtime Safety fencing and host-facing outcomes aligned; built-in storage remains process-local |
 | Artifacts | Open/finalized/aborted lifecycle, ordered batches, idempotent receipts, coverage, validation, access, writer claims, recovery candidates, maintenance | Python Artifact lifecycle and durable store ports | Phase 7 host-facing safety outcomes aligned; ownership stays opaque and built-in storage remains process-local |
 | Delegation | Root Run-scoped batches, policy bounds, idempotent replay, isolated dynamic execution, read-tool filtering, cancellation, aggregation, lifecycle events | Python `DelegationCoordinator`, `DynamicDelegatedAgentExecutor`, and delegation ports | Phase 8 one-Run outcomes aligned; no child Run, recursive delegation, write authority, or second event stream |
 | Observability | Content-free operational, stability, failure, recovery, performance, trend, and regression-gate projections | Python `purra.observability` | Phase 9 frozen evidence, stable codes, confidence, and redaction aligned; reports are read-only |
@@ -40,7 +40,7 @@ signatures, or implementation details. Cross-language fixtures are added only
 when both implementations consume the same wire representation.
 
 Phase 12C re-audited this matrix by host behavior. No unapproved `Partial` or
-`Missing` framework capability remains in the alpha matrix. The clean installed
+`Missing` framework capability remains in the capability matrix. The clean installed
 consumer exercises Reactive, Planned reference helpers, managed context model
 tasks, Operation evidence, Durable dispatch, Artifacts, delegation, recovery,
 observability, and declarations through the package root. Provider SDKs and

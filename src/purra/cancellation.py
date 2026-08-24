@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Awaitable, TypeVar
 
-from purra.errors import AgentCoreError
+from purra.errors import AgentCoreError, CodedAgentCoreError
 from purra.ports import CancellationSignal
 
 
@@ -16,8 +17,103 @@ class OperationCanceled(AgentCoreError):
     """An in-flight Core operation was canceled by its run signal."""
 
 
+class ExecutionDeadlineExceeded(CodedAgentCoreError):
+    """A Core-owned absolute execution deadline elapsed."""
+
+    default_code = "execution_deadline_exceeded"
+
+
+class ExecutionStopSignal:
+    """Reason-aware signal that clips one absolute deadline to its parent."""
+
+    def __init__(
+        self,
+        parent: CancellationSignal | None = None,
+        *,
+        deadline_at_ms: int | None = None,
+        deadline_code: str = "execution_deadline_exceeded",
+    ) -> None:
+        self._parent = parent
+        self._event = asyncio.Event()
+        self._reason_code: str | None = None
+        self._timer: asyncio.TimerHandle | None = None
+        if deadline_at_ms is not None:
+            remaining = max(0.0, (int(deadline_at_ms) - time.time() * 1000) / 1000)
+            self._timer = asyncio.get_running_loop().call_later(
+                remaining,
+                self.set,
+                deadline_code,
+            )
+
+    @property
+    def reason_code(self) -> str | None:
+        if self._parent is not None and self._parent.is_set():
+            return str(
+                getattr(self._parent, "reason_code", None) or "request_canceled"
+            )
+        return self._reason_code
+
+    def is_set(self) -> bool:
+        return self._event.is_set() or bool(
+            self._parent is not None and self._parent.is_set()
+        )
+
+    def set(self, reason_code: str = "request_canceled") -> None:
+        if self._event.is_set():
+            return
+        self._reason_code = str(reason_code or "request_canceled")
+        self._event.set()
+
+    async def wait(self) -> bool:
+        if self.is_set():
+            return True
+        local_waiter = asyncio.create_task(self._event.wait())
+        if self._parent is None:
+            return await local_waiter
+        parent_waiter = asyncio.create_task(self._parent.wait())
+        try:
+            await asyncio.wait(
+                {local_waiter, parent_waiter},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            return True
+        finally:
+            for waiter in (local_waiter, parent_waiter):
+                if not waiter.done():
+                    waiter.cancel()
+            await asyncio.gather(
+                local_waiter,
+                parent_waiter,
+                return_exceptions=True,
+            )
+
+    def close(self) -> None:
+        if self._timer is not None:
+            self._timer.cancel()
+            self._timer = None
+
+
 def is_canceled(signal: CancellationSignal | None) -> bool:
     return bool(signal is not None and signal.is_set())
+
+
+def stop_reason(signal: CancellationSignal | None) -> str:
+    return str(getattr(signal, "reason_code", None) or "request_canceled")
+
+
+def raise_if_stopped(signal: CancellationSignal | None) -> None:
+    if is_canceled(signal):
+        raise _stop_exception(signal)
+
+
+def _stop_exception(signal: CancellationSignal | None) -> AgentCoreError:
+    reason = stop_reason(signal)
+    if reason.endswith("_deadline_exceeded"):
+        return ExecutionDeadlineExceeded(
+            "execution deadline was exceeded",
+            code=reason,
+        )
+    return OperationCanceled("agent run was canceled")
 
 
 async def cancel_and_wait(task: asyncio.Future) -> None:
@@ -66,7 +162,7 @@ async def await_with_cancellation(
             return await operation
         if signal.is_set():
             await cancel_and_wait(operation)
-            raise OperationCanceled("agent run was canceled")
+            raise _stop_exception(signal)
 
         cancel_waiter = asyncio.create_task(signal.wait())
         done, _ = await asyncio.wait(
@@ -80,7 +176,7 @@ async def await_with_cancellation(
         if signal.is_set():
             if not completion_wins_after_cancel:
                 await cancel_and_wait(operation)
-                raise OperationCanceled("agent run was canceled")
+                raise _stop_exception(signal)
             operation.cancel()
             try:
                 # Receipt-returning persistence adapters may suppress task
@@ -89,7 +185,7 @@ async def await_with_cancellation(
                 # would invite a duplicate retry for an already-applied write.
                 return await operation
             except asyncio.CancelledError:
-                raise OperationCanceled("agent run was canceled") from None
+                raise _stop_exception(signal) from None
         return await operation
     except asyncio.CancelledError:
         if completion_wins_after_cancel:
@@ -104,7 +200,11 @@ async def await_with_cancellation(
 
 
 __all__ = [
+    "ExecutionDeadlineExceeded",
+    "ExecutionStopSignal",
     "OperationCanceled",
     "await_with_cancellation",
     "is_canceled",
+    "raise_if_stopped",
+    "stop_reason",
 ]

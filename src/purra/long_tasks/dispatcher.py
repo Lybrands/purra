@@ -7,6 +7,7 @@ The host owns durable task identity and the executors for each recipe step.
 from __future__ import annotations
 
 import asyncio
+import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -16,6 +17,7 @@ from purra.contracts import AgentRunRequest, ExecutionRecipe, ExecutionPlan
 from purra.events import AgentEvent, CoreEventType
 from purra.json_values import freeze_json_mapping, thaw_json_mapping
 from purra.long_tasks.contracts import (
+    LongTaskBudgetLimits,
     LongTaskCreateCommand,
     LongTaskRecord,
     LongTaskRunRelation,
@@ -53,6 +55,10 @@ class DurableTaskDescriptor:
     idempotency_key: str
     message: str | None = None
     failed_resume_attempts: int = 0
+    deadline_at_ms: int | None = None
+    budget_limits: LongTaskBudgetLimits = field(
+        default_factory=LongTaskBudgetLimits
+    )
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -71,6 +77,13 @@ class DurableTaskDescriptor:
                 "durable failed resume attempts",
             ),
         )
+        if self.deadline_at_ms is not None:
+            deadline = int(self.deadline_at_ms)
+            if deadline <= 0:
+                raise ValueError("durable task deadline_at_ms must be positive")
+            object.__setattr__(self, "deadline_at_ms", deadline)
+        if not isinstance(self.budget_limits, LongTaskBudgetLimits):
+            raise TypeError("durable task budget_limits must be LongTaskBudgetLimits")
         object.__setattr__(self, "metadata", freeze_json_mapping(self.metadata))
 
 
@@ -166,6 +179,8 @@ class RecipeLongTaskDispatcher:
         lease_duration_ms: int = 300_000,
         retry_backoff_ms: tuple[int, ...] = (),
         idle_poll_ms: int = 100,
+        task_timeout_ms: int | None = 86_400_000,
+        clock_ms: Callable[[], int] | None = None,
     ) -> None:
         self._long_tasks = long_task_repository
         self._descriptors = descriptor_resolver
@@ -179,6 +194,12 @@ class RecipeLongTaskDispatcher:
             max(0, int(value)) for value in retry_backoff_ms
         )
         self._idle_poll_ms = max(1, int(idle_poll_ms))
+        if task_timeout_ms is not None and int(task_timeout_ms) <= 0:
+            raise ValueError("durable task timeout must be positive")
+        self._task_timeout_ms = (
+            None if task_timeout_ms is None else int(task_timeout_ms)
+        )
+        self._clock_ms = clock_ms or (lambda: int(time.time() * 1000))
 
     async def dispatch(
         self,
@@ -324,6 +345,8 @@ class RecipeLongTaskDispatcher:
         if active is not None:
             if active.metadata.get("idempotencyKey") != descriptor.idempotency_key:
                 raise RuntimeError("durable_task_scope_conflict")
+            if active.budget_limits != descriptor.budget_limits:
+                raise RuntimeError("durable_task_scope_conflict")
             _require_same_recipe(active, recipe)
             return active
         recent = await self._long_tasks.list_for_owner(
@@ -340,6 +363,8 @@ class RecipeLongTaskDispatcher:
             and task.status in {LongTaskStatus.COMPLETED, LongTaskStatus.FAILED}
         ), None)
         if reusable is not None:
+            if reusable.budget_limits != descriptor.budget_limits:
+                raise RuntimeError("durable_task_scope_conflict")
             _require_same_recipe(reusable, recipe)
         return reusable
 
@@ -392,6 +417,16 @@ class RecipeLongTaskDispatcher:
                 created_by_run_id=run_id,
                 units=units,
                 max_parallelism=recipe.max_parallelism,
+                deadline_at_ms=(
+                    descriptor.deadline_at_ms
+                    if descriptor.deadline_at_ms is not None
+                    else (
+                        None
+                        if self._task_timeout_ms is None
+                        else self._clock_ms() + self._task_timeout_ms
+                    )
+                ),
+                budget_limits=descriptor.budget_limits,
                 metadata=metadata,
             ),
         )
@@ -431,6 +466,7 @@ class _RecipeUnitRunner:
                 task.id,
                 unit.id,
                 worker_id=self._worker_id,
+                lease_epoch=unit.lease_epoch,
                 run_id=run_id,
             )
             if (

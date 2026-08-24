@@ -12,6 +12,7 @@ from purra.output.contracts import (
     OutputSource,
     OutputStreamSpec,
     OutputVisibility,
+    PROVIDER_DELTA_BATCH_SCHEMA,
     PublicFact,
     PublicFactBundle,
     PublicPresentationMode,
@@ -22,6 +23,7 @@ from purra.output.contracts import (
     TERMINAL_STREAM_ABORT_CAUSE,
     TERMINAL_STREAM_ABORT_ERROR_CODE,
     ToolOutputEvent,
+    provider_delta_batch_digest,
 )
 from purra.output.ports import (
     AgentOutputPolicy,
@@ -33,6 +35,7 @@ from purra.output.ports import (
 )
 _LAZY_EXPORT_MODULES = {
     "AgentOutputProcessor": "processor",
+    "OutputBatchLimits": "processor",
     "OutputRecoveryObserver": "processor",
     "AgentResponseTransaction": "response_transaction",
     "ResponseTransactionValidationError": "response_transaction",
@@ -66,12 +69,14 @@ __all__ = [
     "DelegationOutputEvent",
     "DomainEffectOutput",
     "OutputChannel",
+    "OutputBatchLimits",
     "OutputCommitMode",
     "OutputEventKind",
     "OutputRecoveryObserver",
     "OutputSource",
     "OutputStreamSpec",
     "OutputVisibility",
+    "PROVIDER_DELTA_BATCH_SCHEMA",
     "PublicFact",
     "PublicFactBundle",
     "PublicPresentationMode",
@@ -83,5 +88,6 @@ __all__ = [
     "TERMINAL_STREAM_ABORT_CAUSE",
     "TERMINAL_STREAM_ABORT_ERROR_CODE",
     "ToolOutputEvent",
+    "provider_delta_batch_digest",
     "ValidatedResultCommitter",
 ]

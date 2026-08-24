@@ -1,6 +1,57 @@
 # Changelog
 
-## purra 0.1.0-alpha.0 - 2026-08-25
+## 0.3.0 - 2026-08-25
+
+### TypeScript/npm
+
+- Added absolute Run, invocation, and Long Task deadlines with bounded
+  cancellation and reason-specific failure codes.
+- Added repository-authoritative attempt, input, output, reasoning, output-byte,
+  and output-event budgets. Missing Provider usage fails closed when a finite
+  token budget is configured.
+- Added atomic `RunRepository.appendBatch()`, bounded Provider-delta
+  coalescing, and incremental stream limits before accumulation.
+- Added lease epochs, renewal heartbeats, and stale-writer fencing to every
+  claimed Long Task mutation.
+- Added strict full-document Planner JSON parsing and Agent Preset snapshot
+  schema version 3.
+
+#### Breaking changes
+
+- `RunBudgetOptions.maxTotalTokens` is replaced by `maxInputTokens`,
+  `maxOutputTokens`, and `maxReasoningTokens`; `RunUsage.knownTokens` is
+  replaced by separate counters plus `unreportedUsageAttempts`.
+- `LongTaskCreateCommand.deadlineAt` and `LongTaskRecord.deadlineAt` are
+  replaced by epoch-millisecond `deadlineAtMs`; Long Task budgets now use
+  `LongTaskBudgetLimits`.
+- Host `RunRepository` adapters must implement atomic `appendBatch()`.
+- Agent Preset snapshot schema version 2 is not resumable.
+
+### Python
+
+- Added canonical attempt reservation and usage settlement before Provider
+  calls, persisted Run and Long Task budgets, and fail-closed handling of
+  missing usage.
+- Added absolute Run, invocation, and Long Task deadlines with bounded
+  cancellation and stable failure attribution.
+- Added Long Task lease epochs, renewal heartbeats, same-worker ABA fencing,
+  deadline expiry, and budget-aware claim authority.
+- Added atomic output batch append, bounded Provider-delta coalescing,
+  incremental stream limits, and snapshot/wire protocol version 3.
+- Planner and control-plane JSON now require one complete strict document;
+  surrounding prose, duplicate keys, and non-finite numbers are rejected.
+
+#### Breaking changes
+
+- Host Run repositories must persist `RunCreateParams.runtime_limits` and
+  `deadline_at_ms`, and implement idempotent `reserve_model_attempt()` and
+  `settle_model_attempt()`.
+- Host output repositories must implement atomic `append_batch()`.
+- Every claimed Long Task mutation requires `lease_epoch`; repositories must
+  also implement `renew_unit_lease()` and `expire_deadline()`.
+- Agent Preset snapshot schema version 2 is not resumable.
+
+## npm purra 0.1.0-alpha.0 - 2026-08-25
 
 - Added the TypeScript-native Reactive, Planned, Durable, Artifact, delegation,
   observability, evaluation, and public adapter-conformance capabilities.

@@ -34,34 +34,41 @@ export interface RunRequest {
 
 export interface RunBudgetOptions {
   readonly maxModelAttempts?: number | null;
-  readonly maxTotalTokens?: number | null;
+  readonly maxInputTokens?: number | null;
+  readonly maxOutputTokens?: number | null;
+  readonly maxReasoningTokens?: number | null;
   readonly maxOutputBytes?: number | null;
   readonly maxOutputEvents?: number | null;
 }
 
 export interface RunBudgets {
   readonly maxModelAttempts: number | null;
-  readonly maxTotalTokens: number | null;
+  readonly maxInputTokens: number | null;
+  readonly maxOutputTokens: number | null;
+  readonly maxReasoningTokens: number | null;
   readonly maxOutputBytes: number | null;
   readonly maxOutputEvents: number | null;
 }
 
 export interface RunUsage {
   readonly modelAttempts: number;
-  readonly knownTokens: number;
+  readonly unreportedUsageAttempts: number;
+  readonly inputTokens: number;
+  readonly outputTokens: number;
+  readonly reasoningTokens: number;
   readonly outputBytes: number;
   readonly outputEvents: number;
 }
 
 export interface RunOptions {
   readonly signal?: AbortSignal;
-  readonly deadlineAt?: string;
+  readonly deadlineAt?: string | null;
   readonly budgets?: RunBudgetOptions;
   readonly durableContinuation?: DurableContinuation;
 }
 
 export interface AgentPresetSnapshot {
-  readonly schemaVersion: 2;
+  readonly schemaVersion: 3;
   readonly presetId: string;
   readonly presetRevision: string;
   readonly promptFingerprint: string;

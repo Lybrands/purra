@@ -145,12 +145,12 @@ export async function assertLongTaskRepositoryConforms(repository: LongTaskRepos
       executor: "probe",
       planStepId: "step-1",
     }]),
-    deadlineAt: null,
+    deadlineAtMs: null,
     budgets: Object.freeze({
-      maxModelAttempts: 1,
-      maxTotalTokens: null,
-      maxOutputBytes: 1_000,
-      maxOutputEvents: 10,
+      maxInvocationAttempts: 1,
+      maxInputTokens: null,
+      maxOutputTokens: null,
+      maxReasoningTokens: null,
     }),
   });
   const created = await repository.create(taskId, command);

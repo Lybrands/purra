@@ -18,6 +18,7 @@ from purra.cancellation import (
     OperationCanceled,
     await_with_cancellation,
     is_canceled as _is_canceled,
+    stop_reason,
 )
 from purra.context_budget import (
     context_budget_contract_error as _context_budget_contract_error,
@@ -207,6 +208,8 @@ class AgentRuntime:
             model_gateway,
             output_observer=output_observer,
             operation_controller=operation_controller,
+            invocation_timeout_ms=limits.provider_invocation_timeout_ms,
+            runtime_limits=limits,
         )
         self._tool_execution_gateway = tool_execution_gateway
         self._observer = observer
@@ -239,6 +242,7 @@ class AgentRuntime:
         tools_executable: bool = True,
         planning_hook: RuntimePlanningHook | None = None,
         tool_context_contracts: Mapping[str, ToolContextContract] | None = None,
+        tool_argument_limits: Mapping[str, int] | None = None,
         stage_context_projection_enabled: bool = False,
         signal: CancellationSignal | None = None,
     ) -> AsyncIterator[RuntimeUpdate]:
@@ -266,6 +270,7 @@ class AgentRuntime:
             force_tool_choice=force_tool_choice,
             require_tool_call=require_tool_call,
             tool_context_contracts=tool_context_contracts,
+            tool_argument_limits=tool_argument_limits,
         )
         budget_error = _context_budget_contract_error(
             request,
@@ -307,12 +312,17 @@ class AgentRuntime:
                 )
                 return
             if _is_canceled(signal):
+                reason = stop_reason(signal)
                 yield _runtime_result(
                     run_id,
-                    RuntimeOutcome.CANCELED,
+                    (
+                        RuntimeOutcome.FAILED
+                        if reason.endswith("_deadline_exceeded")
+                        else RuntimeOutcome.CANCELED
+                    ),
                     loop.used_model,
                     round_index,
-                    error_code="request_canceled",
+                    error_code=reason,
                 )
                 return
 
@@ -1062,7 +1072,13 @@ class AgentRuntime:
                         or loop.judges
                     ),
                 ),
-                loop.invocation_context,
+                replace(
+                    loop.invocation_context,
+                    attempt_source_key=(
+                        f"runtime:{loop.invocation_context.run_id}:"
+                        f"round:{loop.round_number}:request:{request_fingerprint}"
+                    ),
+                ),
                 signal,
             )
             parameters = stream.receipt.call_parameters[0]
@@ -1167,6 +1183,16 @@ class AgentRuntime:
                 )
             )
         if stream_error is not None:
+            deadline_code = str(getattr(stream_error, "code", "") or "")
+            if deadline_code.endswith("_deadline_exceeded"):
+                loop.terminal_result = _runtime_result(
+                    run_id,
+                    RuntimeOutcome.FAILED,
+                    loop.used_model,
+                    loop.round_number,
+                    error_code=deadline_code,
+                )
+                return
             failure = resolve_provider_failure(
                 stream_error,
                 phase=ProviderFailurePhase.STREAMING,
@@ -1646,6 +1672,7 @@ class AgentRuntime:
         force_tool_choice: bool,
         require_tool_call: bool | None,
         tool_context_contracts: Mapping[str, ToolContextContract] | None,
+        tool_argument_limits: Mapping[str, int] | None,
     ) -> _RuntimeLoopState:
         messages = list(request.messages)
         validators = tuple(response_validators)
@@ -1688,6 +1715,7 @@ class AgentRuntime:
             invocation_context=ModelInvocationContext(
                 run_id=str(run_id or f"runtime-{uuid4().hex}"),
                 turn_id=turn_id,
+                tool_argument_limits=tool_argument_limits or {},
             ),
             execution_state=execution_state or ExecutionState(),
             evidence_store=evidence_store,

@@ -9,7 +9,7 @@ from typing import Any
 from purra.contracts import AgentDelegation, ExecutionPlan, RunId, RunStatus
 from purra.events import AgentEvent
 from purra.json_values import freeze_json_mapping
-from purra.normalization import required_text
+from purra.normalization import optional_positive_int, required_text
 
 
 @dataclass(frozen=True, slots=True)
@@ -19,6 +19,7 @@ class RunRecoverySnapshot:
     run_id: RunId
     status: RunStatus
     execution_plan: ExecutionPlan | None
+    deadline_at_ms: int | None = None
     agent_preset_snapshot: Mapping[str, Any] = field(default_factory=dict)
     events: tuple[AgentEvent, ...] = ()
     delegations: tuple[AgentDelegation, ...] = ()
@@ -32,6 +33,11 @@ class RunRecoverySnapshot:
             required_text(self.run_id, "run recovery snapshot run id"),
         )
         object.__setattr__(self, "status", RunStatus(self.status))
+        object.__setattr__(
+            self,
+            "deadline_at_ms",
+            optional_positive_int(self.deadline_at_ms, "Run deadline_at_ms"),
+        )
         if self.execution_plan is not None and not isinstance(
             self.execution_plan,
             ExecutionPlan,

@@ -90,13 +90,26 @@ class LongTaskRepository(Protocol):
         lease_duration_ms: int,
     ) -> LongTaskUnitRecord | None: ...
 
+    async def expire_deadline(self, task_id: str) -> LongTaskRecord: ...
+
     async def bind_unit_run(
         self,
         task_id: str,
         unit_id: str,
         *,
         worker_id: str,
+        lease_epoch: int,
         run_id: str,
+    ) -> LongTaskUnitRecord: ...
+
+    async def renew_unit_lease(
+        self,
+        task_id: str,
+        unit_id: str,
+        *,
+        worker_id: str,
+        lease_epoch: int,
+        lease_duration_ms: int,
     ) -> LongTaskUnitRecord: ...
 
     async def update_unit_progress(
@@ -105,6 +118,7 @@ class LongTaskRepository(Protocol):
         unit_id: str,
         *,
         worker_id: str,
+        lease_epoch: int,
         metadata: Mapping[str, Any],
     ) -> LongTaskUnitRecord: ...
 
@@ -114,6 +128,7 @@ class LongTaskRepository(Protocol):
         unit_id: str,
         *,
         worker_id: str,
+        lease_epoch: int,
         result: LongTaskUnitResult,
     ) -> LongTaskRecord: ...
 
@@ -123,6 +138,7 @@ class LongTaskRepository(Protocol):
         unit_id: str,
         *,
         worker_id: str,
+        lease_epoch: int,
         decision: FailureDecision,
     ) -> LongTaskRecord: ...
 
@@ -132,6 +148,7 @@ class LongTaskRepository(Protocol):
         unit_id: str,
         *,
         worker_id: str,
+        lease_epoch: int,
         split: LongTaskSplitResult,
         decision: FailureDecision,
     ) -> LongTaskRecord: ...
@@ -142,6 +159,7 @@ class LongTaskRepository(Protocol):
         unit_id: str,
         *,
         worker_id: str,
+        lease_epoch: int,
         reason_code: str,
     ) -> LongTaskRecord: ...
 

@@ -1,4 +1,88 @@
 {
+  "protocolVersion": 3,
+  "agentPresetSnapshotVersion": 3,
+  "stableErrorCodes": {
+    "invocationDeadline": "model_invocation_deadline_exceeded",
+    "runDeadline": "run_deadline_exceeded",
+    "taskDeadline": "long_task_deadline_exceeded",
+    "leaseLost": "long_task_unit_lease_lost",
+    "budgetExceeded": "runtime_budget_exceeded",
+    "streamLimit": "model_stream_limit_exceeded"
+  },
+  "budgetCases": [
+    {
+      "name": "attempt equality blocks the next claim",
+      "usage": {
+        "invocationCount": 2,
+        "unreportedUsageAttempts": 0,
+        "inputTokens": 0,
+        "outputTokens": 0,
+        "reasoningTokens": 0
+      },
+      "limits": {
+        "maxInvocationAttempts": 2,
+        "maxInputTokens": null,
+        "maxOutputTokens": null,
+        "maxReasoningTokens": null
+      },
+      "inclusive": true,
+      "budgetKind": "model_attempts"
+    },
+    {
+      "name": "authoritative input usage may cross its maximum",
+      "usage": {
+        "invocationCount": 1,
+        "unreportedUsageAttempts": 0,
+        "inputTokens": 6,
+        "outputTokens": 1,
+        "reasoningTokens": 0
+      },
+      "limits": {
+        "maxInvocationAttempts": null,
+        "maxInputTokens": 5,
+        "maxOutputTokens": null,
+        "maxReasoningTokens": null
+      },
+      "inclusive": false,
+      "budgetKind": "input_tokens"
+    },
+    {
+      "name": "missing usage cannot prove a finite token budget",
+      "usage": {
+        "invocationCount": 1,
+        "unreportedUsageAttempts": 1,
+        "inputTokens": 0,
+        "outputTokens": 0,
+        "reasoningTokens": 0
+      },
+      "limits": {
+        "maxInvocationAttempts": null,
+        "maxInputTokens": 5,
+        "maxOutputTokens": null,
+        "maxReasoningTokens": null
+      },
+      "inclusive": false,
+      "budgetKind": "provider_usage_unreported"
+    }
+  ],
+  "providerDeltaBatch": {
+    "schemaVersion": "purra.provider-delta-batch/v1",
+    "entries": [
+      {
+        "sourceChunkIndex": 1,
+        "sourcePartIndex": 0,
+        "kind": "provider.content_delta",
+        "payload": { "delta": "甲" }
+      },
+      {
+        "sourceChunkIndex": 2,
+        "sourcePartIndex": 0,
+        "kind": "provider.content_delta",
+        "payload": { "delta": "乙" }
+      }
+    ],
+    "payloadDigest": "c3caa2d82e1f99afe2fad9aa4b7938c26840d8a4b17ccdce25fb773aa02c0f31"
+  },
   "leaseExpiryCases": [
     {
       "name": "before expiry remains owned",

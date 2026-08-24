@@ -751,7 +751,7 @@ async def test_native_delegation_uses_model_defined_isolated_agent():
     assert not hasattr(delegations[0], "child_run_id")
     assert all(event.run_id == handle.run_id for event in events)
     started_snapshot = events[0].payload["agentPreset"]
-    assert started_snapshot["snapshotVersion"] == 2
+    assert started_snapshot["snapshotVersion"] == 3
     assert started_snapshot["composition"]["delegation"]["enabled"] is True
     assert [
         tool["name"] for tool in started_snapshot["composition"]["tools"]

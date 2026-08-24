@@ -21,7 +21,7 @@ from purra.model_protocol import (
     InvocationOutputLimit,
     resolve_invocation_output_limit,
 )
-from purra.normalization import optional_text, required_text
+from purra.normalization import optional_positive_int, optional_text, required_text
 from purra.output.contracts import AgentOutputIntent, OutputCommitMode
 
 
@@ -29,10 +29,39 @@ from purra.output.contracts import AgentOutputIntent, OutputCommitMode
 class ModelInvocationContext:
     run_id: RunId
     turn_id: str | None = None
+    deadline_at_ms: int | None = None
+    deadline_code: str = "run_deadline_exceeded"
+    attempt_source_key: str | None = None
+    tool_argument_limits: Mapping[str, int] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "run_id", required_text(self.run_id, "run id"))
         object.__setattr__(self, "turn_id", optional_text(self.turn_id))
+        object.__setattr__(
+            self,
+            "attempt_source_key",
+            optional_text(self.attempt_source_key),
+        )
+        object.__setattr__(
+            self,
+            "deadline_at_ms",
+            optional_positive_int(
+                self.deadline_at_ms,
+                "model invocation parent deadline_at_ms",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "deadline_code",
+            required_text(self.deadline_code, "model invocation parent deadline code"),
+        )
+        limits = {
+            required_text(name, "tool argument limit name"): int(limit)
+            for name, limit in self.tool_argument_limits.items()
+        }
+        if any(limit <= 0 for limit in limits.values()):
+            raise ValueError("tool argument limits must be positive")
+        object.__setattr__(self, "tool_argument_limits", freeze_json_mapping(limits))
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,6 +122,7 @@ class ModelInvocationReceipt:
     output_limit: InvocationOutputLimit
     input_fingerprint: str
     tool_schema_fingerprint: str
+    budget_key: str | None = None
     context_evidence: tuple[ContextEvidenceReceipt, ...] = field(
         default_factory=tuple
     )
@@ -133,6 +163,7 @@ class ModelInvocationReceipt:
                 "model tool schema fingerprint",
             ),
         )
+        object.__setattr__(self, "budget_key", optional_text(self.budget_key))
         evidence = tuple(self.context_evidence)
         if not all(isinstance(item, ContextEvidenceReceipt) for item in evidence):
             raise TypeError(
@@ -157,6 +188,7 @@ class ModelInvocationReceipt:
             "outputLimit": self.output_limit.to_mapping(),
             "inputFingerprint": self.input_fingerprint,
             "toolSchemaFingerprint": self.tool_schema_fingerprint,
+            "budgetKey": self.budget_key or self.invocation_id,
             "contextEvidence": [
                 item.to_mapping() for item in self.context_evidence
             ],

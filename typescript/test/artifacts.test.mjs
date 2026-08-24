@@ -314,12 +314,12 @@ test("Artifact finalization never completes its owner Long Task", async () => {
       executor: "fixture",
       planStepId: "step-1",
     }],
-    deadlineAt: null,
+    deadlineAtMs: null,
     budgets: {
-      maxModelAttempts: 2,
-      maxTotalTokens: 100,
-      maxOutputBytes: 1_000,
-      maxOutputEvents: 100,
+      maxInvocationAttempts: 2,
+      maxInputTokens: 100,
+      maxOutputTokens: 100,
+      maxReasoningTokens: 100,
     },
   });
   await longTasks.start("task-owner");

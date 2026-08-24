@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
 from purra.contracts import (
+    ModelTokenUsage,
     RunCreateParams,
     ExecutionPlan,
     RunId,
@@ -30,6 +31,28 @@ class RunBeginResult:
         if self.event.run_id != run_id:
             raise ValueError("run begin event must be bound to the created run")
         object.__setattr__(self, "run_id", run_id)
+
+
+@dataclass(frozen=True, slots=True)
+class RunBudgetSnapshot:
+    model_attempts: int
+    unreported_usage_attempts: int
+    input_tokens: int
+    output_tokens: int
+    reasoning_tokens: int
+
+    def __post_init__(self) -> None:
+        for name in (
+            "model_attempts",
+            "unreported_usage_attempts",
+            "input_tokens",
+            "output_tokens",
+            "reasoning_tokens",
+        ):
+            value = int(getattr(self, name))
+            if value < 0:
+                raise ValueError("Run budget counters must be non-negative")
+            object.__setattr__(self, name, value)
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,3 +190,16 @@ class RunRepository(Protocol):
         ...
 
     async def append_trace(self, run_id: RunId, trace: TraceRecord) -> None: ...
+
+    async def reserve_model_attempt(
+        self,
+        run_id: RunId,
+        invocation_id: str,
+    ) -> RunBudgetSnapshot: ...
+
+    async def settle_model_attempt(
+        self,
+        run_id: RunId,
+        invocation_id: str,
+        usage: ModelTokenUsage | None,
+    ) -> RunBudgetSnapshot: ...

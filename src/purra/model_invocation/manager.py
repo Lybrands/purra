@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass
 from hashlib import sha256
 import json
+import time
 from typing import Protocol
 from uuid import uuid4
 
-from purra.cancellation import await_with_cancellation
+from purra.cancellation import (
+    ExecutionStopSignal,
+    await_with_cancellation,
+    raise_if_stopped,
+)
 from purra.contracts import (
     AgentMessage,
     ModelCompletion,
@@ -16,6 +22,7 @@ from purra.contracts import (
     ModelInvocation,
     ModelStreamChunk,
     ToolCallDelta,
+    RuntimeLimits,
 )
 from purra.errors import ContractViolationError, ModelGatewayError
 from purra.evidence import context_evidence_receipts
@@ -41,6 +48,7 @@ from purra.output.contracts import (
     OutputStreamSpec,
 )
 from purra.ports import CancellationSignal, ModelGateway
+from purra.ports import RunRepository
 from purra.stream_ownership import OwnedAsyncIterator
 
 
@@ -101,12 +109,28 @@ class AgentModelInvocationManager:
         *,
         output_observer: ModelInvocationOutputObserver | None = None,
         operation_controller: AgentOperationController | None = None,
+        invocation_timeout_ms: int | None = 120_000,
+        runtime_limits: RuntimeLimits = RuntimeLimits(),
+        max_tool_argument_chars: int = 1_000_000,
+        budget_repository: RunRepository | None = None,
     ) -> None:
         if not isinstance(gateway, ModelGateway):
             raise TypeError("model invocation manager requires a ModelGateway")
         self._gateway = gateway
         self._output = output_observer or _NullOutputObserver()
         self._operations = operation_controller
+        if invocation_timeout_ms is not None and int(invocation_timeout_ms) <= 0:
+            raise ValueError("model invocation timeout must be positive")
+        self._invocation_timeout_ms = (
+            None if invocation_timeout_ms is None else int(invocation_timeout_ms)
+        )
+        if not isinstance(runtime_limits, RuntimeLimits):
+            raise TypeError("model invocation runtime_limits must be RuntimeLimits")
+        self._limits = runtime_limits
+        if int(max_tool_argument_chars) <= 0:
+            raise ValueError("model stream tool argument limit must be positive")
+        self._max_tool_argument_chars = int(max_tool_argument_chars)
+        self._budget_repository = budget_repository
 
     async def stream(
         self,
@@ -123,31 +147,49 @@ class AgentModelInvocationManager:
         if on_attempt is not None:
             await on_attempt(receipt.call_parameters[0])
         operation_id = await self._start_operation(receipt)
+        invocation_signal = self._invocation_signal(context, signal)
         stream_opened = False
+        attempt_reserved = False
         try:
+            await self._reserve_attempt(receipt)
+            attempt_reserved = True
             await self._output.open_model_stream(receipt, spec)
             stream_opened = True
             stream = await await_with_cancellation(
-                self._gateway.stream(messages, invocation, signal),
-                signal,
+                self._gateway.stream(messages, invocation, invocation_signal),
+                invocation_signal,
             )
+            raise_if_stopped(invocation_signal)
         except BaseException as error:
+            selected_error = error
             try:
+                if attempt_reserved:
+                    try:
+                        await self._settle_attempt(receipt, None)
+                    except BaseException as budget_error:
+                        selected_error = budget_error
                 if stream_opened:
                     await self._output.abort_model_stream(
                         receipt.output_stream_id,
-                        _error_code(error),
+                        _error_code(selected_error),
                     )
             finally:
-                await self._fail_operation(operation_id, error)
+                await self._fail_operation(operation_id, selected_error)
+                invocation_signal.close()
+            if selected_error is not error:
+                raise selected_error from error
             raise
+        meter = self._stream_meter(context)
         return ManagedInvocationStream(
             chunks=OwnedAsyncIterator(
                 self._observe_chunks(
                     stream.chunks,
                     receipt,
-                    signal,
+                    invocation_signal,
                     operation_id,
+                    meter,
+                    receipt,
+                    invocation_signal.close,
                 ),
                 stream.chunks,
                 terminal_predicate=lambda chunk: chunk.finish_reason is not None,
@@ -178,16 +220,23 @@ class AgentModelInvocationManager:
         if on_attempt is not None:
             await on_attempt(receipt.call_parameters[0])
         operation_id = await self._start_operation(receipt)
+        invocation_signal = self._invocation_signal(context, signal)
         stream_opened = False
         output_settled = False
         operation_settled = False
+        attempt_reserved = False
+        attempt_settled = False
+        meter = self._stream_meter(context)
         try:
+            await self._reserve_attempt(receipt)
+            attempt_reserved = True
             await self._output.open_model_stream(receipt, spec)
             stream_opened = True
             completion = await await_with_cancellation(
-                self._gateway.complete(messages, invocation, signal),
-                signal,
+                self._gateway.complete(messages, invocation, invocation_signal),
+                invocation_signal,
             )
+            raise_if_stopped(invocation_signal)
             reason = completion.finish_reason
             if reason is None:
                 raise ModelGatewayError(
@@ -210,8 +259,11 @@ class AgentModelInvocationManager:
                     code="unexpected_model_tool_calls",
                     retryable=False,
                 )
+            attempt_settled = True
+            await self._settle_attempt(receipt, completion.usage)
             completion_chunk = _completion_chunk(completion)
             if completion_chunk is not None:
+                meter.accept(completion_chunk)
                 await self._output.accept_provider_chunk(
                     receipt.output_stream_id,
                     completion_chunk,
@@ -228,16 +280,27 @@ class AgentModelInvocationManager:
                 receipt=receipt,
             )
         except BaseException as error:
+            selected_error = error
             try:
+                if attempt_reserved and not attempt_settled:
+                    attempt_settled = True
+                    try:
+                        await self._settle_attempt(receipt, None)
+                    except BaseException as budget_error:
+                        selected_error = budget_error
                 if stream_opened and not output_settled:
                     await self._output.abort_model_stream(
                         receipt.output_stream_id,
-                        _error_code(error),
+                        _error_code(selected_error),
                     )
             finally:
                 if not operation_settled:
-                    await self._fail_operation(operation_id, error)
+                    await self._fail_operation(operation_id, selected_error)
+            if selected_error is not error:
+                raise selected_error from error
             raise
+        finally:
+            invocation_signal.close()
 
     @staticmethod
     def _validate_call(
@@ -295,6 +358,7 @@ class AgentModelInvocationManager:
                 }
                 for tool in invocation.tools
             ]),
+            budget_key=context.attempt_source_key,
             context_evidence=context_evidence_receipts(messages),
             call_parameters=(parameters,),
         )
@@ -307,29 +371,98 @@ class AgentModelInvocationManager:
             commit_mode=call.commit_mode,
         )
 
+    def _invocation_signal(
+        self,
+        context: ModelInvocationContext,
+        parent: CancellationSignal | None,
+    ) -> ExecutionStopSignal:
+        timeout_deadline = (
+            None
+            if self._invocation_timeout_ms is None
+            else int(time.time() * 1000) + self._invocation_timeout_ms
+        )
+        deadlines = tuple(
+            candidate
+            for candidate in (
+                (
+                    context.deadline_at_ms,
+                    context.deadline_code,
+                ),
+                (timeout_deadline, "model_invocation_deadline_exceeded"),
+            )
+            if candidate[0] is not None
+        )
+        deadline, code = min(deadlines, key=lambda item: item[0]) if deadlines else (
+            None,
+            "model_invocation_deadline_exceeded",
+        )
+        return ExecutionStopSignal(
+            parent,
+            deadline_at_ms=deadline,
+            deadline_code=code,
+        )
+
+    def _stream_meter(self, context: ModelInvocationContext) -> "_StreamMeter":
+        return _StreamMeter(
+            max_chunks=self._limits.max_stream_chunks,
+            max_content_chars=self._limits.max_stream_content_chars,
+            max_reasoning_chars=self._limits.max_stream_reasoning_chars,
+            max_tool_argument_chars=self._max_tool_argument_chars,
+            tool_argument_limits=context.tool_argument_limits,
+        )
+
+    async def _reserve_attempt(self, receipt: ModelInvocationReceipt) -> None:
+        if self._budget_repository is not None:
+            await self._budget_repository.reserve_model_attempt(
+                receipt.run_id,
+                receipt.budget_key or receipt.invocation_id,
+            )
+
+    async def _settle_attempt(
+        self,
+        receipt: ModelInvocationReceipt,
+        usage,
+    ) -> None:
+        if self._budget_repository is not None:
+            await self._budget_repository.settle_model_attempt(
+                receipt.run_id,
+                receipt.budget_key or receipt.invocation_id,
+                usage,
+            )
+
     async def _observe_chunks(
         self,
         chunks: AsyncIterator[ModelStreamChunk],
         receipt: ModelInvocationReceipt,
         signal: CancellationSignal | None,
         operation_id: str | None,
+        meter: "_StreamMeter",
+        budget_receipt: ModelInvocationReceipt,
+        close_signal: Callable[[], None],
     ) -> AsyncIterator[ModelStreamChunk]:
         finish_reason: ModelFinishReason | None = None
         tool_indices: set[int] = set()
         output_settled = False
         operation_settled = False
+        attempt_settled = False
+        usage = None
         try:
             while True:
                 try:
                     chunk = await await_with_cancellation(anext(chunks), signal)
                 except StopAsyncIteration:
                     break
+                raise_if_stopped(signal)
+                meter.accept(chunk)
+                usage = chunk.usage or usage
                 tool_indices.update(delta.index for delta in chunk.tool_call_deltas)
                 await self._output.accept_provider_chunk(
                     receipt.output_stream_id,
                     chunk,
                 )
                 if chunk.finish_reason is not None:
+                    attempt_settled = True
+                    await self._settle_attempt(budget_receipt, usage)
                     finish_reason = chunk.finish_reason
                     termination = classify_model_termination(
                         finish_reason,
@@ -363,32 +496,63 @@ class AgentModelInvocationManager:
                     retryable=True,
                 )
         except BaseException as error:
+            selected_error = error
             try:
+                if not attempt_settled:
+                    attempt_settled = True
+                    try:
+                        await self._settle_attempt(budget_receipt, usage)
+                    except BaseException as budget_error:
+                        selected_error = budget_error
                 if not output_settled:
                     await self._output.abort_model_stream(
                         receipt.output_stream_id,
-                        _error_code(error),
+                        _error_code(selected_error),
                     )
                     output_settled = True
             finally:
                 if not operation_settled:
-                    await self._fail_operation(operation_id, error)
+                    await self._fail_operation(operation_id, selected_error)
                     operation_settled = True
+            if selected_error is not error:
+                raise selected_error from error
             raise
         finally:
-            await _close_async_iterator(chunks)
+            consumer_error: BaseException | None = None
             try:
-                if not output_settled:
-                    await self._output.abort_model_stream(
-                        receipt.output_stream_id,
-                        "invocation_consumer_closed",
-                    )
+                if not attempt_settled:
+                    attempt_settled = True
+                    try:
+                        await self._settle_attempt(budget_receipt, usage)
+                    except BaseException as error:
+                        consumer_error = error
+                await _close_async_iterator(chunks)
+                try:
+                    if not output_settled:
+                        await self._output.abort_model_stream(
+                            receipt.output_stream_id,
+                            (
+                                _error_code(consumer_error)
+                                if consumer_error is not None
+                                else "invocation_consumer_closed"
+                            ),
+                        )
+                finally:
+                    if not operation_settled:
+                        if consumer_error is None:
+                            await self._cancel_operation(
+                                operation_id,
+                                "invocation_consumer_closed",
+                            )
+                        else:
+                            await self._fail_operation(
+                                operation_id,
+                                consumer_error,
+                            )
             finally:
-                if not operation_settled:
-                    await self._cancel_operation(
-                        operation_id,
-                        "invocation_consumer_closed",
-                    )
+                close_signal()
+            if consumer_error is not None:
+                raise consumer_error
 
     async def _start_operation(
         self,
@@ -503,6 +667,61 @@ async def _close_async_iterator(iterator: object) -> None:
     close = getattr(iterator, "aclose", None)
     if callable(close):
         await close()
+
+
+@dataclass(slots=True)
+class _ToolStreamSize:
+    name: str = ""
+    argument_chars: int = 0
+
+
+class _StreamMeter:
+    def __init__(
+        self,
+        *,
+        max_chunks: int,
+        max_content_chars: int,
+        max_reasoning_chars: int,
+        max_tool_argument_chars: int,
+        tool_argument_limits: Mapping[str, int],
+    ) -> None:
+        self._max_chunks = max_chunks
+        self._max_content = max_content_chars
+        self._max_reasoning = max_reasoning_chars
+        self._max_tool = max_tool_argument_chars
+        self._tool_limits = dict(tool_argument_limits)
+        self._chunks = 0
+        self._content = 0
+        self._reasoning = 0
+        self._tools: dict[int, _ToolStreamSize] = {}
+
+    def accept(self, chunk: ModelStreamChunk) -> None:
+        self._chunks += 1
+        self._content += len(chunk.content_delta)
+        self._reasoning += len(chunk.reasoning_delta)
+        self._require_within(self._chunks, self._max_chunks, "chunk_count")
+        self._require_within(self._content, self._max_content, "content_chars")
+        self._require_within(
+            self._reasoning,
+            self._max_reasoning,
+            "reasoning_chars",
+        )
+        for delta in chunk.tool_call_deltas:
+            current = self._tools.setdefault(delta.index, _ToolStreamSize())
+            if delta.name is not None:
+                current.name = str(delta.name).strip()
+            current.argument_chars += len(str(delta.arguments_fragment or ""))
+            limit = self._tool_limits.get(current.name, self._max_tool)
+            self._require_within(current.argument_chars, limit, "tool_argument_chars")
+
+    @staticmethod
+    def _require_within(value: int, limit: int, kind: str) -> None:
+        if value > limit:
+            raise ModelGatewayError(
+                f"model stream exceeded the {kind} limit ({limit})",
+                code="model_stream_limit_exceeded",
+                retryable=False,
+            )
 
 
 __all__ = ["AgentModelInvocationManager", "ModelInvocationOutputObserver"]

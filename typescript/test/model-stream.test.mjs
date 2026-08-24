@@ -184,6 +184,38 @@ test("Agent stops waiting for a completion gateway when canceled", async () => {
   await assert.rejects(running, AgentCanceledError);
 });
 
+test("Agent enforces one invocation deadline for a never-returning gateway", async () => {
+  const agent = new Agent({
+    model: { invoke: () => new Promise(() => {}) },
+    runtimeLimits: { invocationTimeoutMs: 100 },
+  });
+
+  await assert.rejects(
+    agent.invoke({ messages: [{ role: "user", content: "Wait" }] }),
+    (error) => error instanceof AgentError
+      && error.code === "model_invocation_deadline_exceeded",
+  );
+});
+
+test("Agent rejects the first oversized stream fragment before materializing it", async () => {
+  const agent = new Agent({
+    model: {
+      async invoke() { throw new Error("stream should be used"); },
+      async *stream() {
+        yield { contentDelta: "ab" };
+        yield { contentDelta: "cd", finishReason: "stop" };
+      },
+    },
+    runtimeLimits: { maxContentChars: 3 },
+  });
+
+  await assert.rejects(
+    agent.invoke({ messages: [{ role: "user", content: "Oversize" }] }),
+    (error) => error instanceof AgentError
+      && error.code === "model_stream_limit_exceeded",
+  );
+});
+
 test("Agent rejects malformed streamed tool calls before execution", async () => {
   let executions = 0;
   const agent = new Agent({

@@ -22,6 +22,9 @@ export type OutputEventKind =
   | "invocation.failed"
   | "invocation.aborted"
   | "model.delta"
+  | "provider.delta_batch"
+  | "model.usage"
+  | "model.finish"
   | "model.completed"
   | "reasoning.delta"
   | "commentary"
@@ -65,4 +68,10 @@ export interface OutputEventQuery {
   readonly afterSequence?: number;
   readonly visibility?: "public" | "all";
   readonly signal?: AbortSignal;
+}
+
+export interface OutputBatchLimits {
+  readonly maxPayloadBytes: number;
+  readonly maxFragments: number;
+  readonly maxLatencyMs: number;
 }

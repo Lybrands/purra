@@ -10,6 +10,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
+import hashlib
 import json
 import re
 from typing import Any
@@ -71,6 +72,7 @@ class OutputEventKind(StrEnum):
     PROVIDER_CONTENT_DELTA = "provider.content_delta"
     PROVIDER_REASONING_DELTA = "provider.reasoning_delta"
     PROVIDER_TOOL_CALL_DELTA = "provider.tool_call_delta"
+    PROVIDER_DELTA_BATCH = "provider.delta_batch"
     PROVIDER_USAGE = "provider.usage"
     STREAM_COMMITTED = "stream.committed"
     STREAM_ABORTED = "stream.aborted"
@@ -86,6 +88,7 @@ class OutputEventKind(StrEnum):
 
 TERMINAL_STREAM_ABORT_ERROR_CODE = "run_terminalized"
 TERMINAL_STREAM_ABORT_CAUSE = "run_terminal_commit"
+PROVIDER_DELTA_BATCH_SCHEMA = "purra.provider-delta-batch/v1"
 
 
 class ResponseTransactionMode(StrEnum):
@@ -325,6 +328,15 @@ class AgentOutputEventDraft:
         visibility = OutputVisibility(self.visibility)
         _require_aware(self.occurred_at, "occurred_at")
         payload = freeze_json_mapping(self.payload)
+        _validate_provider_delta_batch(
+            source=source,
+            kind=kind,
+            channel=channel,
+            visibility=visibility,
+            payload=payload,
+            output_stream_id=self.output_stream_id,
+            invocation_id=self.invocation_id,
+        )
         _validate_public_text(
             source=source,
             kind=kind,
@@ -409,6 +421,15 @@ class AgentOutputEvent:
         _require_aware(self.occurred_at, "occurred_at")
         _require_aware(self.emitted_at, "emitted_at")
         payload = freeze_json_mapping(self.payload)
+        _validate_provider_delta_batch(
+            source=source,
+            kind=kind,
+            channel=channel,
+            visibility=visibility,
+            payload=payload,
+            output_stream_id=self.output_stream_id,
+            invocation_id=self.invocation_id,
+        )
         _validate_public_text(
             source=source,
             kind=kind,
@@ -571,6 +592,73 @@ class DelegationOutputEvent:
         _require_aware(self.occurred_at, "occurred_at")
 
 
+_PROVIDER_DELTA_KINDS = frozenset({
+    OutputEventKind.PROVIDER_CONTENT_DELTA,
+    OutputEventKind.PROVIDER_REASONING_DELTA,
+    OutputEventKind.PROVIDER_TOOL_CALL_DELTA,
+})
+
+
+def provider_delta_batch_digest(entries: Sequence[Mapping[str, Any]]) -> str:
+    encoded = json.dumps(
+        [thaw_json_value(entry) for entry in entries],
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _validate_provider_delta_batch(
+    *,
+    source: OutputSource,
+    kind: OutputEventKind,
+    channel: OutputChannel,
+    visibility: OutputVisibility,
+    payload: FrozenDict,
+    output_stream_id: str | None,
+    invocation_id: str | None,
+) -> None:
+    if kind is not OutputEventKind.PROVIDER_DELTA_BATCH:
+        return
+    if source is not OutputSource.PROVIDER or not output_stream_id or not invocation_id:
+        raise ValueError("Provider delta batch requires Provider stream identity")
+    if payload.get("schemaVersion") != PROVIDER_DELTA_BATCH_SCHEMA:
+        raise ValueError("unsupported Provider delta batch schema")
+    entries = payload.get("entries")
+    if (
+        not isinstance(entries, Sequence)
+        or isinstance(entries, (str, bytes, bytearray))
+        or not entries
+    ):
+        raise ValueError("Provider delta batch entries are required")
+    indices = []
+    for entry in entries:
+        if not isinstance(entry, FrozenDict):
+            raise ValueError("Provider delta batch entry must be an object")
+        index = positive_int(entry.get("sourceChunkIndex"), "source chunk index")
+        entry_kind = OutputEventKind(entry.get("kind"))
+        if entry_kind not in _PROVIDER_DELTA_KINDS:
+            raise ValueError("Provider delta batch contains a non-delta event")
+        entry_payload = entry.get("payload")
+        if not isinstance(entry_payload, FrozenDict):
+            raise ValueError("Provider delta batch entry payload must be an object")
+        if visibility is OutputVisibility.PUBLIC and (
+            channel not in _TEXT_CHANNELS
+            or entry_kind is not OutputEventKind.PROVIDER_CONTENT_DELTA
+            or not isinstance(entry_payload.get("delta"), str)
+        ):
+            raise ValueError("public Provider batch may contain only text deltas")
+        indices.append(index)
+    if payload.get("sourceChunkStart") != min(indices):
+        raise ValueError("Provider delta batch start index does not match entries")
+    if payload.get("sourceChunkEnd") != max(indices):
+        raise ValueError("Provider delta batch end index does not match entries")
+    if payload.get("payloadDigest") != provider_delta_batch_digest(entries):
+        raise ValueError("Provider delta batch digest does not match entries")
+
+
 def _validate_public_text(
     *,
     source: OutputSource,
@@ -585,18 +673,27 @@ def _validate_public_text(
         visibility is not OutputVisibility.PUBLIC
         or channel not in _TEXT_CHANNELS
         or (
-            kind is not OutputEventKind.PROVIDER_CONTENT_DELTA
+            kind not in {
+                OutputEventKind.PROVIDER_CONTENT_DELTA,
+                OutputEventKind.PROVIDER_DELTA_BATCH,
+            }
             and "delta" not in payload
         )
     ):
         return
     if source is not OutputSource.PROVIDER:
         raise ValueError("public text requires provider source")
-    if kind is not OutputEventKind.PROVIDER_CONTENT_DELTA:
+    if kind not in {
+        OutputEventKind.PROVIDER_CONTENT_DELTA,
+        OutputEventKind.PROVIDER_DELTA_BATCH,
+    }:
         raise ValueError("public text requires provider content delta")
     if not output_stream_id or not invocation_id:
         raise ValueError("public text requires stream and invocation ids")
-    if not isinstance(payload.get("delta"), str):
+    if (
+        kind is OutputEventKind.PROVIDER_CONTENT_DELTA
+        and not isinstance(payload.get("delta"), str)
+    ):
         raise ValueError("public text requires a string delta")
 
 

@@ -176,7 +176,9 @@ const durableReceipt: LongTaskDispatchReceipt = await durableDispatcher.dispatch
   deadlineAt: null,
   budgets: {
     maxModelAttempts: 2,
-    maxTotalTokens: 100,
+    maxInputTokens: 100,
+    maxOutputTokens: 100,
+    maxReasoningTokens: 100,
     maxOutputBytes: 1_000,
     maxOutputEvents: 100,
   },

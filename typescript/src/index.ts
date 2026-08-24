@@ -305,6 +305,7 @@ export type {
   ExecutionRecipe,
   ExecutionRecipeStep,
   LongTaskCheckpoint,
+  LongTaskBudgetLimits,
   LongTaskClaim,
   LongTaskCreateCommand,
   LongTaskDispatchReceipt,
@@ -328,6 +329,7 @@ export type {
 } from "./durable/types.js";
 export { InMemoryOutputPublisher } from "./output/publisher.js";
 export type {
+  OutputBatchLimits,
   OutputChannel,
   OutputEvent,
   OutputEventDraft,

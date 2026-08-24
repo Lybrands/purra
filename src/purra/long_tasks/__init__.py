@@ -1,6 +1,7 @@
 """Durable, multi-Run task execution primitives."""
 
 from purra.long_tasks.contracts import (
+    LongTaskBudgetLimits,
     LongTaskCreateCommand,
     LongTaskRecord,
     LongTaskRunBinding,
@@ -31,6 +32,7 @@ __all__ = [
     "DurableUnitExecutionContext",
     "DurableUnitExecutor",
     "LongTaskCoordinator",
+    "LongTaskBudgetLimits",
     "LongTaskCreateCommand",
     "LongTaskRecord",
     "LongTaskRunBinding",

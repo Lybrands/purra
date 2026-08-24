@@ -36,8 +36,10 @@ from purra.artifacts.maintenance import (
     ArtifactMaintenanceSnapshot,
 )
 from purra.artifacts.ownership import ArtifactOwnerRef
+from purra.errors import ContractViolationError
 from purra.json_values import thaw_json_mapping
 from purra.long_tasks.contracts import (
+    LongTaskBudgetLimits,
     LongTaskCreateCommand,
     LongTaskRecord,
     LongTaskRunBinding,
@@ -626,6 +628,8 @@ class InMemoryLongTaskRepository:
                 completed_units=0,
                 failed_units=0,
                 max_parallelism=command.max_parallelism,
+                deadline_at_ms=command.deadline_at_ms,
+                budget_limits=command.budget_limits,
                 metadata=command.metadata,
                 create_time=timestamp,
                 update_time=timestamp,
@@ -748,6 +752,10 @@ class InMemoryLongTaskRepository:
                 state.record,
                 usage=self._aggregate_usage(state.usage_by_run.values()),
             )
+            budget_kind = self._task_budget_exhaustion(state, exceeded_only=True)
+            if budget_kind is not None:
+                self._fail_budget(state, budget_kind)
+                return state.record
             self._touch(state)
             return state.record
 
@@ -759,6 +767,9 @@ class InMemoryLongTaskRepository:
     ) -> LongTaskRecord:
         async with self._lock:
             state = self._require_state(task_id)
+            if self._deadline_elapsed(state):
+                self._expire_deadline(state)
+                return state.record
             if state.record.cancellation_requested_at_ms is not None:
                 self._cancel(state)
                 return state.record
@@ -783,6 +794,13 @@ class InMemoryLongTaskRepository:
             raise ValueError("long task lease duration must be positive")
         async with self._lock:
             state = self._require_state(task_id)
+            if self._deadline_elapsed(state):
+                self._expire_deadline(state)
+                return None
+            budget_kind = self._task_budget_exhaustion(state)
+            if budget_kind is not None:
+                self._fail_budget(state, budget_kind)
+                return None
             if (
                 state.record.status is not LongTaskStatus.RUNNING
                 or state.record.cancellation_requested_at_ms is not None
@@ -847,7 +865,9 @@ class InMemoryLongTaskRepository:
                     status=LongTaskUnitStatus.CLAIMED,
                     attempt=unit.attempt + 1,
                     worker_id=worker,
+                    lease_epoch=unit.lease_epoch + 1,
                     lease_expires_at_ms=now + duration,
+                    settled_by_worker_id=None,
                     run_id=None,
                 )
                 state.units[unit.id] = claimed
@@ -855,19 +875,32 @@ class InMemoryLongTaskRepository:
                 return claimed
             return None
 
+    async def expire_deadline(self, task_id: str) -> LongTaskRecord:
+        async with self._lock:
+            state = self._require_state(task_id)
+            if state.record.status.terminal:
+                return state.record
+            if not self._deadline_elapsed(state):
+                raise ContractViolationError(
+                    "long task deadline has not elapsed",
+                    code="long_task_deadline_not_elapsed",
+                )
+            self._expire_deadline(state)
+            return state.record
+
     async def bind_unit_run(
         self,
         task_id: str,
         unit_id: str,
         *,
         worker_id: str,
+        lease_epoch: int,
         run_id: str,
     ) -> LongTaskUnitRecord:
         async with self._lock:
             state = self._require_state(task_id)
             unit = self._require_unit(state, unit_id)
-            self._require_worker(unit, worker_id)
-            self._require_active_unit(unit)
+            self._require_unit_claim(state, unit, worker_id, lease_epoch)
             normalized_run = _required(run_id, "long task unit Run id")
             history = list(thaw_json_mapping(unit.metadata).get("runHistory") or ())
             if not any(item.get("runId") == normalized_run for item in history):
@@ -884,19 +917,43 @@ class InMemoryLongTaskRepository:
             self._touch(state)
             return bound
 
+    async def renew_unit_lease(
+        self,
+        task_id: str,
+        unit_id: str,
+        *,
+        worker_id: str,
+        lease_epoch: int,
+        lease_duration_ms: int,
+    ) -> LongTaskUnitRecord:
+        duration = int(lease_duration_ms)
+        if duration <= 0:
+            raise ValueError("long task lease duration must be positive")
+        async with self._lock:
+            state = self._require_state(task_id)
+            unit = self._require_unit(state, unit_id)
+            self._require_unit_claim(state, unit, worker_id, lease_epoch)
+            renewed = replace(
+                unit,
+                lease_expires_at_ms=self._clock_ms() + duration,
+            )
+            state.units[unit.id] = renewed
+            self._touch(state)
+            return renewed
+
     async def update_unit_progress(
         self,
         task_id: str,
         unit_id: str,
         *,
         worker_id: str,
+        lease_epoch: int,
         metadata: Mapping[str, object],
     ) -> LongTaskUnitRecord:
         async with self._lock:
             state = self._require_state(task_id)
             unit = self._require_unit(state, unit_id)
-            self._require_worker(unit, worker_id)
-            self._require_active_unit(unit)
+            self._require_unit_claim(state, unit, worker_id, lease_epoch)
             updated = replace(
                 unit,
                 metadata={**thaw_json_mapping(unit.metadata), **dict(metadata)},
@@ -911,23 +968,28 @@ class InMemoryLongTaskRepository:
         unit_id: str,
         *,
         worker_id: str,
+        lease_epoch: int,
         result: LongTaskUnitResult,
     ) -> LongTaskRecord:
         async with self._lock:
             state = self._require_state(task_id)
             unit = self._require_unit(state, unit_id)
             if unit.status is LongTaskUnitStatus.COMPLETED:
-                if self._matches_result(unit, result):
+                if (
+                    unit.lease_epoch == int(lease_epoch)
+                    and unit.settled_by_worker_id
+                    == _required(worker_id, "long task worker id")
+                    and self._matches_result(unit, result)
+                ):
                     return state.record
-                raise ValueError("long task unit completion conflicts")
-            self._require_running(state)
-            self._require_worker(unit, worker_id)
-            self._require_active_unit(unit)
+                self._raise_lease_lost(unit)
+            self._require_unit_claim(state, unit, worker_id, lease_epoch)
             state.units[unit.id] = replace(
                 unit,
                 status=LongTaskUnitStatus.COMPLETED,
                 worker_id=None,
                 lease_expires_at_ms=None,
+                settled_by_worker_id=_required(worker_id, "long task worker id"),
                 run_id=result.run_id or unit.run_id,
                 output_ref=result.output_ref,
                 artifact_digest=result.artifact_digest,
@@ -949,6 +1011,7 @@ class InMemoryLongTaskRepository:
         unit_id: str,
         *,
         worker_id: str,
+        lease_epoch: int,
         decision: FailureDecision,
     ) -> LongTaskRecord:
         if not isinstance(decision, FailureDecision):
@@ -956,8 +1019,7 @@ class InMemoryLongTaskRepository:
         async with self._lock:
             state = self._require_state(task_id)
             unit = self._require_unit(state, unit_id)
-            self._require_worker(unit, worker_id)
-            self._require_active_unit(unit)
+            self._require_unit_claim(state, unit, worker_id, lease_epoch)
             targets = {
                 FailureDisposition.RETRY_ATTEMPT: LongTaskUnitStatus.WAITING_RETRY,
                 FailureDisposition.RESUME_CHECKPOINT: LongTaskUnitStatus.WAITING_RETRY,
@@ -1001,6 +1063,7 @@ class InMemoryLongTaskRepository:
         unit_id: str,
         *,
         worker_id: str,
+        lease_epoch: int,
         split: LongTaskSplitResult,
         decision: FailureDecision,
     ) -> LongTaskRecord:
@@ -1012,9 +1075,14 @@ class InMemoryLongTaskRepository:
             state = self._require_state(task_id)
             parent = self._require_unit(state, unit_id)
             if parent.status is LongTaskUnitStatus.EXPANDED:
-                return state.record
-            self._require_worker(parent, worker_id)
-            self._require_active_unit(parent)
+                if (
+                    parent.lease_epoch == int(lease_epoch)
+                    and parent.settled_by_worker_id
+                    == _required(worker_id, "long task worker id")
+                ):
+                    return state.record
+                self._raise_lease_lost(parent)
+            self._require_unit_claim(state, parent, worker_id, lease_epoch)
             ids = set(state.units)
             keys = {unit.semantic_key for unit in state.units.values()}
             positions = {unit.position for unit in state.units.values()}
@@ -1067,6 +1135,7 @@ class InMemoryLongTaskRepository:
                 required=False,
                 worker_id=None,
                 lease_expires_at_ms=None,
+                settled_by_worker_id=_required(worker_id, "long task worker id"),
                 error_code=decision.code,
                 disposition=decision.disposition,
                 failure=self._failure_payload(decision),
@@ -1081,13 +1150,13 @@ class InMemoryLongTaskRepository:
         unit_id: str,
         *,
         worker_id: str,
+        lease_epoch: int,
         reason_code: str,
     ) -> LongTaskRecord:
         async with self._lock:
             state = self._require_state(task_id)
             unit = self._require_unit(state, unit_id)
-            self._require_worker(unit, worker_id)
-            self._require_active_unit(unit)
+            self._require_unit_claim(state, unit, worker_id, lease_epoch)
             state.units[unit.id] = replace(
                 unit,
                 status=LongTaskUnitStatus.PENDING,
@@ -1204,6 +1273,9 @@ class InMemoryLongTaskRepository:
     async def finalize_if_complete(self, task_id: str) -> LongTaskRecord:
         async with self._lock:
             state = self._require_state(task_id)
+            if self._deadline_elapsed(state):
+                self._expire_deadline(state)
+                return state.record
             if state.record.cancellation_requested_at_ms is not None:
                 self._cancel(state)
                 return state.record
@@ -1255,18 +1327,41 @@ class InMemoryLongTaskRepository:
         except KeyError as error:
             raise LookupError("long task unit does not exist") from error
 
-    @staticmethod
-    def _require_worker(unit: LongTaskUnitRecord, worker_id: str) -> None:
-        if unit.worker_id != _required(worker_id, "long task worker id"):
-            raise ValueError("long task unit worker conflicts")
+    def _require_unit_claim(
+        self,
+        state: _LongTaskState,
+        unit: LongTaskUnitRecord,
+        worker_id: str,
+        lease_epoch: int,
+    ) -> None:
+        if self._deadline_elapsed(state):
+            self._expire_deadline(state)
+            raise ContractViolationError(
+                "long task deadline was exceeded",
+                code="long_task_deadline_exceeded",
+                details={"taskId": state.record.id},
+            )
+        worker = _required(worker_id, "long task worker id")
+        if (
+            state.record.status is not LongTaskStatus.RUNNING
+            or unit.status not in {
+                LongTaskUnitStatus.CLAIMED,
+                LongTaskUnitStatus.RUNNING,
+            }
+            or unit.worker_id != worker
+            or unit.lease_epoch != int(lease_epoch)
+            or unit.lease_expires_at_ms is None
+            or unit.lease_expires_at_ms <= self._clock_ms()
+        ):
+            self._raise_lease_lost(unit)
 
     @staticmethod
-    def _require_active_unit(unit: LongTaskUnitRecord) -> None:
-        if unit.status not in {
-            LongTaskUnitStatus.CLAIMED,
-            LongTaskUnitStatus.RUNNING,
-        }:
-            raise ValueError("long task unit is not active")
+    def _raise_lease_lost(unit: LongTaskUnitRecord) -> None:
+        raise ContractViolationError(
+            "long task unit lease authority was lost",
+            code="long_task_unit_lease_lost",
+            details={"taskId": unit.task_id, "unitId": unit.id},
+        )
 
     @staticmethod
     def _require_running(state: _LongTaskState) -> None:
@@ -1327,6 +1422,9 @@ class InMemoryLongTaskRepository:
         values = tuple(values)
         return LongTaskUsage(
             invocation_count=sum(value.invocation_count for value in values),
+            unreported_usage_attempts=sum(
+                value.unreported_usage_attempts for value in values
+            ),
             input_tokens=sum(value.input_tokens for value in values),
             output_tokens=sum(value.output_tokens for value in values),
             reasoning_tokens=(
@@ -1477,6 +1575,8 @@ class InMemoryLongTaskRepository:
             and record.owner_id == command.owner_id
             and record.created_by_run_id == command.created_by_run_id
             and record.max_parallelism == command.max_parallelism
+            and record.deadline_at_ms == command.deadline_at_ms
+            and record.budget_limits == command.budget_limits
             and thaw_json_mapping(record.metadata)
             == thaw_json_mapping(command.metadata)
             and len(units) == len(specs)
@@ -1502,6 +1602,71 @@ class InMemoryLongTaskRepository:
             }).static_order())
         except CycleError as error:
             raise ValueError("long task dependencies contain a cycle") from error
+
+    def _deadline_elapsed(self, state: _LongTaskState) -> bool:
+        deadline = state.record.deadline_at_ms
+        return deadline is not None and deadline <= self._clock_ms()
+
+    def _expire_deadline(self, state: _LongTaskState) -> None:
+        for unit_id, unit in tuple(state.units.items()):
+            if not unit.status.terminal:
+                state.units[unit_id] = replace(
+                    unit,
+                    status=LongTaskUnitStatus.FAILED,
+                    worker_id=None,
+                    lease_expires_at_ms=None,
+                    error_code="long_task_deadline_exceeded",
+                )
+        self._refresh_totals(state)
+        self._set_status(state, LongTaskStatus.FAILED)
+
+    @staticmethod
+    def _task_budget_exhaustion(
+        state: _LongTaskState,
+        *,
+        exceeded_only: bool = False,
+    ) -> str | None:
+        usage = state.record.usage
+        limits: LongTaskBudgetLimits = state.record.budget_limits
+        if usage.unreported_usage_attempts and any(
+            limit is not None
+            for limit in (
+                limits.max_input_tokens,
+                limits.max_output_tokens,
+                limits.max_reasoning_tokens,
+            )
+        ):
+            return "provider_usage_unreported"
+        if limits.max_reasoning_tokens is not None and usage.reasoning_tokens is None:
+            return "reasoning_tokens_unreported"
+        for kind, value, limit in (
+            ("model_attempts", usage.invocation_count, limits.max_invocation_attempts),
+            ("input_tokens", usage.input_tokens, limits.max_input_tokens),
+            ("output_tokens", usage.output_tokens, limits.max_output_tokens),
+            ("reasoning_tokens", usage.reasoning_tokens, limits.max_reasoning_tokens),
+        ):
+            if limit is not None and value is not None and (
+                value > limit or (not exceeded_only and value >= limit)
+            ):
+                return kind
+        return None
+
+    def _fail_budget(self, state: _LongTaskState, budget_kind: str) -> None:
+        for unit_id, unit in tuple(state.units.items()):
+            if not unit.status.terminal:
+                state.units[unit_id] = replace(
+                    unit,
+                    status=LongTaskUnitStatus.FAILED,
+                    worker_id=None,
+                    lease_expires_at_ms=None,
+                    error_code="runtime_budget_exceeded",
+                    metadata={
+                        **thaw_json_mapping(unit.metadata),
+                        "budgetKind": budget_kind,
+                    },
+                )
+        self._refresh_totals(state)
+        self._set_status(state, LongTaskStatus.FAILED)
 
 
 class InMemoryDurableAdapters:

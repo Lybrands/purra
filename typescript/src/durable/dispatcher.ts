@@ -124,8 +124,10 @@ export class RecipeLongTaskDispatcher implements LongTaskDispatcher {
         ...(admission.executionRecipe.maxParallelism === undefined
           ? {}
           : { maxParallelism: admission.executionRecipe.maxParallelism }),
-        deadlineAt: input.deadlineAt,
-        budgets: input.budgets,
+        deadlineAtMs: descriptor.deadlineAtMs === undefined
+          ? deadlineMs(input.deadlineAt)
+          : descriptor.deadlineAtMs,
+        budgets: descriptor.budgets ?? taskBudgets(input.budgets),
         metadata: Object.freeze({
           ...(descriptor.metadata ?? {}),
           recipeFingerprint,
@@ -142,6 +144,19 @@ export class RecipeLongTaskDispatcher implements LongTaskDispatcher {
         throw new AgentError(
           "durable_idempotency_conflict",
           "Existing durable task belongs to a different authority",
+        );
+      }
+      const expectedDeadline = descriptor.deadlineAtMs === undefined
+        ? deadlineMs(input.deadlineAt)
+        : descriptor.deadlineAtMs;
+      const expectedBudgets = descriptor.budgets ?? taskBudgets(input.budgets);
+      if (
+        task.deadlineAtMs !== expectedDeadline
+        || JSON.stringify(task.budgets) !== JSON.stringify(expectedBudgets)
+      ) {
+        throw new AgentError(
+          "durable_idempotency_conflict",
+          "Existing durable task uses different deadline or budget authority",
         );
       }
       await this.#repository.bindRun(task.id, input.runId, "continuation");
@@ -234,13 +249,19 @@ export class RecipeLongTaskDispatcher implements LongTaskDispatcher {
     const executor = this.#executors.require(unit.executor);
     let heartbeatFailure: unknown;
     let heartbeatPending: Promise<void> = Promise.resolve();
+    const executionController = new AbortController();
+    const forwardCancellation = () => executionController.abort(signal?.reason);
+    signal?.addEventListener("abort", forwardCancellation, { once: true });
+    if (signal?.aborted === true) forwardCancellation();
     const heartbeatMs = Math.max(1, Math.floor(this.#leaseDurationMs / 3));
     const timer = globalThis.setInterval(() => {
       heartbeatPending = heartbeatPending.then(async () => {
+        if (heartbeatFailure !== undefined) return;
         try {
           await this.#repository.heartbeat(claim, this.#leaseDurationMs);
         } catch (error) {
           heartbeatFailure = error;
+          executionController.abort(error);
         }
       });
     }, heartbeatMs);
@@ -249,7 +270,7 @@ export class RecipeLongTaskDispatcher implements LongTaskDispatcher {
         task,
         unit,
         dependencyOutputs,
-        ...(signal === undefined ? {} : { signal }),
+        signal: executionController.signal,
         checkpoint: async (payload: JsonValue) => {
           const checkpoint = await this.#repository.appendCheckpoint(claim, payload);
           await observer?.(Object.freeze({
@@ -267,7 +288,10 @@ export class RecipeLongTaskDispatcher implements LongTaskDispatcher {
           this.#repository.recordUsage(claim, usage).then(() => undefined)
         ),
       });
-      const result = await abortable(Promise.resolve(executor.execute(context)), signal);
+      const result = await abortable(
+        Promise.resolve(executor.execute(context)),
+        executionController.signal,
+      );
       await heartbeatPending;
       if (heartbeatFailure !== undefined) throw heartbeatFailure;
       await this.#repository.completeUnit(
@@ -276,6 +300,8 @@ export class RecipeLongTaskDispatcher implements LongTaskDispatcher {
         `${task.id}:${unit.id}:${unit.attempt}:${requiredText(result.outputRef, "durable outputRef")}`,
       );
     } catch (error) {
+      if (heartbeatFailure !== undefined) return;
+      if (error instanceof AgentError && error.code === "runtime_budget_exceeded") return;
       if (error instanceof AgentCanceledError || signal?.aborted === true) {
         await this.#repository.pause(task.id);
         return;
@@ -291,6 +317,7 @@ export class RecipeLongTaskDispatcher implements LongTaskDispatcher {
     } finally {
       globalThis.clearInterval(timer);
       await heartbeatPending;
+      signal?.removeEventListener("abort", forwardCancellation);
     }
   }
 
@@ -366,6 +393,24 @@ function errorCode(error: unknown): string {
     if (typeof code === "string" && code.trim() !== "") return code.trim().slice(0, 128);
   }
   return "durable_unit_failed";
+}
+
+function taskBudgets(value: import("../run/types.js").RunBudgets): import("./types.js").LongTaskBudgetLimits {
+  return Object.freeze({
+    maxInvocationAttempts: value.maxModelAttempts,
+    maxInputTokens: value.maxInputTokens,
+    maxOutputTokens: value.maxOutputTokens,
+    maxReasoningTokens: value.maxReasoningTokens,
+  });
+}
+
+function deadlineMs(value: string | null): number | null {
+  if (value === null) return null;
+  const milliseconds = Date.parse(value);
+  if (!Number.isFinite(milliseconds) || milliseconds <= 0) {
+    throw new TypeError("Durable deadline must be an ISO date-time");
+  }
+  return milliseconds;
 }
 
 async function abortable<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {

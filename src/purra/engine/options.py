@@ -15,6 +15,7 @@ from purra.contracts import (
 )
 from purra.normalization import (
     optional_non_negative_int,
+    optional_positive_int,
     positive_int,
 )
 from purra.model_protocol import InvocationOutputLimit
@@ -78,6 +79,7 @@ class AgentCoreRunOptions:
     committed_result_facts_provider: CommittedResultFactsProvider | None = None
     durable_continuation: DurableTaskContinuation | None = None
     agent_preset_snapshot: AgentPresetSnapshot | None = None
+    deadline_at_ms: int | None = None
 
     def __post_init__(self) -> None:
         claims = tuple(self.context_claims)
@@ -175,6 +177,11 @@ class AgentCoreRunOptions:
             raise TypeError(
                 "agent preset snapshot must be an AgentPresetSnapshot"
             )
+        object.__setattr__(
+            self,
+            "deadline_at_ms",
+            optional_positive_int(self.deadline_at_ms, "Run deadline_at_ms"),
+        )
         if (
             self.durable_continuation is not None
             and self.agent_preset_snapshot is not None
@@ -187,6 +194,15 @@ class AgentCoreRunOptions:
                 raise ValueError(
                     "durable continuation must reuse the source AgentPreset snapshot"
                 )
+        if (
+            self.durable_continuation is not None
+            and self.deadline_at_ms is not None
+            and self.deadline_at_ms
+            != self.durable_continuation.source.deadline_at_ms
+        ):
+            raise ValueError(
+                "durable continuation cannot replace the source Run deadline"
+            )
         requires_full_text = bool(
             self.response_constraints.exact_top_level_item_count is not None
             or validators
@@ -260,7 +276,7 @@ async def restore_continuation_preset(
         snapshot = AgentPresetSnapshot.from_mapping(stored)
     except (TypeError, ValueError) as error:
         raise ContractViolationError(
-            "durable continuation requires a complete AgentPreset snapshot version 2",
+            "durable continuation requires a complete AgentPreset snapshot version 3",
             code="agent_preset_snapshot_unsupported",
         ) from error
     if (
@@ -277,5 +293,6 @@ async def restore_continuation_preset(
     return replace(
         options,
         agent_preset_snapshot=snapshot,
+        deadline_at_ms=source.deadline_at_ms,
         durable_continuation=replace(continuation, source=restored),
     )

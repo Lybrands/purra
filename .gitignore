@@ -4,7 +4,7 @@ __pycache__/
 .venv/
 build/
 dist/
-docs/plans/
+docs/
 node_modules/
 typescript/dist/
 typescript/*.tgz

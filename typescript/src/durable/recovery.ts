@@ -83,8 +83,8 @@ export async function validateContinuation(input: {
   if (snapshot?.schemaVersion !== 1) {
     throw new AgentError("durable_recovery_snapshot_unsupported", "Recovery snapshot is unsupported");
   }
-  if (snapshot.preset.schemaVersion !== 2 || input.currentPreset.schemaVersion !== 2) {
-    throw new AgentError("agent_preset_snapshot_unsupported", "Durable continuation requires preset snapshot v2");
+  if (snapshot.preset.schemaVersion !== 3 || input.currentPreset.schemaVersion !== 3) {
+    throw new AgentError("agent_preset_snapshot_unsupported", "Durable continuation requires preset snapshot v3");
   }
   if (canonicalJson(snapshot.preset) !== canonicalJson(input.currentPreset)) {
     throw new AgentError("agent_preset_snapshot_mismatch", "Durable continuation preset does not match");
@@ -115,9 +115,24 @@ export async function validateContinuation(input: {
 }
 
 function remainingBudgets(run: RunSnapshot): RunBudgets {
+  if (
+    run.usage.unreportedUsageAttempts > 0
+    && (
+      run.budgets.maxInputTokens !== null
+      || run.budgets.maxOutputTokens !== null
+      || run.budgets.maxReasoningTokens !== null
+    )
+  ) {
+    throw new AgentError(
+      "runtime_budget_exceeded",
+      "Durable continuation cannot prove remaining token budgets",
+    );
+  }
   return Object.freeze({
     maxModelAttempts: remaining(run.budgets.maxModelAttempts, run.usage.modelAttempts),
-    maxTotalTokens: remaining(run.budgets.maxTotalTokens, run.usage.knownTokens),
+    maxInputTokens: remaining(run.budgets.maxInputTokens, run.usage.inputTokens),
+    maxOutputTokens: remaining(run.budgets.maxOutputTokens, run.usage.outputTokens),
+    maxReasoningTokens: remaining(run.budgets.maxReasoningTokens, run.usage.reasoningTokens),
     maxOutputBytes: remaining(run.budgets.maxOutputBytes, run.usage.outputBytes),
     maxOutputEvents: remaining(run.budgets.maxOutputEvents, run.usage.outputEvents),
   });
@@ -136,7 +151,9 @@ function copyBudgets(value: RunBudgets): RunBudgets {
   if (value === null || typeof value !== "object") throw new TypeError("Recovery budgets are invalid");
   return Object.freeze({
     maxModelAttempts: nullablePositive(value.maxModelAttempts, "maxModelAttempts"),
-    maxTotalTokens: nullablePositive(value.maxTotalTokens, "maxTotalTokens"),
+    maxInputTokens: nullablePositive(value.maxInputTokens, "maxInputTokens"),
+    maxOutputTokens: nullablePositive(value.maxOutputTokens, "maxOutputTokens"),
+    maxReasoningTokens: nullablePositive(value.maxReasoningTokens, "maxReasoningTokens"),
     maxOutputBytes: nullablePositive(value.maxOutputBytes, "maxOutputBytes"),
     maxOutputEvents: nullablePositive(value.maxOutputEvents, "maxOutputEvents"),
   });

@@ -1,6 +1,7 @@
 import type { JsonValue, ModelTokenUsage } from "../model/types.js";
 import { copyJsonValue } from "../model/validation.js";
 import { AgentError } from "../shared/errors.js";
+import { copyLongTaskBudgets } from "./contracts.js";
 import type {
   LongTaskCheckpoint,
   LongTaskClaim,
@@ -24,6 +25,7 @@ interface TaskState {
 
 const ZERO_USAGE: LongTaskUsage = Object.freeze({
   invocationCount: 0,
+  unreportedUsageAttempts: 0,
   inputTokens: 0,
   outputTokens: 0,
   reasoningTokens: 0,
@@ -87,8 +89,8 @@ export class InMemoryLongTaskRepository implements LongTaskRepository {
       completedUnits: 0,
       failedUnits: 0,
       maxParallelism: positiveInteger(command.maxParallelism ?? 1, "long task maxParallelism"),
-      deadlineAt: normalizeDeadline(command.deadlineAt),
-      budgets: copyBudgets(command.budgets),
+      deadlineAtMs: nullablePositive(command.deadlineAtMs, "long task deadlineAtMs"),
+      budgets: copyLongTaskBudgets(command.budgets),
       cancellationRequestedAtMs: null,
       usage: ZERO_USAGE,
       metadata: copyMapping(command.metadata ?? {}),
@@ -170,6 +172,11 @@ export class InMemoryLongTaskRepository implements LongTaskRepository {
     const state = this.#require(taskId);
     if (state.record.status !== "running") return undefined;
     this.#assertDeadline(state);
+    const budgetKind = this.#budgetKind(state, true);
+    if (budgetKind !== undefined) {
+      this.#failBudget(state, budgetKind);
+      return undefined;
+    }
     const now = this.#clockMs();
     const duration = positiveInteger(leaseDurationMs, "lease duration");
     let swept = false;
@@ -266,13 +273,18 @@ export class InMemoryLongTaskRepository implements LongTaskRepository {
 
   public async recordUsage(
     claim: LongTaskClaim,
-    usage: ModelTokenUsage,
+    usage: ModelTokenUsage | null,
   ): Promise<LongTaskUnitRecord> {
     const { state, unit } = this.#requireClaim(claim);
     const delta = normalizeUsage(usage);
     const updated = Object.freeze({ ...unit, usage: addUsage(unit.usage, delta) });
     state.units.set(unit.id, updated);
     state.record = Object.freeze({ ...state.record, usage: addUsage(state.record.usage, delta) });
+    const budgetKind = this.#budgetKind(state, false);
+    if (budgetKind !== undefined) {
+      this.#failBudget(state, budgetKind);
+      throw new AgentError("runtime_budget_exceeded", `Long task ${budgetKind} budget is exhausted`);
+    }
     this.#touch(state);
     return updated;
   }
@@ -313,6 +325,11 @@ export class InMemoryLongTaskRepository implements LongTaskRepository {
       const delta = normalizeUsage(result.usage);
       state.units.set(completed.id, Object.freeze({ ...completed, usage: addUsage(completed.usage, delta) }));
       state.record = Object.freeze({ ...state.record, usage: addUsage(state.record.usage, delta) });
+      const budgetKind = this.#budgetKind(state, false);
+      if (budgetKind !== undefined) {
+        this.#failBudget(state, budgetKind);
+        return state.units.get(completed.id)!;
+      }
     }
     this.#refreshCounts(state);
     return state.units.get(completed.id)!;
@@ -452,16 +469,62 @@ export class InMemoryLongTaskRepository implements LongTaskRepository {
       || unit.claimToken !== claim.claimToken
       || unit.leaseEpoch !== claim.leaseEpoch
     ) {
-      throw new AgentError("stale_long_task_claim", "Long task claim is stale");
+      throw new AgentError("long_task_unit_lease_lost", "Long task claim is stale");
     }
     return { state, unit };
   }
 
   #assertDeadline(state: TaskState): void {
-    if (state.record.deadlineAt !== null && Date.parse(state.record.deadlineAt) <= this.#clockMs()) {
+    if (state.record.deadlineAtMs !== null && state.record.deadlineAtMs <= this.#clockMs()) {
+      for (const [id, unit] of state.units) {
+        if (unit.status !== "completed" && unit.status !== "failed" && unit.status !== "canceled") {
+          state.units.set(id, Object.freeze({
+            ...clearClaim(unit, "failed"),
+            errorCode: "long_task_deadline_exceeded",
+          }));
+        }
+      }
+      this.#refreshCounts(state);
       this.#setStatus(state, "failed");
       throw new AgentError("long_task_deadline_exceeded", "Long task deadline has elapsed");
     }
+  }
+
+  #budgetKind(state: TaskState, inclusive: boolean): string | undefined {
+    const { budgets, usage } = state.record;
+    if (
+      usage.unreportedUsageAttempts > 0
+      && (
+        budgets.maxInputTokens !== null
+        || budgets.maxOutputTokens !== null
+        || budgets.maxReasoningTokens !== null
+      )
+    ) return "provider_usage_unreported";
+    const rows = [
+      ["model_attempts", usage.invocationCount, budgets.maxInvocationAttempts],
+      ["input_tokens", usage.inputTokens, budgets.maxInputTokens],
+      ["output_tokens", usage.outputTokens, budgets.maxOutputTokens],
+      ["reasoning_tokens", usage.reasoningTokens, budgets.maxReasoningTokens],
+    ] as const;
+    return rows.find(([, used, maximum]) => (
+      maximum !== null
+      && used !== null
+      && (used > maximum || (inclusive && used >= maximum))
+    ))?.[0];
+  }
+
+  #failBudget(state: TaskState, budgetKind: string): void {
+    for (const [id, unit] of state.units) {
+      if (unit.status !== "completed" && unit.status !== "failed" && unit.status !== "canceled") {
+        state.units.set(id, Object.freeze({
+          ...clearClaim(unit, "failed"),
+          errorCode: "runtime_budget_exceeded",
+          metadata: copyMapping({ ...unit.metadata, budgetKind }),
+        }));
+      }
+    }
+    this.#refreshCounts(state);
+    this.#setStatus(state, "failed");
   }
 
   #refreshCounts(state: TaskState): void {
@@ -486,7 +549,7 @@ export class InMemoryLongTaskRepository implements LongTaskRepository {
 
 export function claimFromUnit(unit: LongTaskUnitRecord): LongTaskClaim {
   if (unit.workerId === null || unit.claimToken === null) {
-    throw new AgentError("stale_long_task_claim", "Long task unit is not claimed");
+    throw new AgentError("long_task_unit_lease_lost", "Long task unit is not claimed");
   }
   return Object.freeze({
     taskId: unit.taskId,
@@ -541,10 +604,18 @@ function clearClaim(
   });
 }
 
-function normalizeUsage(value: ModelTokenUsage): LongTaskUsage {
+function normalizeUsage(value: ModelTokenUsage | null): LongTaskUsage {
+  if (value === null) return Object.freeze({
+    invocationCount: 1,
+    unreportedUsageAttempts: 1,
+    inputTokens: 0,
+    outputTokens: 0,
+    reasoningTokens: 0,
+  });
   if (value === null || typeof value !== "object") throw new TypeError("Usage must be an object");
   return Object.freeze({
     invocationCount: 1,
+    unreportedUsageAttempts: 0,
     inputTokens: nonNegativeInteger(value.inputTokens, "usage inputTokens"),
     outputTokens: nonNegativeInteger(value.outputTokens ?? 0, "usage outputTokens"),
     reasoningTokens: value.reasoningOutputTokens === undefined
@@ -556,20 +627,12 @@ function normalizeUsage(value: ModelTokenUsage): LongTaskUsage {
 function addUsage(left: LongTaskUsage, right: LongTaskUsage): LongTaskUsage {
   return Object.freeze({
     invocationCount: left.invocationCount + right.invocationCount,
+    unreportedUsageAttempts: left.unreportedUsageAttempts + right.unreportedUsageAttempts,
     inputTokens: left.inputTokens + right.inputTokens,
     outputTokens: left.outputTokens + right.outputTokens,
     reasoningTokens: left.reasoningTokens === null || right.reasoningTokens === null
       ? null
       : left.reasoningTokens + right.reasoningTokens,
-  });
-}
-
-function copyBudgets(value: import("../run/types.js").RunBudgets): import("../run/types.js").RunBudgets {
-  return Object.freeze({
-    maxModelAttempts: nullablePositive(value.maxModelAttempts, "maxModelAttempts"),
-    maxTotalTokens: nullablePositive(value.maxTotalTokens, "maxTotalTokens"),
-    maxOutputBytes: nullablePositive(value.maxOutputBytes, "maxOutputBytes"),
-    maxOutputEvents: nullablePositive(value.maxOutputEvents, "maxOutputEvents"),
   });
 }
 
@@ -582,13 +645,6 @@ function copyMapping(value: Readonly<Record<string, JsonValue>>): Readonly<Recor
 
 function idempotencyKey(namespace: string, key: string): string {
   return `${requiredText(namespace, "namespace")}\u0000${requiredText(key, "idempotency key")}`;
-}
-
-function normalizeDeadline(value: string | null): string | null {
-  if (value === null) return null;
-  const milliseconds = Date.parse(value);
-  if (!Number.isFinite(milliseconds)) throw new TypeError("Long task deadline must be an ISO date-time");
-  return new Date(milliseconds).toISOString();
 }
 
 function nullablePositive(value: number | null, label: string): number | null {

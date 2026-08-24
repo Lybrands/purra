@@ -39,6 +39,13 @@ class AgentOutputRepository(Protocol):
         draft: AgentOutputEventDraft,
     ) -> AgentOutputEvent: ...
 
+    async def append_batch(
+        self,
+        drafts: tuple[AgentOutputEventDraft, ...],
+    ) -> tuple[AgentOutputEvent, ...]:
+        """Atomically append one ordered batch with consecutive sequences."""
+        ...
+
     async def commit_run_lifecycle(
         self,
         run_id: RunId,

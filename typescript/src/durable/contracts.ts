@@ -6,6 +6,7 @@ import type {
   DurableTaskDescriptor,
   ExecutionRecipe,
   ExecutionRecipeStep,
+  LongTaskBudgetLimits,
   TaskAdmissionDecision,
 } from "./types.js";
 
@@ -99,7 +100,23 @@ export function copyDurableTaskDescriptor(value: DurableTaskDescriptor): Durable
     ownerId: requiredText(value.ownerId, "durable ownerId"),
     idempotencyKey: requiredText(value.idempotencyKey, "durable idempotencyKey"),
     ...(value.message === undefined ? {} : { message: requiredText(value.message, "durable message") }),
+    ...(value.deadlineAtMs === undefined
+      ? {}
+      : { deadlineAtMs: nullablePositive(value.deadlineAtMs, "durable deadlineAtMs") }),
+    ...(value.budgets === undefined ? {} : { budgets: copyLongTaskBudgets(value.budgets) }),
     metadata: copyMapping(value.metadata ?? {}, "durable descriptor metadata"),
+  });
+}
+
+export function copyLongTaskBudgets(value: LongTaskBudgetLimits): LongTaskBudgetLimits {
+  if (value === null || typeof value !== "object") {
+    throw new TypeError("Long task budgets must be an object");
+  }
+  return Object.freeze({
+    maxInvocationAttempts: nullableNonNegative(value.maxInvocationAttempts, "maxInvocationAttempts"),
+    maxInputTokens: nullableNonNegative(value.maxInputTokens, "maxInputTokens"),
+    maxOutputTokens: nullableNonNegative(value.maxOutputTokens, "maxOutputTokens"),
+    maxReasoningTokens: nullableNonNegative(value.maxReasoningTokens, "maxReasoningTokens"),
   });
 }
 
@@ -182,4 +199,12 @@ function positiveInteger(value: number, label: string): number {
 function nonNegativeInteger(value: number, label: string): number {
   if (!Number.isSafeInteger(value) || value < 0) throw new TypeError(`${label} must be non-negative`);
   return value;
+}
+
+function nullableNonNegative(value: number | null, label: string): number | null {
+  return value === null ? null : nonNegativeInteger(value, label);
+}
+
+function nullablePositive(value: number | null, label: string): number | null {
+  return value === null ? null : positiveInteger(value, label);
 }

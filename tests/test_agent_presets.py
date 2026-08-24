@@ -266,21 +266,26 @@ def test_preset_snapshot_derives_builtin_compaction_settings():
     }
 
 
-def test_snapshot_v2_round_trip_rejects_legacy_or_incomplete_values():
+def test_snapshot_v3_round_trip_rejects_v2_or_incomplete_values():
     snapshot = AgentPreset(
         id="portable",
         revision="1",
         tool_catalog=InMemoryToolCatalog(()),
     ).snapshot(_request())
 
-    assert snapshot.snapshot_version == 2
-    assert snapshot.to_mapping()["snapshotVersion"] == 2
+    assert snapshot.snapshot_version == 3
+    assert snapshot.to_mapping()["snapshotVersion"] == 3
     assert AgentPresetSnapshot.from_mapping(snapshot.to_mapping()) == snapshot
 
     legacy = snapshot.to_mapping()
     legacy.pop("snapshotVersion")
     with pytest.raises(ValueError, match="snapshot version"):
         AgentPresetSnapshot.from_mapping(legacy)
+
+    version_two = snapshot.to_mapping()
+    version_two["snapshotVersion"] = 2
+    with pytest.raises(ValueError, match="snapshot version"):
+        AgentPresetSnapshot.from_mapping(version_two)
 
 
 async def _tool_handler(state, arguments, signal=None):

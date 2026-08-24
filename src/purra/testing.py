@@ -65,6 +65,7 @@ from purra.errors import ContractViolationError
 from purra.events import AgentEvent, CoreEventType
 from purra.model_protocol import classify_model_termination
 from purra.long_tasks import (
+    LongTaskBudgetLimits,
     LongTaskCreateCommand,
     LongTaskRunRelation,
     LongTaskStatus,
@@ -342,18 +343,23 @@ async def assert_host_adapters_conform(
     )
     assert await outputs.open_stream(stream) == stream
     assert await outputs.open_stream(stream) == stream
-    delta = await outputs.append_event(AgentOutputEventDraft.public_text(
-        run_id=stream_run_id,
-        turn_id=stream.turn_id,
-        output_stream_id=stream.output_stream_id,
-        invocation_id=stream.invocation_id,
-        source_event_key=f"conformance:{stream_run_id}:delta",
-        source=OutputSource.PROVIDER,
-        channel=OutputChannel.FINAL,
-        delta="portable",
-        occurred_at=_now(),
-    ))
-    assert delta.sequence == 1
+    delta_drafts = tuple(
+        AgentOutputEventDraft.public_text(
+            run_id=stream_run_id,
+            turn_id=stream.turn_id,
+            output_stream_id=stream.output_stream_id,
+            invocation_id=stream.invocation_id,
+            source_event_key=f"conformance:{stream_run_id}:delta:{index}",
+            source=OutputSource.PROVIDER,
+            channel=OutputChannel.FINAL,
+            delta=value,
+            occurred_at=_now(),
+        )
+        for index, value in enumerate(("port", "able"), start=1)
+    )
+    deltas = await outputs.append_batch(delta_drafts)
+    assert [event.sequence for event in deltas] == [1, 2]
+    assert await outputs.append_batch(delta_drafts) == deltas
     committed_stream = await outputs.commit_stream(
         stream.output_stream_id,
         ModelFinishReason.STOP,
@@ -1004,6 +1010,7 @@ async def assert_long_task_repository_conforms(
         task_id,
         claimed.id,
         worker_id=worker,
+        lease_epoch=claimed.lease_epoch,
         run_id=created.created_by_run_id,
     )
     result = LongTaskUnitResult(
@@ -1014,12 +1021,14 @@ async def assert_long_task_repository_conforms(
         task_id,
         claimed.id,
         worker_id=worker,
+        lease_epoch=claimed.lease_epoch,
         result=result,
     )
     assert await repository.complete_unit(
         task_id,
         claimed.id,
         worker_id=worker,
+        lease_epoch=claimed.lease_epoch,
         result=result,
     ) == settled
     second = await repository.claim_ready_unit(
@@ -1047,6 +1056,7 @@ async def assert_long_task_repository_conforms(
         task_id,
         reclaimed.id,
         worker_id="worker-d",
+        lease_epoch=reclaimed.lease_epoch,
         result=LongTaskUnitResult(
             output_ref=f"memory://{task_id}/{reclaimed.id}",
         ),
@@ -1073,6 +1083,38 @@ async def assert_long_task_repository_conforms(
         usage=usage,
         expected_revision=usage_task.revision,
     ) == recorded
+
+    budget_task = await repository.create(
+        f"conformance-budget-{suffix}",
+        replace(
+            command,
+            owner_id=f"budget-owner-{suffix}",
+            budget_limits=LongTaskBudgetLimits(max_invocation_attempts=1),
+            metadata={"sessionId": f"budget-session-{suffix}"},
+        ),
+    )
+    budget_task = await repository.record_usage(
+        budget_task.id,
+        run_id=command.created_by_run_id,
+        usage=LongTaskUsage(invocation_count=1),
+        expected_revision=budget_task.revision,
+    )
+    budget_task = await repository.start(
+        budget_task.id,
+        expected_revision=budget_task.revision,
+    )
+    assert await repository.claim_ready_unit(
+        budget_task.id,
+        worker_id="budget-worker",
+        lease_duration_ms=30_000,
+    ) is None
+    budget_task = await repository.load(budget_task.id)
+    assert budget_task is not None
+    assert budget_task.status is LongTaskStatus.FAILED
+    budget_units = await repository.list_units(budget_task.id)
+    assert all(
+        unit.error_code == "runtime_budget_exceeded" for unit in budget_units
+    )
 
 
 class _ConformanceSink:

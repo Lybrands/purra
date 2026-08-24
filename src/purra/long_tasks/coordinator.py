@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 
+from purra.cancellation import ExecutionStopSignal, stop_reason
+from purra.errors import ContractViolationError
 from purra.long_tasks.contracts import LongTaskStatus
 from purra.long_tasks.ports import LongTaskRepository, LongTaskUnitRunner
 from purra.ports import CancellationSignal
@@ -44,8 +46,17 @@ class LongTaskCoordinator:
         signal: CancellationSignal | None = None,
     ):
         task = await self._require(task_id)
+        task_stop = ExecutionStopSignal(
+            signal,
+            deadline_at_ms=task.deadline_at_ms,
+            deadline_code="long_task_deadline_exceeded",
+        )
+        signal = task_stop
         if task.cancellation_requested_at_ms is not None:
-            return await self._repository.cancel(task.id)
+            try:
+                return await self._repository.cancel(task.id)
+            finally:
+                task_stop.close()
         if task.status is LongTaskStatus.PENDING:
             task = await self._repository.start(
                 task.id,
@@ -55,6 +66,9 @@ class LongTaskCoordinator:
         try:
             while task.status is LongTaskStatus.RUNNING:
                 if signal is not None and signal.is_set():
+                    if stop_reason(signal) == "long_task_deadline_exceeded":
+                        await self._cancel_active(active)
+                        return await self._repository.expire_deadline(task.id)
                     return await self._stop_active(task.id, active)
 
                 task = await self._require(task.id)
@@ -100,32 +114,57 @@ class LongTaskCoordinator:
         except asyncio.CancelledError:
             return await self._stop_active(task.id, active)
         finally:
+            task_stop.close()
             if active:
                 await self._cancel_active(active)
 
     async def _run_claimed_unit(self, task, unit, runner, signal):
         try:
-            if unit.attempt > 1 and unit.error_code:
-                await self._wait_before_retry(unit.attempt - 1, signal)
-            if signal is not None and signal.is_set():
-                raise asyncio.CancelledError
-            result = await runner.run_unit(task, unit, signal)
-            settled = await self._repository.complete_unit(
-                task.id,
-                unit.id,
-                worker_id=self._worker_id,
-                result=result,
+            local_stop = asyncio.Event()
+            combined_signal = _CombinedCancellationSignal(signal, local_stop)
+            result = await self._run_with_heartbeat(
+                task,
+                unit,
+                runner,
+                combined_signal,
+                local_stop,
             )
+            try:
+                settled = await self._repository.complete_unit(
+                    task.id,
+                    unit.id,
+                    worker_id=self._worker_id,
+                    lease_epoch=unit.lease_epoch,
+                    result=result,
+                )
+            except ContractViolationError as error:
+                if _is_lease_lost(error):
+                    return await self._require(task.id)
+                raise
             await self._notify_settled(runner, task.id)
             return settled
         except asyncio.CancelledError:
-            return await self._checkpoint_interrupted(task.id, unit.id)
+            return await self._checkpoint_interrupted(
+                task.id,
+                unit.id,
+                unit.lease_epoch,
+            )
+        except ContractViolationError as error:
+            if _is_lease_lost(error):
+                return await self._require(task.id)
+            if error.code == "long_task_deadline_exceeded":
+                return await self._require(task.id)
+            raise
         except Exception as error:
             current = await self._require(task.id)
             if current.status is not LongTaskStatus.RUNNING:
                 return current
             if signal is not None and signal.is_set():
-                return await self._checkpoint_interrupted(task.id, unit.id)
+                return await self._checkpoint_interrupted(
+                    task.id,
+                    unit.id,
+                    unit.lease_epoch,
+                )
             classifier = getattr(runner, "classify_unit_failure", None)
             failure = None
             if callable(classifier):
@@ -158,6 +197,7 @@ class LongTaskCoordinator:
                         task.id,
                         unit.id,
                         worker_id=self._worker_id,
+                        lease_epoch=unit.lease_epoch,
                         split=split,
                         decision=decision,
                     )
@@ -172,25 +212,101 @@ class LongTaskCoordinator:
                     ),
                     attempts_remaining=0,
                 )
-            settled = await self._repository.settle_unit_failure(
-                task.id,
-                unit.id,
-                worker_id=self._worker_id,
-                decision=decision,
-            )
+            try:
+                settled = await self._repository.settle_unit_failure(
+                    task.id,
+                    unit.id,
+                    worker_id=self._worker_id,
+                    lease_epoch=unit.lease_epoch,
+                    decision=decision,
+                )
+            except ContractViolationError as lease_error:
+                if _is_lease_lost(lease_error):
+                    return await self._require(task.id)
+                if lease_error.code == "long_task_deadline_exceeded":
+                    return await self._require(task.id)
+                raise
             await self._notify_settled(runner, task.id)
             return settled
 
-    async def _checkpoint_interrupted(self, task_id: str, unit_id: str):
+    async def _run_with_heartbeat(
+        self,
+        task,
+        unit,
+        runner,
+        signal,
+        local_stop: asyncio.Event,
+    ):
+        execution = asyncio.create_task(
+            self._execute_claimed_unit(task, unit, runner, signal)
+        )
+        heartbeat = asyncio.create_task(self._heartbeat(task.id, unit))
+        try:
+            done, _ = await asyncio.wait(
+                {execution, heartbeat},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if heartbeat in done:
+                error = heartbeat.exception()
+                local_stop.set()
+                if not execution.done():
+                    execution.cancel()
+                await asyncio.gather(execution, return_exceptions=True)
+                if error is None:
+                    raise RuntimeError("long task heartbeat stopped unexpectedly")
+                raise error
+            heartbeat.cancel()
+            await asyncio.gather(heartbeat, return_exceptions=True)
+            return await execution
+        finally:
+            if not heartbeat.done():
+                heartbeat.cancel()
+            if not execution.done():
+                execution.cancel()
+            await asyncio.gather(heartbeat, execution, return_exceptions=True)
+
+    async def _execute_claimed_unit(self, task, unit, runner, signal):
+        if unit.attempt > 1 and unit.error_code:
+            await self._wait_before_retry(unit.attempt - 1, signal)
+        if signal.is_set():
+            raise asyncio.CancelledError
+        return await runner.run_unit(task, unit, signal)
+
+    async def _heartbeat(self, task_id: str, unit) -> None:
+        interval = max(1, self._lease_duration_ms // 3) / 1000
+        while True:
+            await asyncio.sleep(interval)
+            await self._repository.renew_unit_lease(
+                task_id,
+                unit.id,
+                worker_id=self._worker_id,
+                lease_epoch=unit.lease_epoch,
+                lease_duration_ms=self._lease_duration_ms,
+            )
+
+    async def _checkpoint_interrupted(
+        self,
+        task_id: str,
+        unit_id: str,
+        lease_epoch: int,
+    ):
         current = await self._require(task_id)
         if current.status is not LongTaskStatus.RUNNING:
             return current
-        return await self._repository.interrupt_unit(
-            task_id,
-            unit_id,
-            worker_id=self._worker_id,
-            reason_code="execution_interrupted",
-        )
+        try:
+            return await self._repository.interrupt_unit(
+                task_id,
+                unit_id,
+                worker_id=self._worker_id,
+                lease_epoch=lease_epoch,
+                reason_code="execution_interrupted",
+            )
+        except ContractViolationError as error:
+            if _is_lease_lost(error):
+                return current
+            if error.code == "long_task_deadline_exceeded":
+                return await self._require(task_id)
+            raise
 
     async def _notify_settled(self, runner, task_id: str) -> None:
         callback = getattr(runner, "on_unit_settled", None)
@@ -256,6 +372,44 @@ class LongTaskCoordinator:
 def _error_code(error: Exception) -> str:
     code = str(getattr(error, "code", "") or "").strip()
     return (code or str(error) or type(error).__name__)[:240]
+
+
+class _CombinedCancellationSignal:
+    def __init__(self, parent, local: asyncio.Event) -> None:
+        self._parent = parent
+        self._local = local
+
+    def is_set(self) -> bool:
+        return self._local.is_set() or bool(
+            self._parent is not None and self._parent.is_set()
+        )
+
+    async def wait(self) -> bool:
+        if self.is_set():
+            return True
+        local_waiter = asyncio.create_task(self._local.wait())
+        if self._parent is None:
+            return await local_waiter
+        parent_waiter = asyncio.create_task(self._parent.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {local_waiter, parent_waiter},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            return any(bool(waiter.result()) for waiter in done)
+        finally:
+            for waiter in (local_waiter, parent_waiter):
+                if not waiter.done():
+                    waiter.cancel()
+            await asyncio.gather(
+                local_waiter,
+                parent_waiter,
+                return_exceptions=True,
+            )
+
+
+def _is_lease_lost(error: BaseException) -> bool:
+    return getattr(error, "code", None) == "long_task_unit_lease_lost"
 
 
 __all__ = ["LongTaskCoordinator"]

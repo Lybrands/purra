@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 
@@ -22,6 +23,39 @@ const durableFixture = JSON.parse(readFileSync(
 ));
 
 test("shared Durable classifications and exact lease boundary stay aligned", () => {
+  assert.equal(durableFixture.protocolVersion, 3);
+  assert.equal(durableFixture.agentPresetSnapshotVersion, 3);
+  assert.deepEqual(durableFixture.stableErrorCodes, {
+    invocationDeadline: "model_invocation_deadline_exceeded",
+    runDeadline: "run_deadline_exceeded",
+    taskDeadline: "long_task_deadline_exceeded",
+    leaseLost: "long_task_unit_lease_lost",
+    budgetExceeded: "runtime_budget_exceeded",
+    streamLimit: "model_stream_limit_exceeded",
+  });
+  for (const row of durableFixture.budgetCases) {
+    const { usage, limits } = row;
+    const missing = usage.unreportedUsageAttempts > 0 && [
+      limits.maxInputTokens,
+      limits.maxOutputTokens,
+      limits.maxReasoningTokens,
+    ].some((value) => value !== null);
+    const actual = missing ? "provider_usage_unreported" : [
+      ["model_attempts", usage.invocationCount, limits.maxInvocationAttempts],
+      ["input_tokens", usage.inputTokens, limits.maxInputTokens],
+      ["output_tokens", usage.outputTokens, limits.maxOutputTokens],
+      ["reasoning_tokens", usage.reasoningTokens, limits.maxReasoningTokens],
+    ].find(([, used, maximum]) => (
+      maximum !== null && (used > maximum || (row.inclusive && used >= maximum))
+    ))?.[0];
+    assert.equal(actual, row.budgetKind, row.name);
+  }
+  assert.equal(
+    createHash("sha256")
+      .update(JSON.stringify(sortJson(durableFixture.providerDeltaBatch.entries)))
+      .digest("hex"),
+    durableFixture.providerDeltaBatch.payloadDigest,
+  );
   for (const row of durableFixture.leaseExpiryCases) {
     assert.equal(row.leaseExpiresAtMs <= row.nowMs, row.expired, row.name);
   }
@@ -54,7 +88,7 @@ test("repository fences an expired same-worker claim and settles replay once", a
   assert.notEqual(second.claimToken, first.claimToken);
   await assert.rejects(
     repository.heartbeat(first, 10),
-    (error) => error instanceof AgentError && error.code === "stale_long_task_claim",
+    (error) => error instanceof AgentError && error.code === "long_task_unit_lease_lost",
   );
 
   await repository.markUnitRunning(second);
@@ -84,6 +118,51 @@ test("repository fences an expired same-worker claim and settles replay once", a
     (await repository.listRunBindings("task-1")).map((item) => [item.runId, item.relation]),
     [["run-1", "created"], ["run-2", "continuation"]],
   );
+});
+
+test("Long Task budgets fail before the next claim and preserve unreported usage", async () => {
+  const repository = new InMemoryLongTaskRepository({ tokenFactory: () => "budget-claim" });
+  await repository.create("task-budget", {
+    ...taskCommand([
+      { id: "unit-1", position: 0 },
+      { id: "unit-2", position: 1, dependencies: ["unit-1"] },
+    ]),
+    idempotencyKey: "budget-task",
+    budgets: {
+      maxInvocationAttempts: 1,
+      maxInputTokens: null,
+      maxOutputTokens: null,
+      maxReasoningTokens: null,
+    },
+  });
+  await repository.start("task-budget");
+  const first = claimFromUnit(await repository.claimReadyUnit("task-budget", "worker", 60_000));
+  await repository.markUnitRunning(first);
+  await repository.recordUsage(first, { inputTokens: 1, outputTokens: 1 });
+  await repository.completeUnit(first, { outputRef: "result:1" }, "budget-settlement");
+  assert.equal(await repository.claimReadyUnit("task-budget", "worker", 60_000), undefined);
+  assert.equal((await repository.load("task-budget")).status, "failed");
+  assert.equal((await repository.listUnits("task-budget"))[1].errorCode, "runtime_budget_exceeded");
+
+  const missing = new InMemoryLongTaskRepository({ tokenFactory: () => "missing-claim" });
+  await missing.create("task-missing", {
+    ...taskCommand([{ id: "unit-1", position: 0 }]),
+    idempotencyKey: "missing-task",
+    budgets: {
+      maxInvocationAttempts: null,
+      maxInputTokens: 10,
+      maxOutputTokens: null,
+      maxReasoningTokens: null,
+    },
+  });
+  await missing.start("task-missing");
+  const claim = claimFromUnit(await missing.claimReadyUnit("task-missing", "worker", 60_000));
+  await missing.markUnitRunning(claim);
+  await assert.rejects(
+    missing.recordUsage(claim, null),
+    (error) => error instanceof AgentError && error.code === "runtime_budget_exceeded",
+  );
+  assert.equal((await missing.load("task-missing")).usage.unreportedUsageAttempts, 1);
 });
 
 test("recipe dispatcher resumes a DAG without replaying completed units and retries safely", async () => {
@@ -504,7 +583,7 @@ function dispatchInput(recipe) {
     },
     runId: "run-1",
     deadlineAt: null,
-    budgets: budgets(),
+    budgets: runBudgets(),
   };
 }
 
@@ -556,17 +635,28 @@ function taskCommand(units) {
       executor: "fixture",
       planStepId: unit.id,
     })),
-    deadlineAt: null,
-    budgets: budgets(),
+    deadlineAtMs: null,
+    budgets: taskBudgets(),
   };
 }
 
-function budgets() {
+function runBudgets() {
   return {
     maxModelAttempts: 10,
-    maxTotalTokens: 1_000,
+    maxInputTokens: 1_000,
+    maxOutputTokens: 1_000,
+    maxReasoningTokens: 1_000,
     maxOutputBytes: 100_000,
     maxOutputEvents: 1_000,
+  };
+}
+
+function taskBudgets() {
+  return {
+    maxInvocationAttempts: 10,
+    maxInputTokens: 1_000,
+    maxOutputTokens: 1_000,
+    maxReasoningTokens: 1_000,
   };
 }
 
@@ -584,7 +674,7 @@ async function signedSnapshotWithDeadline(deadlineAt, preset) {
     }),
     preset,
     deadlineAt,
-    remainingBudgets: budgets(),
+    remainingBudgets: runBudgets(),
   };
   return { ...base, authorityProof: await authenticator.sign(base) };
 }
@@ -595,6 +685,16 @@ function user(content) {
 
 function finalTurn(content) {
   return { message: { role: "assistant", content }, finishReason: "stop" };
+}
+
+function sortJson(value) {
+  if (Array.isArray(value)) return value.map(sortJson);
+  if (value !== null && typeof value === "object") {
+    return Object.fromEntries(
+      Object.keys(value).sort().map((key) => [key, sortJson(value[key])]),
+    );
+  }
+  return value;
 }
 
 async function rejectsCode(promise, code) {

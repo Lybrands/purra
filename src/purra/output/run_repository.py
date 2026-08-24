@@ -74,5 +74,15 @@ class CanonicalRunRepository:
     async def append_trace(self, run_id, trace):
         return await self._repository.append_trace(run_id, trace)
 
+    async def reserve_model_attempt(self, run_id, invocation_id):
+        return await self._repository.reserve_model_attempt(run_id, invocation_id)
+
+    async def settle_model_attempt(self, run_id, invocation_id, usage):
+        return await self._repository.settle_model_attempt(
+            run_id,
+            invocation_id,
+            usage,
+        )
+
 
 __all__ = ["CanonicalRunRepository"]
