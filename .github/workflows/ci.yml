@@ -25,6 +25,7 @@ jobs:
       - run: python -m pip install ".[test]" build
       - run: python -m coverage run -m pytest
       - run: python -m coverage report
+      - run: python examples/python/quickstart.py
       - run: git diff --check
       - if: matrix.python-version == '3.11'
         run: python -m build --sdist --wheel

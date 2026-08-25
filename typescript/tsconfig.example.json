@@ -1,0 +1,9 @@
+{
+  "extends": "./test/tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "rootDir": ".",
+    "outDir": ".example-dist"
+  },
+  "include": ["examples/quickstart.ts"]
+}

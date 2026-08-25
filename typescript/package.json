@@ -35,10 +35,13 @@
   },
   "scripts": {
     "clean": "node --eval \"import { rmSync } from 'node:fs'; rmSync('dist', { recursive: true, force: true })\"",
+    "clean:example": "node --eval \"import { rmSync } from 'node:fs'; rmSync('.example-dist', { recursive: true, force: true })\"",
     "build": "npm run clean && tsc -p tsconfig.json",
+    "example": "npm run build && npm run test:example",
     "test": "node --test test/*.test.mjs",
+    "test:example": "npm run clean:example && tsc -p tsconfig.example.json && node .example-dist/examples/quickstart.js && npm run clean:example",
     "test:types": "tsc -p test/tsconfig.json",
-    "check": "npm run build && npm run test && npm run test:types",
+    "check": "npm run build && npm run test && npm run test:types && npm run test:example",
     "prepack": "npm run build",
     "prepublishOnly": "npm run check"
   },
