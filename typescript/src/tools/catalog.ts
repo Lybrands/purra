@@ -25,7 +25,12 @@ interface CatalogOptions {
 interface ExecuteOptions {
   readonly executionKey: string;
   readonly enabledTools?: readonly string[];
+  readonly runId?: string;
   readonly rootRunId?: string;
+  readonly agentId?: string;
+  readonly parentRunId?: string;
+  readonly leaseOwnerId?: string;
+  readonly leaseEpoch?: number;
   readonly delegationEnabledTools?: readonly string[];
   readonly signal?: AbortSignal;
   readonly onEvent?: (event: ToolExecutionEvent) => Promise<void> | void;
@@ -140,7 +145,12 @@ export class ToolCatalog {
         tool,
         options.executionKey,
         options.signal,
+        options.runId,
         options.rootRunId,
+        options.agentId,
+        options.parentRunId,
+        options.leaseOwnerId,
+        options.leaseEpoch,
         options.delegationEnabledTools,
       );
       await options.onEvent?.(Object.freeze({
@@ -298,12 +308,27 @@ export class ToolCatalog {
     tool: RegisteredTool,
     executionKey: string,
     signal: AbortSignal | undefined,
+    runId: string | undefined,
     rootRunId: string | undefined,
+    agentId: string | undefined,
+    parentRunId: string | undefined,
+    leaseOwnerId: string | undefined,
+    leaseEpoch: number | undefined,
     delegationEnabledTools: readonly string[] | undefined,
   ): Promise<ToolHandlerResult> {
     const operation = async (): Promise<ToolHandlerResult> => tool.definition.run(
       call.arguments,
-      context(call, signal, rootRunId, delegationEnabledTools),
+      context(
+        call,
+        signal,
+        runId,
+        rootRunId,
+        agentId,
+        parentRunId,
+        leaseOwnerId,
+        leaseEpoch,
+        delegationEnabledTools,
+      ),
     );
     const guarded = tool.policy.mode !== "read" && tool.definition.hostManagedDurability !== true
       ? () => this.#idempotency!.executeOnce(`${executionKey}:${call.name}:${call.id}`, operation)
@@ -566,13 +591,23 @@ function normalizeErrorCode(value: unknown): string {
 function context(
   call: ToolCall,
   signal: AbortSignal | undefined,
+  runId?: string,
   rootRunId?: string,
+  agentId?: string,
+  parentRunId?: string,
+  leaseOwnerId?: string,
+  leaseEpoch?: number,
   enabledTools?: readonly string[],
 ) {
   return Object.freeze({
     call,
     ...(signal === undefined ? {} : { signal }),
+    ...(runId === undefined ? {} : { runId }),
     ...(rootRunId === undefined ? {} : { rootRunId }),
+    ...(agentId === undefined ? {} : { agentId }),
+    ...(parentRunId === undefined ? {} : { parentRunId }),
+    ...(leaseOwnerId === undefined ? {} : { leaseOwnerId }),
+    ...(leaseEpoch === undefined ? {} : { leaseEpoch }),
     ...(enabledTools === undefined ? {} : { enabledTools }),
   });
 }

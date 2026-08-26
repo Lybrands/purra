@@ -8,7 +8,22 @@ from importlib.metadata import version
 from pathlib import Path
 
 import purra
-from purra.api import AgentCore, AgentPreset, InMemoryAgentAdapters
+from purra.api import (
+    AgentCapabilityGrant,
+    AgentCore,
+    AgentExecutionCheckpoint,
+    AgentPreset,
+    AgentTreeExecutionResult,
+    AgentTreeRunStatus,
+    AgentTreeRunSupervisor,
+    BeginRootAgentCommand,
+    ChildAgentSpec,
+    ContinueAgentCommand,
+    InMemoryAgentAdapters,
+    InMemoryRunTreeRepository,
+    RunCommandService,
+    SpawnAgentsCommand,
+)
 from purra.artifacts import (
     ArtifactAccessController,
     ArtifactAccessMode,
@@ -31,6 +46,9 @@ from purra.contracts import (
     ModelFinishReason,
     ModelRequest,
     ModelStream,
+    ModelStreamActivity,
+    ModelStreamActivityKind,
+    ModelStreamActivitySupport,
     ModelStreamChunk,
     RunStatus,
 )
@@ -39,6 +57,7 @@ from purra.tools import InMemoryToolCatalog
 
 
 async def _chunks():
+    yield ModelStreamActivity(ModelStreamActivityKind.WORKING)
     yield ModelStreamChunk(
         content_delta="installed PurrA is runnable",
         finish_reason=ModelFinishReason.STOP,
@@ -48,7 +67,11 @@ async def _chunks():
 class _Gateway:
     async def stream(self, messages, invocation, signal=None):
         del messages, invocation, signal
-        return ModelStream(chunks=_chunks(), model="smoke-model")
+        return ModelStream(
+            chunks=_chunks(),
+            model="smoke-model",
+            activity_support=ModelStreamActivitySupport.WORKING,
+        )
 
     async def complete(self, messages, invocation, signal=None):
         del messages, invocation, signal
@@ -65,7 +88,7 @@ class _Gateway:
 async def _run() -> None:
     package_path = Path(purra.__file__).resolve()
     assert "site-packages" in package_path.parts, package_path
-    assert version("purra") == "0.3.0"
+    assert version("purra") == "0.4.0"
 
     adapters = InMemoryAgentAdapters()
     core = AgentCore(
@@ -98,12 +121,140 @@ async def _run() -> None:
         context_window=8_192,
     )
     try:
-        result = await (await core.submit(request)).wait()
+        handle = await core.submit(request)
+        result = await handle.wait()
+        events = await adapters.outputs.list_events(
+            handle.run_id,
+            after_sequence=0,
+        )
     finally:
         await core.close()
 
     assert result.status is RunStatus.DONE
     assert result.final_response == "installed PurrA is runnable"
+    snapshot = events[0].payload["agentPreset"]
+    assert snapshot["snapshotVersion"] == 4
+    runtime_limits = snapshot["composition"]["runtimeLimits"]
+    assert runtime_limits["providerActivityIdleTimeoutMs"] == 30_000
+    assert runtime_limits["providerProgressIdleTimeoutMs"] == 60_000
+    assert runtime_limits["providerInvocationTimeoutMs"] == 300_000
+    execution_checkpoint = AgentExecutionCheckpoint(
+        run_id="installed-checkpoint",
+        next_round=2,
+        round_limit=6,
+        messages=(AgentMessage(
+            role=MessageRole.USER,
+            content="resume",
+        ),),
+        pending_tool_input_retries=(("call-invalid", "readThing"),),
+    )
+    assert AgentExecutionCheckpoint.from_mapping(
+        execution_checkpoint.to_mapping()
+    ) == execution_checkpoint
+
+    tree = InMemoryRunTreeRepository()
+
+    class _InstalledTreeExecutor:
+        commands: RunCommandService | None = None
+        parallel_active = 0
+        parallel_peak = 0
+        parallel_started = asyncio.Event()
+
+        async def execute(self, run, agent, checkpoint, signal=None):
+            del checkpoint, signal
+            if agent.name in {"child", "peer"} and run.previous_run_id is None:
+                self.parallel_active += 1
+                self.parallel_peak = max(
+                    self.parallel_peak,
+                    self.parallel_active,
+                )
+                if self.parallel_active == 2:
+                    self.parallel_started.set()
+                await self.parallel_started.wait()
+                await asyncio.sleep(0)
+                self.parallel_active -= 1
+            if agent.name == "child":
+                assert self.commands is not None
+                nested = await self.commands.spawn_agents(SpawnAgentsCommand(
+                    parent_run_id=run.run_id,
+                    idempotency_key="installed-nested",
+                    lease_owner_id=run.lease_owner_id,
+                    lease_epoch=run.lease_epoch,
+                    children=(ChildAgentSpec(
+                        name="grandchild",
+                        title="Grandchild",
+                        instruction="Finish.",
+                        objective="Finish nested work.",
+                    ),),
+                ))
+                assert (await self.commands.join_runs(
+                    run.run_id,
+                    (nested.items[0].run.run_id,),
+                    lease_owner_id=run.lease_owner_id,
+                    lease_epoch=run.lease_epoch,
+                )).state == "ready"
+            return AgentTreeExecutionResult(
+                status=AgentTreeRunStatus.DONE,
+                result={"agent": agent.name},
+                content_ref=f"memory://{run.run_id}",
+                fingerprint=f"fingerprint:{run.run_id}",
+            )
+
+    tree_executor = _InstalledTreeExecutor()
+    tree_supervisor = AgentTreeRunSupervisor(
+        repository=tree,
+        executor=tree_executor,
+    )
+    tree_commands = RunCommandService(tree, tree_supervisor)
+    tree_executor.commands = tree_commands
+    tree_root = await tree_commands.begin_root(BeginRootAgentCommand(
+        run_id="installed-tree-root",
+        agent_id="installed-tree-agent",
+        name="root",
+        title="Root",
+        instruction="Own the smoke test.",
+        objective="Run two levels.",
+        capability_grant=AgentCapabilityGrant(
+            can_spawn_agents=True,
+            max_parallel_runs=2,
+        ),
+        idempotency_key="installed-tree-begin",
+    ))
+    tree_child = await tree_commands.spawn_agents(SpawnAgentsCommand(
+        parent_run_id=tree_root.run_id,
+        idempotency_key="installed-tree-spawn",
+        children=(
+            ChildAgentSpec(
+                name="child",
+                title="Child",
+                instruction="Delegate once.",
+                objective="Run child work.",
+            ),
+            ChildAgentSpec(
+                name="peer",
+                title="Peer",
+                instruction="Run beside Child.",
+                objective="Prove parallel execution.",
+            ),
+        ),
+    ))
+    assert (await tree_commands.join_runs(
+        tree_root.run_id,
+        tuple(item.run.run_id for item in tree_child.items),
+    )).state == "ready"
+    assert tree_executor.parallel_peak == 2
+    continued = await tree_commands.continue_agent(ContinueAgentCommand(
+        requester_run_id=tree_root.run_id,
+        idempotency_key="installed-tree-continue",
+        agent_id=tree_child.items[0].agent.agent_id,
+        expected_context_version=1,
+        message="Run the installed Child Agent again.",
+    ))
+    assert (await tree_commands.join_runs(
+        tree_root.run_id,
+        (continued.run.run_id,),
+    )).state == "ready"
+    assert len(await tree.list_descendants(tree_root.run_id)) == 5
 
     lifecycle = ArtifactLifecycle(
         adapters.artifacts,

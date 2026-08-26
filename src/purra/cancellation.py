@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Mapping
 import time
+from types import MappingProxyType
 from typing import Awaitable, TypeVar
 
 from purra.errors import AgentCoreError, CodedAgentCoreError
@@ -36,6 +38,7 @@ class ExecutionStopSignal:
         self._parent = parent
         self._event = asyncio.Event()
         self._reason_code: str | None = None
+        self._reason_details: Mapping[str, object] = MappingProxyType({})
         self._timer: asyncio.TimerHandle | None = None
         if deadline_at_ms is not None:
             remaining = max(0.0, (int(deadline_at_ms) - time.time() * 1000) / 1000)
@@ -53,15 +56,28 @@ class ExecutionStopSignal:
             )
         return self._reason_code
 
+    @property
+    def reason_details(self) -> Mapping[str, object]:
+        if self._parent is not None and self._parent.is_set():
+            return MappingProxyType(dict(
+                getattr(self._parent, "reason_details", {}) or {}
+            ))
+        return self._reason_details
+
     def is_set(self) -> bool:
         return self._event.is_set() or bool(
             self._parent is not None and self._parent.is_set()
         )
 
-    def set(self, reason_code: str = "request_canceled") -> None:
+    def set(
+        self,
+        reason_code: str = "request_canceled",
+        details: Mapping[str, object] | None = None,
+    ) -> None:
         if self._event.is_set():
             return
         self._reason_code = str(reason_code or "request_canceled")
+        self._reason_details = MappingProxyType(dict(details or {}))
         self._event.set()
 
     async def wait(self) -> bool:
@@ -112,6 +128,7 @@ def _stop_exception(signal: CancellationSignal | None) -> AgentCoreError:
         return ExecutionDeadlineExceeded(
             "execution deadline was exceeded",
             code=reason,
+            details=getattr(signal, "reason_details", None),
         )
     return OperationCanceled("agent run was canceled")
 

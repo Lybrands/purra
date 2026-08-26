@@ -8,6 +8,11 @@ from contextlib import suppress
 from typing import Any, Protocol
 from uuid import uuid4
 
+from purra.agent_tree import AgentRunAggregation, RunTreeRepository
+from purra.agent_tree_execution import (
+    AgentTreeRunExecutor,
+    _AgentTreeSchedulingCapability,
+)
 from purra.contracts import AgentRunRequest, AgentRunResult, RunId
 from purra.errors import ContractViolationError
 from purra.events import AgentEvent
@@ -59,6 +64,46 @@ class AgentRunSupervisor:
             float(poll_interval_seconds),
         )
         self._tasks: set[asyncio.Task[None]] = set()
+        self._agent_tree: _AgentTreeSchedulingCapability | None = None
+
+    def configure_agent_tree(
+        self,
+        repository: RunTreeRepository,
+        executor: AgentTreeRunExecutor,
+    ) -> None:
+        """Attach tree scheduling to this execution owner exactly once."""
+
+        if self._agent_tree is not None:
+            raise RuntimeError("Agent tree scheduling is already configured")
+        self._agent_tree = _AgentTreeSchedulingCapability(
+            repository=repository,
+            executor=executor,
+            owner_id=self._owner_id,
+            lease_duration_ms=self._lease_duration_ms,
+        )
+
+    async def execute_and_join(
+        self,
+        requester_run_id: str,
+        run_ids: tuple[str, ...],
+        signal: asyncio.Event | None = None,
+        *,
+        lease_owner_id: str | None = None,
+        lease_epoch: int | None = None,
+    ) -> AgentRunAggregation:
+        tree = self._agent_tree
+        if tree is None:
+            raise ContractViolationError(
+                "Agent tree scheduling is not configured",
+                code="agent_tree_unavailable",
+            )
+        return await tree.execute_and_join(
+            requester_run_id,
+            run_ids,
+            signal,
+            lease_owner_id=lease_owner_id,
+            lease_epoch=lease_epoch,
+        )
 
     async def submit(
         self,

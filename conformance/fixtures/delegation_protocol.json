@@ -7,6 +7,8 @@
     "maxTitleChars": 120,
     "maxInstructionChars": 4000,
     "maxObjectiveChars": 4000,
+    "maxDepth": 3,
+    "maxAgentsPerRoot": 16,
     "contextMode": "isolated",
     "toolMode": "read",
     "allowsRecursiveDelegation": false

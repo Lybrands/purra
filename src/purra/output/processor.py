@@ -63,9 +63,15 @@ class OutputBatchLimits:
     max_payload_bytes: int = 16_384
     max_fragments: int = 64
     max_latency_ms: int = 25
+    max_background_latency_ms: int = 250
 
     def __post_init__(self) -> None:
-        for name in ("max_payload_bytes", "max_fragments", "max_latency_ms"):
+        for name in (
+            "max_payload_bytes",
+            "max_fragments",
+            "max_latency_ms",
+            "max_background_latency_ms",
+        ):
             value = int(getattr(self, name))
             if value <= 0:
                 raise ValueError(f"{name.replace('_', ' ')} must be positive")
@@ -240,6 +246,7 @@ class AgentOutputProcessor:
             events: list[AgentOutputEvent] = []
             must_flush = (
                 authorized.usage is not None
+                or authorized.finish_reason is not None
                 or batch.payload_bytes >= self._batch_limits.max_payload_bytes
                 or len(batch.entries) >= self._batch_limits.max_fragments
             )
@@ -732,7 +739,15 @@ class AgentOutputProcessor:
     ) -> None:
         current = asyncio.current_task()
         try:
-            await self._sleep(self._batch_limits.max_latency_ms / 1000)
+            latency_ms = (
+                self._batch_limits.max_latency_ms
+                if spec.intent in {
+                    AgentOutputIntent.EXECUTION_PUBLIC,
+                    AgentOutputIntent.FINAL_PUBLIC,
+                }
+                else self._batch_limits.max_background_latency_ms
+            )
+            await self._sleep(latency_ms / 1000)
             async with batch.lock:
                 self._raise_background_error(batch)
                 await self._flush_batch_locked(spec, batch)
@@ -865,7 +880,10 @@ _PUBLIC_RUNTIME_EVENT_TYPES = frozenset({
     "long_task.dispatched",
 })
 
-_PRIVATE_RUNTIME_EVENT_TYPES = frozenset({"long_task.progress"})
+_PRIVATE_RUNTIME_EVENT_TYPES = frozenset({
+    "agent.execution_checkpointed",
+    "long_task.progress",
+})
 
 
 __all__ = ["AgentOutputProcessor", "OutputRecoveryObserver"]

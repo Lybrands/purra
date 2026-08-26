@@ -15,8 +15,10 @@ from purra.contracts import (
     TerminalRunStatus,
     TraceRecord,
 )
+from purra.agent_execution_checkpoint import AgentExecutionCheckpoint
 from purra.events import AgentEvent, CoreEventType
 from purra.normalization import required_text
+from purra.run_state import RunSnapshot
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +67,7 @@ class RunCommit:
     final_response: str | None = None
     validated_result: str | None = None
     error: str | None = None
+    execution_checkpoint: AgentExecutionCheckpoint | None = None
     events: tuple[AgentEvent, ...] = ()
 
     def __post_init__(self) -> None:
@@ -99,6 +102,16 @@ class RunCommit:
             raise ValueError(
                 "run commit validated_result is only valid for completed runs"
             )
+        checkpoint = self.execution_checkpoint
+        if checkpoint is not None and not isinstance(
+            checkpoint,
+            AgentExecutionCheckpoint,
+        ):
+            raise TypeError("run commit execution checkpoint is invalid")
+        if terminal is not None and checkpoint is not None:
+            raise ValueError(
+                "terminal run commit cannot install an execution checkpoint"
+            )
 
         object.__setattr__(self, "replace_plan", replacement)
         object.__setattr__(self, "step_updates", updates)
@@ -112,6 +125,7 @@ class RunCommit:
                 else str(self.validated_result)
             ),
         )
+        object.__setattr__(self, "execution_checkpoint", checkpoint)
         object.__setattr__(self, "events", events)
 
 
@@ -169,13 +183,23 @@ def validate_run_commit_lifecycle(commit: RunCommit) -> None:
 
 @runtime_checkable
 class RunRepository(Protocol):
-    """Atomic, cancellation-linearizable Run persistence."""
+    """Atomic, cancellation-linearizable Run persistence.
+
+    Child Run mutations validate ``current_agent_run_lease(run_id)`` against
+    the same durable lease authority used by ``RunTreeRepository``. The
+    execution-local proof prevents an old Task from borrowing a newer claim
+    stored on the Run record after worker recovery.
+    """
 
     async def begin(
         self,
         params: RunCreateParams,
         started_event: AgentEvent,
     ) -> RunBeginResult: ...
+
+    async def get(self, run_id: RunId) -> RunSnapshot:
+        """Load detached canonical Run state for recovery reconciliation."""
+        ...
 
     async def commit(
         self,

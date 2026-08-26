@@ -46,6 +46,7 @@ import type { OutputBatchLimits, OutputPolicy, OutputPublisher } from "../output
 import { allowAllOutput, RunSession } from "../run/session.js";
 import { InMemoryRunRepository, type RunRepository } from "../run/store.js";
 import type {
+  AgentExecutionCheckpoint,
   AgentPreset,
   AgentPresetSnapshot,
   ModelInvocationReceipt,
@@ -56,6 +57,25 @@ import type {
   RunRequest,
   RunResult,
 } from "../run/types.js";
+import {
+  AgentCapabilityGrant,
+  type AgentNode,
+  type AgentRunAggregation,
+  type AgentTreeRun,
+  type ContinueAgentCommand,
+  type ContinueAgentReceipt,
+  type ContextCheckpoint,
+  type RunTreeRepository,
+  type SpawnAgentsCommand,
+  type SpawnAgentsReceipt,
+} from "../agent-tree.js";
+import {
+  AgentTreeRunSupervisor,
+  RunCommandService,
+  type AgentTreeExecutionResult,
+  type AgentTreeOptions,
+} from "../agent-tree-execution.js";
+import { buildAgentTreeTool } from "../agent-tree-tool.js";
 import { ToolCatalog } from "../tools/catalog.js";
 import type {
   ToolApprovalGateway,
@@ -110,6 +130,7 @@ export interface AgentOptions {
   readonly responseValidation?: ResponseValidationOptions;
   readonly durable?: DurableOptions;
   readonly delegation?: DelegationOptions;
+  readonly agentTree?: AgentTreeOptions;
   readonly recovery?: RecoveryPolicy;
   readonly operations?: AgentOperationController;
   readonly runtimeLimits?: Partial<AgentRuntimeLimits>;
@@ -136,6 +157,17 @@ export type AgentStreamEvent =
 
 type Emit = (event: Exclude<AgentStreamEvent, { readonly type: "final" }>) => void;
 
+interface AgentTreeRootBinding {
+  readonly request: RunRequest;
+  readonly options: RunOptions;
+  readonly fingerprint: string;
+}
+
+interface AgentTreeRunScope {
+  readonly run: AgentTreeRun;
+  readonly agent: AgentNode;
+}
+
 export class Agent {
   readonly #model: ModelGateway;
   readonly #tools: ToolCatalog;
@@ -155,6 +187,12 @@ export class Agent {
   readonly #delegationCoordinator: DelegationCoordinator | undefined;
   readonly #dynamicDelegatedExecutor: DynamicDelegatedAgentExecutor | undefined;
   readonly #delegationPolicy: DelegationPolicySnapshot | undefined;
+  readonly #agentTreeRepository: RunTreeRepository | undefined;
+  readonly #agentTreeCommands: RunCommandService | undefined;
+  readonly #agentTreePolicy: DelegationPolicy | undefined;
+  readonly #agentTreeRootId: string | undefined;
+  readonly #configuredAgentTreeGrant: AgentCapabilityGrant | undefined;
+  readonly #agentTreeRoots = new Map<string, AgentTreeRootBinding>();
   readonly #recoveryPolicy: RecoveryPolicy;
   readonly #operations: AgentOperationController | undefined;
   readonly #idempotencyNamespace = globalThis.crypto.randomUUID();
@@ -176,45 +214,109 @@ export class Agent {
     }
     this.#context = copyContextOptions(options.context);
     const definitions = Object.freeze([...(options.tools ?? [])]);
+    if (options.agentTree !== undefined && options.delegation !== undefined) {
+      throw new TypeError("Agent tree and legacy delegation are mutually exclusive");
+    }
     let delegationPolicy: DelegationPolicy | undefined;
-    if (options.delegation === undefined) {
+    let effectiveDefinitions: readonly ToolDefinition[];
+    if (options.agentTree !== undefined) {
+      const tree = options.agentTree;
+      if (tree === null || typeof tree !== "object") {
+        throw new TypeError("agentTree must be an object");
+      }
+      const repository = tree.repository;
+      if (repository === null || typeof repository !== "object") {
+        throw new TypeError("Agent tree requires a RunTreeRepository");
+      }
+      const policy = new DelegationPolicy(tree.policy);
+      const commands = new RunCommandService(
+        repository,
+        new AgentTreeRunSupervisor({
+          repository,
+          executor: {
+            execute: (run, agent, checkpoint, signal) => (
+              this.#executeAgentTreeRun(run, agent, checkpoint, signal)
+            ),
+          },
+          ...(tree.ownerId === undefined ? {} : { ownerId: tree.ownerId }),
+          ...(tree.leaseDurationMs === undefined
+            ? {}
+            : { leaseDurationMs: tree.leaseDurationMs }),
+        }),
+      );
+      const readableTools = definitions
+        .filter((definition) => definition.enabled !== false && definition.policy.mode === "read")
+        .map((definition) => definition.name);
+      this.#agentTreeRepository = repository;
+      this.#agentTreeCommands = commands;
+      this.#agentTreePolicy = policy;
+      this.#agentTreeRootId = requiredText(
+        tree.rootAgentId ?? `root-agent-${globalThis.crypto.randomUUID()}`,
+        "root Agent id",
+      );
+      if (
+        tree.capabilityGrant !== undefined
+        && !(tree.capabilityGrant instanceof AgentCapabilityGrant)
+      ) {
+        throw new TypeError("Agent tree capability grant is invalid");
+      }
+      this.#configuredAgentTreeGrant = tree.capabilityGrant;
       this.#delegationCoordinator = undefined;
       this.#dynamicDelegatedExecutor = undefined;
-      this.#delegationPolicy = undefined;
-    } else {
-      if (options.delegation === null || typeof options.delegation !== "object") {
-        throw new TypeError("delegation must be an object");
-      }
-      const policy = new DelegationPolicy(options.delegation.policy);
-      delegationPolicy = policy;
       this.#delegationPolicy = policy.snapshot();
-      const repository = options.delegation.repository ?? new InMemoryDelegationRepository();
-      const dynamic = options.delegation.executor === undefined
-        ? new DynamicDelegatedAgentExecutor({
-            model: options.model,
-            tools: definitions,
-            ...(this.#context === undefined ? {} : { context: this.#context }),
-            ...(options.recovery === undefined ? {} : { recovery: options.recovery }),
-            ...(options.operations === undefined ? {} : { operations: options.operations }),
-            maxRounds,
-          })
-        : undefined;
-      this.#dynamicDelegatedExecutor = dynamic;
-      this.#delegationCoordinator = new DelegationCoordinator({
-        repository,
-        executor: options.delegation.executor ?? dynamic!,
-        policy,
-      });
-    }
-    const effectiveDefinitions = this.#delegationCoordinator === undefined
-      ? definitions
-      : Object.freeze([
+      effectiveDefinitions = Object.freeze([
+        ...definitions,
+        buildAgentTreeTool({
+          commands,
+          policy,
+          childAllowedTools: readableTools,
+        }),
+      ]);
+    } else {
+      this.#agentTreeRepository = undefined;
+      this.#agentTreeCommands = undefined;
+      this.#agentTreePolicy = undefined;
+      this.#agentTreeRootId = undefined;
+      this.#configuredAgentTreeGrant = undefined;
+      if (options.delegation === undefined) {
+        this.#delegationCoordinator = undefined;
+        this.#dynamicDelegatedExecutor = undefined;
+        this.#delegationPolicy = undefined;
+        effectiveDefinitions = definitions;
+      } else {
+        if (options.delegation === null || typeof options.delegation !== "object") {
+          throw new TypeError("delegation must be an object");
+        }
+        const policy = new DelegationPolicy(options.delegation.policy);
+        delegationPolicy = policy;
+        this.#delegationPolicy = policy.snapshot();
+        const repository = options.delegation.repository ?? new InMemoryDelegationRepository();
+        const dynamic = options.delegation.executor === undefined
+          ? new DynamicDelegatedAgentExecutor({
+              model: options.model,
+              runtimeLimits: this.#runtimeLimits,
+              tools: definitions,
+              ...(this.#context === undefined ? {} : { context: this.#context }),
+              ...(options.recovery === undefined ? {} : { recovery: options.recovery }),
+              ...(options.operations === undefined ? {} : { operations: options.operations }),
+              maxRounds,
+            })
+          : undefined;
+        this.#dynamicDelegatedExecutor = dynamic;
+        this.#delegationCoordinator = new DelegationCoordinator({
+          repository,
+          executor: options.delegation.executor ?? dynamic!,
+          policy,
+        });
+        effectiveDefinitions = Object.freeze([
           ...definitions,
           buildDelegationTool({
             coordinator: this.#delegationCoordinator,
-            policy: delegationPolicy!,
+            policy: delegationPolicy,
           }),
         ]);
+      }
+    }
     this.#tools = new ToolCatalog(effectiveDefinitions, {
       ...(options.approval === undefined ? {} : { approval: options.approval }),
       ...(options.idempotency === undefined ? {} : { idempotency: options.idempotency }),
@@ -266,7 +368,111 @@ export class Agent {
     return this.#executeTransient(input);
   }
 
-  public async submit(request: RunRequest, options: RunOptions = {}): Promise<RunHandle> {
+  public submit(request: RunRequest, options: RunOptions = {}): Promise<RunHandle> {
+    return this.#submit(request, options);
+  }
+
+  public spawnAgents(command: SpawnAgentsCommand): Promise<SpawnAgentsReceipt> {
+    return this.#requireAgentTreeCommands().spawnAgents(command);
+  }
+
+  public continueAgent(command: ContinueAgentCommand): Promise<ContinueAgentReceipt> {
+    return this.#requireAgentTreeCommands().continueAgent(command);
+  }
+
+  public joinAgentRuns(
+    requesterRunId: string,
+    runIds: readonly string[],
+    signal?: AbortSignal,
+    claim: { readonly leaseOwnerId?: string; readonly leaseEpoch?: number } = {},
+  ): Promise<AgentRunAggregation> {
+    return this.#requireAgentTreeCommands().joinRuns(
+      requesterRunId,
+      runIds,
+      signal,
+      claim,
+    );
+  }
+
+  public cancelAgentRun(runId: string): Promise<readonly string[]> {
+    return this.#requireAgentTreeCommands().cancelRun(runId);
+  }
+
+  public closeAgent(agentId: string): Promise<AgentNode> {
+    return this.#requireAgentTreeCommands().closeAgent(agentId);
+  }
+
+  public async bindAgentTreeRoot(
+    rootRunId: string,
+    request: RunRequest,
+    options: RunOptions = {},
+  ): Promise<void> {
+    const repository = this.#agentTreeRepository;
+    if (repository === undefined) {
+      this.#requireAgentTreeCommands();
+      return;
+    }
+    const runId = requiredText(rootRunId, "Agent tree Root Run id");
+    const root = await repository.getRun(runId);
+    if (
+      root.runId !== root.rootRunId
+      || (root.status !== "running" && root.status !== "waiting")
+    ) {
+      throw new AgentError(
+        "root_run_not_active",
+        "Agent tree recovery requires an active Root Run",
+      );
+    }
+    const copiedRequest = Object.freeze({
+      ...request,
+      messages: copyMessages(request.messages),
+      metadata: copyMapping(request.metadata ?? {}, "Run metadata"),
+    });
+    const copiedOptions = Object.freeze({ ...options });
+    const binding = Object.freeze({
+      request: copiedRequest,
+      options: copiedOptions,
+      fingerprint: await agentTreeBindingFingerprint(copiedRequest, copiedOptions),
+    });
+    const existing = this.#agentTreeRoots.get(runId);
+    if (existing !== undefined && existing.fingerprint !== binding.fingerprint) {
+      throw new AgentError(
+        "run_identity_conflict",
+        "Agent tree Root Run already has a different binding",
+      );
+    }
+    this.#agentTreeRoots.set(runId, binding);
+  }
+
+  public async recoverAgentTreeRoot(
+    rootRunId: string,
+    request: RunRequest,
+    options: RunOptions = {},
+  ): Promise<AgentRunAggregation> {
+    await this.bindAgentTreeRoot(rootRunId, request, options);
+    const repository = this.#agentTreeRepository!;
+    const runId = requiredText(rootRunId, "Agent tree Root Run id");
+    const descendants = await repository.listDescendants(runId);
+    return await this.joinAgentRuns(
+      runId,
+      descendants.map((run) => run.runId),
+      options.signal,
+    );
+  }
+
+  #requireAgentTreeCommands(): RunCommandService {
+    if (this.#agentTreeCommands === undefined) {
+      throw new AgentError("agent_tree_unavailable", "Agent tree is not configured");
+    }
+    return this.#agentTreeCommands;
+  }
+
+  async #submit(
+    request: RunRequest,
+    options: RunOptions,
+    treeScope?: AgentTreeRunScope,
+    resumeCheckpoint?: AgentExecutionCheckpoint,
+  ): Promise<RunHandle> {
     const callerMessages = copyMessages(request.messages);
     if (callerMessages.length === 0) throw new TypeError("Run requires at least one caller message");
     const enabledTools = request.enabledTools === undefined
@@ -274,29 +480,46 @@ export class Agent {
       : Object.freeze([...request.enabledTools]);
     const tools = this.#tools.specsFor(enabledTools);
     const evidence = copyEvidence(request.contextEvidence ?? []);
+    const treeGrant = this.#agentTreeRepository === undefined
+      ? undefined
+      : treeScope?.agent.capabilityGrant ?? this.#rootAgentTreeGrant();
+    const snapshotVersion = treeGrant === undefined ? 4 : 5;
     const [promptFingerprint, toolFingerprint, compositionFingerprint] = await Promise.all([
       stableFingerprint(copyJsonValue(this.#preset.promptSections)),
       stableFingerprint(copyJsonValue(tools)),
       stableFingerprint(copyJsonValue({
-        schemaVersion: 3,
+        schemaVersion: snapshotVersion,
         maxRounds: this.#maxRounds,
         runtimeLimits: this.#runtimeLimits,
         contextStrategy: this.#context?.strategy ?? "single_pass",
         planningBinding: this.#planning?.binding ?? null,
         durableBinding: this.#durable?.binding ?? null,
         delegation: this.#delegationPolicy ?? { enabled: false },
+        ...(treeGrant === undefined ? {} : {
+          agentTree: {
+            protocolVersion: 1,
+            capabilityGrant: treeGrant.toJSON(),
+          },
+        }),
         recovery: this.#recoveryPolicy.snapshot(),
       })),
     ]);
     const preset: AgentPresetSnapshot = Object.freeze({
-      schemaVersion: 3,
+      schemaVersion: snapshotVersion,
       presetId: this.#preset.id,
       presetRevision: this.#preset.revision,
       promptFingerprint,
       toolFingerprint,
       capabilityProfileId: this.#capabilities?.profileId ?? null,
       compositionFingerprint,
-    });
+      runtimeLimits: this.#runtimeLimits,
+      ...(treeGrant === undefined ? {} : {
+        agentTree: Object.freeze({
+          protocolVersion: 1,
+          capabilityGrant: treeGrant.toJSON(),
+        }),
+      }),
+    }) as AgentPresetSnapshot;
     let continuation: DurableRecoverySnapshot | undefined;
     let deadlineAt = normalizeDeadline(
       options.deadlineAt,
@@ -322,13 +545,119 @@ export class Agent {
       budgets = continuation.remainingBudgets;
     }
     const metadata = copyMapping(request.metadata ?? {}, "Run metadata");
-    const session = await RunSession.begin(
-      this.#runRepository,
-      this.#outputPublisher,
-      this.#outputPolicy,
-      { preset, deadlineAt, budgets, metadata },
-      this.#outputBatchLimits,
-    );
+    const rootTreeRunId = treeGrant === undefined
+      ? undefined
+      : treeScope?.run.runId ?? globalThis.crypto.randomUUID();
+    let session: RunSession;
+    if (resumeCheckpoint === undefined) {
+      session = await RunSession.begin(
+        this.#runRepository,
+        this.#outputPublisher,
+        this.#outputPolicy,
+        {
+          ...(rootTreeRunId === undefined ? {} : { requestedRunId: rootTreeRunId }),
+          ...(treeScope === undefined
+            ? rootTreeRunId === undefined
+              ? {}
+              : {
+                  rootRunId: rootTreeRunId,
+                  agentId: this.#agentTreeRootId!,
+                }
+            : {
+                rootRunId: treeScope.run.rootRunId,
+                agentId: treeScope.run.agentId,
+                ...(treeScope.run.parentRunId === null
+                  ? {}
+                  : { parentRunId: treeScope.run.parentRunId }),
+                leaseOwnerId: requiredText(
+                  treeScope.run.leaseOwnerId,
+                  "Agent Run lease owner",
+                ),
+                leaseEpoch: treeScope.run.leaseEpoch,
+              }),
+          preset,
+          deadlineAt,
+          budgets,
+          metadata,
+        },
+        this.#outputBatchLimits,
+      );
+    } else {
+      if (treeScope === undefined) {
+        throw new AgentError(
+          "agent_run_resume_checkpoint_missing",
+          "Only a claimed Child Run can resume an execution checkpoint",
+        );
+      }
+      const snapshot = await this.#runRepository.get(resumeCheckpoint.runId);
+      const [persistedPreset, currentPreset, persistedCheckpoint, selectedCheckpoint] = await Promise.all([
+        stableFingerprint(copyJsonValue(snapshot.preset as unknown as JsonValue)),
+        stableFingerprint(copyJsonValue(preset as unknown as JsonValue)),
+        stableFingerprint(copyJsonValue((snapshot.executionCheckpoint ?? null) as unknown as JsonValue)),
+        stableFingerprint(copyJsonValue(resumeCheckpoint as unknown as JsonValue)),
+      ]);
+      if (persistedPreset !== currentPreset) {
+        throw new AgentError(
+          "agent_preset_mismatch",
+          "Agent composition differs from the checkpointed Run",
+        );
+      }
+      if (persistedCheckpoint !== selectedCheckpoint) {
+        throw new AgentError(
+          "agent_execution_checkpoint_conflict",
+          "Selected Agent execution checkpoint is not canonical",
+        );
+      }
+      session = RunSession.resume(
+        this.#runRepository,
+        this.#outputPublisher,
+        this.#outputPolicy,
+        snapshot,
+        {
+          rootRunId: treeScope.run.rootRunId,
+          agentId: treeScope.run.agentId,
+          ...(treeScope.run.parentRunId === null
+            ? {}
+            : { parentRunId: treeScope.run.parentRunId }),
+          leaseOwnerId: requiredText(
+            treeScope.run.leaseOwnerId,
+            "Agent Run lease owner",
+          ),
+          leaseEpoch: treeScope.run.leaseEpoch,
+        },
+        this.#outputBatchLimits,
+      );
+    }
+    let ownsAgentTreeRoot = false;
+    if (this.#agentTreeRepository !== undefined && treeScope === undefined) {
+      try {
+        await this.#agentTreeRepository.beginRoot({
+          runId: session.runId,
+          agentId: this.#agentTreeRootId!,
+          name: "root",
+          title: "Root Agent",
+          instruction: "Own the root request.",
+          objective: latestUserText(callerMessages),
+          capabilityGrant: treeGrant!,
+          idempotencyKey: `begin:${session.runId}`,
+        });
+      } catch (error) {
+        await session.fail(errorCode(error));
+        throw error;
+      }
+      const rootRequest = Object.freeze({
+        ...request,
+        messages: callerMessages,
+        metadata,
+      });
+      const rootOptions = Object.freeze({ ...options });
+      this.#agentTreeRoots.set(session.runId, Object.freeze({
+        request: rootRequest,
+        options: rootOptions,
+        fingerprint: await agentTreeBindingFingerprint(rootRequest, rootOptions),
+      }));
+      ownsAgentTreeRoot = true;
+    }
     const runInput: AgentRunInput = Object.freeze({
       messages: Object.freeze([
         ...this.#preset.promptSections.map((section) => Object.freeze({
@@ -345,13 +674,17 @@ export class Agent {
       ...(enabledTools === undefined ? {} : { enabledTools }),
     });
 
-    const execution = this.#executePersistent(
+    const persistentExecution = this.#executePersistent(
       runInput,
       session,
       evidence,
       metadata,
       continuation,
+      resumeCheckpoint,
     );
+    const execution = ownsAgentTreeRoot
+      ? this.#settleRootAgentTree(session.runId, persistentExecution)
+      : persistentExecution;
     let result: Promise<RunResult> = execution;
     if (options.signal !== undefined) {
       let rejectCancellation: (error: unknown) => void = () => undefined;
@@ -370,6 +703,228 @@ export class Agent {
       );
     }
     return session.handle(result);
+  }
+
+  #rootAgentTreeGrant(): AgentCapabilityGrant {
+    const modelId = this.#capabilities?.profileId ?? "configured:model";
+    const configured = this.#configuredAgentTreeGrant;
+    if (configured !== undefined) {
+      if (!configured.allowedModels.includes(modelId)) {
+        throw new AgentError(
+          "agent_capability_escalation",
+          "Configured model is outside the Root Agent capability grant",
+        );
+      }
+      return configured;
+    }
+    const policy = this.#agentTreePolicy;
+    if (policy === undefined) {
+      throw new AgentError("agent_tree_unavailable", "Agent tree is not configured");
+    }
+    const limits = policy.snapshot();
+    return new AgentCapabilityGrant({
+      canSpawnAgents: true,
+      maxDepth: limits.maxDepth,
+      maxChildrenPerCall: limits.maxAgentsPerCall,
+      maxAgentsPerRoot: limits.maxAgentsPerRoot,
+      maxParallelRuns: limits.maxParallel,
+      allowedTools: this.#tools.readToolNamesFor(),
+      allowedModels: [modelId],
+    });
+  }
+
+  async #executeAgentTreeRun(
+    run: AgentTreeRun,
+    agent: AgentNode,
+    checkpoint?: ContextCheckpoint,
+    signal?: AbortSignal,
+  ): Promise<AgentTreeExecutionResult> {
+    const binding = this.#agentTreeRoots.get(run.rootRunId);
+    if (binding === undefined) {
+      throw new AgentError(
+        "agent_tree_root_not_bound",
+        "Agent tree Root Run has no execution binding",
+      );
+    }
+    const modelId = this.#capabilities?.profileId ?? "configured:model";
+    if (!agent.capabilityGrant.allowedModels.includes(modelId)) {
+      throw new AgentError(
+        "agent_capability_escalation",
+        "Configured model is outside the Child Agent capability grant",
+      );
+    }
+    const reconciliation = await this.#reconcileCanonicalAgentTreeRun(run);
+    if (reconciliation.result !== undefined) return reconciliation.result;
+    const objective = Object.keys(run.input).length === 0
+      ? run.objective
+      : `${run.objective}\n\nInput:\n${JSON.stringify(run.input)}`;
+    const enabledTools = Object.freeze([
+      ...agent.capabilityGrant.allowedTools,
+      ...(agent.capabilityGrant.canSpawnAgents ? ["delegateToAgents"] : []),
+    ]);
+    const childRequest: RunRequest = Object.freeze({
+      messages: Object.freeze([
+        Object.freeze({
+          role: "system",
+          content: agent.instruction,
+          attributes: Object.freeze({
+            agentId: agent.agentId,
+            parentAgentId: agent.parentAgentId ?? "",
+          }),
+        }),
+        Object.freeze({ role: "user", content: objective }),
+      ]),
+      enabledTools,
+      metadata: Object.freeze({
+        ...(binding.request.metadata ?? {}),
+        agentId: agent.agentId,
+        rootRunId: run.rootRunId,
+        parentRunId: run.parentRunId ?? "",
+        previousRunId: run.previousRunId ?? "",
+        contextVersion: agent.contextVersion,
+        contextCheckpointId: checkpoint?.checkpointId ?? "",
+        contextContentRef: checkpoint?.contentRef ?? "",
+      }),
+    });
+    const { durableContinuation: _ignored, signal: _rootSignal, ...baseOptions } = binding.options;
+    void _ignored;
+    void _rootSignal;
+    const handle = await this.#submit(
+      childRequest,
+      Object.freeze({
+        ...baseOptions,
+        ...(signal === undefined ? {} : { signal }),
+      }),
+      { run, agent },
+      reconciliation.checkpoint,
+    );
+    try {
+      const result = await handle.result;
+      return Object.freeze({
+        status: "done",
+        result: result.output,
+        contentRef: `run://${run.runId}/final`,
+        fingerprint: await stableFingerprint(result.output),
+      });
+    } catch (error) {
+      if (signal?.aborted === true || error instanceof AgentCanceledError) {
+        return Object.freeze({
+          status: "canceled",
+          errorCode: "agent_run_canceled",
+        });
+      }
+      throw error;
+    }
+  }
+
+  async #reconcileCanonicalAgentTreeRun(
+    run: AgentTreeRun,
+  ): Promise<{
+    readonly result?: AgentTreeExecutionResult;
+    readonly checkpoint?: AgentExecutionCheckpoint;
+  }> {
+    let snapshot;
+    try {
+      snapshot = await this.#runRepository.get(run.runId);
+    } catch (error) {
+      if (error instanceof AgentError && error.code === "run_not_found") return Object.freeze({});
+      throw error;
+    }
+    if (snapshot.status === "completed") {
+      if (snapshot.finalOutput === undefined) {
+        throw new AgentError(
+          "run_repository_nonconforming",
+          "Completed Child Run has no canonical final output",
+        );
+      }
+      return Object.freeze({ result: Object.freeze({
+          status: "done",
+          result: snapshot.finalOutput,
+          contentRef: `run://${run.runId}/final`,
+          fingerprint: await stableFingerprint(snapshot.finalOutput),
+        }) });
+    }
+    if (snapshot.status === "failed") {
+      return Object.freeze({ result: Object.freeze({
+          status: "failed",
+          errorCode: snapshot.errorCode ?? "agent_run_failed",
+        }) });
+    }
+    if (snapshot.status === "canceled") {
+      return Object.freeze({ result: Object.freeze({
+          status: "canceled",
+          errorCode: snapshot.errorCode ?? "agent_run_canceled",
+        }) });
+    }
+    if (snapshot.executionCheckpoint !== undefined) {
+      return Object.freeze({ checkpoint: snapshot.executionCheckpoint });
+    }
+
+    // A canonical running row proves execution started, but the current
+    // snapshot has no model/tool cursor. Replay could duplicate effects, so
+    // close both authorities with one stable fail-stop result.
+    const errorCode = "agent_run_resume_checkpoint_missing";
+    const settled = await this.#runRepository.settleRun(
+      run.runId,
+      "failed",
+      { errorCode },
+      { leaseOwnerId: run.leaseOwnerId!, leaseEpoch: run.leaseEpoch },
+    );
+    for (const event of settled.events) {
+      await this.#outputPublisher.publishCommitted(event);
+    }
+    return Object.freeze({
+      result: Object.freeze({ status: "failed", errorCode }),
+    });
+  }
+
+  async #settleRootAgentTree(
+    rootRunId: string,
+    execution: Promise<RunResult>,
+  ): Promise<RunResult> {
+    const repository = this.#agentTreeRepository!;
+    try {
+      const result = await execution;
+      const rootRun = await repository.getRun(rootRunId);
+      const rootAgent = await repository.getAgent(rootRun.agentId);
+      await repository.completeRun(rootRunId, {
+        expectedContextVersion: rootAgent.contextVersion,
+        result: result.output,
+        contentRef: `run://${rootRunId}/final`,
+        fingerprint: await stableFingerprint(result.output),
+      });
+      return result;
+    } catch (error) {
+      if (error instanceof AgentCanceledError) {
+        await repository.cancelSubtree(rootRunId);
+      } else {
+        await repository.failRun(rootRunId, errorCode(error));
+      }
+      throw error;
+    } finally {
+      this.#agentTreeRoots.delete(rootRunId);
+    }
+  }
+
+  async #completePersistentSession(
+    session: RunSession,
+    result: RunResult,
+  ): Promise<void> {
+    const repository = this.#agentTreeRepository;
+    if (repository !== undefined && this.#agentTreeRoots.has(session.runId)) {
+      const descendants = await repository.listDescendants(session.runId);
+      if (descendants.some((run) => (
+        run.status === "queued"
+        || run.status === "running"
+        || run.status === "waiting"
+      ))) {
+        throw new AgentError(
+          "root_run_not_quiescent",
+          "Root Run has unfinished descendants",
+        );
+      }
+    }
+    await session.complete(result);
   }
 
   public async *stream(input: AgentRunInput): AsyncIterable<AgentStreamEvent> {
@@ -418,6 +973,7 @@ export class Agent {
     evidence: readonly ContextEvidenceReceipt[],
     metadata: Readonly<Record<string, JsonValue>>,
     continuation?: DurableRecoverySnapshot,
+    resumeCheckpoint?: AgentExecutionCheckpoint,
   ): Promise<RunResult> {
     let delegationBound = false;
     let dynamicExecutorBound = false;
@@ -435,7 +991,32 @@ export class Agent {
       }
       if (continuation !== undefined) {
         const result = await this.#continueDurable(input, session, continuation);
-        await session.complete(result);
+        await this.#completePersistentSession(session, result);
+        return result;
+      }
+      if (resumeCheckpoint !== undefined) {
+        const responseValidation = new ResponseValidationCoordinator(
+          this.#responseValidationOptions,
+          this.#modelTasksForExecution(session.runId, session),
+        );
+        const resumed = await this.#run(
+          input,
+          undefined,
+          session,
+          evidence,
+          undefined,
+          undefined,
+          responseValidation,
+          undefined,
+          resumeCheckpoint,
+        );
+        const result: RunResult = Object.freeze({
+          ...resumed,
+          messages: Object.freeze(
+            resumed.messages.slice(this.#preset.promptSections.length),
+          ),
+        });
+        await this.#completePersistentSession(session, result);
         return result;
       }
       const prepared = await this.#prepareExecution(input, metadata, session.runId, session);
@@ -444,7 +1025,7 @@ export class Agent {
       }
       const durable = await this.#completeAdmission(input, session, prepared.planning);
       if (durable !== undefined) {
-        await session.complete(durable);
+        await this.#completePersistentSession(session, durable);
         return durable;
       }
       const internal = await this.#run(
@@ -460,7 +1041,7 @@ export class Agent {
         ...internal,
         messages: Object.freeze(internal.messages.slice(this.#preset.promptSections.length)),
       });
-      await session.complete(result);
+      await this.#completePersistentSession(session, result);
       return result;
     } catch (error) {
       if (session.deadlineExceeded) {
@@ -495,8 +1076,11 @@ export class Agent {
     planning?: PlannedExecutionCoordinator,
     responseValidation = new ResponseValidationCoordinator(),
     transientExecutionKey?: string,
+    resumeCheckpoint?: AgentExecutionCheckpoint,
   ): Promise<AgentRunResult> {
-    const messages = copyMessages(input.messages);
+    const messages = copyMessages(
+      resumeCheckpoint?.messages ?? input.messages,
+    );
     if (messages.length === 0) throw new TypeError("Agent run requires at least one message");
     if (planning?.workPlan !== undefined) messages.push(planningMessage(planning.workPlan, false));
     // ponytail: transient invoke remains process-local; submitted Runs use
@@ -508,10 +1092,27 @@ export class Agent {
       this.#capabilities,
       input.maxOutputTokens,
     );
-    let responseAttempts = 0;
+    let responseAttempts = resumeCheckpoint?.responseAttempts ?? 0;
     const recovery = new RecoveryLedger(this.#recoveryPolicy);
+    if (resumeCheckpoint !== undefined) {
+      if (
+        resumeCheckpoint.runId !== session?.runId
+        || resumeCheckpoint.executionProfile !== "reactive"
+        || resumeCheckpoint.phase !== "model_ready"
+      ) {
+        throw new AgentError(
+          "agent_execution_checkpoint_conflict",
+          "Agent execution checkpoint does not match the active Run",
+        );
+      }
+      recovery.restore(resumeCheckpoint.recoveryAttempts);
+    }
 
-    for (let round = 1; round <= this.#maxRounds; round += 1) {
+    for (
+      let round = resumeCheckpoint?.nextRound ?? 1;
+      round <= this.#maxRounds;
+      round += 1
+    ) {
       throwIfCanceled(input.signal);
       const transition = planning?.state?.transition();
       let enabledTools: readonly string[] | undefined = planning?.state === undefined
@@ -755,7 +1356,15 @@ export class Agent {
         batch = await this.#tools.executeBatch(calls, {
           executionKey,
           ...(enabledTools === undefined ? {} : { enabledTools }),
-          ...(session === undefined ? {} : { rootRunId: session.runId }),
+          ...(session === undefined ? {} : {
+            runId: session.runId,
+            rootRunId: session.rootRunId,
+            agentId: session.agentId,
+            ...(session.parentRunId === undefined
+              ? {}
+              : { parentRunId: session.parentRunId }),
+            ...session.leaseClaim,
+          }),
           ...(this.#delegationCoordinator === undefined
             ? {}
             : { delegationEnabledTools: this.#tools.readToolNamesFor(input.enabledTools) }),
@@ -825,6 +1434,22 @@ export class Agent {
       }
       if (batch.replan === undefined) {
         planning?.state?.completeToolRound();
+        if (
+          session !== undefined
+          && session.parentRunId !== undefined
+          && planning?.state === undefined
+        ) {
+          await session.saveExecutionCheckpoint(Object.freeze({
+            schemaVersion: 1,
+            runId: session.runId,
+            phase: "model_ready",
+            executionProfile: "reactive",
+            nextRound: round + 1,
+            messages: Object.freeze(copyMessages(messages)),
+            responseAttempts,
+            recoveryAttempts: recovery.snapshot(),
+          }));
+        }
         continue;
       }
       if (planning === undefined) {
@@ -1106,6 +1731,7 @@ export class Agent {
     return new ModelTaskRunner({
       model: this.#model,
       runId,
+      runtimeLimits: this.#runtimeLimits,
       recovery: this.#recoveryPolicy,
       ...(this.#operations === undefined ? {} : { operations: this.#operations }),
       ...(authority === undefined ? {} : { authority }),
@@ -1308,6 +1934,22 @@ function copyEvidence(value: readonly ContextEvidenceReceipt[]): readonly Contex
   }));
 }
 
+async function agentTreeBindingFingerprint(
+  request: RunRequest,
+  options: RunOptions,
+): Promise<string> {
+  const serialized = JSON.stringify({
+    request,
+    options: {
+      deadlineAt: options.deadlineAt === undefined
+        ? { source: "default" }
+        : { source: "explicit", value: options.deadlineAt },
+      budgets: options.budgets ?? null,
+    },
+  });
+  return stableFingerprint(JSON.parse(serialized) as JsonValue);
+}
+
 function mergeEvidence(
   direct: readonly ContextEvidenceReceipt[],
   contextual: readonly ContextEvidenceReceipt[],
@@ -1491,7 +2133,7 @@ function resolveBudgets(
     maxInputTokens: budgetValue(value?.maxInputTokens, null, "maxInputTokens"),
     maxOutputTokens: budgetValue(value?.maxOutputTokens, null, "maxOutputTokens"),
     maxReasoningTokens: budgetValue(value?.maxReasoningTokens, null, "maxReasoningTokens"),
-    maxOutputBytes: budgetValue(value?.maxOutputBytes, 1_000_000, "maxOutputBytes"),
+    maxOutputBytes: budgetValue(value?.maxOutputBytes, 8 * 1024 * 1024, "maxOutputBytes"),
     maxOutputEvents: budgetValue(value?.maxOutputEvents, 10_000, "maxOutputEvents"),
   });
 }
@@ -1523,9 +2165,19 @@ function resolveRuntimeLimits(
 ): AgentRuntimeLimits {
   return Object.freeze({
     runTimeoutMs: nullableLimit(value?.runTimeoutMs, 900_000, "runTimeoutMs"),
+    activityIdleTimeoutMs: nullableLimit(
+      value?.activityIdleTimeoutMs,
+      30_000,
+      "activityIdleTimeoutMs",
+    ),
+    progressIdleTimeoutMs: nullableLimit(
+      value?.progressIdleTimeoutMs,
+      60_000,
+      "progressIdleTimeoutMs",
+    ),
     invocationTimeoutMs: nullableLimit(
       value?.invocationTimeoutMs,
-      120_000,
+      300_000,
       "invocationTimeoutMs",
     ),
     maxChunks: positiveLimit(value?.maxChunks, 100_000, "maxChunks"),
@@ -1569,6 +2221,11 @@ function resolveOutputBatchLimits(
       25,
       "output batch maxLatencyMs",
     ),
+    maxBackgroundLatencyMs: positiveLimit(
+      value?.maxBackgroundLatencyMs,
+      250,
+      "output batch maxBackgroundLatencyMs",
+    ),
   });
 }
 
@@ -1605,6 +2262,17 @@ function requiredText(value: unknown, label: string): string {
   const text = typeof value === "string" ? value.trim() : "";
   if (text === "") throw new TypeError(`${label} must be non-empty text`);
   return text;
+}
+
+function latestUserText(messages: readonly Message[]): string {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index]!;
+    if (message.role !== "user") continue;
+    return typeof message.content === "string"
+      ? message.content
+      : JSON.stringify(message.content);
+  }
+  return "Run the request.";
 }
 
 function optionalText(value: unknown, label: string): string | undefined {

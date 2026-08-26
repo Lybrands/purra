@@ -46,6 +46,7 @@ _SCHEMA_KEYWORDS = frozenset({
     "required",
     "title",
     "type",
+    "uniqueItems",
 })
 
 
@@ -315,6 +316,12 @@ def _schema_contract_violations(
     additional = schema.get("additionalProperties")
     if additional is not None and not isinstance(additional, bool):
         violations.append(f"{path}.additionalProperties: must be boolean")
+
+    if "uniqueItems" in schema and not isinstance(
+        schema.get("uniqueItems"),
+        bool,
+    ):
+        violations.append(f"{path}.uniqueItems: must be boolean")
 
     if "items" in schema:
         violations.extend(_schema_contract_violations(

@@ -5,11 +5,36 @@ from __future__ import annotations
 import asyncio
 from contextlib import aclosing, suppress
 from dataclasses import dataclass, replace
+from hashlib import sha256
+import json
 from time import perf_counter, time
 from typing import Any, AsyncIterator, Callable, Iterable, Mapping, Sequence
+from uuid import uuid4
 
+from purra.agent_tree import (
+    AgentCapabilityGrant,
+    AgentNode,
+    AgentRunAggregation,
+    AgentTreeRun,
+    AgentTreeRunStatus,
+    BeginRootAgentCommand,
+    ContinueAgentCommand,
+    ContinueAgentReceipt,
+    ContextCheckpoint,
+    RunTreeRepository,
+    SpawnAgentsCommand,
+    SpawnAgentsReceipt,
+)
+from purra.agent_execution_checkpoint import AgentExecutionCheckpoint
+from purra.agent_tree_execution import (
+    AgentTreeExecutionResult,
+    RunCommandService,
+)
+from purra.agent_tree_lease import bind_agent_run_lease
+from purra.agent_tree_tool import build_agent_tree_tool_registration
 from purra.agent_presets import (
     AgentPreset,
+    AgentPresetSnapshot,
 )
 from purra.cancellation import (
     ExecutionDeadlineExceeded,
@@ -59,7 +84,10 @@ from purra.contracts import (
     ToolExecutionLimits,
     TraceRecord,
 )
-from purra.normalization import optional_text as _optional_text
+from purra.normalization import (
+    optional_text as _optional_text,
+    required_text,
+)
 from purra.errors import (
     ContextOverflowError,
     ContractViolationError,
@@ -91,6 +119,7 @@ from purra.engine.planning_phase import PlanningCapability, PlanningPhaseResult
 from purra.engine.task_orchestration import TaskOrchestrationCapability
 from purra.delegation import DelegatedAgentExecutor, DelegationCoordinator, DelegationPolicy
 from purra.engine.delegation_assembly import assemble_delegation
+from purra.engine.tool_catalog import AugmentedToolCatalog
 from purra.delegation.dynamic_executor import DynamicDelegatedAgentExecutor
 from purra.execution import AgentRunHandle, AgentRunSupervisor
 from purra.engine.planning_validation import (
@@ -98,7 +127,7 @@ from purra.engine.planning_validation import (
 )
 from purra.execution_profiles import ExecutionProfile
 from purra.host_planned_tool_gateway import HostPlannedToolGateway
-from purra.json_values import thaw_json_mapping
+from purra.json_values import freeze_json_mapping, thaw_json_mapping
 from purra.model_protocol import resolve_invocation_output_limit
 from purra.model_invocation import (
     AgentModelInvocationManager,
@@ -123,6 +152,7 @@ from purra.ports import (
     PlanningPolicy,
     ResponseJudge,
     ResponseValidator,
+    RunCommit,
     RunRepository,
     TaskContextDemandProvider,
     WorkPlanner,
@@ -133,10 +163,12 @@ from purra.ports import (
 )
 from purra.output import AgentResponseTransaction
 from purra.output.contracts import PublicPresentationMode, ResponseTransactionMode
+from purra.output.contracts import ResponseTransactionPolicy
 from purra.output.processor import AgentOutputProcessor
 from purra.output.run_repository import CanonicalRunRepository
 from purra.output.ports import AgentOutputPublisher, AgentOutputRepository
 from purra.run_controller import AgentRunController
+from purra.run_state import RunStateMachine
 from purra.runtime import AgentRuntime
 from purra.recovery import RecoveryPolicy
 from purra.tools import (
@@ -165,6 +197,215 @@ class _PreparedRuntimePhase:
     state: ExecutionState
     events: tuple[AgentEvent, ...]
     delegation_bound: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _RuntimeDependencies:
+    model_tasks: AgentModelTaskRunner
+    context_provider: ContextProvider
+    conversation_compactor: ConversationCompactor | None
+    context_capability: ContextCapability
+
+
+@dataclass(frozen=True, slots=True)
+class _AgentTreeRootBinding:
+    request: AgentRunRequest
+    options: AgentCoreRunOptions
+
+
+class _AgentCoreTreeRunExecutor:
+    """Route Child Runs back through this AgentCore's normal supervisor."""
+
+    def __init__(self, core: "AgentCore") -> None:
+        self._core = core
+
+    async def execute(
+        self,
+        run: AgentTreeRun,
+        agent: AgentNode,
+        checkpoint: ContextCheckpoint | None,
+        signal: CancellationSignal | None = None,
+    ) -> AgentTreeExecutionResult:
+        binding = self._core._agent_tree_roots.get(run.root_run_id)
+        if binding is None:
+            return AgentTreeExecutionResult(
+                status=AgentTreeRunStatus.FAILED,
+                error_code="agent_tree_root_not_bound",
+            )
+        with bind_agent_run_lease(
+            run.run_id,
+            required_text(run.lease_owner_id, "Agent Run lease owner"),
+            run.lease_epoch,
+        ):
+            reconciled = await self._reconcile_canonical_run(run)
+            if isinstance(reconciled, AgentTreeExecutionResult):
+                return reconciled
+            resume_checkpoint = reconciled
+
+        input_payload = thaw_json_mapping(run.input_payload)
+        objective = run.objective
+        if input_payload:
+            objective += "\n\nInput:\n" + json.dumps(
+                input_payload,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        child_request = replace(
+            binding.request,
+            messages=(
+                AgentMessage(
+                    role=MessageRole.SYSTEM,
+                    content=agent.instruction,
+                    origin=MessageOrigin.MODEL,
+                    attributes={
+                        "agentId": agent.agent_id,
+                        "parentAgentId": agent.parent_agent_id or "",
+                    },
+                ),
+                AgentMessage(role=MessageRole.USER, content=objective),
+            ),
+            tools_enabled=bool(
+                agent.capability_grant.allowed_tools
+                or agent.capability_grant.can_spawn_agents
+            ),
+            metadata={
+                **thaw_json_mapping(binding.request.metadata),
+                "agentId": agent.agent_id,
+                "rootRunId": run.root_run_id,
+                "parentRunId": run.parent_run_id or "",
+                "previousRunId": run.previous_run_id or "",
+                "contextVersion": agent.context_version,
+                "contextCheckpointId": (
+                    checkpoint.checkpoint_id if checkpoint is not None else ""
+                ),
+                "contextContentRef": (
+                    checkpoint.content_ref if checkpoint is not None else ""
+                ),
+            },
+        )
+        child_options = replace(
+            binding.options,
+            turn_id=f"agent-tree:{run.run_id}",
+            durable_continuation=None,
+            response_transaction_policy=ResponseTransactionPolicy(
+                mode=ResponseTransactionMode.VALIDATED_RESULT,
+                public_presentation=PublicPresentationMode.NONE,
+            ),
+            committed_result_facts_provider=None,
+            agent_tree_run_id=run.run_id,
+            agent_tree_root_run_id=run.root_run_id,
+            agent_tree_agent_id=run.agent_id,
+            agent_tree_parent_run_id=run.parent_run_id,
+            agent_tree_lease_owner_id=run.lease_owner_id,
+            agent_tree_lease_epoch=run.lease_epoch,
+            agent_capability_grant=agent.capability_grant,
+            agent_execution_checkpoint=resume_checkpoint,
+        )
+        with bind_agent_run_lease(
+            run.run_id,
+            required_text(run.lease_owner_id, "Agent Run lease owner"),
+            run.lease_epoch,
+        ):
+            handle = await self._core.submit(child_request, options=child_options)
+            try:
+                result = await await_with_cancellation(handle.wait(), signal)
+            except OperationCanceled:
+                await handle.cancel("ancestor_run_canceled")
+                return AgentTreeExecutionResult(
+                    status=AgentTreeRunStatus.CANCELED,
+                    error_code="agent_run_canceled",
+                )
+            except asyncio.CancelledError:
+                await handle.cancel("ancestor_run_canceled")
+                raise
+        if result.status is RunStatus.DONE:
+            if self._core._output_repository is None:
+                raise ContractViolationError(
+                    "Child Run result requires canonical output repository"
+                )
+            content = await self._core._output_repository.load_validated_result(
+                run.run_id
+            )
+            return AgentTreeExecutionResult(
+                status=AgentTreeRunStatus.DONE,
+                result={"content": content},
+                content_ref=f"run://{run.run_id}/validated-result",
+                fingerprint=sha256(content.encode("utf-8")).hexdigest(),
+            )
+        if result.status is RunStatus.CANCELED:
+            return AgentTreeExecutionResult(
+                status=AgentTreeRunStatus.CANCELED,
+                error_code=result.error or "agent_run_canceled",
+            )
+        return AgentTreeExecutionResult(
+            status=AgentTreeRunStatus.FAILED,
+            error_code=result.error or "agent_run_failed",
+        )
+
+    async def _reconcile_canonical_run(
+        self,
+        run: AgentTreeRun,
+    ) -> AgentTreeExecutionResult | AgentExecutionCheckpoint | None:
+        """Resolve a Tree/Run crash seam without replaying Provider work."""
+
+        try:
+            snapshot = await self._core._repository.get(run.run_id)
+        except ContractViolationError as error:
+            if error.code == "run_not_found":
+                return None
+            raise
+        if snapshot.status is RunStatus.DONE:
+            if self._core._output_repository is None:
+                raise ContractViolationError(
+                    "Child Run result requires canonical output repository"
+                )
+            content = await self._core._output_repository.load_validated_result(
+                run.run_id
+            )
+            return AgentTreeExecutionResult(
+                status=AgentTreeRunStatus.DONE,
+                result={"content": content},
+                content_ref=f"run://{run.run_id}/validated-result",
+                fingerprint=sha256(content.encode("utf-8")).hexdigest(),
+            )
+        if snapshot.status is RunStatus.CANCELED:
+            return AgentTreeExecutionResult(
+                status=AgentTreeRunStatus.CANCELED,
+                error_code=snapshot.error or "agent_run_canceled",
+            )
+        if snapshot.status in {RunStatus.FAILED, RunStatus.BLOCKED}:
+            return AgentTreeExecutionResult(
+                status=AgentTreeRunStatus.FAILED,
+                error_code=snapshot.error or "agent_run_failed",
+            )
+        if snapshot.execution_checkpoint is not None:
+            return snapshot.execution_checkpoint
+
+        # A canonical running row proves that execution began, but the current
+        # snapshot has no model/tool cursor. Replay could duplicate effects, so
+        # close both authorities with one stable fail-stop result.
+        error_code = "agent_run_resume_checkpoint_missing"
+        transition = RunStateMachine.fail(snapshot, error_code)
+        await self._core._repository.commit(
+            run.run_id,
+            RunCommit(
+                step_updates=transition.step_updates,
+                terminal_status=RunStatus.FAILED,
+                error=error_code,
+                events=(AgentEvent(
+                    type=CoreEventType.RUN_FAILED,
+                    run_id=run.run_id,
+                    payload={
+                        "status": RunStatus.FAILED.value,
+                        "error": error_code,
+                    },
+                ),),
+            ),
+        )
+        return AgentTreeExecutionResult(
+            status=AgentTreeRunStatus.FAILED,
+            error_code=error_code,
+        )
 
 
 class AgentCore:
@@ -210,6 +451,9 @@ class AgentCore:
         execution_lease_duration_ms: int | None = None,
         delegation_repository: DelegationRepository | None = None,
         delegated_agent_executor: DelegatedAgentExecutor | None = None,
+        run_tree_repository: RunTreeRepository | None = None,
+        root_agent_id: str | None = None,
+        agent_capability_grant: AgentCapabilityGrant | None = None,
     ) -> None:
         if preset is not None:
             if not isinstance(preset, AgentPreset):
@@ -252,6 +496,7 @@ class AgentCore:
                 "delegation_policy must be a DelegationPolicy or None"
             )
         self._preset = preset
+        self._delegation_policy = delegation_policy
         self._model_gateway = model_gateway
         self._output_repository = output_repository
         self._runtime_limits, self._tool_execution_limits = runtime_limits, tool_execution_limits
@@ -333,41 +578,6 @@ class AgentCore:
             execution_state_factory or _DefaultExecutionStateFactory()
         )
         self._approval_gateway = approval_gateway or InMemoryApprovalGateway()
-        base_tool_catalog = tool_catalog or InMemoryToolCatalog(())
-        (
-            self._delegation_coordinator,
-            self._dynamic_delegated_executor,
-            self._tool_catalog,
-        ) = assemble_delegation(
-            base_tool_catalog=base_tool_catalog,
-            policy=delegation_policy,
-            repository=delegation_repository,
-            executor=delegated_agent_executor,
-            idempotency=tool_idempotency_gateway,
-            output=self._output_processor,
-            operations=self._operations,
-            model_gateway=self._model_gateway,
-            model_manager=self._model_invocations,
-            approval=self._approval_gateway,
-            context_provider=context_provider,
-            context_provider_factory=context_provider_factory,
-            conversation_compactor=conversation_compactor,
-            conversation_compactor_factory=conversation_compactor_factory,
-            execution_state_factory=execution_state_factory,
-            runtime_limits=runtime_limits,
-            recovery_policy=recovery_policy,
-            tool_execution_limits=tool_execution_limits,
-        )
-        self._registrations = tuple(self._tool_catalog.registrations())
-        # This is deliberately not replaceable by a domain ``execute`` hook:
-        # every registered handler crosses the same Core policy boundary.
-        self._tool_executor = CoreToolExecutor(
-            _CapturedToolCatalog(self._registrations),
-            self._approval_gateway,
-            tool_execution_limits,
-            tool_idempotency_gateway,
-            self._operations,
-        )
         self._run_supervisor = _build_run_supervisor(
             run_repository=run_repository,
             output_repository=output_repository,
@@ -376,6 +586,37 @@ class AgentCore:
             lease_store=execution_lease_store,
             owner_id=execution_owner_id,
             lease_duration_ms=execution_lease_duration_ms,
+        )
+        if run_tree_repository is not None and self._run_supervisor is None:
+            raise ValueError(
+                "Agent tree execution requires output repository and publisher"
+            )
+        base_tool_catalog = tool_catalog or InMemoryToolCatalog(())
+        self._configure_delegation_capability(
+            base_tool_catalog=base_tool_catalog,
+            policy=delegation_policy,
+            legacy_repository=delegation_repository,
+            legacy_executor=delegated_agent_executor,
+            run_tree_repository=run_tree_repository,
+            root_agent_id=root_agent_id,
+            agent_capability_grant=agent_capability_grant,
+            idempotency=tool_idempotency_gateway,
+            context_provider=context_provider,
+            context_provider_factory=context_provider_factory,
+            conversation_compactor=conversation_compactor,
+            conversation_compactor_factory=conversation_compactor_factory,
+            execution_state_factory=execution_state_factory,
+        )
+        self._registrations = tuple(self._tool_catalog.registrations())
+        self._tool_idempotency_gateway = tool_idempotency_gateway
+        # This is deliberately not replaceable by a domain ``execute`` hook:
+        # every registered handler crosses the same Core policy boundary.
+        self._tool_executor = CoreToolExecutor(
+            _CapturedToolCatalog(self._registrations),
+            self._approval_gateway,
+            tool_execution_limits,
+            tool_idempotency_gateway,
+            self._operations,
         )
 
     async def resolve_approval(
@@ -392,6 +633,238 @@ class AgentCore:
 
     async def cancel_pending_approvals(self, run_id: RunId) -> int:
         return await self._approval_gateway.cancel_pending(run_id)
+
+    async def spawn_agents(
+        self,
+        command: SpawnAgentsCommand,
+    ) -> SpawnAgentsReceipt:
+        return await self._require_agent_tree_commands().spawn_agents(command)
+
+    async def continue_agent(
+        self,
+        command: ContinueAgentCommand,
+    ) -> ContinueAgentReceipt:
+        return await self._require_agent_tree_commands().continue_agent(command)
+
+    async def join_agent_runs(
+        self,
+        requester_run_id: str,
+        run_ids: tuple[str, ...],
+        signal: CancellationSignal | None = None,
+        *,
+        lease_owner_id: str | None = None,
+        lease_epoch: int | None = None,
+    ) -> AgentRunAggregation:
+        return await self._require_agent_tree_commands().join_runs(
+            requester_run_id,
+            run_ids,
+            signal,
+            lease_owner_id=lease_owner_id,
+            lease_epoch=lease_epoch,
+        )
+
+    async def cancel_agent_run(self, run_id: str) -> tuple[str, ...]:
+        return await self._require_agent_tree_commands().cancel_run(run_id)
+
+    async def close_agent(self, agent_id: str) -> AgentNode:
+        return await self._require_agent_tree_commands().close_agent(agent_id)
+
+    async def bind_agent_tree_root(
+        self,
+        root_run_id: str,
+        request: AgentRunRequest,
+        *,
+        options: AgentCoreRunOptions | None = None,
+    ) -> None:
+        """Rebind a persisted active Root tree to this execution owner."""
+
+        repository = self._run_tree_repository
+        if repository is None:
+            self._require_agent_tree_commands()
+            raise AssertionError("unreachable")
+        if not isinstance(request, AgentRunRequest):
+            raise TypeError("Agent tree recovery requires AgentRunRequest")
+        selected_options = options or AgentCoreRunOptions()
+        if not isinstance(selected_options, AgentCoreRunOptions):
+            raise TypeError("Agent tree recovery options are invalid")
+        run_id = required_text(root_run_id, "Agent tree Root Run id")
+        root = await repository.get_run(run_id)
+        if (
+            root.run_id != root.root_run_id
+            or root.status
+            not in {AgentTreeRunStatus.RUNNING, AgentTreeRunStatus.WAITING}
+        ):
+            raise ContractViolationError(
+                "Agent tree recovery requires an active Root Run",
+                code="root_run_not_active",
+            )
+        binding = _AgentTreeRootBinding(request=request, options=selected_options)
+        existing = self._agent_tree_roots.get(run_id)
+        if existing is not None and existing != binding:
+            raise ContractViolationError(
+                "Agent tree Root Run already has a different binding",
+                code="run_identity_conflict",
+            )
+        self._agent_tree_roots[run_id] = binding
+
+    async def recover_agent_tree_root(
+        self,
+        root_run_id: str,
+        request: AgentRunRequest,
+        *,
+        options: AgentCoreRunOptions | None = None,
+        signal: CancellationSignal | None = None,
+    ) -> AgentRunAggregation:
+        """Rebind one active Root and settle its complete descendant set."""
+
+        await self.bind_agent_tree_root(
+            root_run_id,
+            request,
+            options=options,
+        )
+        repository = self._run_tree_repository
+        assert repository is not None
+        run_id = required_text(root_run_id, "Agent tree Root Run id")
+        descendants = await repository.list_descendants(run_id)
+        return await self.join_agent_runs(
+            run_id,
+            tuple(run.run_id for run in descendants),
+            signal,
+        )
+
+    def _require_agent_tree_commands(self) -> RunCommandService:
+        commands = self._run_commands
+        if commands is None:
+            raise ContractViolationError(
+                "Agent tree execution is not configured",
+                code="agent_tree_unavailable",
+            )
+        return commands
+
+    def _root_agent_grant(
+        self,
+        request: AgentRunRequest,
+    ) -> AgentCapabilityGrant:
+        policy = self._delegation_policy
+        if policy is None:
+            raise ContractViolationError(
+                "Agent tree execution has no delegation policy"
+            )
+        return AgentCapabilityGrant(
+            can_spawn_agents=True,
+            max_depth=policy.max_depth,
+            max_children_per_call=policy.max_agents_per_call,
+            max_agents_per_root=policy.max_agents_per_root,
+            max_parallel_runs=policy.max_parallel,
+            allowed_tools=tuple(
+                registration.schema.name
+                for registration in self._registrations
+                if registration.schema.name != "delegateToAgents"
+            ),
+            allowed_models=(request.model.model,),
+        )
+
+    def _configure_delegation_capability(
+        self,
+        *,
+        base_tool_catalog: ToolCatalog,
+        policy: DelegationPolicy | None,
+        legacy_repository: DelegationRepository | None,
+        legacy_executor: DelegatedAgentExecutor | None,
+        run_tree_repository: RunTreeRepository | None,
+        root_agent_id: str | None,
+        agent_capability_grant: AgentCapabilityGrant | None,
+        idempotency: ToolIdempotencyGateway | None,
+        context_provider: ContextProvider | None,
+        context_provider_factory,
+        conversation_compactor: ConversationCompactor | None,
+        conversation_compactor_factory,
+        execution_state_factory: ExecutionStateFactory | None,
+    ) -> None:
+        if run_tree_repository is not None and not isinstance(
+            run_tree_repository,
+            RunTreeRepository,
+        ):
+            raise TypeError("run_tree_repository must implement RunTreeRepository")
+        if agent_capability_grant is not None and not isinstance(
+            agent_capability_grant,
+            AgentCapabilityGrant,
+        ):
+            raise TypeError("agent_capability_grant is invalid")
+        if run_tree_repository is not None and (
+            legacy_repository is not None or legacy_executor is not None
+        ):
+            raise ValueError(
+                "Agent tree execution cannot share the legacy delegation lifecycle"
+            )
+        if run_tree_repository is not None and policy is None:
+            raise ValueError("Agent tree execution requires a delegation policy")
+        self._run_tree_repository = run_tree_repository
+        self._root_agent_id = str(
+            root_agent_id or f"root-agent-{uuid4().hex}"
+        ).strip()
+        if not self._root_agent_id:
+            raise ValueError("root_agent_id must be non-empty")
+        self._configured_agent_grant = agent_capability_grant
+        self._agent_tree_policy = policy if run_tree_repository is not None else None
+        self._agent_tree_child_allowed_tools: tuple[str, ...] = ()
+        self._agent_tree_roots: dict[str, _AgentTreeRootBinding] = {}
+        self._run_commands: RunCommandService | None = None
+        if run_tree_repository is not None:
+            if self._output_processor is None or self._output_repository is None:
+                raise ValueError(
+                    "Agent tree execution requires canonical output infrastructure"
+                )
+            assert self._run_supervisor is not None
+            self._run_supervisor.configure_agent_tree(
+                run_tree_repository,
+                _AgentCoreTreeRunExecutor(self),
+            )
+            self._run_commands = RunCommandService(
+                run_tree_repository,
+                self._run_supervisor,
+            )
+            readable_tools = tuple(
+                registration.schema.name
+                for registration in base_tool_catalog.registrations()
+                if registration.policy.mode.value == "read"
+            )
+            self._agent_tree_child_allowed_tools = readable_tools
+            self._delegation_coordinator = None
+            self._dynamic_delegated_executor = None
+            self._tool_catalog = AugmentedToolCatalog(
+                base_tool_catalog,
+                (build_agent_tree_tool_registration(
+                    self._run_commands,
+                    policy,
+                    child_allowed_tools=readable_tools,
+                ),),
+            )
+            return
+        (
+            self._delegation_coordinator,
+            self._dynamic_delegated_executor,
+            self._tool_catalog,
+        ) = assemble_delegation(
+            base_tool_catalog=base_tool_catalog,
+            policy=policy,
+            repository=legacy_repository,
+            executor=legacy_executor,
+            idempotency=idempotency,
+            output=self._output_processor,
+            operations=self._operations,
+            model_gateway=self._model_gateway,
+            model_manager=self._model_invocations,
+            approval=self._approval_gateway,
+            context_provider=context_provider,
+            context_provider_factory=context_provider_factory,
+            conversation_compactor=conversation_compactor,
+            conversation_compactor_factory=conversation_compactor_factory,
+            execution_state_factory=execution_state_factory,
+            runtime_limits=self._runtime_limits,
+            recovery_policy=self._recovery_policy,
+            tool_execution_limits=self._tool_execution_limits,
+        )
 
     async def close(self) -> None:
         if self._run_supervisor is not None:
@@ -421,6 +894,29 @@ class AgentCore:
                 request,
                 tool_catalog=self._tool_catalog,
             )
+            if self._run_tree_repository is not None:
+                tree_grant = (
+                    self._configured_agent_grant
+                    or self._root_agent_grant(request)
+                )
+                tree_composition = {
+                    **thaw_json_mapping(snapshot.composition),
+                    "agentTree": {
+                        "protocolVersion": 1,
+                        "capabilityGrant": tree_grant.to_mapping(),
+                    },
+                }
+                snapshot = AgentPresetSnapshot(
+                    id=snapshot.id,
+                    revision=snapshot.revision,
+                    fingerprint=_preset_fingerprint_for_composition(
+                        snapshot.id,
+                        snapshot.revision,
+                        tree_composition,
+                    ),
+                    composition=tree_composition,
+                    snapshot_version=5,
+                )
             persisted = resolved_options.agent_preset_snapshot
             if persisted is not None and persisted != snapshot:
                 raise ContractViolationError(
@@ -429,6 +925,13 @@ class AgentCore:
             resolved_options = replace(
                 resolved_options,
                 agent_preset_snapshot=snapshot,
+                agent_capability_grant=(
+                    resolved_options.agent_capability_grant
+                    if resolved_options.agent_tree_run_id is not None
+                    else tree_grant
+                    if self._run_tree_repository is not None
+                    else resolved_options.agent_capability_grant
+                ),
             )
         elif resolved_options.durable_continuation is not None:
             raise ContractViolationError(
@@ -467,6 +970,159 @@ class AgentCore:
             signal=signal,
         )
 
+    async def _bind_agent_tree_run(
+        self,
+        request: AgentRunRequest,
+        options: AgentCoreRunOptions,
+        controller: AgentRunController,
+    ) -> tuple[bool, int | None]:
+        repository = self._run_tree_repository
+        if repository is None:
+            return False, None
+        if options.agent_tree_run_id is None:
+            grant = self._configured_agent_grant or self._root_agent_grant(
+                request
+            )
+            tree_run = await repository.begin_root(BeginRootAgentCommand(
+                run_id=controller.run_id or "",
+                agent_id=self._root_agent_id,
+                name="root",
+                title="Root Agent",
+                instruction="Own the root request.",
+                objective=request.latest_user_text() or "Run the request.",
+                capability_grant=grant,
+                idempotency_key=f"begin:{controller.run_id}",
+            ))
+            self._agent_tree_roots[tree_run.root_run_id] = _AgentTreeRootBinding(
+                request=request,
+                options=options,
+            )
+            root_owner = True
+        else:
+            tree_run = await repository.get_run(options.agent_tree_run_id)
+            if (
+                tree_run.run_id != controller.run_id
+                or tree_run.status is not AgentTreeRunStatus.RUNNING
+            ):
+                raise ContractViolationError(
+                    "Child Run identity or state does not match its tree claim",
+                    code="run_identity_conflict",
+                )
+            root_owner = False
+        agent = await repository.get_agent(tree_run.agent_id)
+        return root_owner, agent.context_version
+
+    async def _settle_root_agent_tree_run(
+        self,
+        snapshot,
+        expected_context_version: int | None,
+    ) -> None:
+        repository = self._run_tree_repository
+        if repository is None or expected_context_version is None:
+            raise ContractViolationError("Root Agent tree settlement is unbound")
+        try:
+            if snapshot.status is RunStatus.DONE:
+                await repository.complete_run(
+                    snapshot.run_id,
+                    expected_context_version=expected_context_version,
+                    result={"content": snapshot.final_response},
+                    content_ref=f"run://{snapshot.run_id}/final",
+                    fingerprint=sha256(
+                        snapshot.final_response.encode("utf-8")
+                    ).hexdigest(),
+                )
+            elif snapshot.status is RunStatus.CANCELED:
+                await repository.cancel_subtree(snapshot.run_id)
+            else:
+                await repository.fail_run(
+                    snapshot.run_id,
+                    snapshot.error or "root_run_failed",
+                )
+        finally:
+            self._agent_tree_roots.pop(snapshot.run_id, None)
+
+    def _run_create_params(
+        self,
+        request: AgentRunRequest,
+        options: AgentCoreRunOptions,
+    ) -> RunCreateParams:
+        return RunCreateParams(
+            session_id=request.session_id,
+            prompt=request.latest_user_text(),
+            mode=request.mode,
+            turn_id=options.turn_id,
+            deadline_at_ms=options.deadline_at_ms,
+            runtime_limits=self._runtime_limits,
+            provenance=options.provenance,
+            binding=options.binding,
+            agent_preset_snapshot=(
+                options.agent_preset_snapshot.to_mapping()
+                if options.agent_preset_snapshot is not None
+                else {}
+            ),
+            requested_run_id=options.agent_tree_run_id,
+            root_run_id=options.agent_tree_root_run_id,
+            agent_id=(
+                options.agent_tree_agent_id
+                or self._root_agent_id
+                if self._run_tree_repository is not None
+                else None
+            ),
+            parent_run_id=options.agent_tree_parent_run_id,
+            lease_owner_id=options.agent_tree_lease_owner_id,
+            lease_epoch=options.agent_tree_lease_epoch,
+        )
+
+    @staticmethod
+    def _restrict_agent_capabilities(
+        request: AgentRunRequest,
+        grant: AgentCapabilityGrant | None,
+        registrations: tuple[ToolRegistration, ...],
+        enabled_names: frozenset[str],
+    ) -> tuple[tuple[ToolRegistration, ...], frozenset[str]]:
+        if grant is None:
+            return registrations, enabled_names
+        if request.model.model not in grant.allowed_models:
+            raise ContractViolationError(
+                "Agent Run model is outside its capability grant",
+                code="agent_capability_escalation",
+            )
+        allowed_names = set(grant.allowed_tools)
+        if grant.can_spawn_agents:
+            allowed_names.add("delegateToAgents")
+        return (
+            tuple(
+                registration
+                for registration in registrations
+                if registration.schema.name in allowed_names
+            ),
+            frozenset(enabled_names) & allowed_names,
+        )
+
+    def _bind_agent_tree_lease(
+        self,
+        registrations: tuple[ToolRegistration, ...],
+        options: AgentCoreRunOptions,
+    ) -> tuple[ToolRegistration, ...]:
+        if (
+            options.agent_tree_run_id is None
+            or self._run_commands is None
+            or self._agent_tree_policy is None
+        ):
+            return registrations
+        return tuple(
+            build_agent_tree_tool_registration(
+                self._run_commands,
+                self._agent_tree_policy,
+                child_allowed_tools=self._agent_tree_child_allowed_tools,
+                lease_owner_id=options.agent_tree_lease_owner_id,
+                lease_epoch=options.agent_tree_lease_epoch,
+            )
+            if registration.schema.name == "delegateToAgents"
+            else registration
+            for registration in registrations
+        )
+
     async def _execute_run(
         self,
         request: AgentRunRequest,
@@ -503,73 +1159,36 @@ class AgentCore:
             event_sink=sink,
         )
         delegation_bound = False
+        agent_tree_root_owner = False
+        agent_tree_context_version: int | None = None
         compaction_source_request = request
-        pre_planning_compaction: dict[str, Any] = {
-            "outcome": "not_configured",
-        }
+        pre_planning_compaction: dict[str, Any] = {"outcome": "not_configured"}
         try:
-            await controller.start(
-                RunCreateParams(
-                    session_id=request.session_id,
-                    prompt=request.latest_user_text(),
-                    mode=request.mode,
-                    turn_id=options.turn_id,
-                    deadline_at_ms=options.deadline_at_ms,
-                    runtime_limits=self._runtime_limits,
-                    provenance=options.provenance,
-                    binding=options.binding,
-                    agent_preset_snapshot=(
-                        options.agent_preset_snapshot.to_mapping()
-                        if options.agent_preset_snapshot is not None
-                        else {}
-                    ),
-                )
-            )
-            model_tasks = AgentModelTaskRunner(
-                self._model_invocations,
-                ModelInvocationContext(
-                    run_id=controller.run_id,
-                    turn_id=options.turn_id,
-                    deadline_at_ms=options.deadline_at_ms,
-                ),
-            )
-            context_provider = (
-                self._context_provider_factory(model_tasks)
-                if self._context_provider_factory is not None
-                else self._context_provider
-            )
-            conversation_compactor = (
-                self._conversation_compactor_factory(model_tasks)
-                if self._conversation_compactor_factory is not None
-                else self._conversation_compactor
-            )
-            if (
-                self._conversation_compactor_factory is not None
-                and isinstance(
-                    conversation_compactor,
-                    ContextCompressionCoordinator,
-                )
-            ):
-                conversation_compactor = ContextCompressionCoordinator(
-                    conversation_compactor.hook,
-                    conversation_compactor.settings,
-                    operation_controller=self._operations,
-                )
-            if not isinstance(context_provider, ContextProvider):
-                raise TypeError("context provider factory returned an invalid port")
-            if (
-                conversation_compactor is not None
-                and not isinstance(conversation_compactor, ConversationCompactor)
-            ):
-                raise TypeError(
-                    "conversation compactor factory returned an invalid port"
-                )
-            context_capability = ContextCapability(
-                self._context_strategy,
-                context_provider,
-            )
+            await self._start_or_attach_run(request, options, controller)
+            (
+                agent_tree_root_owner,
+                agent_tree_context_version,
+            ) = await self._bind_agent_tree_run(request, options, controller)
+            dependencies = self._runtime_dependencies(controller, options)
+            model_tasks = dependencies.model_tasks
+            context_provider = dependencies.context_provider
+            conversation_compactor = dependencies.conversation_compactor
+            context_capability = dependencies.context_capability
             for event in sink.drain():
                 yield event
+
+            if options.agent_execution_checkpoint is not None:
+                async for event in self._resume_checkpointed_run(
+                    request,
+                    options,
+                    controller,
+                    sink,
+                    model_tasks,
+                    output_limit,
+                    signal,
+                ):
+                    yield event
+                return
 
             compaction_trace = request.metadata.get("conversationCompaction")
             if isinstance(compaction_trace, Mapping):
@@ -630,6 +1249,13 @@ class AgentCore:
                     request,
                     model_supports_tools=options.model_supports_tools,
                 )
+                registrations, enabled_names = self._restrict_agent_capabilities(
+                    request,
+                    options.agent_capability_grant,
+                    registrations,
+                    enabled_names,
+                )
+                registrations = self._bind_agent_tree_lease(registrations, options)
                 display_locale = str(
                     request.metadata.get("locale") or "zh-CN"
                 )
@@ -916,6 +1542,204 @@ class AgentCore:
                 # itself is shutting down; subscriber disposal never reaches
                 # this path.
                 await controller.cancel("execution_owner_stopped")
+                snapshot = controller.snapshot
+            if agent_tree_root_owner and snapshot is not None:
+                await self._settle_root_agent_tree_run(
+                    snapshot,
+                    agent_tree_context_version,
+                )
+
+    async def _start_or_attach_run(
+        self,
+        request: AgentRunRequest,
+        options: AgentCoreRunOptions,
+        controller: AgentRunController,
+    ) -> None:
+        checkpoint = options.agent_execution_checkpoint
+        if checkpoint is None:
+            await controller.start(self._run_create_params(request, options))
+            return
+        persisted = await self._repository.get(checkpoint.run_id)
+        expected_preset = (
+            options.agent_preset_snapshot.to_mapping()
+            if options.agent_preset_snapshot is not None
+            else {}
+        )
+        if persisted.agent_preset_snapshot != freeze_json_mapping(
+            expected_preset
+        ):
+            raise ContractViolationError(
+                "Agent composition differs from the checkpointed Run",
+                code="agent_preset_mismatch",
+            )
+        await controller.attach(persisted)
+
+    def _runtime_dependencies(
+        self,
+        controller: AgentRunController,
+        options: AgentCoreRunOptions,
+    ) -> _RuntimeDependencies:
+        model_tasks = AgentModelTaskRunner(
+            self._model_invocations,
+            ModelInvocationContext(
+                run_id=controller.run_id,
+                turn_id=options.turn_id,
+                deadline_at_ms=options.deadline_at_ms,
+            ),
+        )
+        context_provider = (
+            self._context_provider_factory(model_tasks)
+            if self._context_provider_factory is not None
+            else self._context_provider
+        )
+        conversation_compactor = (
+            self._conversation_compactor_factory(model_tasks)
+            if self._conversation_compactor_factory is not None
+            else self._conversation_compactor
+        )
+        if (
+            self._conversation_compactor_factory is not None
+            and isinstance(
+                conversation_compactor,
+                ContextCompressionCoordinator,
+            )
+        ):
+            conversation_compactor = ContextCompressionCoordinator(
+                conversation_compactor.hook,
+                conversation_compactor.settings,
+                operation_controller=self._operations,
+            )
+        if not isinstance(context_provider, ContextProvider):
+            raise TypeError("context provider factory returned an invalid port")
+        if conversation_compactor is not None and not isinstance(
+            conversation_compactor,
+            ConversationCompactor,
+        ):
+            raise TypeError(
+                "conversation compactor factory returned an invalid port"
+            )
+        return _RuntimeDependencies(
+            model_tasks=model_tasks,
+            context_provider=context_provider,
+            conversation_compactor=conversation_compactor,
+            context_capability=ContextCapability(
+                self._context_strategy,
+                context_provider,
+            ),
+        )
+
+    async def _resume_reactive_runtime(
+        self,
+        *,
+        request: AgentRunRequest,
+        options: AgentCoreRunOptions,
+        controller: AgentRunController,
+        sink: _BufferedEventSink,
+        model_tasks: AgentModelTaskRunner,
+        output_limit,
+        signal: CancellationSignal | None,
+    ) -> tuple[AgentRuntimeResult | None, tuple[AgentEvent, ...]]:
+        checkpoint = options.agent_execution_checkpoint
+        if checkpoint is None:  # pragma: no cover - caller invariant
+            raise ContractViolationError("Reactive resume requires a checkpoint")
+        registrations, enabled_names = _effective_registrations(
+            self._tool_catalog,
+            self._registrations,
+            request,
+            model_supports_tools=options.model_supports_tools,
+        )
+        registrations, enabled_names = self._restrict_agent_capabilities(
+            request,
+            options.agent_capability_grant,
+            registrations,
+            enabled_names,
+        )
+        registrations = self._bind_agent_tree_lease(registrations, options)
+        display_locale = str(request.metadata.get("locale") or "zh-CN")
+        schemas = tuple(
+            model_visible_tool_schema(registration.schema, display_locale)
+            for registration in registrations
+            if registration.schema.name in enabled_names
+        )
+        budget = allocate_context_budget(
+            window_tokens=(
+                request.context_window
+                or options.default_context_window_tokens
+            ),
+            output_reserve_tokens=output_limit.max_tokens,
+            tools=schemas,
+            claims=(),
+            safety_reserve_tokens=options.safety_reserve_tokens,
+            runtime_reserve_tokens=options.runtime_reserve_tokens,
+            minimum_message_tokens=options.minimum_message_tokens,
+        )
+        prepared_request = replace(
+            request,
+            messages=checkpoint.messages,
+            context_window=budget.window_tokens,
+        )
+        state = ExecutionState(
+            domain=thaw_json_mapping(checkpoint.execution_state_domain),
+            run_id=controller.run_id,
+        )
+        return await self._drive_runtime(
+            request=request,
+            prepared_request=prepared_request,
+            options=options,
+            controller=controller,
+            sink=sink,
+            conversation_compactor=None,
+            model_tasks=model_tasks,
+            schemas=schemas,
+            registrations=registrations,
+            selected_names=enabled_names,
+            planning_hook=None,
+            plan=None,
+            state=state,
+            budget=budget,
+            output_limit=output_limit,
+            signal=signal,
+            resume_checkpoint=checkpoint,
+        )
+
+    async def _resume_checkpointed_run(
+        self,
+        request: AgentRunRequest,
+        options: AgentCoreRunOptions,
+        controller: AgentRunController,
+        sink: _BufferedEventSink,
+        model_tasks: AgentModelTaskRunner,
+        output_limit,
+        signal: CancellationSignal | None,
+    ) -> AsyncIterator[AgentEvent | AgentRunResult]:
+        runtime_result, runtime_events = await self._resume_reactive_runtime(
+            request=request,
+            options=options,
+            controller=controller,
+            sink=sink,
+            model_tasks=model_tasks,
+            output_limit=output_limit,
+            signal=signal,
+        )
+        for event in runtime_events:
+            yield event
+        await self._settle_runtime_result(
+            request=request,
+            options=options,
+            controller=controller,
+            result=runtime_result,
+            signal=signal,
+        )
+        for event in sink.drain():
+            yield event
+        yield _run_result(
+            controller,
+            model=(
+                runtime_result.model
+                if runtime_result is not None
+                else request.model.model
+            ),
+        )
 
     async def _prepare_runtime_phase(
         self,
@@ -1161,6 +1985,7 @@ class AgentCore:
             await controller.fail(result.error_code or "runtime_failed")
             return
         try:
+            await self._require_root_agent_tree_quiescent(controller.run_id)
             final_response = result.final_response
             validated_result: str | None = None
             policy = options.resolved_response_transaction_policy
@@ -1220,6 +2045,31 @@ class AgentCore:
             ).strip()
             await controller.fail(code)
 
+    async def _require_root_agent_tree_quiescent(
+        self,
+        run_id: str | None,
+    ) -> None:
+        repository = self._run_tree_repository
+        if (
+            repository is None
+            or run_id is None
+            or run_id not in self._agent_tree_roots
+        ):
+            return
+        descendants = await repository.list_descendants(run_id)
+        if any(
+            run.status in {
+                AgentTreeRunStatus.QUEUED,
+                AgentTreeRunStatus.RUNNING,
+                AgentTreeRunStatus.WAITING,
+            }
+            for run in descendants
+        ):
+            raise ContractViolationError(
+                "Root Run has unfinished descendants",
+                code="root_run_not_quiescent",
+            )
+
     async def _drive_runtime(
         self,
         *,
@@ -1239,6 +2089,7 @@ class AgentCore:
         budget: ContextBudget,
         output_limit,
         signal: CancellationSignal | None,
+        resume_checkpoint: AgentExecutionCheckpoint | None = None,
     ) -> tuple[AgentRuntimeResult | None, tuple[AgentEvent, ...]]:
         host_arguments = {
             item.schema.name: thaw_json_mapping(item.host_planned_arguments)
@@ -1264,7 +2115,17 @@ class AgentCore:
             )
         runtime = AgentRuntime(
             model_gateway=gateway,
-            tool_execution_gateway=self._tool_executor,
+            tool_execution_gateway=(
+                self._tool_executor
+                if tuple(registrations) == self._registrations
+                else CoreToolExecutor(
+                    _CapturedToolCatalog(registrations),
+                    self._approval_gateway,
+                    self._tool_execution_limits,
+                    self._tool_idempotency_gateway,
+                    self._operations,
+                )
+            ),
             observer=controller,
             context_compressor=conversation_compactor,
             limits=self._runtime_limits,
@@ -1293,7 +2154,12 @@ class AgentCore:
                     ),
                 ),
                 response_transaction_mode=(
-                    options.resolved_response_transaction_policy.mode
+                    ResponseTransactionMode.VALIDATED_RESULT
+                    if (
+                        controller.run_id is not None
+                        and controller.run_id in self._agent_tree_roots
+                    )
+                    else options.resolved_response_transaction_policy.mode
                 ),
                 execution_state=state,
                 run_id=controller.run_id,
@@ -1325,6 +2191,12 @@ class AgentCore:
                 },
                 stage_context_projection_enabled=bool(
                     plan is not None and plan.task_spec is not None
+                ),
+                resume_checkpoint=resume_checkpoint,
+                checkpoint_writer=(
+                    controller.save_execution_checkpoint
+                    if options.agent_tree_run_id is not None and plan is None
+                    else None
                 ),
                 signal=signal,
             )
@@ -1580,3 +2452,22 @@ def _run_result(
         error=snapshot.error,
         model=model,
     )
+
+
+def _preset_fingerprint_for_composition(
+    preset_id: str,
+    revision: str,
+    composition: Mapping[str, Any],
+) -> str:
+    encoded = json.dumps(
+        {
+            "id": preset_id,
+            "revision": revision,
+            "composition": composition,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return sha256(encoded).hexdigest()

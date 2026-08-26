@@ -1,5 +1,80 @@
 # Changelog
 
+## 0.4.0 - 2026-08-25
+
+### Recursive Child Agents
+
+- Add stable `AgentNode` identity and immutable `AgentRun` chains with bounded
+  recursive spawn, structured join, context-version continuation, subtree
+  cancellation, and capability narrowing.
+- Route Python and TypeScript Child Runs through their normal Agent runtime;
+  `delegateToAgents` is now a create-and-wait facade over canonical Child Runs
+  when Agent tree execution is enabled.
+- Add Root-scoped atomic model/output budgets and one attributed canonical
+  journal with strictly increasing `root_sequence` values.
+- Add lease epochs, heartbeat renewal, stale-writer fencing for commands,
+  budgets, output, checkpoints, and terminal commits, plus idempotent recovery
+  of committed Child Runs that lost their worker before execution started.
+  Root recovery rebinds execution inputs and scans the complete descendant set.
+- Add Agent Preset snapshot v5 and shared Python/TypeScript Agent tree fixtures,
+  runtime tests, and installed-package recursion/parallelism/continuation smoke
+  coverage.
+- Reject Root completion before public final output while any descendant remains
+  non-terminal, and expose join cancellation as `child_run_join_canceled` in
+  both runtimes.
+
+### Provider output repair
+
+- Preserve stable Core failure codes such as `runtime_budget_exceeded` through
+  Provider stream handling instead of rewriting them as generic stream errors.
+- Keep PUBLIC Provider output bounded by the existing 25 ms batching latency,
+  while allowing PRIVATE background output to batch for up to 250 ms.
+- Raise the default Provider-output journal budget for new Runs from 1 MiB to
+  8 MiB. Explicit host limits and limits restored from persisted snapshots are
+  unchanged.
+- Keep `provider.delta_batch/v1`, output ordering, visibility, atomic append,
+  digest, and terminal-event behavior unchanged.
+
+### Provider liveness and sustained streams
+
+- Replace the 120-second Provider invocation default with a non-renewable
+  300-second resource fuse selected from local DeepSeek V4 Flash samples.
+- Add opt-in Transport and Provider-working stream activity evidence with
+  separate 30-second activity-idle and 60-second progress-idle limits.
+  Semantic-only streams and non-stream completions do not arm idle limits.
+- Keep activity evidence outside semantic chunks, output journals, stream
+  meters, token accounting, and `provider.delta_batch/v1`.
+- Persist the resolved timeout policy in Agent Preset snapshot v4. Snapshots
+  and durable continuations from v3 or older are no longer accepted.
+- Add stable terminal `model_activity_deadline_exceeded` and
+  `model_progress_deadline_exceeded` outcomes without automatic retry.
+
+### Tool schema conformance
+
+- Admit and recursively enforce JSON Schema `uniqueItems` in Python and
+  TypeScript Core before scope checks, approvals, cache probes, or handlers.
+  Provider-side schema validation remains advisory.
+- Align the JSON-value equality used by `uniqueItems`, `enum`, and `const`:
+  numeric representations compare by mathematical value, booleans stay
+  distinct from numbers, arrays compare in order, and object property order is
+  irrelevant.
+- Python hosts may observe corrected `enum` and `const` results where `1` and
+  `1.0` were previously distinguished or nested booleans compared equal to
+  numbers. This intentional conformance correction has no compatibility flag,
+  wire migration, or persisted-state migration.
+
+### Planner WorkPlan control
+
+- Remove Python's default 1-8 WorkPlan step limit. Hosts may still configure
+  an explicit `PlannerLimits.max_steps`; TypeScript retains its existing
+  optional `PlanningConstraints.maxSteps` contract.
+- Keep tool-step, model-round, output, timeout, approval, and compiled-plan
+  authority limits unchanged.
+- Reject duplicate normalized step ids and repair revised plans that reuse
+  completed step ids instead of silently renaming or dropping them.
+- Ask model Planners for the smallest non-redundant user-visible semantic plan
+  and record WorkPlan/ExecutionPlan size and repair counts in planning traces.
+
 ## 0.3.0 - 2026-08-25
 
 ### TypeScript/npm

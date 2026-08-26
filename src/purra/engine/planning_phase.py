@@ -14,6 +14,7 @@ from purra.contracts import (
     PlanningKind,
     RuntimeLimits,
     ExecutionPlan,
+    StepExecutor,
     TraceRecord,
 )
 from purra.engine.context_phase import (
@@ -246,6 +247,37 @@ class PlanningCapability:
                         constraints.allow_model_only_fallback
                     ),
                     "planned": should_plan,
+                    "workPlanStepCount": (
+                        len(planning.work_plan.steps) if should_plan else 0
+                    ),
+                    "executionPlanStepCount": (
+                        len(plan.steps) if plan is not None else 0
+                    ),
+                    "workPlanModelStepCount": (
+                        sum(
+                            step.executor is StepExecutor.MODEL
+                            for step in planning.work_plan.steps
+                        )
+                        if should_plan else 0
+                    ),
+                    "workPlanToolStepCount": (
+                        sum(
+                            step.executor is StepExecutor.TOOL
+                            for step in planning.work_plan.steps
+                        )
+                        if should_plan else 0
+                    ),
+                    "executionToolStepCount": (
+                        sum(
+                            step.executor is StepExecutor.TOOL
+                            for step in plan.steps
+                        )
+                        if plan is not None else 0
+                    ),
+                    "plannerRepairCount": (
+                        max(0, planning.model_call_count - 1)
+                        if should_plan else 0
+                    ),
                     "hostInsertedPrerequisiteCount": (
                         len(compiled.inserted_tool_names) if should_plan else 0
                     ),

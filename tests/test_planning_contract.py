@@ -26,6 +26,7 @@ from purra.contracts import (
     PlanningCapabilities,
     PlanningConstraints,
     PlannerLimits,
+    PlanningTurn,
     StepExecutor,
     StepStatus,
     StepType,
@@ -37,7 +38,7 @@ from purra.contracts import (
     WorkPlan,
     WorkStep,
 )
-from purra.errors import ContractViolationError
+from purra.errors import ContractViolationError, InvalidPlannerOutputError
 from purra.model_protocol import generic_capability_snapshot
 from purra.plan_compiler import compile_work_plan
 from purra.ports import ToolRegistration
@@ -230,6 +231,137 @@ async def test_planner_repairs_a_host_rejected_normalized_result():
     assert "answer taskSpec must omit deliverable" in (
         gateway.message_rounds[3][-1].content
     )
+    assert "None total steps" not in gateway.message_rounds[1][-1].content
+    assert "total steps" not in gateway.message_rounds[1][-1].content
+
+
+def test_planner_has_no_default_total_step_limit_but_honors_an_explicit_one():
+    raw = {
+        "needsTodos": True,
+        "title": "Nine milestones",
+        "todos": [
+            {
+                "id": f"milestone-{index}",
+                "title": f"Milestone {index}",
+                "type": "review",
+                "executor": "model",
+            }
+            for index in range(1, 10)
+        ],
+    }
+
+    planning = normalize_work_plan(raw, PlanningCapabilities())
+
+    assert len(planning.work_plan.steps) == 9
+    with pytest.raises(
+        InvalidPlannerOutputError,
+        match="at most 3 steps",
+    ):
+        normalize_work_plan(
+            raw,
+            PlanningCapabilities(),
+            PlannerLimits(max_steps=3, max_tool_steps=3),
+        )
+
+
+def test_planner_rejects_duplicate_normalized_step_ids():
+    with pytest.raises(
+        InvalidPlannerOutputError,
+        match="step ids must be unique: same-step",
+    ):
+        normalize_work_plan(
+            {
+                "needsTodos": True,
+                "title": "Duplicate",
+                "todos": [
+                    {
+                        "id": "same step",
+                        "title": "First",
+                        "type": "review",
+                        "executor": "model",
+                    },
+                    {
+                        "id": "same-step",
+                        "title": "Second",
+                        "type": "review",
+                        "executor": "model",
+                    },
+                ],
+            },
+            PlanningCapabilities(),
+        )
+
+
+def test_planner_prompt_uses_only_an_explicit_total_step_limit():
+    system, default_user = build_planner_messages(
+        _request(),
+        PlanningCapabilities(),
+    )
+    _, capped_user = build_planner_messages(
+        _request(),
+        PlanningCapabilities(),
+        PlannerLimits(max_steps=3, max_tool_steps=3),
+    )
+
+    assert "1-8" not in system.content
+    assert "smallest non-redundant set" in system.content
+    assert "maxPlanSteps" not in json.loads(default_user.content)
+    assert json.loads(capped_user.content)["maxPlanSteps"] == 3
+
+
+@pytest.mark.asyncio
+async def test_planner_repairs_a_revised_plan_that_reuses_completed_step_ids():
+    reused = {
+        "needsTodos": True,
+        "title": "Continue",
+        "todos": [{
+            "id": "completed",
+            "title": "Repeat completed work",
+            "type": "review",
+            "executor": "model",
+        }],
+    }
+    repaired = {
+        **reused,
+        "todos": [{
+            "id": "remaining",
+            "title": "Finish remaining work",
+            "type": "review",
+            "executor": "model",
+        }],
+    }
+    gateway = _ScriptedPlannerGateway([
+        json.dumps(reused),
+        json.dumps(repaired),
+    ])
+    completed = TaskStep(
+        id="completed",
+        title="Completed",
+        type=StepType.REVIEW,
+        executor=StepExecutor.MODEL,
+        status=StepStatus.DONE,
+    )
+
+    planning = await AgentPlanner(
+        gateway,
+        limits=PlannerLimits(max_steps=3, max_tool_steps=3),
+    ).revise_plan(
+        _request(),
+        PlanningCapabilities(),
+        PlanningTurn(
+            revision=1,
+            round_number=2,
+            remaining_model_rounds=3,
+            messages=(),
+            completed_steps=(completed,),
+        ),
+    )
+
+    assert [step.id for step in planning.work_plan.steps] == ["remaining"]
+    assert "reuses completed step ids: completed" in (
+        gateway.message_rounds[1][-1].content
+    )
+    assert "Use at most 3 total steps." in gateway.message_rounds[1][-1].content
 
 
 def test_diagnostics_cannot_be_smuggled_into_planning_capabilities():

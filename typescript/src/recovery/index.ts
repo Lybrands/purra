@@ -145,6 +145,44 @@ export class RecoveryLedger {
     return this.#attempts.get(key(cause, requiredText(scope, "recovery scope"))) ?? 0;
   }
 
+  public snapshot(): readonly {
+    readonly cause: RecoveryCause;
+    readonly scope: string;
+    readonly attempts: number;
+  }[] {
+    return Object.freeze([...this.#attempts.entries()]
+      .map(([attemptKey, attempts]) => {
+        const separator = attemptKey.indexOf("\u0000");
+        return Object.freeze({
+          cause: attemptKey.slice(0, separator) as RecoveryCause,
+          scope: attemptKey.slice(separator + 1),
+          attempts,
+        });
+      })
+      .sort((left, right) => (
+        left.cause.localeCompare(right.cause) || left.scope.localeCompare(right.scope)
+      )));
+  }
+
+  public restore(snapshot: readonly {
+    readonly cause: RecoveryCause;
+    readonly scope: string;
+    readonly attempts: number;
+  }[]): void {
+    if (this.#attempts.size > 0) throw new Error("Recovery ledger has already been used");
+    if (!Array.isArray(snapshot)) throw new TypeError("Recovery attempt snapshot must be an array");
+    for (const item of snapshot) {
+      assertCause(item.cause);
+      const scope = requiredText(item.scope, "recovery scope");
+      const attempts = nonNegativeInteger(item.attempts, "recovery attempts");
+      const attemptKey = key(item.cause, scope);
+      if (this.#attempts.has(attemptKey)) {
+        throw new TypeError("Recovery attempt snapshot contains duplicates");
+      }
+      this.#attempts.set(attemptKey, attempts);
+    }
+  }
+
   public decide(value: RecoveryRequest): RecoveryDecision {
     const request = normalizeRequest(value);
     const maxAttempts = this.#policy.maxAttempts(request.cause);

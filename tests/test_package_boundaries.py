@@ -94,6 +94,7 @@ def test_second_host_uses_public_composition_and_keeps_its_style_out_of_core():
 
     assert imported_roots <= {
         "__future__",
+        "asyncio",
         "dataclasses",
         "json",
         "pytest",

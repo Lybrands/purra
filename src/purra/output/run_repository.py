@@ -33,6 +33,9 @@ class CanonicalRunRepository:
     ) -> RunBeginResult:
         return await self._output.begin_run_lifecycle(params, started_event)
 
+    async def get(self, run_id: RunId):
+        return await self._repository.get(run_id)
+
     async def commit(
         self,
         run_id: RunId,

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
+from purra.agent_execution_checkpoint import AgentExecutionCheckpoint
+from purra.agent_tree import AgentCapabilityGrant
 from purra.agent_presets import AgentPresetSnapshot
 from purra.errors import ContractViolationError
 from purra.contracts import (
@@ -14,6 +16,7 @@ from purra.contracts import (
     RunProvenance,
 )
 from purra.normalization import (
+    non_negative_int,
     optional_non_negative_int,
     optional_positive_int,
     positive_int,
@@ -80,6 +83,14 @@ class AgentCoreRunOptions:
     durable_continuation: DurableTaskContinuation | None = None
     agent_preset_snapshot: AgentPresetSnapshot | None = None
     deadline_at_ms: int | None = None
+    agent_tree_run_id: str | None = None
+    agent_tree_root_run_id: str | None = None
+    agent_tree_agent_id: str | None = None
+    agent_tree_parent_run_id: str | None = None
+    agent_tree_lease_owner_id: str | None = None
+    agent_tree_lease_epoch: int | None = None
+    agent_capability_grant: AgentCapabilityGrant | None = None
+    agent_execution_checkpoint: AgentExecutionCheckpoint | None = None
 
     def __post_init__(self) -> None:
         claims = tuple(self.context_claims)
@@ -182,6 +193,61 @@ class AgentCoreRunOptions:
             "deadline_at_ms",
             optional_positive_int(self.deadline_at_ms, "Run deadline_at_ms"),
         )
+        for name in (
+            "agent_tree_run_id",
+            "agent_tree_root_run_id",
+            "agent_tree_agent_id",
+            "agent_tree_parent_run_id",
+            "agent_tree_lease_owner_id",
+        ):
+            object.__setattr__(
+                self,
+                name,
+                str(getattr(self, name) or "").strip() or None,
+            )
+        if self.agent_tree_run_id is not None and (
+            self.agent_tree_root_run_id is None
+            or self.agent_tree_agent_id is None
+        ):
+            raise ValueError(
+                "Child Agent Run requires root and Agent scope identities"
+            )
+        if (self.agent_tree_lease_owner_id is None) != (
+            self.agent_tree_lease_epoch is None
+        ):
+            raise ValueError(
+                "Child Agent Run lease owner and epoch must be provided together"
+            )
+        if self.agent_tree_lease_epoch is not None:
+            object.__setattr__(
+                self,
+                "agent_tree_lease_epoch",
+                non_negative_int(
+                    self.agent_tree_lease_epoch,
+                    "Agent tree lease epoch",
+                ),
+            )
+        if (
+            self.agent_capability_grant is not None
+            and not isinstance(self.agent_capability_grant, AgentCapabilityGrant)
+        ):
+            raise TypeError("Agent capability grant is invalid")
+        if (
+            self.agent_execution_checkpoint is not None
+            and not isinstance(
+                self.agent_execution_checkpoint,
+                AgentExecutionCheckpoint,
+            )
+        ):
+            raise TypeError("Agent execution checkpoint is invalid")
+        if (
+            self.agent_execution_checkpoint is not None
+            and self.agent_tree_run_id
+            != self.agent_execution_checkpoint.run_id
+        ):
+            raise ValueError(
+                "Agent execution checkpoint must match the Child Run id"
+            )
         if (
             self.durable_continuation is not None
             and self.agent_preset_snapshot is not None
@@ -276,7 +342,7 @@ async def restore_continuation_preset(
         snapshot = AgentPresetSnapshot.from_mapping(stored)
     except (TypeError, ValueError) as error:
         raise ContractViolationError(
-            "durable continuation requires a complete AgentPreset snapshot version 3",
+            "durable continuation requires a complete AgentPreset snapshot version 4",
             code="agent_preset_snapshot_unsupported",
         ) from error
     if (

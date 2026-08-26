@@ -396,6 +396,11 @@ class AgentOutputEvent:
     payload: Mapping[str, Any]
     occurred_at: datetime
     emitted_at: datetime
+    root_run_id: RunId | None = None
+    agent_id: str | None = None
+    parent_run_id: RunId | None = None
+    root_sequence: int | None = None
+    source_event_key: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -413,6 +418,22 @@ class AgentOutputEvent:
         )
         object.__setattr__(
             self, "sequence", positive_int(self.sequence, "sequence")
+        )
+        for name in ("root_run_id", "agent_id", "parent_run_id"):
+            object.__setattr__(self, name, optional_text(getattr(self, name)))
+        object.__setattr__(
+            self,
+            "root_sequence",
+            (
+                None
+                if self.root_sequence is None
+                else positive_int(self.root_sequence, "root sequence")
+            ),
+        )
+        object.__setattr__(
+            self,
+            "source_event_key",
+            optional_text(self.source_event_key),
         )
         source = OutputSource(self.source)
         kind = OutputEventKind(self.kind)

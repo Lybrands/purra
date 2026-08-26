@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
+from typing import Any, Mapping
+
+from purra.agent_execution_checkpoint import AgentExecutionCheckpoint
 
 from purra.contracts import (
     ExecutionTransition,
@@ -21,6 +24,7 @@ from purra.normalization import (
     optional_text as _optional_text,
     required_text,
 )
+from purra.json_values import freeze_json_mapping
 from purra.errors import ContractViolationError
 
 
@@ -50,6 +54,8 @@ class RunSnapshot:
     work_step_ids: tuple[str, ...] | None = None
     final_response: str = ""
     error: str | None = None
+    execution_checkpoint: AgentExecutionCheckpoint | None = None
+    agent_preset_snapshot: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         run_id = required_text(self.run_id, "run snapshot run id")
@@ -91,6 +97,19 @@ class RunSnapshot:
         object.__setattr__(self, "work_step_ids", work_step_ids)
         object.__setattr__(self, "final_response", str(self.final_response or ""))
         object.__setattr__(self, "error", _optional_text(self.error))
+        object.__setattr__(
+            self,
+            "agent_preset_snapshot",
+            freeze_json_mapping(self.agent_preset_snapshot or {}),
+        )
+        if self.execution_checkpoint is not None:
+            if not isinstance(
+                self.execution_checkpoint,
+                AgentExecutionCheckpoint,
+            ):
+                raise TypeError("Run execution checkpoint is invalid")
+            if self.execution_checkpoint.run_id != run_id:
+                raise ValueError("Run execution checkpoint belongs to another Run")
 
     @property
     def terminal(self) -> bool:

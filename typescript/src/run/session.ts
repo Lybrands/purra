@@ -14,12 +14,14 @@ import type { ToolExecutionEvent } from "../tools/types.js";
 import type { DelegationLifecycleEvent } from "../delegation/types.js";
 import type { RunRepository } from "./store.js";
 import type {
+  AgentExecutionCheckpoint,
   InvocationReceiptInput,
   ModelInvocationReceipt,
   RunBeginParams,
   RunCancellationReceipt,
   RunCommand,
   RunHandle,
+  RunLeaseClaim,
   RunResult,
   RunSnapshot,
 } from "./types.js";
@@ -58,6 +60,11 @@ export class RunSession {
   readonly #policy: OutputPolicy;
   readonly #controller = new AbortController();
   readonly #runId: string;
+  readonly #rootRunId: string;
+  readonly #agentId: string;
+  readonly #parentRunId: string | undefined;
+  readonly #outwardVisibility: "public" | "private";
+  readonly #leaseClaim: RunLeaseClaim;
   readonly #batchLimits: OutputBatchLimits;
   #deadlineExceeded = false;
   #deadlineTimer: number | undefined;
@@ -69,6 +76,10 @@ export class RunSession {
     publisher: OutputPublisher,
     policy: OutputPolicy,
     runId: string,
+    rootRunId: string,
+    agentId: string,
+    parentRunId: string | undefined,
+    leaseClaim: RunLeaseClaim,
     deadlineAt: string | null,
     batchLimits: OutputBatchLimits,
   ) {
@@ -76,6 +87,11 @@ export class RunSession {
     this.#publisher = publisher;
     this.#policy = policy;
     this.#runId = runId;
+    this.#rootRunId = rootRunId;
+    this.#agentId = agentId;
+    this.#parentRunId = parentRunId;
+    this.#outwardVisibility = parentRunId === undefined ? "public" : "private";
+    this.#leaseClaim = Object.freeze({ ...leaseClaim });
     this.#batchLimits = batchLimits;
     if (deadlineAt !== null) {
       const delay = Math.max(0, Date.parse(deadlineAt) - Date.now());
@@ -100,13 +116,75 @@ export class RunSession {
       publisher,
       policy,
       begun.snapshot.runId,
+      params.rootRunId ?? begun.snapshot.runId,
+      params.agentId ?? begun.snapshot.runId,
+      params.parentRunId,
+      params.leaseOwnerId === undefined
+        ? Object.freeze({})
+        : Object.freeze({
+            leaseOwnerId: params.leaseOwnerId,
+            leaseEpoch: params.leaseEpoch,
+          }),
       begun.snapshot.deadlineAt,
+      batchLimits,
+    );
+  }
+
+  public static resume(
+    repository: RunRepository,
+    publisher: OutputPublisher,
+    policy: OutputPolicy,
+    snapshot: RunSnapshot,
+    scope: {
+      readonly rootRunId: string;
+      readonly agentId: string;
+      readonly parentRunId?: string;
+      readonly leaseOwnerId: string;
+      readonly leaseEpoch: number;
+    },
+    batchLimits: OutputBatchLimits,
+  ): RunSession {
+    if (snapshot.status !== "running" || snapshot.executionCheckpoint === undefined) {
+      throw new AgentError(
+        "agent_run_resume_checkpoint_missing",
+        "Running Agent Run has no resumable checkpoint",
+      );
+    }
+    return new RunSession(
+      repository,
+      publisher,
+      policy,
+      snapshot.runId,
+      scope.rootRunId,
+      scope.agentId,
+      scope.parentRunId,
+      {
+        leaseOwnerId: scope.leaseOwnerId,
+        leaseEpoch: scope.leaseEpoch,
+      },
+      snapshot.deadlineAt,
       batchLimits,
     );
   }
 
   public get runId(): string {
     return this.#runId;
+  }
+
+  public get rootRunId(): string {
+    return this.#rootRunId;
+  }
+
+  public get agentId(): string {
+    return this.#agentId;
+  }
+
+  public get parentRunId(): string | undefined {
+    return this.#parentRunId;
+  }
+
+  public get leaseClaim(): RunLeaseClaim {
+    return this.#leaseClaim;
   }
 
   public get signal(): AbortSignal {
@@ -160,7 +238,7 @@ export class RunSession {
       contextEvidence: Object.freeze(input.evidence.map((receipt) => Object.freeze({ ...receipt }))),
       capabilityProfileId: input.capabilityProfileId,
       outputLimit: input.outputLimit,
-    });
+    }, this.#leaseClaim);
     this.#receipts.set(opened.receipt.invocationId, opened.receipt);
     await this.#publisher.publishCommitted(opened.event);
     return opened.receipt;
@@ -241,7 +319,7 @@ export class RunSession {
       status,
       ...(turn?.usage === undefined ? {} : { usage: turn.usage }),
       ...(errorCode === undefined ? {} : { errorCode }),
-    });
+    }, this.#leaseClaim);
     this.#receipts.delete(receipt.invocationId);
     this.#batches.delete(receipt.invocationId);
     await this.#publisher.publishCommitted(settled.event);
@@ -255,7 +333,7 @@ export class RunSession {
       sourceKey: `invocation:${receipt.invocationId}:commentary`,
       kind: "commentary",
       channel: "commentary",
-      visibility: "public",
+      visibility: this.#outwardVisibility,
       payload: { content },
     });
   }
@@ -303,7 +381,7 @@ export class RunSession {
       .filter((draft): draft is OutputEventDraft => draft !== null);
     const events = authorized.length === 0
       ? []
-      : await this.#repository.appendBatch(this.#runId, authorized);
+      : await this.#repository.appendBatch(this.#runId, authorized, this.#leaseClaim);
     batch.entries.splice(0);
     batch.payloadBytes = 0;
     if (batch.timer !== undefined) globalThis.clearTimeout(batch.timer);
@@ -317,7 +395,7 @@ export class RunSession {
       batch.timer = undefined;
       void this.#withBatch(receipt, (current) => this.#flushBatch(receipt, current))
         .catch((error: unknown) => { batch.error = error; });
-    }, this.#batchLimits.maxLatencyMs);
+    }, this.#batchLimits.maxBackgroundLatencyMs);
   }
 
   public async publishTool(event: ToolExecutionEvent, round: number): Promise<void> {
@@ -325,7 +403,7 @@ export class RunSession {
       sourceKey: `tool:${round}:${event.toolCallId}:${event.type}`,
       kind: event.type === "tool_started" ? "tool.started" : "tool.completed",
       channel: "tool",
-      visibility: "public",
+      visibility: this.#outwardVisibility,
       payload: copyJsonValue(event) as Readonly<Record<string, JsonValue>>,
     });
   }
@@ -339,7 +417,7 @@ export class RunSession {
       sourceKey: `delegation:${delegationId}:tool:${round}:${event.toolCallId}:${event.type}`,
       kind: event.type === "tool_started" ? "tool.started" : "tool.completed",
       channel: "tool",
-      visibility: "public",
+      visibility: this.#outwardVisibility,
       payload: copyJsonValue({ ...event, delegationId }) as Readonly<Record<string, JsonValue>>,
     });
   }
@@ -352,7 +430,7 @@ export class RunSession {
       sourceKey: `delegation:${event.batchId}:${event.delegationId}:${event.status}`,
       kind: "delegation.status",
       channel: "lifecycle",
-      visibility: "public",
+      visibility: this.#outwardVisibility,
       payload: copyJsonValue({
         batchId: event.batchId,
         delegationId: event.delegationId,
@@ -369,7 +447,7 @@ export class RunSession {
       sourceKey: `plan:${revision}`,
       kind: "plan.updated",
       channel: "plan",
-      visibility: "public",
+      visibility: this.#outwardVisibility,
       payload: copyJsonValue({ revision, plan }) as Readonly<Record<string, JsonValue>>,
     });
   }
@@ -379,7 +457,7 @@ export class RunSession {
       sourceKey: `admission:${continuation ? "continuation" : "initial"}`,
       kind: "task_admission.decided",
       channel: "lifecycle",
-      visibility: "public",
+      visibility: this.#outwardVisibility,
       payload: copyJsonValue({
         mode: decision.mode,
         reasonCode: decision.reasonCode,
@@ -406,6 +484,17 @@ export class RunSession {
     });
   }
 
+  public async saveExecutionCheckpoint(
+    checkpoint: AgentExecutionCheckpoint,
+  ): Promise<void> {
+    const committed = await this.#repository.saveExecutionCheckpoint(
+      this.#runId,
+      checkpoint,
+      this.#leaseClaim,
+    );
+    await this.#publisher.publishCommitted(committed.event);
+  }
+
   public async publishDurableDispatch(
     receipt: LongTaskDispatchReceipt,
     snapshot: DurableRecoverySnapshot,
@@ -414,7 +503,7 @@ export class RunSession {
       sourceKey: `long-task:${receipt.taskId}:dispatched`,
       kind: "long_task.dispatched",
       channel: "lifecycle",
-      visibility: "public",
+      visibility: this.#outwardVisibility,
       payload: copyJsonValue({
         taskId: receipt.taskId,
         message: receipt.message,
@@ -435,7 +524,7 @@ export class RunSession {
       sourceKey: `${update.type}:${String(update.payload.taskId ?? "task")}:${String(update.payload.unitId ?? update.payload.completedUnits ?? "update")}:${globalThis.crypto.randomUUID()}`,
       kind: update.type,
       channel: "lifecycle",
-      visibility: "public",
+      visibility: this.#outwardVisibility,
       payload: update.payload,
     });
   }
@@ -449,7 +538,7 @@ export class RunSession {
       sourceKey: `run:${this.#runId}:final`,
       kind: "final",
       channel: "final",
-      visibility: "public",
+      visibility: this.#outwardVisibility,
       payload: { output: result.output, rounds: result.rounds },
     });
     if (finalEvent === null) {
@@ -458,7 +547,7 @@ export class RunSession {
     const settled = await this.#repository.settleRun(this.#runId, "completed", {
       relatedEvents: [finalEvent],
       finalOutput: result.output,
-    });
+    }, this.#leaseClaim);
     this.#clearDeadline();
     await this.#publishAll(settled.events);
   }
@@ -467,14 +556,19 @@ export class RunSession {
     const snapshot = await this.#repository.get(this.#runId);
     if (snapshot.status !== "running") return;
     await this.#flushAllBatches(true);
-    const settled = await this.#repository.settleRun(this.#runId, "failed", { errorCode });
+    const settled = await this.#repository.settleRun(
+      this.#runId,
+      "failed",
+      { errorCode },
+      this.#leaseClaim,
+    );
     this.#clearDeadline();
     await this.#publishAll(settled.events);
   }
 
   public async cancel(): Promise<RunCancellationReceipt> {
     await this.#flushAllBatches(true);
-    const receipt = await this.#repository.cancel(this.#runId);
+    const receipt = await this.#repository.cancel(this.#runId, this.#leaseClaim);
     if (!receipt.accepted) return receipt;
     this.#clearDeadline();
     this.#controller.abort();
@@ -505,7 +599,11 @@ export class RunSession {
   async #persist(draft: OutputEventDraft): Promise<OutputEvent | undefined> {
     const authorized = await this.#authorize(draft);
     if (authorized === null) return undefined;
-    const event = await this.#repository.appendEvent(this.#runId, authorized);
+    const event = await this.#repository.appendEvent(
+      this.#runId,
+      authorized,
+      this.#leaseClaim,
+    );
     await this.#publisher.publishCommitted(event);
     return event;
   }

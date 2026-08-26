@@ -124,18 +124,27 @@ class AgentPresetSnapshot:
     revision: str
     fingerprint: str
     composition: Mapping[str, Any]
-    snapshot_version: int = 3
+    snapshot_version: int = 4
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "id", required_text(self.id, "agent preset id"))
-        if self.snapshot_version != 3:
-            raise ValueError("agent preset snapshot version must be 3")
+        if self.snapshot_version not in {4, 5}:
+            raise ValueError("agent preset snapshot version must be 4 or 5")
         object.__setattr__(
             self,
             "revision",
             required_text(self.revision, "agent preset revision"),
         )
         composition = freeze_json_mapping(self.composition)
+        if self.snapshot_version == 5:
+            agent_tree = composition.get("agentTree")
+            if (
+                not isinstance(agent_tree, Mapping)
+                or agent_tree.get("protocolVersion") != 1
+            ):
+                raise ValueError(
+                    "agent preset snapshot v5 requires Agent tree protocol v1"
+                )
         object.__setattr__(self, "composition", composition)
         expected = _preset_fingerprint(
             self.id,
@@ -159,8 +168,8 @@ class AgentPresetSnapshot:
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "AgentPresetSnapshot":
         snapshot_version = value.get("snapshotVersion")
-        if snapshot_version != 3:
-            raise ValueError("agent preset snapshot version must be 3")
+        if snapshot_version not in {4, 5}:
+            raise ValueError("agent preset snapshot version must be 4 or 5")
         composition = value.get("composition")
         if not isinstance(composition, Mapping):
             raise TypeError("agent preset snapshot composition must be an object")
@@ -392,6 +401,8 @@ class AgentPreset:
             "runtimeLimits": {
                 "maxModelRounds": self.runtime_limits.max_model_rounds,
                 "maxProgressRounds": self.runtime_limits.max_progress_rounds,
+                "providerActivityIdleTimeoutMs": self.runtime_limits.provider_activity_idle_timeout_ms,
+                "providerProgressIdleTimeoutMs": self.runtime_limits.provider_progress_idle_timeout_ms,
                 "providerInvocationTimeoutMs": self.runtime_limits.provider_invocation_timeout_ms,
                 "rootRunTimeoutMs": self.runtime_limits.root_run_timeout_ms,
                 "maxModelInvocationAttempts": self.runtime_limits.max_model_invocation_attempts,

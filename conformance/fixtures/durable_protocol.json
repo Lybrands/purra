@@ -1,7 +1,21 @@
 {
-  "protocolVersion": 3,
-  "agentPresetSnapshotVersion": 3,
+  "protocolVersion": 4,
+  "agentPresetSnapshotVersion": 4,
+  "runtimeDefaults": {
+    "providerActivityIdleTimeoutMs": 30000,
+    "providerProgressIdleTimeoutMs": 60000,
+    "providerInvocationTimeoutMs": 300000,
+    "maxProviderOutputBytes": 8388608
+  },
+  "outputBatchDefaults": {
+    "maxPayloadBytes": 16384,
+    "maxFragments": 64,
+    "maxLatencyMs": 25,
+    "maxBackgroundLatencyMs": 250
+  },
   "stableErrorCodes": {
+    "activityDeadline": "model_activity_deadline_exceeded",
+    "progressDeadline": "model_progress_deadline_exceeded",
     "invocationDeadline": "model_invocation_deadline_exceeded",
     "runDeadline": "run_deadline_exceeded",
     "taskDeadline": "long_task_deadline_exceeded",

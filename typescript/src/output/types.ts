@@ -37,7 +37,8 @@ export type OutputEventKind =
   | "long_task.dispatched"
   | "long_task.progress"
   | "long_task.checkpoint"
-  | "durable.recovery_snapshot";
+  | "durable.recovery_snapshot"
+  | "agent.execution_checkpoint";
 
 export interface OutputEventDraft {
   readonly sourceKey: string;
@@ -50,7 +51,11 @@ export interface OutputEventDraft {
 export interface OutputEvent extends OutputEventDraft {
   readonly eventId: string;
   readonly runId: string;
+  readonly rootRunId: string;
+  readonly agentId: string;
+  readonly parentRunId: string | null;
   readonly sequence: number;
+  readonly rootSequence: number;
   readonly occurredAt: string;
   readonly payload: Readonly<Record<string, JsonValue>>;
 }
@@ -74,4 +79,5 @@ export interface OutputBatchLimits {
   readonly maxPayloadBytes: number;
   readonly maxFragments: number;
   readonly maxLatencyMs: number;
+  readonly maxBackgroundLatencyMs: number;
 }

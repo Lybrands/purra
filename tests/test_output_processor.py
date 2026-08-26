@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import replace
 from datetime import datetime, timezone
+import json
 
 import pytest
 
@@ -12,9 +13,14 @@ from purra.contracts import (
     ModelRequest,
     ModelStreamChunk,
     ModelTokenUsage,
+    RunCreateParams,
+    RuntimeLimits,
 )
+from purra.api import InMemoryAgentAdapters
+from purra.events import AgentEvent
 from purra.model_invocation import ModelInvocationReceipt
 from purra.model_protocol import generic_capability_snapshot
+from purra.json_values import thaw_json_mapping
 from purra.operations import OperationKind, OperationStarted
 from purra.output import (
     AgentOutputEvent,
@@ -158,6 +164,31 @@ class _Recovery:
 
     async def notify_output_failure(self, run_id, code):
         self.codes.append((run_id, code))
+
+
+class _ControlledClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.waiters = []
+
+    async def sleep(self, delay: float) -> None:
+        future = asyncio.get_running_loop().create_future()
+        waiter = (self.now + delay, future)
+        self.waiters.append(waiter)
+        try:
+            await future
+        finally:
+            if waiter in self.waiters:
+                self.waiters.remove(waiter)
+
+    async def advance(self, delay: float) -> None:
+        await asyncio.sleep(0)
+        self.now += delay
+        for target, future in tuple(self.waiters):
+            if target <= self.now and not future.done():
+                future.set_result(None)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
 
 
 async def _opened_processor(spec: OutputStreamSpec):
@@ -422,6 +453,363 @@ async def test_latency_flush_uses_the_injected_clock_and_leaves_no_pending_timer
     gate.set()
     await asyncio.wait_for(flushed.wait(), timeout=1)
     assert repository.events[-1].kind is OutputEventKind.PROVIDER_DELTA_BATCH
+
+
+@pytest.mark.asyncio
+async def test_private_stream_uses_the_background_latency_ceiling():
+    from purra.output.processor import AgentOutputProcessor, OutputBatchLimits
+
+    gate = asyncio.Event()
+    observed_delays = []
+
+    async def controlled_sleep(delay: float) -> None:
+        observed_delays.append(delay)
+        await gate.wait()
+
+    repository = _Repository()
+    processor = AgentOutputProcessor(
+        repository,
+        _Publisher(),
+        batch_limits=OutputBatchLimits(
+            max_payload_bytes=1_000_000,
+            max_fragments=100,
+            max_latency_ms=7,
+            max_background_latency_ms=70,
+        ),
+        sleep=controlled_sleep,
+    )
+    spec = _spec(
+        intent=AgentOutputIntent.STRUCTURED_PRIVATE,
+        commit_mode=OutputCommitMode.PRIVATE,
+    )
+    await processor.open_model_stream(_receipt(spec), spec)
+    await processor.accept_provider_chunk(
+        spec.output_stream_id,
+        ModelStreamChunk(reasoning_delta="delayed"),
+    )
+    await asyncio.sleep(0)
+
+    assert observed_delays == [0.07]
+    gate.set()
+    await processor.finish_model_stream(
+        spec.output_stream_id,
+        ModelFinishReason.STOP,
+    )
+
+
+@pytest.mark.asyncio
+async def test_size_threshold_preempts_public_and_background_timers():
+    from purra.output.processor import AgentOutputProcessor, OutputBatchLimits
+
+    for spec in (
+        _spec(),
+        _spec(
+            intent=AgentOutputIntent.STRUCTURED_PRIVATE,
+            commit_mode=OutputCommitMode.PRIVATE,
+        ),
+    ):
+        observed_delays = []
+
+        async def controlled_sleep(delay: float) -> None:
+            observed_delays.append(delay)
+
+        processor = AgentOutputProcessor(
+            _Repository(),
+            _Publisher(),
+            batch_limits=OutputBatchLimits(
+                max_payload_bytes=1_000_000,
+                max_fragments=1,
+                max_latency_ms=7,
+                max_background_latency_ms=70,
+            ),
+            sleep=controlled_sleep,
+        )
+        await processor.open_model_stream(_receipt(spec), spec)
+        events = await processor.accept_provider_chunk(
+            spec.output_stream_id,
+            ModelStreamChunk(content_delta="immediate"),
+        )
+        await asyncio.sleep(0)
+
+        assert len(events) == 1
+        assert observed_delays == []
+
+
+@pytest.mark.asyncio
+async def test_timer_and_terminal_flush_append_each_source_range_once():
+    from purra.output.processor import AgentOutputProcessor, OutputBatchLimits
+
+    gate = asyncio.Event()
+
+    async def controlled_sleep(_delay: float) -> None:
+        await gate.wait()
+
+    repository = _Repository()
+    processor = AgentOutputProcessor(
+        repository,
+        _Publisher(),
+        batch_limits=OutputBatchLimits(
+            max_payload_bytes=1_000_000,
+            max_fragments=100,
+            max_latency_ms=7,
+            max_background_latency_ms=70,
+        ),
+        sleep=controlled_sleep,
+    )
+    spec = _spec(
+        intent=AgentOutputIntent.STRUCTURED_PRIVATE,
+        commit_mode=OutputCommitMode.PRIVATE,
+    )
+    await processor.open_model_stream(_receipt(spec), spec)
+    await processor.accept_provider_chunk(
+        spec.output_stream_id,
+        ModelStreamChunk(reasoning_delta="race"),
+    )
+    await asyncio.sleep(0)
+
+    gate.set()
+    await processor.finish_model_stream(
+        spec.output_stream_id,
+        ModelFinishReason.STOP,
+    )
+    await asyncio.sleep(0)
+
+    batches = [
+        event for event in repository.events
+        if event.kind is OutputEventKind.PROVIDER_DELTA_BATCH
+    ]
+    assert len(batches) == 1
+    assert batches[0].payload["sourceChunkStart"] == 1
+    assert batches[0].payload["sourceChunkEnd"] == 1
+
+
+@pytest.mark.asyncio
+async def test_abort_flush_cancels_the_background_timer():
+    from purra.output.processor import AgentOutputProcessor, OutputBatchLimits
+
+    started = asyncio.Event()
+    canceled = asyncio.Event()
+
+    async def controlled_sleep(_delay: float) -> None:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            canceled.set()
+
+    repository = _Repository()
+    processor = AgentOutputProcessor(
+        repository,
+        _Publisher(),
+        batch_limits=OutputBatchLimits(
+            max_payload_bytes=1_000_000,
+            max_fragments=100,
+            max_latency_ms=7,
+            max_background_latency_ms=70,
+        ),
+        sleep=controlled_sleep,
+    )
+    spec = _spec(
+        intent=AgentOutputIntent.REASONING_PRIVATE,
+        commit_mode=OutputCommitMode.PRIVATE,
+    )
+    await processor.open_model_stream(_receipt(spec), spec)
+    await processor.accept_provider_chunk(
+        spec.output_stream_id,
+        ModelStreamChunk(reasoning_delta="pending"),
+    )
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    await processor.abort_model_stream(spec.output_stream_id, "request_canceled")
+    await asyncio.wait_for(canceled.wait(), timeout=1)
+
+    assert sum(
+        event.kind is OutputEventKind.PROVIDER_DELTA_BATCH
+        for event in repository.events
+    ) == 1
+
+
+async def _append_fragmented_reasoning_corpus(processor, run_id, clock):
+    fragments = tuple(
+        "rrr" if index < 3_395 else "rr"
+        for index in range(6_921)
+    )
+    offset = 0
+    for attempt in range(5):
+        count = 1_385 if attempt == 0 else 1_384
+        spec = replace(
+            _spec(
+                intent=AgentOutputIntent.REASONING_PRIVATE,
+                commit_mode=OutputCommitMode.PRIVATE,
+            ),
+            output_stream_id=f"output-{attempt}",
+            invocation_id=f"invocation-{attempt}",
+            run_id=run_id,
+            turn_id=None,
+        )
+        await processor.open_model_stream(_receipt(spec), spec)
+        for fragment in fragments[offset:offset + count]:
+            await processor.accept_provider_chunk(
+                spec.output_stream_id,
+                ModelStreamChunk(reasoning_delta=fragment),
+            )
+            await clock.advance(0.005)
+        offset += count
+        await processor.finish_model_stream(
+            spec.output_stream_id,
+            ModelFinishReason.STOP,
+        )
+
+
+def _batch_payload_bytes(batches) -> int:
+    return sum(
+        len(json.dumps(
+            thaw_json_mapping(event.payload),
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8"))
+        for event in batches
+    )
+
+
+async def _fragmented_reasoning_corpus(background_latency_ms: int):
+    from purra.output.processor import AgentOutputProcessor, OutputBatchLimits
+
+    repository = _Repository()
+    clock = _ControlledClock()
+    processor = AgentOutputProcessor(
+        repository,
+        _Publisher(),
+        batch_limits=OutputBatchLimits(
+            max_payload_bytes=16_384,
+            max_fragments=64,
+            max_latency_ms=25,
+            max_background_latency_ms=background_latency_ms,
+        ),
+        sleep=clock.sleep,
+    )
+    await _append_fragmented_reasoning_corpus(processor, "run-1", clock)
+
+    batches = tuple(
+        event for event in repository.events
+        if event.kind is OutputEventKind.PROVIDER_DELTA_BATCH
+    )
+    reconstructed = "".join(
+        entry["payload"]["delta"]
+        for event in batches
+        for entry in event.payload["entries"]
+    )
+    payload_bytes = _batch_payload_bytes(batches)
+    return len(batches), payload_bytes, reconstructed
+
+
+@pytest.mark.asyncio
+async def test_incident_corpus_background_batching_reduces_canonical_overhead():
+    baseline = await _fragmented_reasoning_corpus(25)
+    repaired = await _fragmented_reasoning_corpus(250)
+    print(
+        "incident corpus: "
+        f"25ms={baseline[0]} batches/{baseline[1]} bytes; "
+        f"250ms={repaired[0]} batches/{repaired[1]} bytes"
+    )
+
+    assert len(repaired[2]) == 17_237
+    assert repaired[2] == baseline[2]
+    assert repaired[0] * 4 < baseline[0]
+    assert repaired[1] < 1_000_000
+
+
+@pytest.mark.asyncio
+async def test_eight_mib_candidate_clears_the_incident_corpus_with_two_x_headroom():
+    from purra.output.processor import AgentOutputProcessor
+
+    candidate = 8 * 1024 * 1024
+    adapters = InMemoryAgentAdapters()
+    begun = await adapters.runs.begin(
+        RunCreateParams(
+            session_id=None,
+            prompt="calibrate Provider output",
+            mode=None,
+            runtime_limits=RuntimeLimits(max_provider_output_bytes=candidate),
+        ),
+        AgentEvent(type="run.started"),
+    )
+    clock = _ControlledClock()
+    processor = AgentOutputProcessor(
+        adapters.outputs,
+        adapters.publisher,
+        sleep=clock.sleep,
+    )
+
+    await _append_fragmented_reasoning_corpus(processor, begun.run_id, clock)
+    events = await adapters.outputs.list_events(
+        begun.run_id,
+        after_sequence=0,
+        limit=500,
+    )
+    batches = tuple(
+        event for event in events
+        if event.kind is OutputEventKind.PROVIDER_DELTA_BATCH
+    )
+    payload_bytes = _batch_payload_bytes(batches)
+    reconstructed = "".join(
+        entry["payload"]["delta"]
+        for event in batches
+        for entry in event.payload["entries"]
+    )
+    print(
+        f"8 MiB candidate: {len(batches)} batches/{payload_bytes} bytes/"
+        f"{candidate / payload_bytes:.2f}x headroom"
+    )
+
+    assert len(batches) == 140
+    assert len(reconstructed) == 17_237
+    assert candidate >= 2 * max(payload_bytes, 990_883)
+
+
+@pytest.mark.asyncio
+async def test_eight_mib_candidate_rejects_oversize_before_provider_append():
+    from purra.output.processor import AgentOutputProcessor
+
+    candidate = 8 * 1024 * 1024
+    adapters = InMemoryAgentAdapters()
+    begun = await adapters.runs.begin(
+        RunCreateParams(
+            session_id=None,
+            prompt="reject oversized Provider output",
+            mode=None,
+            runtime_limits=RuntimeLimits(max_provider_output_bytes=candidate),
+        ),
+        AgentEvent(type="run.started"),
+    )
+    processor = AgentOutputProcessor(adapters.outputs, adapters.publisher)
+    spec = replace(
+        _spec(),
+        output_stream_id="oversized-output",
+        invocation_id="oversized-invocation",
+        run_id=begun.run_id,
+        turn_id=None,
+    )
+    await processor.open_model_stream(_receipt(spec), spec)
+
+    with pytest.raises(Exception) as exceeded:
+        await processor.accept_provider_chunk(
+            spec.output_stream_id,
+            ModelStreamChunk(content_delta="x" * candidate),
+        )
+
+    events = await adapters.outputs.list_events(
+        begun.run_id,
+        after_sequence=0,
+        limit=20,
+    )
+    assert getattr(exceeded.value, "code", None) == "runtime_budget_exceeded"
+    assert not any(
+        event.kind is OutputEventKind.PROVIDER_DELTA_BATCH
+        for event in events
+    )
 
 
 @pytest.mark.asyncio

@@ -1,7 +1,7 @@
 import { prepareContext, resolveContextFactories } from "../context/coordinator.js";
 import type { PreparedContext } from "../context/types.js";
 import { ModelTaskRunner } from "../extensions/model-tasks.js";
-import { invokeModel } from "../model/stream.js";
+import { invokeModel, type ModelStreamLimits } from "../model/stream.js";
 import type { Message, ModelTurn, ToolSpec } from "../model/types.js";
 import {
   copyCapabilitySnapshot,
@@ -32,6 +32,7 @@ export class DynamicDelegatedAgentExecutor {
   readonly #operations: AgentOperationController | undefined;
   readonly #sessions = new Map<string, RunSession>();
   readonly #useStream: boolean;
+  readonly #runtimeLimits: ModelStreamLimits | undefined;
 
   public constructor(options: DynamicDelegatedAgentExecutorOptions) {
     if (typeof options.model?.invoke !== "function") {
@@ -58,6 +59,7 @@ export class DynamicDelegatedAgentExecutor {
     }
     this.#recovery = options.recovery ?? new RecoveryPolicy();
     this.#operations = options.operations;
+    this.#runtimeLimits = options.runtimeLimits;
     this.#useStream = typeof options.model.stream === "function"
       && this.#capabilities?.protocol.streaming !== "unavailable";
   }
@@ -140,6 +142,7 @@ export class DynamicDelegatedAgentExecutor {
       runId,
       recovery: this.#recovery,
       authority: session,
+      ...(this.#runtimeLimits === undefined ? {} : { runtimeLimits: this.#runtimeLimits }),
       ...(this.#operations === undefined ? {} : { operations: this.#operations }),
     }));
   }
@@ -184,6 +187,7 @@ export class DynamicDelegatedAgentExecutor {
             await session.persistChunk(receipt, chunkIndex, chunk);
             chunkIndex += 1;
           },
+          this.#runtimeLimits,
         );
         if (!this.#useStream) await session.persistCompletion(receipt, turn);
         await session.settleInvocation(receipt, "completed", turn);

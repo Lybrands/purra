@@ -28,6 +28,8 @@ const PLANNER_INSTRUCTION = [
   "Return one JSON object only with the shape {\"workPlan\":{\"title\":string,\"goal\"?:string,\"taskSpec\"?:object,\"steps\":array}}.",
   "Each step requires id, title, type, and executor.",
   "Keep user-visible titles and goals in the language of the current request.",
+  "Return the smallest non-redundant set of user-visible semantic steps needed to complete the request.",
+  "Each step must represent a distinct result, evidence phase, or domain milestone; do not split out reasoning, retries, approvals, persistence, internal validation, protocol lowering, or tool prerequisites.",
   "A tool step must select exactly one name from availableTools in capabilityNames; a model step must not select tools.",
   "Dependencies may reference only earlier step ids. Never create hidden permissions, tools, or execution stages.",
   "For a direct response, return one model/review step. For a revision, return only unfinished work and never reuse a completed step id.",

@@ -2,6 +2,7 @@ import type { ContextOptions } from "../context/types.js";
 import type { AgentOperationController } from "../operations/index.js";
 import type { RecoveryPolicy } from "../recovery/index.js";
 import type { JsonValue, ModelGateway } from "../model/types.js";
+import type { ModelStreamLimits } from "../model/stream.js";
 import type { ToolDefinition } from "../tools/types.js";
 
 export type DelegationStatus = "queued" | "running" | "done" | "failed" | "canceled";
@@ -25,6 +26,9 @@ export interface DelegationPolicyOptions {
   readonly maxTitleChars?: number;
   readonly maxInstructionChars?: number;
   readonly maxObjectiveChars?: number;
+  readonly maxDepth?: number;
+  readonly maxAgentsPerRoot?: number;
+  readonly allowRecursiveDelegation?: boolean;
 }
 
 export interface DelegationPolicySnapshot {
@@ -35,9 +39,11 @@ export interface DelegationPolicySnapshot {
   readonly maxTitleChars: number;
   readonly maxInstructionChars: number;
   readonly maxObjectiveChars: number;
+  readonly maxDepth: number;
+  readonly maxAgentsPerRoot: number;
   readonly contextMode: DelegationContextMode;
   readonly toolMode: "read";
-  readonly allowsRecursiveDelegation: false;
+  readonly allowsRecursiveDelegation: boolean;
 }
 
 export interface AgentDelegation extends DelegationDefinition {
@@ -139,6 +145,7 @@ export interface DelegationOptions {
 
 export interface DynamicDelegatedAgentExecutorOptions {
   readonly model: ModelGateway;
+  readonly runtimeLimits?: ModelStreamLimits;
   readonly tools?: readonly ToolDefinition[];
   readonly context?: ContextOptions;
   readonly maxRounds?: number;

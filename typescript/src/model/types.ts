@@ -54,6 +54,20 @@ export interface ModelStreamChunk {
   readonly usage?: ModelTokenUsage;
 }
 
+export type ModelStreamActivityKind = "transport" | "working";
+export type ModelStreamActivitySupport = "semantic_only" | "transport" | "working";
+
+export interface ModelStreamActivity {
+  readonly type: "activity";
+  readonly kind: ModelStreamActivityKind;
+}
+
+export type ModelStreamItem = ModelStreamChunk | ModelStreamActivity;
+
+export interface ModelStream extends AsyncIterable<ModelStreamItem> {
+  readonly activitySupport?: ModelStreamActivitySupport;
+}
+
 export interface ModelTurn {
   readonly message: Message;
   readonly finishReason: ModelFinishReason;
@@ -112,5 +126,5 @@ export interface ModelGateway {
   stream?(
     request: ModelRequest,
     signal?: AbortSignal,
-  ): AsyncIterable<ModelStreamChunk> | Promise<AsyncIterable<ModelStreamChunk>>;
+  ): ModelStream | Promise<ModelStream>;
 }

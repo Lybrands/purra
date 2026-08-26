@@ -7,11 +7,18 @@ def test_complete_run_api_is_importable_from_the_package_boundary():
     from purra.api import (
         AgentCore,
         AgentCoreRunOptions,
+        AgentCapabilityGrant,
         AgentComponentBinding,
+        AgentNode,
+        AgentTreeExecutionResult,
+        AgentTreeRun,
+        AgentTreeRunExecutor,
+        AgentTreeRunSupervisor,
         AgentPreset,
         AgentPresetSnapshot,
         AgentPlanner,
         AgentRunHandle,
+        AgentRunLeaseClaim,
         ContextStrategy,
         DelegatedAgentExecutor,
         DelegatedAgentRequest,
@@ -21,6 +28,7 @@ def test_complete_run_api_is_importable_from_the_package_boundary():
         DynamicDelegatedAgentExecutor,
         ExecutionProfile,
         InMemoryAgentAdapters,
+        InMemoryRunTreeRepository,
         ReactivePlanningPolicy,
         PromptSection,
         OrphanRunCandidate,
@@ -33,15 +41,25 @@ def test_complete_run_api_is_importable_from_the_package_boundary():
         RunActivitySnapshot,
         RunCancellationReceipt,
         RunRecoverySnapshot,
+        RunCommandService,
         ToolPlanningPolicy,
         WorkPlan,
         WorkPlanner,
         WorkStep,
         canonicalize_execution_plan,
+        current_agent_run_lease,
         decide_orphan_run,
     )
 
     assert AgentCore.__module__.startswith("purra.")
+    assert AgentCapabilityGrant.__module__.startswith("purra.")
+    assert AgentNode.__module__.startswith("purra.")
+    assert AgentTreeExecutionResult.__module__.startswith("purra.")
+    assert AgentTreeRun.__module__.startswith("purra.")
+    assert AgentTreeRunExecutor.__module__.startswith("purra.")
+    assert AgentTreeRunSupervisor.__module__.startswith("purra.")
+    assert AgentRunLeaseClaim.__module__.startswith("purra.")
+    assert callable(current_agent_run_lease)
     assert AgentComponentBinding("host.context", "1").revision == "1"
     assert AgentPreset.__module__.startswith("purra.")
     assert AgentPresetSnapshot.__module__.startswith("purra.")
@@ -57,6 +75,7 @@ def test_complete_run_api_is_importable_from_the_package_boundary():
     assert RunCancellationReceipt.__module__.startswith("purra.")
     assert decide_orphan_run.__module__.startswith("purra.")
     assert RunRecoverySnapshot.__module__.startswith("purra.")
+    assert RunCommandService.__module__.startswith("purra.")
     assert AgentCoreRunOptions.__module__.startswith("purra.")
     assert AgentRunHandle.__module__.startswith("purra.")
     assert ContextStrategy.SINGLE_PASS.value == "single_pass"
@@ -68,6 +87,7 @@ def test_complete_run_api_is_importable_from_the_package_boundary():
     assert DelegatedAgentResult.__module__.startswith("purra.")
     assert ExecutionProfile().context_strategy is ContextStrategy.SINGLE_PASS
     adapters = InMemoryAgentAdapters()
+    assert InMemoryRunTreeRepository.__module__.startswith("purra.")
     assert adapters.runs is not adapters.outputs
     assert adapters.outputs is not adapters.publisher
     assert ReactivePlanningPolicy.__module__.startswith("purra.")
@@ -78,6 +98,13 @@ def test_complete_run_api_is_importable_from_the_package_boundary():
     assert WorkPlanner.__module__.startswith("purra.")
     assert canonicalize_execution_plan.__module__.startswith("purra.")
     assert hasattr(AgentCore, "submit")
+    assert hasattr(AgentCore, "spawn_agents")
+    assert hasattr(AgentCore, "continue_agent")
+    assert hasattr(AgentCore, "join_agent_runs")
+    assert hasattr(AgentCore, "cancel_agent_run")
+    assert hasattr(AgentCore, "close_agent")
+    assert hasattr(AgentCore, "bind_agent_tree_root")
+    assert hasattr(AgentCore, "recover_agent_tree_root")
     assert not hasattr(AgentCore, "run")
 
 
@@ -142,6 +169,8 @@ def test_facades_do_not_reexport_private_implementation_helpers():
 def test_public_facades_have_explicit_non_module_exports():
     facade_names = (
         "adapters",
+        "agent_tree",
+        "agent_tree_execution",
         "api",
         "artifacts",
         "context_orchestration",

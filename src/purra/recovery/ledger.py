@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import Counter
 
 from purra.recovery.contracts import (
+    RecoveryCause,
     RecoveryDecision,
     RecoveryEffectState,
     RecoveryReason,
@@ -17,9 +18,8 @@ class RecoveryLedger:
     """Atomically decide and consume bounded recovery attempts in memory.
 
     Allowed and denied decisions are emitted by the runtime through the normal
-    durable trace channel. The ledger itself is deliberately request-scoped:
-    an interrupted process never resumes an in-flight model loop and therefore
-    cannot accidentally inherit or replay a stale attempt.
+    durable trace channel. Only a committed model-ready checkpoint may carry
+    the consumed-attempt snapshot into a replacement process.
     """
 
     def __init__(self, policy: RecoveryPolicy = RecoveryPolicy()) -> None:
@@ -29,6 +29,28 @@ class RecoveryLedger:
     def attempts(self, request_or_cause, *, scope: str = "run") -> int:
         cause = getattr(request_or_cause, "cause", request_or_cause)
         return int(self._attempts[(cause, str(scope))])
+
+    def snapshot(self) -> tuple[tuple[str, str, int], ...]:
+        return tuple(sorted(
+            (
+                str(getattr(cause, "value", cause)),
+                scope,
+                int(attempts),
+            )
+            for (cause, scope), attempts in self._attempts.items()
+        ))
+
+    def restore(self, snapshot: tuple[tuple[str, str, int], ...]) -> None:
+        if self._attempts:
+            raise RuntimeError("recovery ledger has already been used")
+        restored: Counter[tuple[object, str]] = Counter()
+        for cause, scope, attempts in snapshot:
+            key = (RecoveryCause(cause), str(scope))
+            count = int(attempts)
+            if count < 0:
+                raise ValueError("recovery attempt count must be non-negative")
+            restored[key] = count
+        self._attempts = restored
 
     def decide(self, request: RecoveryRequest) -> RecoveryDecision:
         max_attempts = self._policy.max_attempts(request.cause)

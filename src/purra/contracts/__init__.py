@@ -293,15 +293,41 @@ class ModelStreamChunk:
             raise TypeError("model stream usage must be ModelTokenUsage")
 
 
+class ModelStreamActivityKind(StrEnum):
+    TRANSPORT = "transport"
+    WORKING = "working"
+
+
+class ModelStreamActivitySupport(StrEnum):
+    SEMANTIC_ONLY = "semantic_only"
+    TRANSPORT = "transport"
+    WORKING = "working"
+
+
+@dataclass(frozen=True, slots=True)
+class ModelStreamActivity:
+    kind: ModelStreamActivityKind
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "kind", ModelStreamActivityKind(self.kind))
+
+
+ModelStreamItem: TypeAlias = ModelStreamActivity | ModelStreamChunk
+
+
 @dataclass(slots=True)
 class ModelStream:
-    chunks: AsyncIterator[ModelStreamChunk]
+    chunks: AsyncIterator[ModelStreamItem]
     model: str
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    activity_support: ModelStreamActivitySupport = (
+        ModelStreamActivitySupport.SEMANTIC_ONLY
+    )
 
     def __post_init__(self) -> None:
         self.model = required_text(self.model, "model stream model name")
         self.metadata = freeze_json_mapping(self.metadata)
+        self.activity_support = ModelStreamActivitySupport(self.activity_support)
 
 
 @dataclass(frozen=True, slots=True)
@@ -543,7 +569,7 @@ from purra.contracts.plans import (
 
 @dataclass(frozen=True, slots=True)
 class PlannerLimits:
-    max_steps: int = 8
+    max_steps: int | None = None
     max_step_id_chars: int = 48
     max_title_chars: int = 48
     max_goal_chars: int = 160
@@ -552,7 +578,6 @@ class PlannerLimits:
 
     def __post_init__(self) -> None:
         for name in (
-            "max_steps",
             "max_step_id_chars",
             "max_title_chars",
             "max_goal_chars",
@@ -560,9 +585,18 @@ class PlannerLimits:
             object.__setattr__(self, name, positive_int(
                 getattr(self, name), name
             ))
+        object.__setattr__(self, "max_steps", optional_positive_int(
+            self.max_steps, "max_steps"
+        ))
         max_tool_steps = int(self.max_tool_steps)
-        if max_tool_steps < 0 or max_tool_steps > self.max_steps:
-            raise ValueError("max_tool_steps must be between zero and max_steps")
+        if max_tool_steps < 0 or (
+            self.max_steps is not None
+            and max_tool_steps > self.max_steps
+        ):
+            raise ValueError(
+                "max_tool_steps must be non-negative and must not exceed "
+                "max_steps when configured"
+            )
         object.__setattr__(self, "max_tool_steps", max_tool_steps)
         max_repair_attempts = int(self.max_repair_attempts)
         if max_repair_attempts < 0 or max_repair_attempts > 3:
@@ -1117,6 +1151,7 @@ class ToolBatchRequest:
     allowed_tool_names: frozenset[str]
     state: ExecutionState
     invocation_id: str | None = None
+    retry_of_tool_call_ids: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "calls", tuple(self.calls))
@@ -1131,6 +1166,23 @@ class ToolBatchRequest:
             self,
             "invocation_id",
             _optional_text(self.invocation_id),
+        )
+        call_ids = {call.id for call in self.calls}
+        retry_links = {
+            required_text(call_id, "retry tool call id"): required_text(
+                retry_of,
+                "retried tool call id",
+            )
+            for call_id, retry_of in self.retry_of_tool_call_ids.items()
+        }
+        if not retry_links.keys() <= call_ids:
+            raise ValueError("tool retry links must target calls in the batch")
+        if any(call_id == retry_of for call_id, retry_of in retry_links.items()):
+            raise ValueError("a tool call cannot retry itself")
+        object.__setattr__(
+            self,
+            "retry_of_tool_call_ids",
+            freeze_json_mapping(retry_links),
         )
 
 
@@ -1421,10 +1473,41 @@ class RunCreateParams:
     deadline_at_ms: int | None = None
     runtime_limits: "RuntimeLimits" = field(default_factory=lambda: RuntimeLimits())
     agent_preset_snapshot: Mapping[str, Any] = field(default_factory=dict)
+    requested_run_id: RunId | None = None
+    root_run_id: RunId | None = None
+    agent_id: str | None = None
+    parent_run_id: RunId | None = None
+    lease_owner_id: str | None = None
+    lease_epoch: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "prompt", str(self.prompt or ""))
         object.__setattr__(self, "mode", _optional_text(self.mode))
+        object.__setattr__(
+            self,
+            "requested_run_id",
+            _optional_text(self.requested_run_id),
+        )
+        for name in (
+            "root_run_id",
+            "agent_id",
+            "parent_run_id",
+            "lease_owner_id",
+        ):
+            object.__setattr__(self, name, _optional_text(getattr(self, name)))
+        object.__setattr__(
+            self,
+            "lease_epoch",
+            (
+                None
+                if self.lease_epoch is None
+                else non_negative_int(self.lease_epoch, "Run lease_epoch")
+            ),
+        )
+        if (self.lease_owner_id is None) != (self.lease_epoch is None):
+            raise ValueError("Run lease owner and epoch must be provided together")
+        if self.parent_run_id is not None and self.root_run_id is None:
+            raise ValueError("Child Run scope requires root_run_id")
         object.__setattr__(self, "turn_id", _optional_text(self.turn_id))
         object.__setattr__(
             self,
@@ -1524,14 +1607,16 @@ class RuntimeLimits:
 
     max_model_rounds: int = 6
     max_progress_rounds: int = 32
-    provider_invocation_timeout_ms: int | None = 120_000
+    provider_activity_idle_timeout_ms: int | None = 30_000
+    provider_progress_idle_timeout_ms: int | None = 60_000
+    provider_invocation_timeout_ms: int | None = 300_000
     root_run_timeout_ms: int | None = 900_000
     max_model_invocation_attempts: int = 64
     max_input_tokens: int | None = None
     max_output_tokens: int | None = None
     max_reasoning_tokens: int | None = None
     max_provider_output_events: int = 10_000
-    max_provider_output_bytes: int = 1_000_000
+    max_provider_output_bytes: int = 8 * 1024 * 1024
     max_stream_content_chars: int = 1_000_000
     max_stream_reasoning_chars: int = 1_000_000
     max_stream_chunks: int = 100_000
@@ -1559,6 +1644,8 @@ class RuntimeLimits:
                 positive_int(getattr(self, name), name.replace("_", " ")),
             )
         for name in (
+            "provider_activity_idle_timeout_ms",
+            "provider_progress_idle_timeout_ms",
             "provider_invocation_timeout_ms",
             "root_run_timeout_ms",
         ):
@@ -1643,6 +1730,10 @@ __all__ = [
     "ModelOutputCapabilities",
     "ModelProtocolCapabilities",
     "ModelRequest",
+    "ModelStreamActivity",
+    "ModelStreamActivityKind",
+    "ModelStreamActivitySupport",
+    "ModelStreamItem",
     "ModelStream",
     "ModelStreamChunk",
     "ModelTokenUsage",

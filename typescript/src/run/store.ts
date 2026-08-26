@@ -1,12 +1,14 @@
-import type { JsonValue } from "../model/types.js";
+import type { JsonValue, ModelTokenUsage } from "../model/types.js";
 import { copyJsonValue } from "../model/validation.js";
 import type { OutputEvent, OutputEventDraft } from "../output/types.js";
 import { AgentError } from "../shared/errors.js";
 import type {
+  AgentExecutionCheckpoint,
   InvocationSettlement,
   ModelInvocationReceipt,
   RunBeginParams,
   RunCancellationReceipt,
+  RunLeaseClaim,
   RunSnapshot,
   RunStatus,
 } from "./types.js";
@@ -16,16 +18,23 @@ export interface RunRepository {
   openInvocation(
     runId: string,
     receipt: Omit<ModelInvocationReceipt, "attempt" | "openedAt">,
+    claim?: RunLeaseClaim,
   ): Promise<{
     readonly snapshot: RunSnapshot;
     readonly receipt: ModelInvocationReceipt;
     readonly event: OutputEvent;
   }>;
-  appendEvent(runId: string, draft: OutputEventDraft): Promise<OutputEvent>;
-  appendBatch(runId: string, drafts: readonly OutputEventDraft[]): Promise<readonly OutputEvent[]>;
+  appendEvent(runId: string, draft: OutputEventDraft, claim?: RunLeaseClaim): Promise<OutputEvent>;
+  appendBatch(runId: string, drafts: readonly OutputEventDraft[], claim?: RunLeaseClaim): Promise<readonly OutputEvent[]>;
+  saveExecutionCheckpoint(
+    runId: string,
+    checkpoint: AgentExecutionCheckpoint,
+    claim?: RunLeaseClaim,
+  ): Promise<{ readonly snapshot: RunSnapshot; readonly event: OutputEvent }>;
   settleInvocation(
     runId: string,
     settlement: InvocationSettlement,
+    claim?: RunLeaseClaim,
   ): Promise<{ readonly event: OutputEvent; readonly budgetError?: string }>;
   settleRun(
     runId: string,
@@ -35,13 +44,27 @@ export interface RunRepository {
       readonly finalOutput?: JsonValue;
       readonly errorCode?: string;
     },
+    claim?: RunLeaseClaim,
   ): Promise<{ readonly snapshot: RunSnapshot; readonly events: readonly OutputEvent[] }>;
-  cancel(runId: string): Promise<RunCancellationReceipt>;
+  cancel(runId: string, claim?: RunLeaseClaim): Promise<RunCancellationReceipt>;
   get(runId: string): Promise<RunSnapshot>;
   listEvents(runId: string, afterSequence: number, limit?: number): Promise<readonly OutputEvent[]>;
+  listRootEvents(
+    rootRunId: string,
+    afterRootSequence: number,
+    limit?: number,
+  ): Promise<readonly OutputEvent[]>;
 }
 
 interface StoredRun {
+  readonly runId: string;
+  readonly rootRunId: string;
+  readonly agentId: string;
+  readonly parentRunId: string | null;
+  readonly leaseOwnerId: string | null;
+  readonly leaseEpoch: number | null;
+  readonly rootEvents: OutputEvent[];
+  readonly rootBySourceKey: Map<string, OutputEvent>;
   snapshot: RunSnapshot;
   readonly events: OutputEvent[];
   readonly bySourceKey: Map<string, OutputEvent>;
@@ -64,11 +87,68 @@ const METERED_KINDS = new Set([
 
 export class InMemoryRunRepository implements RunRepository {
   readonly #runs = new Map<string, StoredRun>();
+  readonly #rootEvents = new Map<string, OutputEvent[]>();
+  readonly #rootEventsBySourceKey = new Map<string, Map<string, OutputEvent>>();
+  readonly #leaseValidator: (
+    runId: string,
+    claim: { readonly leaseOwnerId?: string; readonly leaseEpoch?: number },
+  ) => void;
+
+  public constructor(options: {
+    readonly leaseValidator?: (
+      runId: string,
+      claim: { readonly leaseOwnerId?: string; readonly leaseEpoch?: number },
+    ) => void;
+  } = {}) {
+    this.#leaseValidator = options.leaseValidator ?? (() => undefined);
+  }
 
   public async begin(
     params: RunBeginParams,
   ): Promise<{ readonly snapshot: RunSnapshot; readonly event: OutputEvent }> {
-    const runId = globalThis.crypto.randomUUID();
+    const runId = params.requestedRunId === undefined
+      ? globalThis.crypto.randomUUID()
+      : requiredText(params.requestedRunId, "requested Run id");
+    if (this.#runs.has(runId)) {
+      throw new AgentError("run_identity_conflict", "Requested Run id already exists");
+    }
+    const rootRunId = requiredText(params.rootRunId ?? runId, "root Run id");
+    const agentId = requiredText(params.agentId ?? runId, "Agent id");
+    const parentRunId = params.parentRunId === undefined
+      ? null
+      : requiredText(params.parentRunId, "parent Run id");
+    const leaseOwnerId = params.leaseOwnerId === undefined
+      ? null
+      : requiredText(params.leaseOwnerId, "lease owner id");
+    const leaseEpoch = params.leaseEpoch === undefined
+      ? null
+      : nonNegativeInteger(params.leaseEpoch, "lease epoch");
+    if ((leaseOwnerId === null) !== (leaseEpoch === null)) {
+      throw new TypeError("Run lease owner and epoch must be provided together");
+    }
+    if (leaseOwnerId !== null && leaseEpoch !== null) {
+      this.#leaseValidator(runId, { leaseOwnerId, leaseEpoch });
+    }
+    if (rootRunId === runId) {
+      if (parentRunId !== null) {
+        throw new AgentError("run_scope_conflict", "Root Run cannot have a parent Run");
+      }
+    } else {
+      const root = this.#require(rootRunId);
+      if (root.rootRunId !== rootRunId) {
+        throw new AgentError("run_scope_conflict", "Run scope root is not a Root Run");
+      }
+      if (parentRunId === null) {
+        throw new AgentError("run_scope_conflict", "Child Run requires a parent Run");
+      }
+      if (this.#require(parentRunId).rootRunId !== rootRunId) {
+        throw new AgentError("run_scope_conflict", "Parent Run belongs to another Root scope");
+      }
+    }
+    const rootEvents = this.#rootEvents.get(rootRunId) ?? [];
+    const rootBySourceKey = this.#rootEventsBySourceKey.get(rootRunId) ?? new Map();
+    this.#rootEvents.set(rootRunId, rootEvents);
+    this.#rootEventsBySourceKey.set(rootRunId, rootBySourceKey);
     const now = new Date().toISOString();
     const snapshot = freezeSnapshot({
       runId,
@@ -90,6 +170,14 @@ export class InMemoryRunRepository implements RunRepository {
       preset: params.preset,
     });
     const stored: StoredRun = {
+      runId,
+      rootRunId,
+      agentId,
+      parentRunId,
+      leaseOwnerId,
+      leaseEpoch,
+      rootEvents,
+      rootBySourceKey,
       snapshot,
       events: [],
       bySourceKey: new Map(),
@@ -111,8 +199,10 @@ export class InMemoryRunRepository implements RunRepository {
   public async openInvocation(
     runId: string,
     input: Omit<ModelInvocationReceipt, "attempt" | "openedAt">,
+    claim: RunLeaseClaim = {},
   ) {
-    const run = this.#active(runId);
+    const run = this.#active(runId, claim);
+    const root = this.#root(run);
     const existing = run.invocationReceipts.get(input.invocationId);
     if (existing !== undefined) {
       if (!sameInvocationInput(existing, input)) {
@@ -124,11 +214,12 @@ export class InMemoryRunRepository implements RunRepository {
         event: run.bySourceKey.get(`invocation:${existing.invocationId}:started`)!,
       });
     }
-    requireBudgetForNextInvocation(run);
+    requireBudgetForNextInvocation(root);
     const nextAttempt = run.snapshot.usage.modelAttempts + 1;
-    const limit = run.snapshot.budgets.maxModelAttempts;
-    if (limit !== null && nextAttempt > limit) {
-      throw new AgentError("runtime_budget_exceeded", "Run model-attempt budget is exhausted");
+    const nextRootAttempt = root.snapshot.usage.modelAttempts + 1;
+    const limit = root.snapshot.budgets.maxModelAttempts;
+    if (limit !== null && nextRootAttempt > limit) {
+      throw new AgentError("runtime_budget_exceeded", "Root Run model-attempt budget is exhausted");
     }
     const receipt: ModelInvocationReceipt = Object.freeze({
       ...input,
@@ -138,6 +229,7 @@ export class InMemoryRunRepository implements RunRepository {
     run.openInvocations.add(receipt.invocationId);
     run.invocationReceipts.set(receipt.invocationId, receipt);
     updateUsage(run, { modelAttempts: nextAttempt });
+    if (root !== run) updateUsage(root, { modelAttempts: nextRootAttempt });
     const event = append(run, runId, {
       sourceKey: `invocation:${receipt.invocationId}:started`,
       kind: "invocation.started",
@@ -148,42 +240,100 @@ export class InMemoryRunRepository implements RunRepository {
     return Object.freeze({ snapshot: run.snapshot, receipt, event });
   }
 
-  public async appendEvent(runId: string, draft: OutputEventDraft): Promise<OutputEvent> {
-    const run = this.#active(runId);
-    const existing = run.bySourceKey.get(draft.sourceKey);
+  public async appendEvent(
+    runId: string,
+    draft: OutputEventDraft,
+    claim: RunLeaseClaim = {},
+  ): Promise<OutputEvent> {
+    const run = this.#active(runId, claim);
+    const existing = run.rootBySourceKey.get(draft.sourceKey);
     if (existing !== undefined) {
-      requireSameEvent(existing, draft);
+      requireSameEvent(existing, draft, runId);
       return existing;
     }
-    return append(run, runId, draft, true);
+    return append(run, runId, draft, true, this.#root(run));
   }
 
   public async appendBatch(
     runId: string,
     drafts: readonly OutputEventDraft[],
+    claim: RunLeaseClaim = {},
   ): Promise<readonly OutputEvent[]> {
-    const run = this.#active(runId);
+    const run = this.#active(runId, claim);
     if (!Array.isArray(drafts) || drafts.length === 0) return Object.freeze([]);
     const copied = Object.freeze(drafts.map(copyDraft));
     if (new Set(copied.map((draft) => draft.sourceKey)).size !== copied.length) {
       throw new AgentError("output_batch_conflict", "Output batch source keys must be unique");
     }
     const pending = copied.filter((draft) => {
-      const existing = run.bySourceKey.get(draft.sourceKey);
-      if (existing !== undefined) requireSameEvent(existing, draft);
+      const existing = run.rootBySourceKey.get(draft.sourceKey);
+      if (existing !== undefined) requireSameEvent(existing, draft, runId);
       return existing === undefined;
     });
-    checkRelatedBudget(run, pending);
+    const root = this.#root(run);
+    checkRelatedBudget(root, pending);
     return Object.freeze(copied.map((draft) => (
-      run.bySourceKey.get(draft.sourceKey) ?? append(run, runId, draft, true)
+      run.rootBySourceKey.get(draft.sourceKey) ?? append(run, runId, draft, true, root)
     )));
+  }
+
+  public async saveExecutionCheckpoint(
+    runId: string,
+    checkpoint: AgentExecutionCheckpoint,
+    claim: RunLeaseClaim = {},
+  ): Promise<{ readonly snapshot: RunSnapshot; readonly event: OutputEvent }> {
+    const run = this.#active(runId, claim);
+    const copied = copyExecutionCheckpoint(checkpoint);
+    if (copied.runId !== runId) {
+      throw new AgentError(
+        "agent_execution_checkpoint_conflict",
+        "Agent execution checkpoint belongs to another Run",
+      );
+    }
+    const current = run.snapshot.executionCheckpoint;
+    if (current !== undefined) {
+      if (copied.nextRound < current.nextRound) {
+        throw new AgentError(
+          "agent_execution_checkpoint_conflict",
+          "Agent execution checkpoint cannot move backwards",
+        );
+      }
+      if (
+        copied.nextRound === current.nextRound
+        && canonicalJson(copied) !== canonicalJson(current)
+      ) {
+        throw new AgentError(
+          "agent_execution_checkpoint_conflict",
+          "Agent execution checkpoint content conflicts",
+        );
+      }
+    }
+    const event = append(run, runId, {
+      sourceKey: `agent-checkpoint:${runId}:${copied.nextRound}`,
+      kind: "agent.execution_checkpoint",
+      channel: "lifecycle",
+      visibility: "private",
+      payload: {
+        schemaVersion: copied.schemaVersion,
+        phase: copied.phase,
+        executionProfile: copied.executionProfile,
+        nextRound: copied.nextRound,
+      },
+    }, false);
+    run.snapshot = freezeSnapshot({
+      ...run.snapshot,
+      executionCheckpoint: copied,
+    });
+    return Object.freeze({ snapshot: run.snapshot, event });
   }
 
   public async settleInvocation(
     runId: string,
     settlement: InvocationSettlement,
+    claim: RunLeaseClaim = {},
   ): Promise<{ readonly event: OutputEvent; readonly budgetError?: string }> {
-    const run = this.#active(runId);
+    const run = this.#active(runId, claim);
+    const root = this.#root(run);
     const replay = run.invocationSettlements.get(settlement.invocationId);
     if (replay !== undefined) {
       if (!sameSettlement(replay.input, settlement)) {
@@ -198,14 +348,9 @@ export class InMemoryRunRepository implements RunRepository {
       throw new AgentError("model_invocation_not_open", "Model invocation is not open");
     }
     const usage = settlement.usage;
-    updateUsage(run, usage === undefined
-      ? { unreportedUsageAttempts: run.snapshot.usage.unreportedUsageAttempts + 1 }
-      : {
-          inputTokens: run.snapshot.usage.inputTokens + usage.inputTokens,
-          outputTokens: run.snapshot.usage.outputTokens + (usage.outputTokens ?? 0),
-          reasoningTokens: run.snapshot.usage.reasoningTokens + (usage.reasoningOutputTokens ?? 0),
-        });
-    const budgetError = exceededTokenBudget(run) === undefined
+    applyInvocationUsage(run, usage);
+    if (root !== run) applyInvocationUsage(root, usage);
+    const budgetError = exceededTokenBudget(root) === undefined
       ? undefined
       : "runtime_budget_exceeded";
     const status = budgetError === undefined ? settlement.status : "failed";
@@ -242,12 +387,14 @@ export class InMemoryRunRepository implements RunRepository {
       readonly finalOutput?: JsonValue;
       readonly errorCode?: string;
     } = {},
+    claim: RunLeaseClaim = {},
   ): Promise<{ readonly snapshot: RunSnapshot; readonly events: readonly OutputEvent[] }> {
     const run = this.#require(runId);
     if (run.snapshot.status !== "running") {
       if (run.snapshot.status === status) return Object.freeze({ snapshot: run.snapshot, events: [] });
       throw new AgentError("run_terminal_conflict", "Run already has a different terminal status");
     }
+    this.#requireLease(run, claim);
     if (status === "completed" && options.finalOutput === undefined) {
       throw new TypeError("Completed Run requires finalOutput");
     }
@@ -262,7 +409,8 @@ export class InMemoryRunRepository implements RunRepository {
       throw new TypeError("Failed Run requires errorCode");
     }
     const related = Object.freeze((options.relatedEvents ?? []).map(copyDraft));
-    checkRelatedBudget(run, related);
+    const root = this.#root(run);
+    checkRelatedBudget(root, related);
 
     const events: OutputEvent[] = [];
     for (const invocationId of [...run.openInvocations]) {
@@ -275,7 +423,7 @@ export class InMemoryRunRepository implements RunRepository {
         payload: { invocationId, cause: "run_terminal_commit" },
       }, false));
     }
-    for (const draft of related) events.push(append(run, runId, draft, true));
+    for (const draft of related) events.push(append(run, runId, draft, true, root));
     const now = new Date().toISOString();
     run.snapshot = freezeSnapshot({
       ...run.snapshot,
@@ -300,12 +448,15 @@ export class InMemoryRunRepository implements RunRepository {
     return Object.freeze({ snapshot: run.snapshot, events: Object.freeze(events) });
   }
 
-  public async cancel(runId: string): Promise<RunCancellationReceipt> {
+  public async cancel(
+    runId: string,
+    claim: RunLeaseClaim = {},
+  ): Promise<RunCancellationReceipt> {
     const run = this.#require(runId);
     if (run.snapshot.status !== "running") {
       return Object.freeze({ runId, accepted: false, status: run.snapshot.status });
     }
-    const settled = await this.settleRun(runId, "canceled");
+    const settled = await this.settleRun(runId, "canceled", {}, claim);
     const event = settled.events.at(-1)!;
     return Object.freeze({
       runId,
@@ -333,7 +484,25 @@ export class InMemoryRunRepository implements RunRepository {
     return Object.freeze(run.events.filter((event) => event.sequence > afterSequence).slice(0, limit));
   }
 
-  #active(runId: string): StoredRun {
+  public async listRootEvents(
+    rootRunId: string,
+    afterRootSequence: number,
+    limit = 200,
+  ): Promise<readonly OutputEvent[]> {
+    const root = this.#require(rootRunId);
+    if (root.rootRunId !== rootRunId) {
+      throw new AgentError("run_scope_conflict", "Root journal query requires a Root Run");
+    }
+    if (!Number.isSafeInteger(afterRootSequence) || afterRootSequence < 0) {
+      throw new TypeError("afterRootSequence must be a non-negative integer");
+    }
+    if (!Number.isSafeInteger(limit) || limit < 1) throw new TypeError("limit must be positive");
+    return Object.freeze(
+      root.rootEvents.filter((event) => event.rootSequence > afterRootSequence).slice(0, limit),
+    );
+  }
+
+  #active(runId: string, claim: RunLeaseClaim): StoredRun {
     const run = this.#require(runId);
     if (run.snapshot.status !== "running") {
       throw new AgentError("run_not_active", "Run is already terminal");
@@ -341,6 +510,7 @@ export class InMemoryRunRepository implements RunRepository {
     if (run.snapshot.deadlineAt !== null && Date.now() >= Date.parse(run.snapshot.deadlineAt)) {
       throw new AgentError("run_deadline_exceeded", "Run deadline has elapsed");
     }
+    this.#requireLease(run, claim);
     return run;
   }
 
@@ -349,18 +519,38 @@ export class InMemoryRunRepository implements RunRepository {
     if (run === undefined) throw new AgentError("run_not_found", "Run does not exist");
     return run;
   }
+
+  #root(run: StoredRun): StoredRun {
+    return this.#require(run.rootRunId);
+  }
+
+  #requireLease(run: StoredRun, claim: RunLeaseClaim): void {
+    if (run.leaseOwnerId === null || run.leaseEpoch === null) return;
+    this.#leaseValidator(run.runId, claim);
+  }
 }
 
 export async function assertRunRepositoryConforms(repository: RunRepository): Promise<void> {
   const begun = await repository.begin({
+    requestedRunId: "conformance-run-1",
     preset: {
-      schemaVersion: 3,
+      schemaVersion: 4,
       presetId: "conformance",
       presetRevision: "1",
       promptFingerprint: "prompt",
       toolFingerprint: "tools",
       capabilityProfileId: null,
       compositionFingerprint: "composition",
+      runtimeLimits: {
+        runTimeoutMs: 900_000,
+        activityIdleTimeoutMs: 30_000,
+        progressIdleTimeoutMs: 60_000,
+        invocationTimeoutMs: 300_000,
+        maxChunks: 100_000,
+        maxContentChars: 1_000_000,
+        maxReasoningChars: 1_000_000,
+        maxToolArgumentChars: 1_000_000,
+      },
     },
     deadlineAt: null,
     budgets: {
@@ -373,6 +563,13 @@ export async function assertRunRepositoryConforms(repository: RunRepository): Pr
     },
     metadata: {},
   });
+  if (begun.snapshot.runId !== "conformance-run-1") {
+    throw new AgentError("run_repository_nonconforming", "Run repository ignored requested identity");
+  }
+  const begunSnapshot = await repository.get(begun.snapshot.runId);
+  if (begunSnapshot.runId !== begun.snapshot.runId || begunSnapshot.status !== "running") {
+    throw new AgentError("run_repository_nonconforming", "Run repository read model is inconsistent");
+  }
   const batchDrafts = Object.freeze(["a", "b"].map((value) => Object.freeze({
     sourceKey: `conformance:batch:${value}`,
     kind: "provider.delta_batch" as const,
@@ -385,6 +582,32 @@ export async function assertRunRepositoryConforms(repository: RunRepository): Pr
   if (batch.length !== 2 || replay[0]?.eventId !== batch[0]?.eventId) {
     throw new AgentError("run_repository_nonconforming", "Run repository batch replay is not atomic");
   }
+  const checkpoint = await repository.saveExecutionCheckpoint(
+    begun.snapshot.runId,
+    {
+      schemaVersion: 1,
+      runId: begun.snapshot.runId,
+      phase: "model_ready",
+      executionProfile: "reactive",
+      nextRound: 2,
+      messages: [{ role: "user", content: "resume" }],
+      responseAttempts: 0,
+      recoveryAttempts: [],
+    },
+  );
+  const checkpointReplay = await repository.saveExecutionCheckpoint(
+    begun.snapshot.runId,
+    checkpoint.snapshot.executionCheckpoint!,
+  );
+  if (
+    checkpoint.snapshot.executionCheckpoint?.nextRound !== 2
+    || checkpointReplay.event.eventId !== checkpoint.event.eventId
+  ) {
+    throw new AgentError(
+      "run_repository_nonconforming",
+      "Run repository checkpoint commit is not atomic and replayable",
+    );
+  }
   const final = await repository.settleRun(begun.snapshot.runId, "completed", {
     relatedEvents: [{
       sourceKey: "conformance:final",
@@ -396,11 +619,28 @@ export async function assertRunRepositoryConforms(repository: RunRepository): Pr
     finalOutput: "ok",
   });
   const events = await repository.listEvents(begun.snapshot.runId, 0);
-  if (final.snapshot.status !== "completed" || events.length !== 5) {
+  const rootEvents = await repository.listRootEvents(begun.snapshot.runId, 0);
+  if (final.snapshot.status !== "completed" || events.length !== 6) {
     throw new AgentError("run_repository_nonconforming", "Run repository failed atomic lifecycle probe");
+  }
+  const terminalSnapshot = await repository.get(begun.snapshot.runId);
+  if (terminalSnapshot.status !== "completed" || terminalSnapshot.finalOutput !== "ok") {
+    throw new AgentError("run_repository_nonconforming", "Run repository lost terminal state");
   }
   if (events.some((event, index) => event.sequence !== index + 1)) {
     throw new AgentError("run_repository_nonconforming", "Run repository sequences are not ordered");
+  }
+  if (
+    rootEvents.length !== events.length
+    || rootEvents.some((event, index) => (
+      event.eventId !== events[index]?.eventId
+      || event.rootRunId !== begun.snapshot.runId
+      || event.rootSequence !== index + 1
+      || !validText(event.agentId)
+      || !validText(event.sourceKey)
+    ))
+  ) {
+    throw new AgentError("run_repository_nonconforming", "Root journal attribution is not canonical");
   }
 }
 
@@ -409,23 +649,30 @@ function append(
   runId: string,
   rawDraft: OutputEventDraft,
   meter: boolean,
+  root: StoredRun = run,
 ): OutputEvent {
-  const existing = run.bySourceKey.get(rawDraft.sourceKey);
+  const existing = run.rootBySourceKey.get(rawDraft.sourceKey);
   if (existing !== undefined) {
-    requireSameEvent(existing, rawDraft);
+    requireSameEvent(existing, rawDraft, runId);
     return existing;
   }
   const draft = copyDraft(rawDraft);
-  if (meter) applyBudget(run, draft);
+  if (meter) applyBudget(run, root, draft);
   const event: OutputEvent = Object.freeze({
     ...draft,
     eventId: globalThis.crypto.randomUUID(),
     runId,
+    rootRunId: run.rootRunId,
+    agentId: run.agentId,
+    parentRunId: run.parentRunId,
     sequence: run.events.length + 1,
+    rootSequence: run.rootEvents.length + 1,
     occurredAt: new Date().toISOString(),
   });
   run.events.push(event);
+  run.rootEvents.push(event);
   run.bySourceKey.set(event.sourceKey, event);
+  run.rootBySourceKey.set(event.sourceKey, event);
   run.snapshot = freezeSnapshot({
     ...run.snapshot,
     version: run.snapshot.version + 1,
@@ -434,9 +681,14 @@ function append(
   return event;
 }
 
-function requireSameEvent(existing: OutputEvent, draft: OutputEventDraft): void {
+function requireSameEvent(
+  existing: OutputEvent,
+  draft: OutputEventDraft,
+  runId: string,
+): void {
   if (
-    existing.kind !== draft.kind
+    existing.runId !== runId
+    || existing.kind !== draft.kind
     || existing.channel !== draft.channel
     || existing.visibility !== draft.visibility
     || canonicalJson(existing.payload) !== canonicalJson(draft.payload ?? {})
@@ -512,13 +764,30 @@ function checkRelatedBudget(run: StoredRun, drafts: readonly OutputEventDraft[])
   }
 }
 
-function applyBudget(run: StoredRun, draft: OutputEventDraft): void {
-  checkBudget(run, draft);
+function applyBudget(run: StoredRun, root: StoredRun, draft: OutputEventDraft): void {
+  checkBudget(root, draft);
   if (!METERED_KINDS.has(draft.kind)) return;
+  const bytes = byteLength(draft.payload ?? {});
   updateUsage(run, {
-    outputBytes: run.snapshot.usage.outputBytes + byteLength(draft.payload ?? {}),
+    outputBytes: run.snapshot.usage.outputBytes + bytes,
     outputEvents: run.snapshot.usage.outputEvents + 1,
   });
+  if (root !== run) {
+    updateUsage(root, {
+      outputBytes: root.snapshot.usage.outputBytes + bytes,
+      outputEvents: root.snapshot.usage.outputEvents + 1,
+    });
+  }
+}
+
+function applyInvocationUsage(run: StoredRun, usage: ModelTokenUsage | undefined): void {
+  updateUsage(run, usage === undefined
+    ? { unreportedUsageAttempts: run.snapshot.usage.unreportedUsageAttempts + 1 }
+    : {
+        inputTokens: run.snapshot.usage.inputTokens + usage.inputTokens,
+        outputTokens: run.snapshot.usage.outputTokens + (usage.outputTokens ?? 0),
+        reasoningTokens: run.snapshot.usage.reasoningTokens + (usage.reasoningOutputTokens ?? 0),
+      });
 }
 
 function updateUsage(run: StoredRun, patch: Partial<RunSnapshot["usage"]>): void {
@@ -536,7 +805,35 @@ function freezeSnapshot(snapshot: RunSnapshot): RunSnapshot {
     budgets: Object.freeze({ ...snapshot.budgets }),
     usage: Object.freeze({ ...snapshot.usage }),
     preset: Object.freeze({ ...snapshot.preset }),
+    ...(snapshot.executionCheckpoint === undefined
+      ? {}
+      : { executionCheckpoint: copyExecutionCheckpoint(snapshot.executionCheckpoint) }),
   });
+}
+
+function copyExecutionCheckpoint(
+  checkpoint: AgentExecutionCheckpoint,
+): AgentExecutionCheckpoint {
+  const copied = copyJsonValue(checkpoint as unknown as JsonValue) as unknown as AgentExecutionCheckpoint;
+  if (
+    copied.schemaVersion !== 1
+    || copied.phase !== "model_ready"
+    || copied.executionProfile !== "reactive"
+  ) {
+    throw new TypeError("Agent execution checkpoint contract is invalid");
+  }
+  requiredText(copied.runId, "Agent execution checkpoint Run id");
+  if (!Number.isSafeInteger(copied.nextRound) || copied.nextRound < 1) {
+    throw new TypeError("Agent execution checkpoint next round must be positive");
+  }
+  if (!Array.isArray(copied.messages) || copied.messages.length === 0) {
+    throw new TypeError("Agent execution checkpoint messages are required");
+  }
+  nonNegativeInteger(copied.responseAttempts, "checkpoint response attempts");
+  if (!Array.isArray(copied.recoveryAttempts)) {
+    throw new TypeError("Agent execution checkpoint recovery attempts are invalid");
+  }
+  return Object.freeze(copied);
 }
 
 function byteLength(value: unknown): number {
@@ -588,6 +885,13 @@ function requiredText(value: unknown, label: string): string {
   const text = typeof value === "string" ? value.trim() : "";
   if (text === "") throw new TypeError(`${label} must be non-empty text`);
   return text;
+}
+
+function nonNegativeInteger(value: unknown, label: string): number {
+  if (!Number.isSafeInteger(value) || Number(value) < 0) {
+    throw new TypeError(`${label} must be a non-negative integer`);
+  }
+  return Number(value);
 }
 
 function validText(value: unknown): boolean {

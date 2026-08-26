@@ -8,7 +8,7 @@ const TYPES = new Set(["array", "boolean", "integer", "null", "number", "object"
 const KEYWORDS = new Set([
   "additionalProperties", "anyOf", "const", "description", "enum", "items",
   "maximum", "maxItems", "maxLength", "minimum", "minItems", "minLength",
-  "oneOf", "properties", "required", "title", "type",
+  "oneOf", "properties", "required", "title", "type", "uniqueItems",
 ]);
 
 export function inspectToolSchema(value: unknown, toolName: string): JsonSchema {
@@ -96,6 +96,9 @@ function inspectNode(schema: JsonValue, path: string, toolName: string): void {
   ) {
     throw invalidSchema(toolName, `${path}.additionalProperties must be boolean`);
   }
+  if (schema.uniqueItems !== undefined && typeof schema.uniqueItems !== "boolean") {
+    throw invalidSchema(toolName, `${path}.uniqueItems must be boolean`);
+  }
   if (schema.items !== undefined) inspectNode(schema.items, `${path}.items`, toolName);
 
   for (const keyword of ["anyOf", "oneOf"] as const) {
@@ -173,6 +176,15 @@ function findViolation(value: JsonValue, schema: JsonSchema, path: string): stri
     }
     if (typeof schema.maxItems === "number" && value.length > schema.maxItems) {
       return `argument ${path} exceeds maxItems ${schema.maxItems}`;
+    }
+    if (schema.uniqueItems === true) {
+      for (let duplicateIndex = 1; duplicateIndex < value.length; duplicateIndex += 1) {
+        for (let firstIndex = 0; firstIndex < duplicateIndex; firstIndex += 1) {
+          if (jsonEqual(value[firstIndex]!, value[duplicateIndex]!)) {
+            return `argument ${path} violates uniqueItems at indexes ${firstIndex} and ${duplicateIndex}`;
+          }
+        }
+      }
     }
     if (schema.items !== undefined) {
       for (let index = 0; index < value.length; index += 1) {

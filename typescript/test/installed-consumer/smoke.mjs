@@ -2,18 +2,22 @@ import assert from "node:assert/strict";
 
 import {
   Agent,
+  AgentCapabilityGrant,
+  AgentTreeRunSupervisor,
   AgentOperationController,
   ArtifactAccessController,
   ArtifactLifecycle,
   DurableExecutorRegistry,
   evaluateAgentRun,
   InMemoryAgentAdapters,
+  InMemoryRunTreeRepository,
   InMemoryLongTaskRepository,
   InMemoryArtifactStore,
   ModelResponseJudge,
   ModelWorkPlanner,
   RecipeLongTaskDispatcher,
   RecoveryPolicy,
+  RunCommandService,
   ToolPlanningPolicy,
 } from "purra";
 
@@ -107,7 +111,19 @@ assert.deepEqual(events.map((event) => event.kind), [
 ]);
 assert.equal(result.output, "installed");
 assert.equal(events.at(-2).payload.output, "installed");
-assert.equal((await handle.snapshot()).status, "completed");
+const completedSnapshot = await handle.snapshot();
+assert.equal(completedSnapshot.status, "completed");
+assert.equal(completedSnapshot.preset.schemaVersion, 4);
+assert.deepEqual(completedSnapshot.preset.runtimeLimits, {
+  runTimeoutMs: 900_000,
+  activityIdleTimeoutMs: 30_000,
+  progressIdleTimeoutMs: 60_000,
+  invocationTimeoutMs: 300_000,
+  maxChunks: 100_000,
+  maxContentChars: 1_000_000,
+  maxReasoningChars: 1_000_000,
+  maxToolArgumentChars: 1_000_000,
+});
 const receipt = allEvents.find((event) => event.kind === "invocation.started").payload.receipt;
 assert.deepEqual(receipt.contextEvidence, [{
   evidenceId: "installed-1",
@@ -251,6 +267,153 @@ assert.deepEqual(
     .map((event) => event.payload.status),
   ["queued", "running", "done"],
 );
+
+const installedTreeAdapters = new InMemoryAgentAdapters();
+const installedTreeAgent = new Agent({
+  model: {
+    async invoke(request) {
+      const system = request.messages.find((message) => message.role === "system")?.content;
+      const afterTool = request.messages.at(-1)?.role === "tool";
+      if (system === "Installed nested worker.") {
+        return finalTurn("installed nested done");
+      }
+      if (system === "Installed recursive worker." && afterTool) {
+        return finalTurn("installed child done");
+      }
+      if (afterTool) return finalTurn("installed tree root done");
+      const nested = system === "Installed recursive worker.";
+      return {
+        message: {
+          role: "assistant",
+          content: "",
+          toolCalls: [{
+            id: nested ? "installed-nested-call" : "installed-recursive-call",
+            name: "delegateToAgents",
+            arguments: {
+              delegations: [{
+                agentName: nested ? "nested" : "recursive",
+                title: nested ? "Nested" : "Recursive",
+                instruction: nested
+                  ? "Installed nested worker."
+                  : "Installed recursive worker.",
+                objective: nested ? "Finish nested work." : "Delegate once.",
+              }],
+            },
+          }],
+        },
+        finishReason: "tool_calls",
+      };
+    },
+  },
+  runRepository: installedTreeAdapters.runs,
+  outputPublisher: installedTreeAdapters.outputs,
+  agentTree: {
+    repository: installedTreeAdapters.runTree,
+    rootAgentId: "installed-tree-root-agent",
+    policy: {
+      allowRecursiveDelegation: true,
+      maxDepth: 2,
+      maxParallel: 1,
+    },
+  },
+});
+const installedTreeHandle = await installedTreeAgent.submit({
+  messages: [{ role: "user", content: "Run the installed Agent tree." }],
+  enabledTools: ["delegateToAgents"],
+});
+assert.equal((await installedTreeHandle.result).output, "installed tree root done");
+assert.equal((await installedTreeHandle.snapshot()).preset.schemaVersion, 5);
+assert.deepEqual(
+  (await installedTreeAdapters.runTree.listDescendants(installedTreeHandle.runId))
+    .map((run) => run.status),
+  ["done", "done"],
+);
+
+const installedContinuationRepository = new InMemoryRunTreeRepository();
+let installedParallelActive = 0;
+let installedParallelPeak = 0;
+let releaseInstalledParallel;
+const installedParallelStarted = new Promise((resolve) => {
+  releaseInstalledParallel = resolve;
+});
+const installedContinuationCommands = new RunCommandService(
+  installedContinuationRepository,
+  new AgentTreeRunSupervisor({
+    repository: installedContinuationRepository,
+    executor: {
+      async execute(run, childAgent) {
+        if (
+          run.previousRunId === null
+          && (childAgent.name === "continued" || childAgent.name === "peer")
+        ) {
+          installedParallelActive += 1;
+          installedParallelPeak = Math.max(installedParallelPeak, installedParallelActive);
+          if (installedParallelActive === 2) releaseInstalledParallel();
+          await installedParallelStarted;
+          await Promise.resolve();
+          installedParallelActive -= 1;
+        }
+        return {
+          status: "done",
+          result: { agent: childAgent.name },
+          contentRef: `memory://${run.runId}`,
+          fingerprint: `installed:${run.runId}`,
+        };
+      },
+    },
+  }),
+);
+const installedContinuationRoot = await installedContinuationCommands.beginRoot({
+  runId: "installed-continuation-root",
+  agentId: "installed-continuation-root-agent",
+  name: "root",
+  title: "Root",
+  instruction: "Own continuation smoke.",
+  objective: "Continue one Child Agent.",
+  capabilityGrant: new AgentCapabilityGrant({
+    canSpawnAgents: true,
+    maxParallelRuns: 2,
+  }),
+  idempotencyKey: "installed-continuation-begin",
+});
+const installedContinuationChildren = await installedContinuationCommands.spawnAgents({
+  parentRunId: installedContinuationRoot.runId,
+  idempotencyKey: "installed-continuation-spawn",
+  children: [
+    {
+      name: "continued",
+      title: "Continued",
+      instruction: "Run twice.",
+      objective: "First run.",
+    },
+    {
+      name: "peer",
+      title: "Peer",
+      instruction: "Run beside Continued.",
+      objective: "Prove parallel execution.",
+    },
+  ],
+});
+const installedContinuationChild = installedContinuationChildren.items[0];
+assert.equal((await installedContinuationCommands.joinRuns(
+  installedContinuationRoot.runId,
+  installedContinuationChildren.items.map((item) => item.run.runId),
+)).state, "ready");
+assert.equal(installedParallelPeak, 2);
+const installedContinuedRun = await installedContinuationCommands.continueAgent({
+  requesterRunId: installedContinuationRoot.runId,
+  idempotencyKey: "installed-continuation-second",
+  agentId: installedContinuationChild.agent.agentId,
+  expectedContextVersion: 1,
+  message: "Run again.",
+});
+assert.equal((await installedContinuationCommands.joinRuns(
+  installedContinuationRoot.runId,
+  [installedContinuedRun.run.runId],
+)).state, "ready");
+assert.equal((await installedContinuationRepository.getAgent(
+  installedContinuationChild.agent.agentId,
+)).contextVersion, 2);
 
 const managedOperationEvents = [];
 let managedOperationSequence = 0;

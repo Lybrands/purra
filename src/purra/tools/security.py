@@ -395,6 +395,23 @@ def _schema_violation(
                     "maxItems": max_items,
                 },
             )
+        if schema.get("uniqueItems") is True:
+            for duplicate_index in range(1, len(value)):
+                for first_index in range(duplicate_index):
+                    if _json_values_equal(
+                        value[first_index],
+                        value[duplicate_index],
+                    ):
+                        return (
+                            f"argument {path} violates uniqueItems at indexes "
+                            f"{first_index} and {duplicate_index}.",
+                            {
+                                "path": path,
+                                "keyword": "uniqueItems",
+                                "firstIndex": first_index,
+                                "duplicateIndex": duplicate_index,
+                            },
+                        )
         if "items" in schema:
             item_schema = schema.get("items")
             for index, item in enumerate(value):
@@ -517,9 +534,43 @@ def _is_schema_integer(value: Any) -> bool:
 
 
 def _json_values_equal(left: Any, right: Any) -> bool:
-    if type(left) is not type(right):
-        return False
-    return left == right
+    if left is None or right is None:
+        return left is right
+    if isinstance(left, bool) or isinstance(right, bool):
+        return left is right
+    if _is_json_number(left) or _is_json_number(right):
+        return (
+            _is_json_number(left)
+            and _is_json_number(right)
+            and left == right
+        )
+    if isinstance(left, str) or isinstance(right, str):
+        return (
+            isinstance(left, str)
+            and isinstance(right, str)
+            and left == right
+        )
+    if _is_json_array(left) or _is_json_array(right):
+        return (
+            _is_json_array(left)
+            and _is_json_array(right)
+            and len(left) == len(right)
+            and all(
+                _json_values_equal(left[index], right[index])
+                for index in range(len(left))
+            )
+        )
+    if isinstance(left, Mapping) or isinstance(right, Mapping):
+        return (
+            isinstance(left, Mapping)
+            and isinstance(right, Mapping)
+            and len(left) == len(right)
+            and all(
+                key in right and _json_values_equal(value, right[key])
+                for key, value in left.items()
+            )
+        )
+    return False
 
 
 def _normalize_schema_value(

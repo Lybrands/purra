@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from hashlib import sha256
@@ -20,6 +21,10 @@ from purra.contracts import (
     ModelCompletion,
     ModelFinishReason,
     ModelInvocation,
+    ModelStreamActivity,
+    ModelStreamActivityKind,
+    ModelStreamActivitySupport,
+    ModelStreamItem,
     ModelStreamChunk,
     ToolCallDelta,
     RuntimeLimits,
@@ -109,7 +114,7 @@ class AgentModelInvocationManager:
         *,
         output_observer: ModelInvocationOutputObserver | None = None,
         operation_controller: AgentOperationController | None = None,
-        invocation_timeout_ms: int | None = 120_000,
+        invocation_timeout_ms: int | None = 300_000,
         runtime_limits: RuntimeLimits = RuntimeLimits(),
         max_tool_argument_chars: int = 1_000_000,
         budget_repository: RunRepository | None = None,
@@ -180,6 +185,17 @@ class AgentModelInvocationManager:
                 raise selected_error from error
             raise
         meter = self._stream_meter(context)
+        liveness = _StreamLiveness(
+            invocation_signal,
+            support=stream.activity_support,
+            activity_timeout_ms=self._limits.provider_activity_idle_timeout_ms,
+            progress_timeout_ms=self._limits.provider_progress_idle_timeout_ms,
+        )
+
+        def close_invocation() -> None:
+            liveness.close()
+            invocation_signal.close()
+
         return ManagedInvocationStream(
             chunks=OwnedAsyncIterator(
                 self._observe_chunks(
@@ -188,8 +204,9 @@ class AgentModelInvocationManager:
                     invocation_signal,
                     operation_id,
                     meter,
+                    liveness,
                     receipt,
-                    invocation_signal.close,
+                    close_invocation,
                 ),
                 stream.chunks,
                 terminal_predicate=lambda chunk: chunk.finish_reason is not None,
@@ -432,11 +449,12 @@ class AgentModelInvocationManager:
 
     async def _observe_chunks(
         self,
-        chunks: AsyncIterator[ModelStreamChunk],
+        chunks: AsyncIterator[ModelStreamItem],
         receipt: ModelInvocationReceipt,
         signal: CancellationSignal | None,
         operation_id: str | None,
         meter: "_StreamMeter",
+        liveness: "_StreamLiveness",
         budget_receipt: ModelInvocationReceipt,
         close_signal: Callable[[], None],
     ) -> AsyncIterator[ModelStreamChunk]:
@@ -449,10 +467,20 @@ class AgentModelInvocationManager:
         try:
             while True:
                 try:
-                    chunk = await await_with_cancellation(anext(chunks), signal)
+                    item = await await_with_cancellation(anext(chunks), signal)
                 except StopAsyncIteration:
                     break
                 raise_if_stopped(signal)
+                if isinstance(item, ModelStreamActivity):
+                    liveness.accept_activity(item)
+                    continue
+                if not isinstance(item, ModelStreamChunk):
+                    raise ContractViolationError(
+                        "model stream yielded an unsupported item",
+                        code="model_stream_item_invalid",
+                    )
+                chunk = item
+                meaningful = liveness.accept_chunk(chunk)
                 meter.accept(chunk)
                 usage = chunk.usage or usage
                 tool_indices.update(delta.index for delta in chunk.tool_call_deltas)
@@ -461,6 +489,7 @@ class AgentModelInvocationManager:
                     chunk,
                 )
                 if chunk.finish_reason is not None:
+                    liveness.close()
                     attempt_settled = True
                     await self._settle_attempt(budget_receipt, usage)
                     finish_reason = chunk.finish_reason
@@ -489,6 +518,8 @@ class AgentModelInvocationManager:
                     yield chunk
                     break
                 yield chunk
+                if meaningful:
+                    liveness.resume()
             if finish_reason is None:
                 raise ModelGatewayError(
                     "model stream ended without a finish reason",
@@ -505,11 +536,13 @@ class AgentModelInvocationManager:
                     except BaseException as budget_error:
                         selected_error = budget_error
                 if not output_settled:
-                    await self._output.abort_model_stream(
-                        receipt.output_stream_id,
-                        _error_code(selected_error),
-                    )
-                    output_settled = True
+                    try:
+                        await self._output.abort_model_stream(
+                            receipt.output_stream_id,
+                            _error_code(selected_error),
+                        )
+                    finally:
+                        output_settled = True
             finally:
                 if not operation_settled:
                     await self._fail_operation(operation_id, selected_error)
@@ -518,6 +551,7 @@ class AgentModelInvocationManager:
                 raise selected_error from error
             raise
         finally:
+            liveness.close()
             consumer_error: BaseException | None = None
             try:
                 if not attempt_settled:
@@ -529,14 +563,17 @@ class AgentModelInvocationManager:
                 await _close_async_iterator(chunks)
                 try:
                     if not output_settled:
-                        await self._output.abort_model_stream(
-                            receipt.output_stream_id,
-                            (
-                                _error_code(consumer_error)
-                                if consumer_error is not None
-                                else "invocation_consumer_closed"
-                            ),
-                        )
+                        try:
+                            await self._output.abort_model_stream(
+                                receipt.output_stream_id,
+                                (
+                                    _error_code(consumer_error)
+                                    if consumer_error is not None
+                                    else "invocation_consumer_closed"
+                                ),
+                            )
+                        finally:
+                            output_settled = True
                 finally:
                     if not operation_settled:
                         if consumer_error is None:
@@ -667,6 +704,173 @@ async def _close_async_iterator(iterator: object) -> None:
     close = getattr(iterator, "aclose", None)
     if callable(close):
         await close()
+
+
+class _StreamLiveness:
+    def __init__(
+        self,
+        signal: ExecutionStopSignal,
+        *,
+        support: ModelStreamActivitySupport,
+        activity_timeout_ms: int | None,
+        progress_timeout_ms: int | None,
+    ) -> None:
+        self._signal = signal
+        self._support = ModelStreamActivitySupport(support)
+        self._activity_timeout_ms = activity_timeout_ms
+        self._progress_timeout_ms = progress_timeout_ms
+        self._started = time.monotonic()
+        self._first_activity_ms: int | None = None
+        self._first_progress_ms: int | None = None
+        self._last_activity_ms: int | None = None
+        self._last_progress_ms: int | None = None
+        self._max_activity_gap_ms: int | None = None
+        self._max_progress_gap_ms: int | None = None
+        self._activity_timer: asyncio.TimerHandle | None = None
+        self._progress_timer: asyncio.TimerHandle | None = None
+        self._closed = False
+        self.resume()
+
+    def accept_activity(self, item: ModelStreamActivity) -> None:
+        if self._support is ModelStreamActivitySupport.SEMANTIC_ONLY:
+            raise ContractViolationError(
+                "semantic-only model stream yielded an activity item",
+                code="model_stream_activity_unsupported",
+            )
+        if (
+            item.kind is ModelStreamActivityKind.WORKING
+            and self._support is not ModelStreamActivitySupport.WORKING
+        ):
+            raise ContractViolationError(
+                "model stream yielded undeclared working activity",
+                code="model_stream_activity_unsupported",
+            )
+        now = self._elapsed_ms()
+        self._record_activity(now)
+        self._arm_activity()
+        if item.kind is ModelStreamActivityKind.WORKING:
+            self._record_progress(now)
+            self._arm_progress()
+
+    def accept_chunk(self, chunk: ModelStreamChunk) -> bool:
+        if not _is_meaningful_chunk(chunk):
+            return False
+        now = self._elapsed_ms()
+        self._record_activity(now)
+        self._record_progress(now)
+        self._cancel_idle_timers()
+        return True
+
+    def resume(self) -> None:
+        if self._closed or self._support is ModelStreamActivitySupport.SEMANTIC_ONLY:
+            return
+        self._arm_activity()
+        self._arm_progress()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._cancel_idle_timers()
+
+    def _record_activity(self, now: int) -> None:
+        if self._first_activity_ms is None:
+            self._first_activity_ms = now
+        if self._last_activity_ms is not None:
+            gap = max(0, now - self._last_activity_ms)
+            self._max_activity_gap_ms = max(
+                gap,
+                self._max_activity_gap_ms or 0,
+            )
+        self._last_activity_ms = now
+
+    def _record_progress(self, now: int) -> None:
+        if self._first_progress_ms is None:
+            self._first_progress_ms = now
+        if self._last_progress_ms is not None:
+            gap = max(0, now - self._last_progress_ms)
+            self._max_progress_gap_ms = max(
+                gap,
+                self._max_progress_gap_ms or 0,
+            )
+        self._last_progress_ms = now
+
+    def _arm_activity(self) -> None:
+        if self._activity_timer is not None:
+            self._activity_timer.cancel()
+        self._activity_timer = self._timer(
+            self._activity_timeout_ms,
+            "model_activity_deadline_exceeded",
+            "activity_idle",
+        )
+
+    def _arm_progress(self) -> None:
+        if self._progress_timer is not None:
+            self._progress_timer.cancel()
+        self._progress_timer = self._timer(
+            self._progress_timeout_ms,
+            "model_progress_deadline_exceeded",
+            "progress_idle",
+        )
+
+    def _timer(
+        self,
+        timeout_ms: int | None,
+        code: str,
+        boundary: str,
+    ) -> asyncio.TimerHandle | None:
+        if self._closed or timeout_ms is None:
+            return None
+        return asyncio.get_running_loop().call_later(
+            timeout_ms / 1000,
+            self._expire,
+            code,
+            boundary,
+        )
+
+    def _expire(self, code: str, boundary: str) -> None:
+        if self._closed:
+            return
+        details = {
+            "activitySupport": self._support.value,
+            "phase": "stream",
+            "elapsedMs": self._elapsed_ms(),
+            "firstActivityMs": self._first_activity_ms,
+            "firstProgressMs": self._first_progress_ms,
+            "lastActivityMs": self._last_activity_ms,
+            "lastProgressMs": self._last_progress_ms,
+            "maxActivityGapMs": self._max_activity_gap_ms,
+            "maxProgressGapMs": self._max_progress_gap_ms,
+            "selectedBoundary": boundary,
+        }
+        self.close()
+        self._signal.set(code, details)
+
+    def _cancel_idle_timers(self) -> None:
+        for timer in (self._activity_timer, self._progress_timer):
+            if timer is not None:
+                timer.cancel()
+        self._activity_timer = None
+        self._progress_timer = None
+
+    def _elapsed_ms(self) -> int:
+        return max(0, round((time.monotonic() - self._started) * 1000))
+
+
+def _is_meaningful_chunk(chunk: ModelStreamChunk) -> bool:
+    return bool(
+        chunk.content_delta
+        or chunk.reasoning_delta
+        or chunk.usage is not None
+        or chunk.finish_reason is not None
+        or any(
+            delta.id is not None
+            or delta.type is not None
+            or delta.name is not None
+            or bool(delta.arguments_fragment)
+            for delta in chunk.tool_call_deltas
+        )
+    )
 
 
 @dataclass(slots=True)

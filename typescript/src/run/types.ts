@@ -2,6 +2,7 @@ import type { ContextEvidenceReceipt } from "../context/types.js";
 import type { JsonValue, Message, ModelTokenUsage, ToolSpec } from "../model/types.js";
 import type { OutputEvent, OutputEventQuery } from "../output/types.js";
 import type { DurableContinuation, DurableRunResult } from "../durable/types.js";
+import type { RecoveryCause } from "../recovery/index.js";
 
 export type RunStatus = "running" | "completed" | "failed" | "canceled";
 
@@ -67,14 +68,39 @@ export interface RunOptions {
   readonly durableContinuation?: DurableContinuation;
 }
 
-export interface AgentPresetSnapshot {
-  readonly schemaVersion: 3;
+interface AgentPresetSnapshotBase {
   readonly presetId: string;
   readonly presetRevision: string;
   readonly promptFingerprint: string;
   readonly toolFingerprint: string;
   readonly capabilityProfileId: string | null;
   readonly compositionFingerprint: string;
+  readonly runtimeLimits: AgentRuntimeLimitSnapshot;
+}
+
+export interface AgentPresetSnapshotV4 extends AgentPresetSnapshotBase {
+  readonly schemaVersion: 4;
+}
+
+export interface AgentPresetSnapshotV5 extends AgentPresetSnapshotBase {
+  readonly schemaVersion: 5;
+  readonly agentTree: {
+    readonly protocolVersion: 1;
+    readonly capabilityGrant: Readonly<Record<string, JsonValue>>;
+  };
+}
+
+export type AgentPresetSnapshot = AgentPresetSnapshotV4 | AgentPresetSnapshotV5;
+
+export interface AgentRuntimeLimitSnapshot {
+  readonly runTimeoutMs: number | null;
+  readonly activityIdleTimeoutMs: number | null;
+  readonly progressIdleTimeoutMs: number | null;
+  readonly invocationTimeoutMs: number | null;
+  readonly maxChunks: number;
+  readonly maxContentChars: number;
+  readonly maxReasoningChars: number;
+  readonly maxToolArgumentChars: number;
 }
 
 export interface RunSnapshot {
@@ -89,6 +115,22 @@ export interface RunSnapshot {
   readonly preset: AgentPresetSnapshot;
   readonly finalOutput?: JsonValue;
   readonly errorCode?: string;
+  readonly executionCheckpoint?: AgentExecutionCheckpoint;
+}
+
+export interface AgentExecutionCheckpoint {
+  readonly schemaVersion: 1;
+  readonly runId: string;
+  readonly phase: "model_ready";
+  readonly executionProfile: "reactive";
+  readonly nextRound: number;
+  readonly messages: readonly Message[];
+  readonly responseAttempts: number;
+  readonly recoveryAttempts: readonly {
+    readonly cause: RecoveryCause;
+    readonly scope: string;
+    readonly attempts: number;
+  }[];
 }
 
 export interface RunCancellationReceipt {
@@ -97,6 +139,11 @@ export interface RunCancellationReceipt {
   readonly status: RunStatus;
   readonly event?: OutputEvent;
   readonly events?: readonly OutputEvent[];
+}
+
+export interface RunLeaseClaim {
+  readonly leaseOwnerId?: string;
+  readonly leaseEpoch?: number;
 }
 
 export interface RunCommand {
@@ -135,6 +182,12 @@ export interface InvocationSettlement {
 }
 
 export interface RunBeginParams {
+  readonly requestedRunId?: string;
+  readonly rootRunId?: string;
+  readonly agentId?: string;
+  readonly parentRunId?: string;
+  readonly leaseOwnerId?: string;
+  readonly leaseEpoch?: number;
   readonly preset: AgentPresetSnapshot;
   readonly deadlineAt: string | null;
   readonly budgets: RunBudgets;

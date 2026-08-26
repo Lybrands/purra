@@ -3,10 +3,69 @@ import test from "node:test";
 
 import {
   Agent,
+  compileWorkPlan,
+  copyWorkPlan,
   ModelResponseJudge,
   ModelWorkPlanner,
   ToolPlanningPolicy,
 } from "purra";
+
+test("WorkPlan has no default total-step limit but honors an explicit host limit", () => {
+  const workPlan = {
+    title: "Nine milestones",
+    steps: Array.from({ length: 9 }, (_, index) => ({
+      id: `milestone-${index + 1}`,
+      title: `Milestone ${index + 1}`,
+      type: "review",
+      executor: "model",
+    })),
+  };
+
+  assert.equal(compileWorkPlan(workPlan, []).executionPlan.steps.length, 9);
+  assert.throws(
+    () => compileWorkPlan(workPlan, [], { maxSteps: 8 }),
+    (error) => error?.code === "invalid_planner_output",
+  );
+});
+
+test("WorkPlan rejects duplicate step ids", () => {
+  assert.throws(
+    () => copyWorkPlan({
+      title: "Duplicate",
+      steps: [
+        { id: "same", title: "First", type: "review", executor: "model" },
+        { id: "same", title: "Second", type: "review", executor: "model" },
+      ],
+    }),
+    (error) => error?.code === "invalid_planner_output",
+  );
+});
+
+test("model Planner requests the smallest non-redundant semantic plan", async () => {
+  let instruction = "";
+  const agent = new Agent({
+    model: {
+      capabilities: capabilities(),
+      async invoke(request) {
+        if (isPlannerRequest(request)) {
+          instruction = String(request.messages[0]?.content ?? "");
+          return finalTurn(JSON.stringify({ workPlan: directPlan() }));
+        }
+        return finalTurn("done");
+      },
+    },
+    planning: {
+      policy: {
+        shouldPlan() { return true; },
+        planningConstraints() { return {}; },
+      },
+      plannerFactory: (tasks) => new ModelWorkPlanner(tasks),
+    },
+  });
+
+  assert.equal((await agent.invoke({ messages: [{ role: "user", content: "answer" }] })).output, "done");
+  assert.match(instruction, /smallest non-redundant set/u);
+});
 
 test("model Planner repairs invalid JSON inside the submitted Run before executing the plan", async () => {
   let plannerRunId;

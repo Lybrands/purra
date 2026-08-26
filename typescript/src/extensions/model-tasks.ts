@@ -11,7 +11,7 @@ import type {
   ModelInvocationReceipt,
 } from "../run/types.js";
 import { AgentCanceledError, AgentError } from "../shared/errors.js";
-import { invokeModel } from "../model/stream.js";
+import { invokeModel, type ModelStreamLimits } from "../model/stream.js";
 import type {
   InvocationOutputLimit,
   Message,
@@ -54,6 +54,7 @@ export interface ModelTaskRunnerOptions {
   readonly recovery?: RecoveryPolicy;
   readonly operations?: AgentOperationController;
   readonly authority?: ModelTaskInvocationAuthority;
+  readonly runtimeLimits?: ModelStreamLimits;
 }
 
 export interface ModelTaskOptions {
@@ -86,6 +87,7 @@ export class ModelTaskRunner {
   readonly #recovery: RecoveryPolicy;
   readonly #operations: AgentOperationController | undefined;
   readonly #authority: ModelTaskInvocationAuthority | undefined;
+  readonly #runtimeLimits: ModelStreamLimits | undefined;
 
   public constructor(options: ModelTaskRunnerOptions) {
     if (typeof options?.model?.invoke !== "function") {
@@ -114,6 +116,7 @@ export class ModelTaskRunner {
     this.#recovery = options.recovery ?? new RecoveryPolicy();
     this.#operations = options.operations;
     this.#authority = options.authority;
+    this.#runtimeLimits = options.runtimeLimits;
   }
 
   public get runId(): string {
@@ -229,13 +232,20 @@ export class ModelTaskRunner {
         runId: this.#runId,
         ...(receipt === undefined ? {} : { invocationId: receipt.invocationId }),
       });
-      turn = await invokeModel(this.#model, request, signal, useStream, async (chunk) => {
-        if (receipt !== undefined) {
-          await this.#authority!.persistChunk(receipt, chunkIndex, chunk);
-          chunkIndex += 1;
-        }
-        await onChunk?.(chunk);
-      });
+      turn = await invokeModel(
+        this.#model,
+        request,
+        signal,
+        useStream,
+        async (chunk) => {
+          if (receipt !== undefined) {
+            await this.#authority!.persistChunk(receipt, chunkIndex, chunk);
+            chunkIndex += 1;
+          }
+          await onChunk?.(chunk);
+        },
+        this.#runtimeLimits,
+      );
       assertNoToolCalls(turn);
       if (receipt !== undefined && !useStream) {
         await this.#authority!.persistCompletion(receipt, turn);

@@ -184,6 +184,8 @@ def test_preset_snapshot_covers_delegation_configuration():
         "maxTitleChars": 120,
         "maxInstructionChars": 4_000,
         "maxObjectiveChars": 4_000,
+        "maxDepth": 3,
+        "maxAgentsPerRoot": 16,
         "contextMode": "isolated",
         "toolMode": "read",
         "allowsRecursiveDelegation": False,
@@ -266,15 +268,15 @@ def test_preset_snapshot_derives_builtin_compaction_settings():
     }
 
 
-def test_snapshot_v3_round_trip_rejects_v2_or_incomplete_values():
+def test_snapshot_v4_round_trip_rejects_v3_or_incomplete_values():
     snapshot = AgentPreset(
         id="portable",
         revision="1",
         tool_catalog=InMemoryToolCatalog(()),
     ).snapshot(_request())
 
-    assert snapshot.snapshot_version == 3
-    assert snapshot.to_mapping()["snapshotVersion"] == 3
+    assert snapshot.snapshot_version == 4
+    assert snapshot.to_mapping()["snapshotVersion"] == 4
     assert AgentPresetSnapshot.from_mapping(snapshot.to_mapping()) == snapshot
 
     legacy = snapshot.to_mapping()
@@ -282,10 +284,26 @@ def test_snapshot_v3_round_trip_rejects_v2_or_incomplete_values():
     with pytest.raises(ValueError, match="snapshot version"):
         AgentPresetSnapshot.from_mapping(legacy)
 
-    version_two = snapshot.to_mapping()
-    version_two["snapshotVersion"] = 2
+    version_three = snapshot.to_mapping()
+    version_three["snapshotVersion"] = 3
     with pytest.raises(ValueError, match="snapshot version"):
-        AgentPresetSnapshot.from_mapping(version_two)
+        AgentPresetSnapshot.from_mapping(version_three)
+
+
+def test_explicit_provider_output_limit_stays_in_snapshot_v4():
+    preset = AgentPreset(
+        id="legacy-budget",
+        revision="1",
+        tool_catalog=InMemoryToolCatalog(()),
+        runtime_limits=RuntimeLimits(max_provider_output_bytes=1_000_000),
+    )
+
+    snapshot = preset.snapshot(_request())
+    recovered = AgentPresetSnapshot.from_mapping(snapshot.to_mapping())
+
+    assert snapshot.snapshot_version == 4
+    assert recovered.composition["runtimeLimits"]["maxProviderOutputBytes"] == 1_000_000
+    assert RuntimeLimits().max_provider_output_bytes == 8 * 1024 * 1024
 
 
 async def _tool_handler(state, arguments, signal=None):
@@ -328,6 +346,9 @@ def test_preset_snapshot_covers_operational_capability_drift():
     assert composition["contextProvider"]["kind"] == "instance"
     assert composition["tools"][0]["policy"]["mode"] == "read"
     assert composition["runtimeLimits"]["maxModelRounds"] == 4
+    assert composition["runtimeLimits"]["providerActivityIdleTimeoutMs"] == 30_000
+    assert composition["runtimeLimits"]["providerProgressIdleTimeoutMs"] == 60_000
+    assert composition["runtimeLimits"]["providerInvocationTimeoutMs"] == 300_000
     assert composition["recoveryPolicy"]["empty_model_response"] == 1
 
     changed = AgentPreset(

@@ -1,10 +1,43 @@
 export { Agent } from "./core/agent.js";
+export {
+  AgentCapabilityGrant,
+  InMemoryRunTreeRepository,
+} from "./agent-tree.js";
+export {
+  AgentTreeRunSupervisor,
+  RunCommandService,
+} from "./agent-tree-execution.js";
+export { buildAgentTreeTool } from "./agent-tree-tool.js";
+export type {
+  AgentTreeExecutionResult,
+  AgentTreeOptions,
+  AgentTreeRunExecutor,
+} from "./agent-tree-execution.js";
+export type {
+  AgentCapabilityGrantOptions,
+  AgentNode,
+  AgentNodeState,
+  AgentRunAggregation,
+  AgentTreeRun,
+  AgentTreeRunStatus,
+  BeginRootAgentCommand,
+  ChildAgentSpec,
+  ContextCheckpoint,
+  ContinueAgentCommand,
+  ContinueAgentReceipt,
+  RunTreeRepository,
+  SpawnAgentsCommand,
+  SpawnAgentsReceipt,
+  SpawnedAgent,
+} from "./agent-tree.js";
 export type {
   AgentOptions,
+  AgentRuntimeLimits,
   AgentRunInput,
   AgentRunResult,
   AgentStreamEvent,
 } from "./core/agent.js";
+export type { ModelStreamLimits } from "./model/stream.js";
 export type {
   AssistantContentWithToolCalls,
   FeatureSupport,
@@ -18,7 +51,12 @@ export type {
   ModelGateway,
   ModelProtocolCapabilities,
   ModelRequest,
+  ModelStream,
+  ModelStreamActivity,
+  ModelStreamActivityKind,
+  ModelStreamActivitySupport,
   ModelStreamChunk,
+  ModelStreamItem,
   ModelTokenUsage,
   ModelTurn,
   ReasoningControl,
@@ -345,8 +383,12 @@ export {
 } from "./run/store.js";
 export type { RunRepository } from "./run/store.js";
 export type {
+  AgentExecutionCheckpoint,
   AgentPreset,
   AgentPresetSnapshot,
+  AgentPresetSnapshotV4,
+  AgentPresetSnapshotV5,
+  AgentRuntimeLimitSnapshot,
   InvocationReceiptInput,
   InvocationSettlement,
   ModelInvocationReceipt,
@@ -357,6 +399,7 @@ export type {
   RunCancellationReceipt,
   RunCommand,
   RunHandle,
+  RunLeaseClaim,
   RunOptions,
   RunRequest,
   RunResult,

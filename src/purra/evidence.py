@@ -161,6 +161,103 @@ class RunEvidenceStore:
     def context_receipts(self) -> tuple[ContextEvidenceReceipt, ...]:
         return tuple(self._context_receipts.values())
 
+    def checkpoint_mapping(self) -> dict[str, Any]:
+        """Return the private JSON state needed for a model-ready resume."""
+
+        return {
+            "records": [
+                {
+                    "evidenceId": item.evidence_id,
+                    "toolCallId": item.tool_call_id,
+                    "toolName": item.tool_name,
+                    "argumentsJson": item.arguments_json,
+                    "content": item.content,
+                    "tokenEstimate": item.token_estimate,
+                    "fromCache": item.from_cache,
+                    "errorCode": item.error_code,
+                    "effects": [dict(effect) for effect in item.effects],
+                }
+                for item in self._records.values()
+            ],
+            "toolResultReceipts": [
+                item.to_mapping() for item in self._tool_result_receipts.values()
+            ],
+            "contextReceipts": [
+                item.to_mapping() for item in self._context_receipts.values()
+            ],
+            "contextBlocks": dict(self._context_blocks),
+        }
+
+    @classmethod
+    def from_checkpoint_mapping(
+        cls,
+        value: Mapping[str, Any],
+    ) -> "RunEvidenceStore":
+        store = cls()
+        for raw in _mapping_rows(value.get("records")):
+            record = EvidenceRecord(
+                evidence_id=str(raw.get("evidenceId") or ""),
+                tool_call_id=str(raw.get("toolCallId") or ""),
+                tool_name=str(raw.get("toolName") or ""),
+                arguments_json=str(raw.get("argumentsJson") or ""),
+                content=str(raw.get("content") or ""),
+                token_estimate=int(raw.get("tokenEstimate") or 0),
+                from_cache=bool(raw.get("fromCache")),
+                error_code=(
+                    str(raw["errorCode"])
+                    if raw.get("errorCode") is not None
+                    else None
+                ),
+                effects=tuple(
+                    dict(effect)
+                    for effect in _mapping_rows(raw.get("effects"))
+                ),
+            )
+            store._records[record.evidence_id] = record
+        for raw in _mapping_rows(value.get("toolResultReceipts")):
+            receipt = ToolResultReceipt(
+                evidence_id=str(raw.get("evidenceId") or ""),
+                tool_call_id=str(raw.get("toolCallId") or ""),
+                tool_name=str(raw.get("tool") or ""),
+                status=str(raw.get("status") or ""),
+                content_characters=int(raw.get("contentCharacters") or 0),
+                token_estimate=int(raw.get("tokenEstimate") or 0),
+                from_cache=bool(raw.get("fromCache")),
+                error_code=(
+                    str(raw["errorCode"])
+                    if raw.get("errorCode") is not None
+                    else None
+                ),
+                effect_types=tuple(str(item) for item in raw.get("effectTypes") or ()),
+                summary=str(raw.get("summary") or ""),
+            )
+            store._tool_result_receipts[receipt.tool_call_id] = receipt
+        for raw in _mapping_rows(value.get("contextReceipts")):
+            receipt = ContextEvidenceReceipt(
+                evidence_id=str(raw.get("evidenceId") or ""),
+                context_block=str(raw.get("contextBlock") or ""),
+                source=str(raw.get("source") or ""),
+                item_id=str(raw.get("itemId") or ""),
+                version=(
+                    int(raw["version"])
+                    if raw.get("version") is not None
+                    else None
+                ),
+                metadata=(
+                    dict(raw["metadata"])
+                    if isinstance(raw.get("metadata"), Mapping)
+                    else {}
+                ),
+            )
+            store._context_receipts[receipt.evidence_id] = receipt
+        blocks = value.get("contextBlocks")
+        if isinstance(blocks, Mapping):
+            store._context_blocks.update({
+                str(name): str(content)
+                for name, content in blocks.items()
+            })
+        return store
+
     @property
     def token_estimate(self) -> int:
         return sum(record.token_estimate for record in self._records.values())
@@ -268,6 +365,12 @@ def _record_and_receipt(
         summary=summary,
     )
     return record, receipt
+
+
+def _mapping_rows(value: Any) -> tuple[Mapping[str, Any], ...]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        return ()
+    return tuple(item for item in value if isinstance(item, Mapping))
 
 
 def _context_receipt_rows(

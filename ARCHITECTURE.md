@@ -12,7 +12,7 @@ deployment choices.
 | Model and tool execution policy | Provider SDK adapters, credentials, and model selection |
 | Tool validation, authorization, approval, and idempotency contracts | Tool implementations and business authorization |
 | Deadlines, budgets, leases, checkpoints, and continuation rules | Production persistence, deployment, transport, and billing |
-| Optional planning, durable execution, Artifacts, and delegation contracts | Product workflows and domain projections |
+| Optional planning, durable execution, Artifacts, and recursive Child Agent contracts | Product workflows and domain projections |
 
 The built-in adapters are process-local references for tests and examples. A
 host that needs restart safety or multi-worker coordination supplies durable
@@ -51,6 +51,21 @@ leased task units, checkpoints, and authenticated continuation. A continuation
 reuses persisted deadlines, budgets, and behavior snapshots instead of silently
 starting a new execution.
 
+Child Agent execution is explicit. An `AgentNode` is stable identity; each
+execution is a separate immutable `AgentRun`. The tree shares the Root Run's
+budget authority and canonical journal, while capability grants may only
+narrow down the tree. `delegateToAgents` is a synchronous create-and-wait
+facade; hosts may also use the public spawn, join, continue, cancel, and close
+commands directly. Root recovery rebinds the execution inputs and scans the
+complete persisted descendant set before replaying work.
+
+Reactive Child Runs persist a private `model_ready` checkpoint after a fully
+committed tool round. A replacement executor may attach to the same canonical
+Run and continue at the next model round only when that checkpoint, its lease,
+and its Agent preset snapshot all match. An in-flight Provider stream, an
+in-flight tool, and Planned execution remain fail-stop boundaries; PurrA does
+not infer or replay their missing state.
+
 ## Safety invariants
 
 - Tool schemas are checked at registration. A complete tool batch is admitted
@@ -59,6 +74,8 @@ starting a new execution.
   evidence are treated as untrusted at their boundaries.
 - Attempts, tokens, output, and absolute deadlines are accounted against the
   Root Run before more work is authorized.
+- Child Run events are attributed projections of the Root journal, not a
+  second output authority. Lease epochs fence stale Child executors.
 - Canonical state is persisted before it is published.
 - Cancellation and terminal settlement have one authority; late work cannot
   reopen a terminal Run.

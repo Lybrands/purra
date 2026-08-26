@@ -1,5 +1,7 @@
 import {
   Agent,
+  AgentCapabilityGrant,
+  AgentTreeRunSupervisor,
   AgentOperationController,
   ArtifactAccessController,
   ArtifactLifecycle,
@@ -7,6 +9,7 @@ import {
   DelegationPolicy,
   evaluateAgentRun,
   InMemoryAgentAdapters,
+  InMemoryRunTreeRepository,
   InMemoryDelegationRepository,
   InMemoryLongTaskRepository,
   InMemoryArtifactStore,
@@ -15,15 +18,57 @@ import {
   ModelWorkPlanner,
   RecipeLongTaskDispatcher,
   RecoveryPolicy,
+  RunCommandService,
   ToolPlanningPolicy,
   type JsonValue,
+  type AgentRuntimeLimits,
+  type AgentRuntimeLimitSnapshot,
+  type AgentExecutionCheckpoint,
   type LongTaskDispatchReceipt,
   type ModelGateway,
+  type ModelStreamActivity,
+  type ModelStreamActivityKind,
+  type ModelStreamActivitySupport,
+  type ModelStreamItem,
+  type ModelStreamLimits,
   type DelegationRepository,
   type OutputEvent,
   type RunHandle,
   type ToolDefinition,
 } from "purra";
+
+const typedActivityKind = "working" satisfies ModelStreamActivityKind;
+"working" satisfies ModelStreamActivitySupport;
+const typedActivity = {
+  type: "activity",
+  kind: typedActivityKind,
+} satisfies ModelStreamActivity;
+typedActivity satisfies ModelStreamItem;
+const typedStreamLimits = {
+  activityIdleTimeoutMs: 30_000,
+  progressIdleTimeoutMs: 60_000,
+  invocationTimeoutMs: 300_000,
+  maxChunks: 100_000,
+  maxContentChars: 1_000_000,
+  maxReasoningChars: 1_000_000,
+  maxToolArgumentChars: 1_000_000,
+} satisfies ModelStreamLimits;
+const typedRuntimeLimits = {
+  ...typedStreamLimits,
+  runTimeoutMs: 900_000,
+} satisfies AgentRuntimeLimits;
+typedRuntimeLimits satisfies AgentRuntimeLimitSnapshot;
+const typedExecutionCheckpoint = {
+  schemaVersion: 1,
+  runId: "typed-checkpoint",
+  phase: "model_ready",
+  executionProfile: "reactive",
+  nextRound: 2,
+  messages: [{ role: "user", content: "resume" }],
+  responseAttempts: 0,
+  recoveryAttempts: [],
+} satisfies AgentExecutionCheckpoint;
+typedExecutionCheckpoint satisfies AgentExecutionCheckpoint;
 
 const typedOperationEvents: unknown[] = [];
 const typedOperations = new AgentOperationController({
@@ -257,6 +302,93 @@ const delegationBatch = await delegationRepository.createBatch({
   }],
 });
 delegationBatch.delegations[0]!.contextMode satisfies "isolated";
+
+const treeRepository = new InMemoryRunTreeRepository();
+let treeCommands: RunCommandService;
+const treeSupervisor = new AgentTreeRunSupervisor({
+  repository: treeRepository,
+  executor: {
+    async execute(run, agent) {
+      if (agent.name === "child") {
+        const nested = await treeCommands.spawnAgents({
+          parentRunId: run.runId,
+          idempotencyKey: "typed-nested",
+          leaseOwnerId: run.leaseOwnerId!,
+          leaseEpoch: run.leaseEpoch,
+          children: [{
+            name: "grandchild",
+            title: "Grandchild",
+            instruction: "Finish.",
+            objective: "Finish nested work.",
+          }],
+        });
+        if ((await treeCommands.joinRuns(
+          run.runId,
+          [nested.items[0]!.run.runId],
+          undefined,
+          {
+            leaseOwnerId: run.leaseOwnerId!,
+            leaseEpoch: run.leaseEpoch,
+          },
+        )).state !== "ready") {
+          throw new Error("nested Agent tree did not settle");
+        }
+      }
+      return {
+        status: "done",
+        result: { agent: agent.name },
+        contentRef: `memory://${run.runId}`,
+        fingerprint: `fingerprint:${run.runId}`,
+      };
+    },
+  },
+});
+treeCommands = new RunCommandService(treeRepository, treeSupervisor);
+const treeRoot = await treeCommands.beginRoot({
+  runId: "typed-tree-root",
+  agentId: "typed-tree-agent",
+  name: "root",
+  title: "Root",
+  instruction: "Own the smoke test.",
+  objective: "Run two levels.",
+  capabilityGrant: new AgentCapabilityGrant({
+    canSpawnAgents: true,
+    maxParallelRuns: 1,
+  }),
+  idempotencyKey: "typed-tree-begin",
+});
+const treeChild = await treeCommands.spawnAgents({
+  parentRunId: treeRoot.runId,
+  idempotencyKey: "typed-tree-spawn",
+  children: [{
+    name: "child",
+    title: "Child",
+    instruction: "Delegate once.",
+    objective: "Run child work.",
+  }],
+});
+if ((await treeCommands.joinRuns(
+  treeRoot.runId,
+  [treeChild.items[0]!.run.runId],
+)).state !== "ready") {
+  throw new Error("installed Agent tree did not settle");
+}
+const continuedTreeChild = await treeCommands.continueAgent({
+  requesterRunId: treeRoot.runId,
+  idempotencyKey: "typed-tree-continue",
+  agentId: treeChild.items[0]!.agent.agentId,
+  expectedContextVersion: 1,
+  message: "Run the installed Child Agent again.",
+});
+if ((await treeCommands.joinRuns(
+  treeRoot.runId,
+  [continuedTreeChild.run.runId],
+)).state !== "ready") {
+  throw new Error("installed Agent continuation did not settle");
+}
+if ((await treeRepository.listDescendants(treeRoot.runId)).length !== 4) {
+  throw new Error("installed Agent tree did not recurse and continue");
+}
 
 function capabilities() {
   return {

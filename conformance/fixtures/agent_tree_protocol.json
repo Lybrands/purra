@@ -1,0 +1,105 @@
+{
+  "protocolVersion": 1,
+  "agentPresetSnapshotVersion": 5,
+  "policyDefaults": {
+    "canSpawnAgents": false,
+    "maxDepth": 3,
+    "maxChildrenPerCall": 3,
+    "maxAgentsPerRoot": 16,
+    "maxParallelRuns": 3,
+    "allowedTools": [],
+    "allowedModels": []
+  },
+  "agentNodeStates": [
+    "active",
+    "closed"
+  ],
+  "agentRunStatuses": [
+    "queued",
+    "running",
+    "waiting",
+    "done",
+    "failed",
+    "canceled"
+  ],
+  "stableErrorCodes": [
+    "agent_not_found",
+    "agent_closed",
+    "agent_busy",
+    "agent_depth_exceeded",
+    "agent_capacity_exceeded",
+    "agent_capability_escalation",
+    "agent_context_conflict",
+    "agent_scope_violation",
+    "agent_run_state_conflict",
+    "agent_run_lease_lost",
+    "agent_run_resume_checkpoint_missing",
+    "agent_execution_checkpoint_conflict",
+    "agent_preset_mismatch",
+    "agent_context_checkpoint_not_found",
+    "run_not_found",
+    "child_run_not_found",
+    "child_run_scope_violation",
+    "child_run_join_canceled",
+    "child_spawn_idempotency_conflict",
+    "root_run_not_active",
+    "root_run_not_quiescent"
+  ],
+  "scheduling": {
+    "order": "priority_desc_created_sequence_asc",
+    "waitingConsumesSlot": false,
+    "rootRunConsumesSlot": true
+  },
+  "lease": {
+    "initialEpoch": 1,
+    "reclaimIncrementsEpoch": true,
+    "expiryBoundary": "now_greater_than_or_equal_expires_at",
+    "fences": [
+      "spawn",
+      "continue",
+      "checkpoint",
+      "budget",
+      "output",
+      "terminal"
+    ]
+  },
+  "continuation": {
+    "terminalRunsAreImmutable": true,
+    "oneActiveRunPerAgent": true,
+    "contextCompareAndSwap": true,
+    "crossRootScope": true
+  },
+  "recovery": {
+    "executionCheckpointSchemaVersion": 1,
+    "resumablePhase": "model_ready",
+    "resumableExecutionProfile": "reactive",
+    "inFlightProviderOrToolPolicy": "fail_stop"
+  },
+  "authority": {
+    "childMayOnlyNarrow": true,
+    "rootBudgetIsCanonical": true,
+    "recursiveSpawnRequiresCapability": true,
+    "rootBudgetDimensions": [
+      "model_attempts",
+      "input_tokens",
+      "output_tokens",
+      "reasoning_tokens",
+      "provider_output_events",
+      "provider_output_bytes"
+    ],
+    "canonicalJournalFields": [
+      "root_run_id",
+      "run_id",
+      "agent_id",
+      "parent_run_id",
+      "root_sequence",
+      "source_key",
+      "kind",
+      "channel",
+      "visibility",
+      "payload"
+    ],
+    "rootSequenceStrictlyIncreasing": true,
+    "childEventsAreFilteredViews": true
+  }
+}

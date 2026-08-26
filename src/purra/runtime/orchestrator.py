@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, replace
 from time import perf_counter
-from typing import Any, AsyncIterator, Mapping, Sequence
+from typing import Any, AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from uuid import uuid4
 
 from purra.cancellation import (
@@ -20,6 +20,7 @@ from purra.cancellation import (
     is_canceled as _is_canceled,
     stop_reason,
 )
+from purra.agent_execution_checkpoint import AgentExecutionCheckpoint
 from purra.context_budget import (
     context_budget_contract_error as _context_budget_contract_error,
     estimate_agent_messages_tokens,
@@ -65,6 +66,7 @@ from purra.evidence import RunEvidenceStore
 from purra.host_planned_tool_gateway import (
     HOST_PLANNED_EXECUTION_ROUTE,
 )
+from purra.json_values import thaw_json_mapping
 from purra.model_invocation import (
     AgentModelInvocationManager,
     ModelInvocationContext,
@@ -141,6 +143,28 @@ from purra.ports import (
 RuntimeUpdate = AgentEvent | AgentRuntimeResult
 
 
+def _match_tool_retry_links(
+    pending: tuple[tuple[str, str], ...],
+    calls: tuple[ToolCall, ...],
+) -> dict[str, str]:
+    remaining = list(pending)
+    links: dict[str, str] = {}
+    for call in calls:
+        match = next(
+            (
+                index
+                for index, (_tool_call_id, tool_name) in enumerate(remaining)
+                if tool_name == call.name
+            ),
+            None,
+        )
+        if match is None:
+            continue
+        retried_tool_call_id, _tool_name = remaining.pop(match)
+        links[call.id] = retried_tool_call_id
+    return links
+
+
 @dataclass(slots=True)
 class _RuntimeLoopState:
     messages: list[AgentMessage]
@@ -170,6 +194,7 @@ class _RuntimeLoopState:
     failed_tool_recovery_error_code: str | None = None
     progress_rounds: int = 0
     tool_input_recovery_epoch: int = 0
+    pending_tool_input_retries: tuple[tuple[str, str], ...] = ()
     round_index: int = 0
     round_number: int = 0
     retry_round: bool = False
@@ -244,6 +269,10 @@ class AgentRuntime:
         tool_context_contracts: Mapping[str, ToolContextContract] | None = None,
         tool_argument_limits: Mapping[str, int] | None = None,
         stage_context_projection_enabled: bool = False,
+        resume_checkpoint: AgentExecutionCheckpoint | None = None,
+        checkpoint_writer: (
+            Callable[[AgentExecutionCheckpoint], Awaitable[None]] | None
+        ) = None,
         signal: CancellationSignal | None = None,
     ) -> AsyncIterator[RuntimeUpdate]:
         if not request.model.protocol_capabilities.reasoning_mode_is_supported(
@@ -272,6 +301,24 @@ class AgentRuntime:
             tool_context_contracts=tool_context_contracts,
             tool_argument_limits=tool_argument_limits,
         )
+        start_round_index = 0
+        if resume_checkpoint is not None:
+            if run_id is None or resume_checkpoint.run_id != run_id:
+                raise ContractViolationError(
+                    "Agent execution checkpoint belongs to another Run",
+                    code="agent_execution_checkpoint_conflict",
+                )
+            self._restore_checkpoint(loop, resume_checkpoint)
+            start_round_index = resume_checkpoint.next_round - 1
+            if start_round_index >= loop.absolute_round_limit:
+                yield _runtime_result(
+                    run_id,
+                    RuntimeOutcome.FAILED,
+                    loop.used_model,
+                    start_round_index,
+                    error_code="max_model_rounds",
+                )
+                return
         budget_error = _context_budget_contract_error(
             request,
             context_budget,
@@ -292,7 +339,10 @@ class AgentRuntime:
             )
             return
 
-        for round_index in range(loop.absolute_round_limit):
+        for round_index in range(
+            start_round_index,
+            loop.absolute_round_limit,
+        ):
             loop.round_index = round_index
             loop.round_number = round_index + 1
             loop.retry_round = False
@@ -399,6 +449,10 @@ class AgentRuntime:
             if loop.terminal_result is not None:
                 yield loop.terminal_result
                 return
+            if checkpoint_writer is not None and planning_hook is None:
+                checkpoint = self._build_execution_checkpoint(loop, run_id)
+                if checkpoint is not None:
+                    await checkpoint_writer(checkpoint)
 
         yield _runtime_result(
             run_id,
@@ -407,6 +461,74 @@ class AgentRuntime:
             loop.round_limit,
             error_code="max_model_rounds",
         )
+
+    def _restore_checkpoint(
+        self,
+        loop: _RuntimeLoopState,
+        checkpoint: AgentExecutionCheckpoint,
+    ) -> None:
+        loop.messages = list(checkpoint.messages)
+        loop.execution_state.domain.clear()
+        loop.execution_state.domain.update(
+            thaw_json_mapping(checkpoint.execution_state_domain)
+        )
+        loop.evidence_store = RunEvidenceStore.from_checkpoint_mapping(
+            thaw_json_mapping(checkpoint.evidence_state)
+        )
+        loop.recovery_ledger.restore(checkpoint.recovery_attempts)
+        loop.round_limit = checkpoint.round_limit
+        loop.logical_round_number = checkpoint.logical_round_number
+        loop.progress_rounds = checkpoint.progress_rounds
+        loop.tool_input_recovery_epoch = checkpoint.tool_input_recovery_epoch
+        loop.logical_required_tool_call_enabled = (
+            checkpoint.logical_required_tool_call_enabled
+        )
+        loop.provider_required_tool_choice_enabled = (
+            checkpoint.provider_required_tool_choice_enabled
+        )
+        loop.declined_response_pending = checkpoint.declined_response_pending
+        loop.response_repair_pending = checkpoint.response_repair_pending
+        loop.public_presentation_pending = (
+            checkpoint.public_presentation_pending
+        )
+        loop.last_tool_outcome = checkpoint.last_tool_outcome
+        loop.pending_tool_input_retries = checkpoint.pending_tool_input_retries
+
+    def _build_execution_checkpoint(
+        self,
+        loop: _RuntimeLoopState,
+        run_id: RunId | None,
+    ) -> AgentExecutionCheckpoint | None:
+        if run_id is None:
+            return None
+        try:
+            return AgentExecutionCheckpoint(
+                run_id=run_id,
+                next_round=loop.round_number + 1,
+                messages=tuple(loop.messages),
+                execution_state_domain=dict(loop.execution_state.domain),
+                evidence_state=loop.evidence_store.checkpoint_mapping(),
+                recovery_attempts=loop.recovery_ledger.snapshot(),
+                round_limit=loop.round_limit,
+                logical_round_number=loop.logical_round_number,
+                progress_rounds=loop.progress_rounds,
+                tool_input_recovery_epoch=loop.tool_input_recovery_epoch,
+                logical_required_tool_call_enabled=(
+                    loop.logical_required_tool_call_enabled
+                ),
+                provider_required_tool_choice_enabled=(
+                    loop.provider_required_tool_choice_enabled
+                ),
+                declined_response_pending=loop.declined_response_pending,
+                response_repair_pending=loop.response_repair_pending,
+                public_presentation_pending=loop.public_presentation_pending,
+                last_tool_outcome=loop.last_tool_outcome,
+                pending_tool_input_retries=loop.pending_tool_input_retries,
+            )
+        except (TypeError, ValueError):
+            # Domain state is explicitly host-owned and may not be JSON. Such
+            # a boundary remains fail-stop rather than weakening persistence.
+            return None
 
 
     async def _authorize_tool_batch(
@@ -523,6 +645,10 @@ class AgentRuntime:
         tool_started = perf_counter()
         try:
             batch_result: ToolBatchResult | None = None
+            retry_links = _match_tool_retry_links(
+                loop.pending_tool_input_retries,
+                loop.calls,
+            )
             batch_stream = _stream_tool_batch(
                 self._tool_execution_gateway,
                 ToolBatchRequest(
@@ -531,6 +657,7 @@ class AgentRuntime:
                     calls=loop.calls,
                     allowed_tool_names=loop.allowed_names,
                     state=loop.execution_state,
+                    retry_of_tool_call_ids=retry_links,
                 ),
                 signal,
             )
@@ -544,6 +671,7 @@ class AgentRuntime:
                 await _close_async_iterator(batch_stream)
             if batch_result is None:
                 raise RuntimeError("tool gateway returned no result")
+            loop.pending_tool_input_retries = ()
         except OperationCanceled:
             await self._trace(
                 "tool_round",
@@ -694,6 +822,11 @@ class AgentRuntime:
                 details=dict(trace.details),
             )
         if recovery.disposition is ToolRecoveryDisposition.RETRY_MODEL:
+            loop.pending_tool_input_retries = tuple(
+                (result.tool_call_id, result.tool_name)
+                for result in batch_result.results
+                if result.error == batch_result.error
+            )
             loop.messages.extend(recovery.messages)
             return
         if recovery.disposition is ToolRecoveryDisposition.REJECT:

@@ -239,7 +239,11 @@ function outputEvent(runId: string, sequence: number): OutputEvent {
   return Object.freeze({
     eventId: `event-${sequence}`,
     runId,
+    rootRunId: runId,
+    agentId: runId,
+    parentRunId: null,
     sequence,
+    rootSequence: sequence,
     occurredAt: new Date(0).toISOString(),
     sourceKey: `conformance:${sequence}`,
     kind: "run.started",

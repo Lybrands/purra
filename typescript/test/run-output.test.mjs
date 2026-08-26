@@ -18,13 +18,23 @@ test("Run output batches are atomic, replayable, and budgeted before append", as
   const repository = new InMemoryRunRepository();
   const begun = await repository.begin({
     preset: {
-      schemaVersion: 3,
+      schemaVersion: 4,
       presetId: "batch",
       presetRevision: "1",
       promptFingerprint: "prompt",
       toolFingerprint: "tools",
       capabilityProfileId: null,
       compositionFingerprint: "composition",
+      runtimeLimits: {
+        runTimeoutMs: 900_000,
+        activityIdleTimeoutMs: 30_000,
+        progressIdleTimeoutMs: 60_000,
+        invocationTimeoutMs: 300_000,
+        maxChunks: 100_000,
+        maxContentChars: 1_000_000,
+        maxReasoningChars: 1_000_000,
+        maxToolArgumentChars: 1_000_000,
+      },
     },
     deadlineAt: null,
     budgets: {
@@ -44,6 +54,7 @@ test("Run output batches are atomic, replayable, and budgeted before append", as
     visibility: "private",
     payload: { value },
   }));
+  assert.equal(begun.snapshot.budgets.maxOutputBytes, 10_000);
   await rejectsCode(
     repository.appendBatch(begun.snapshot.runId, drafts),
     "runtime_budget_exceeded",
@@ -61,12 +72,109 @@ test("Run output batches are atomic, replayable, and budgeted before append", as
   );
 });
 
+test("Child Runs share Root attempts, tokens, output budgets, and journal order", async () => {
+  const repository = new InMemoryRunRepository();
+  const preset = {
+    schemaVersion: 4,
+    presetId: "tree-budget",
+    presetRevision: "1",
+    promptFingerprint: "prompt",
+    toolFingerprint: "tools",
+    capabilityProfileId: null,
+    compositionFingerprint: "composition",
+    runtimeLimits: {
+      runTimeoutMs: 900_000,
+      activityIdleTimeoutMs: 30_000,
+      progressIdleTimeoutMs: 60_000,
+      invocationTimeoutMs: 300_000,
+      maxChunks: 100_000,
+      maxContentChars: 1_000_000,
+      maxReasoningChars: 1_000_000,
+      maxToolArgumentChars: 1_000_000,
+    },
+  };
+  const budgets = {
+    maxModelAttempts: 2,
+    maxInputTokens: 3,
+    maxOutputTokens: null,
+    maxReasoningTokens: null,
+    maxOutputBytes: 10_000,
+    maxOutputEvents: 1,
+  };
+  const root = await repository.begin({
+    requestedRunId: "root-run",
+    agentId: "root-agent",
+    preset,
+    deadlineAt: null,
+    budgets,
+    metadata: {},
+  });
+  const children = await Promise.all([1, 2, 3].map((index) => repository.begin({
+    requestedRunId: `child-run-${index}`,
+    rootRunId: root.snapshot.runId,
+    agentId: `child-agent-${index}`,
+    parentRunId: root.snapshot.runId,
+    preset,
+    deadlineAt: null,
+    budgets,
+    metadata: {},
+  })));
+
+  const attempts = await Promise.allSettled(children.map(({ snapshot }, index) => (
+    repository.openInvocation(snapshot.runId, invocationInput(snapshot.runId, index + 1))
+  )));
+  assert.equal(attempts.filter(({ status }) => status === "fulfilled").length, 2);
+  assert.equal(attempts.filter(({ status }) => status === "rejected").length, 1);
+  assert.equal(attempts.find(({ status }) => status === "rejected").reason.code, "runtime_budget_exceeded");
+
+  const settlements = await Promise.all(attempts.flatMap((attempt, index) => (
+    attempt.status === "fulfilled"
+      ? [repository.settleInvocation(children[index].snapshot.runId, {
+          invocationId: `invocation-${index + 1}`,
+          status: "completed",
+          usage: { inputTokens: 2, outputTokens: 0, totalTokens: 2 },
+        })]
+      : []
+  )));
+  assert.deepEqual(
+    settlements.map(({ budgetError }) => budgetError).sort(),
+    ["runtime_budget_exceeded", undefined].sort(),
+  );
+
+  const outputs = await Promise.allSettled(children.map(({ snapshot }, index) => (
+    repository.appendEvent(snapshot.runId, {
+      sourceKey: `provider:child:${index + 1}`,
+      kind: "provider.delta_batch",
+      channel: "model",
+      visibility: "private",
+      payload: { value: index + 1 },
+    })
+  )));
+  assert.equal(outputs.filter(({ status }) => status === "fulfilled").length, 1);
+  assert.equal(outputs.filter(({ status }) => status === "rejected").length, 2);
+  assert.equal((await repository.get(root.snapshot.runId)).usage.modelAttempts, 2);
+  assert.equal((await repository.get(root.snapshot.runId)).usage.inputTokens, 4);
+
+  const journal = await repository.listRootEvents(root.snapshot.runId, 0);
+  assert.deepEqual(
+    journal.map(({ rootSequence }) => rootSequence),
+    journal.map((_event, index) => index + 1),
+  );
+  assert.deepEqual(new Set(journal.map(({ rootRunId }) => rootRunId)), new Set([root.snapshot.runId]));
+  assert.equal(journal.every(({ agentId, sourceKey }) => agentId && sourceKey), true);
+  const firstChildEvents = await repository.listEvents(children[0].snapshot.runId, 0);
+  assert.equal(firstChildEvents.every(({ runId }) => runId === children[0].snapshot.runId), true);
+  assert.equal(firstChildEvents.every((event) => journal.includes(event)), true);
+});
+
 test("ten thousand one-character chunks coalesce deterministically", async () => {
+  const candidate = 8 * 1024 * 1024;
   const agent = new Agent({
     outputBatchLimits: {
       maxPayloadBytes: 1_000_000,
       maxFragments: 64,
       maxLatencyMs: 60_000,
+      maxBackgroundLatencyMs: 60_000,
     },
     model: {
       async invoke() { throw new Error("stream expected"); },
@@ -82,9 +190,10 @@ test("ten thousand one-character chunks coalesce deterministically", async () =>
   });
   const handle = await agent.submit(
     { messages: [{ role: "user", content: "many" }] },
-    { budgets: { maxOutputBytes: null } },
+    { budgets: { maxOutputBytes: candidate } },
   );
   assert.equal((await handle.result).output.length, 10_000);
+  assert.ok((await handle.snapshot()).usage.outputBytes * 2 <= candidate);
   const events = await collect(handle.events({ visibility: "all" }));
   const batches = events.filter((event) => event.kind === "provider.delta_batch");
   assert.equal(batches.length, Math.ceil(10_000 / 64));
@@ -94,6 +203,62 @@ test("ten thousand one-character chunks coalesce deterministically", async () =>
       .join("").length,
     10_000,
   );
+});
+
+test("private Provider batches use the background latency ceiling", async () => {
+  const agent = new Agent({
+    outputBatchLimits: {
+      maxPayloadBytes: 1_000_000,
+      maxFragments: 64,
+      maxLatencyMs: 1_000,
+      maxBackgroundLatencyMs: 1,
+    },
+    model: {
+      async invoke() { throw new Error("stream expected"); },
+      async *stream() {
+        yield { contentDelta: "a" };
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        yield { contentDelta: "b", finishReason: "stop" };
+      },
+    },
+  });
+  const handle = await agent.submit(
+    { messages: [{ role: "user", content: "background" }] },
+    { budgets: { maxOutputBytes: null } },
+  );
+
+  assert.equal((await handle.result).output, "ab");
+  const events = await collect(handle.events({ visibility: "all" }));
+  const batches = events.filter((event) => event.kind === "provider.delta_batch");
+  assert.equal(batches.length, 2);
+});
+
+test("Provider output budget failure stays coded, terminal, and non-retryable", async () => {
+  let modelCalls = 0;
+  const agent = new Agent({
+    model: {
+      async invoke() { throw new Error("stream expected"); },
+      async *stream() {
+        modelCalls += 1;
+        yield {
+          reasoningDelta: "private reasoning",
+          contentDelta: "answer",
+          finishReason: "stop",
+        };
+      },
+    },
+  });
+  const handle = await agent.submit(
+    { messages: [{ role: "user", content: "budget" }] },
+    { budgets: { maxOutputBytes: 1 } },
+  );
+
+  await rejectsCode(handle.result, "runtime_budget_exceeded");
+  const events = await collect(handle.events({ visibility: "all" }));
+  assert.equal(modelCalls, 1);
+  assert.equal(events.filter((event) => event.kind === "provider.delta_batch").length, 0);
+  assert.equal(events.filter((event) => event.kind === "invocation.aborted").length, 1);
+  assert.equal(events.filter((event) => event.kind === "run.failed").length, 1);
 });
 
 test("submitted Run persists private model evidence and public output in order", async () => {
@@ -326,6 +491,49 @@ test("cancellation atomically aborts an open invocation and wins the terminal ra
   assert.equal((await handle.cancel()).accepted, false);
 });
 
+test("cancellation flushes a pending private batch and clears its timer", async () => {
+  let nextCalls = 0;
+  let returned = 0;
+  let secondStarted;
+  const waiting = new Promise((resolve) => { secondStarted = resolve; });
+  const iterator = {
+    next() {
+      nextCalls += 1;
+      if (nextCalls === 1) {
+        return Promise.resolve({ value: { reasoningDelta: "pending" }, done: false });
+      }
+      secondStarted();
+      return new Promise(() => {});
+    },
+    return() {
+      returned += 1;
+      return Promise.resolve({ done: true });
+    },
+  };
+  const agent = new Agent({
+    outputBatchLimits: {
+      maxPayloadBytes: 1_000_000,
+      maxFragments: 64,
+      maxLatencyMs: 1_000,
+      maxBackgroundLatencyMs: 1_000,
+    },
+    model: {
+      async invoke() { throw new Error("stream should be used"); },
+      stream() { return { [Symbol.asyncIterator]: () => iterator }; },
+    },
+  });
+  const handle = await agent.submit({ messages: [{ role: "user", content: "wait" }] });
+  await waiting;
+
+  assert.equal((await handle.cancel()).accepted, true);
+  await assert.rejects(handle.result, AgentCanceledError);
+  const events = await collect(handle.events({ visibility: "all" }));
+  assert.equal(events.filter((event) => event.kind === "provider.delta_batch").length, 1);
+  assert.equal(events.filter((event) => event.kind === "invocation.aborted").length, 1);
+  assert.equal(events.filter((event) => event.kind === "run.canceled").length, 1);
+  assert.equal(returned, 1);
+});
+
 test("attempt budget prevents a second Provider call", async () => {
   let modelCalls = 0;
   let toolCalls = 0;
@@ -478,6 +686,21 @@ function finalTurn(content) {
   return { message: { role: "assistant", content }, finishReason: "stop" };
 }
 
+function invocationInput(runId, index) {
+  return {
+    schemaVersion: 1,
+    runId,
+    invocationId: `invocation-${index}`,
+    messageFingerprint: `message-${index}`,
+    toolFingerprint: "tools",
+    requestFingerprint: `request-${index}`,
+    evidenceFingerprint: "evidence",
+    contextEvidence: [],
+    capabilityProfileId: null,
+    outputLimit: null,
+  };
+}
+
 async function collect(iterable) {
   const rows = [];
   for await (const row of iterable) rows.push(row);
@@ -502,6 +725,7 @@ function proxyRepository(base, overrides = {}) {
     cancel: overrides.cancel ?? ((...args) => base.cancel(...args)),
     get: overrides.get ?? ((...args) => base.get(...args)),
     listEvents: overrides.listEvents ?? ((...args) => base.listEvents(...args)),
+    listRootEvents: overrides.listRootEvents ?? ((...args) => base.listRootEvents(...args)),
   };
 }
 

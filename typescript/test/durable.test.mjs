@@ -23,9 +23,11 @@ const durableFixture = JSON.parse(readFileSync(
 ));
 
 test("shared Durable classifications and exact lease boundary stay aligned", () => {
-  assert.equal(durableFixture.protocolVersion, 3);
-  assert.equal(durableFixture.agentPresetSnapshotVersion, 3);
+  assert.equal(durableFixture.protocolVersion, 4);
+  assert.equal(durableFixture.agentPresetSnapshotVersion, 4);
   assert.deepEqual(durableFixture.stableErrorCodes, {
+    activityDeadline: "model_activity_deadline_exceeded",
+    progressDeadline: "model_progress_deadline_exceeded",
     invocationDeadline: "model_invocation_deadline_exceeded",
     runDeadline: "run_deadline_exceeded",
     taskDeadline: "long_task_deadline_exceeded",
@@ -65,6 +67,46 @@ test("shared Durable classifications and exact lease boundary stay aligned", () 
     assert.equal(decision.reason, row.reason, row.name);
     assert.equal(decision.terminalStatus, row.terminalStatus, row.name);
   }
+});
+
+test("shared Runtime and output batch defaults stay aligned", async () => {
+  const agent = new Agent({
+    model: {
+      async invoke() { throw new Error("stream should be used"); },
+      async *stream() {
+        yield { contentDelta: "a" };
+        await new Promise((resolve) => setTimeout(resolve, 75));
+        yield { contentDelta: "b", finishReason: "stop" };
+      },
+    },
+  });
+  const handle = await agent.submit({ messages: [{ role: "user", content: "defaults" }] });
+  await handle.result;
+  const snapshot = await handle.snapshot();
+  const events = [];
+  for await (const event of handle.events({ visibility: "all" })) events.push(event);
+
+  assert.equal(
+    snapshot.budgets.maxOutputBytes,
+    durableFixture.runtimeDefaults.maxProviderOutputBytes,
+  );
+  assert.deepEqual(snapshot.preset.runtimeLimits, {
+    runTimeoutMs: 900_000,
+    activityIdleTimeoutMs: durableFixture.runtimeDefaults.providerActivityIdleTimeoutMs,
+    progressIdleTimeoutMs: durableFixture.runtimeDefaults.providerProgressIdleTimeoutMs,
+    invocationTimeoutMs: durableFixture.runtimeDefaults.providerInvocationTimeoutMs,
+    maxChunks: 100_000,
+    maxContentChars: 1_000_000,
+    maxReasoningChars: 1_000_000,
+    maxToolArgumentChars: 1_000_000,
+  });
+  assert.deepEqual(durableFixture.outputBatchDefaults, {
+    maxPayloadBytes: 16_384,
+    maxFragments: 64,
+    maxLatencyMs: 25,
+    maxBackgroundLatencyMs: 250,
+  });
+  assert.equal(events.filter((event) => event.kind === "provider.delta_batch").length, 1);
 });
 
 test("repository fences an expired same-worker claim and settles replay once", async () => {
@@ -460,6 +502,19 @@ test("authenticated continuation skips planning and rejects incompatible authori
   assert.equal(plannerCalls, 1);
   assert.equal(dispatchCalls, 1);
   assert.equal(executeCalls, 2);
+  assert.equal(modelCalls, 0);
+
+  const v3Snapshot = {
+    ...snapshot,
+    preset: { ...snapshot.preset, schemaVersion: 3 },
+  };
+  await rejectsCode(
+    agent.submit(
+      { messages: [user("v3 unsupported")] },
+      { durableContinuation: { snapshot: v3Snapshot, command: "resume" } },
+    ),
+    "agent_preset_snapshot_unsupported",
+  );
   assert.equal(modelCalls, 0);
 
   const tampered = { ...snapshot, authorityProof: "0".repeat(64) };

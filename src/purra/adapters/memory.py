@@ -30,6 +30,7 @@ from purra.contracts import (
     ToolHandlerResult,
     TraceRecord,
 )
+from purra.agent_execution_checkpoint import AgentExecutionCheckpoint
 from purra.errors import ContractViolationError
 from purra.events import AgentEvent
 from purra.json_values import thaw_json_mapping
@@ -56,6 +57,7 @@ from purra.ports.run_lifecycle import (
 from purra.ports import DelegationRepository, ToolIdempotencyGateway
 from purra.normalization import required_text
 from purra.adapters.durable_memory import InMemoryDurableAdapters
+from purra.run_state import RunSnapshot
 
 
 _VALIDATED_RESULT_SCHEMA = "purra.run-validated-result/v1"
@@ -83,6 +85,7 @@ class _RunRecord:
     )
     provider_output_events: int = 0
     provider_output_bytes: int = 0
+    execution_checkpoint: AgentExecutionCheckpoint | None = None
 
 
 @dataclass(slots=True)
@@ -99,10 +102,12 @@ class _MemoryState:
         self.changed = asyncio.Condition()
         self.runs: dict[str, _RunRecord] = {}
         self.output_events: dict[str, list[AgentOutputEvent]] = {}
+        self.root_output_events: dict[str, list[AgentOutputEvent]] = {}
         self.events_by_source_key: dict[str, AgentOutputEvent] = {}
         self.streams: dict[str, _StreamRecord] = {}
         self.stream_by_invocation: dict[str, str] = {}
         self.sequences: dict[str, int] = {}
+        self.root_sequences: dict[str, int] = {}
         self.published_sequences: dict[str, int] = {}
         self.delegations: dict[str, AgentDelegation] = {}
         self.tool_receipts: dict[
@@ -113,6 +118,7 @@ class _MemoryState:
         ] = {}
         self.run_count = 0
         self.delegation_count = 0
+        self.run_tree_authority = None
 
     def next_run_id(self) -> str:
         self.run_count += 1
@@ -127,7 +133,108 @@ def _require_run(state: _MemoryState, run_id: str) -> _RunRecord:
     try:
         return state.runs[run_id]
     except KeyError as error:
-        raise ContractViolationError(f"run {run_id!r} does not exist") from error
+        raise ContractViolationError(
+            f"run {run_id!r} does not exist",
+            code="run_not_found",
+        ) from error
+
+
+def _run_snapshot(run_id: RunId, record: _RunRecord) -> RunSnapshot:
+    plan = record.execution_plan
+    return RunSnapshot(
+        run_id=run_id,
+        title=plan.title if plan is not None else "To-dos",
+        goal=plan.goal if plan is not None else None,
+        status=record.status,
+        task_spec=plan.task_spec if plan is not None else None,
+        steps=tuple(record.steps),
+        work_step_ids=(plan.work_step_ids if plan is not None else ()),
+        final_response=record.final_response or "",
+        error=record.error,
+        execution_checkpoint=record.execution_checkpoint,
+        agent_preset_snapshot=record.params.agent_preset_snapshot,
+    )
+
+
+def _run_scope_id(run_id: str, run: _RunRecord) -> str:
+    return run.params.root_run_id or run_id
+
+
+def _require_run_write(
+    state: _MemoryState,
+    run_id: str,
+) -> _RunRecord:
+    run = _require_run(state, run_id)
+    authority = state.run_tree_authority
+    if (
+        authority is not None
+        and run.params.root_run_id != run_id
+        and run.params.lease_epoch is not None
+    ):
+        from purra.agent_tree_lease import current_agent_run_lease
+
+        claim = current_agent_run_lease(run_id)
+        authority.require_run_claim_unlocked(
+            run_id,
+            claim.owner_id if claim is not None else None,
+            claim.epoch if claim is not None else None,
+        )
+    return run
+
+
+def _scope_runs(state: _MemoryState, run_id: str, run: _RunRecord):
+    root_run_id = _run_scope_id(run_id, run)
+    return root_run_id, tuple(
+        candidate
+        for candidate_id, candidate in state.runs.items()
+        if _run_scope_id(candidate_id, candidate) == root_run_id
+    )
+
+
+def _scoped_run_params(
+    state: _MemoryState,
+    run_id: str,
+    params: RunCreateParams,
+) -> RunCreateParams:
+    root_run_id = params.root_run_id or run_id
+    agent_id = params.agent_id or run_id
+    if root_run_id != run_id:
+        root = _require_run(state, root_run_id)
+        if _run_scope_id(root_run_id, root) != root_run_id:
+            raise ContractViolationError(
+                "Run scope root is not a Root Run",
+                code="run_scope_conflict",
+            )
+        if params.parent_run_id is None:
+            raise ContractViolationError(
+                "Child Run scope requires parent_run_id",
+                code="run_scope_conflict",
+            )
+        parent = _require_run(state, params.parent_run_id)
+        if _run_scope_id(params.parent_run_id, parent) != root_run_id:
+            raise ContractViolationError(
+                "Child Run parent belongs to a different Root scope",
+                code="run_scope_conflict",
+            )
+        if (
+            state.run_tree_authority is not None
+            and params.lease_epoch is not None
+        ):
+            state.run_tree_authority.require_run_claim_unlocked(
+                run_id,
+                params.lease_owner_id,
+                params.lease_epoch,
+            )
+    elif params.parent_run_id is not None:
+        raise ContractViolationError(
+            "Root Run cannot have parent_run_id",
+            code="run_scope_conflict",
+        )
+    return replace(
+        params,
+        root_run_id=root_run_id,
+        agent_id=agent_id,
+    )
 
 
 def _apply_commit(record: _RunRecord, commit: RunCommit) -> None:
@@ -160,6 +267,24 @@ def _apply_commit(record: _RunRecord, commit: RunCommit) -> None:
         record.final_response = commit.final_response
         record.validated_result = commit.validated_result
         record.error = commit.error
+    if commit.execution_checkpoint is not None:
+        checkpoint = commit.execution_checkpoint
+        current = record.execution_checkpoint
+        if current is not None:
+            if checkpoint.next_round < current.next_round:
+                raise ContractViolationError(
+                    "Agent execution checkpoint cannot move backwards",
+                    code="agent_execution_checkpoint_conflict",
+                )
+            if (
+                checkpoint.next_round == current.next_round
+                and checkpoint != current
+            ):
+                raise ContractViolationError(
+                    "Agent execution checkpoint content conflicts",
+                    code="agent_execution_checkpoint_conflict",
+                )
+        record.execution_checkpoint = checkpoint
     record.events.extend(commit.events)
 
 
@@ -229,20 +354,26 @@ def _batched_provider_entries(event: AgentOutputEvent) -> tuple[Mapping[str, Any
 
 
 def _require_provider_output_budget(
+    state: _MemoryState,
+    run_id: str,
     run: _RunRecord,
     event_count: int,
     payload_bytes: int,
 ) -> None:
-    limits = run.params.runtime_limits
-    if run.provider_output_events + event_count > limits.max_provider_output_events:
+    root_run_id, runs = _scope_runs(state, run_id, run)
+    root = _require_run(state, root_run_id)
+    limits = root.params.runtime_limits
+    output_events = sum(item.provider_output_events for item in runs)
+    output_bytes = sum(item.provider_output_bytes for item in runs)
+    if output_events + event_count > limits.max_provider_output_events:
         raise ContractViolationError(
-            "Run Provider output event budget was exceeded",
+            "Root Run Provider output event budget was exceeded",
             code="runtime_budget_exceeded",
             details={"budgetKind": "provider_output_events"},
         )
-    if run.provider_output_bytes + payload_bytes > limits.max_provider_output_bytes:
+    if output_bytes + payload_bytes > limits.max_provider_output_bytes:
         raise ContractViolationError(
-            "Run Provider output byte budget was exceeded",
+            "Root Run Provider output byte budget was exceeded",
             code="runtime_budget_exceeded",
             details={"budgetKind": "provider_output_bytes"},
         )
@@ -254,7 +385,7 @@ def _validate_new_event(
     *,
     allow_committed_stream: bool,
 ) -> _RunRecord:
-    run = _require_run(state, draft.run_id)
+    run = _require_run_write(state, draft.run_id)
     if draft.output_stream_id is not None:
         try:
             stream = state.streams[draft.output_stream_id]
@@ -301,9 +432,18 @@ def _append_event(
     )
     event_count, payload_bytes = _provider_output_cost(draft)
     if not budget_prechecked:
-        _require_provider_output_budget(run, event_count, payload_bytes)
+        _require_provider_output_budget(
+            state,
+            draft.run_id,
+            run,
+            event_count,
+            payload_bytes,
+        )
     sequence = state.sequences.get(draft.run_id, 0) + 1
     state.sequences[draft.run_id] = sequence
+    root_run_id = _run_scope_id(draft.run_id, run)
+    root_sequence = state.root_sequences.get(root_run_id, 0) + 1
+    state.root_sequences[root_run_id] = root_sequence
     event = AgentOutputEvent(
         event_id=f"output-event-{uuid4().hex}",
         output_stream_id=draft.output_stream_id,
@@ -318,8 +458,14 @@ def _append_event(
         payload=draft.payload,
         occurred_at=draft.occurred_at,
         emitted_at=_now(),
+        root_run_id=root_run_id,
+        agent_id=run.params.agent_id,
+        parent_run_id=run.params.parent_run_id,
+        root_sequence=root_sequence,
+        source_event_key=draft.source_event_key,
     )
     state.output_events.setdefault(draft.run_id, []).append(event)
+    state.root_output_events.setdefault(root_run_id, []).append(event)
     state.events_by_source_key[draft.source_event_key] = event
     run.provider_output_events += event_count
     run.provider_output_bytes += payload_bytes
@@ -347,6 +493,8 @@ def _append_events(
     run = _require_run(state, drafts[0].run_id)
     costs = tuple(_provider_output_cost(draft) for draft in pending)
     _require_provider_output_budget(
+        state,
+        drafts[0].run_id,
         run,
         sum(count for count, _ in costs),
         sum(size for _, size in costs),
@@ -366,13 +514,22 @@ class _InMemoryRunRepository:
         started_event: AgentEvent,
     ) -> RunBeginResult:
         async with self._state.lock:
-            run_id = self._state.next_run_id()
+            run_id = params.requested_run_id or self._state.next_run_id()
+            if run_id in self._state.runs:
+                raise ContractViolationError(
+                    "requested Run id already exists",
+                    code="run_identity_conflict",
+                )
             event = replace(started_event, run_id=run_id)
             self._state.runs[run_id] = _RunRecord(
-                params=params,
+                params=_scoped_run_params(self._state, run_id, params),
                 events=[event],
             )
             return RunBeginResult(run_id=run_id, event=event)
+
+    async def get(self, run_id: RunId) -> RunSnapshot:
+        async with self._state.lock:
+            return _run_snapshot(run_id, _require_run(self._state, run_id))
 
     async def commit(
         self,
@@ -380,8 +537,16 @@ class _InMemoryRunRepository:
         commit: RunCommit,
     ) -> tuple[AgentEvent, ...]:
         validate_run_commit_lifecycle(commit)
+        if (
+            commit.execution_checkpoint is not None
+            and commit.execution_checkpoint.run_id != run_id
+        ):
+            raise ContractViolationError(
+                "Agent execution checkpoint belongs to another Run",
+                code="agent_execution_checkpoint_conflict",
+            )
         async with self._state.lock:
-            _apply_commit(_require_run(self._state, run_id), commit)
+            _apply_commit(_require_run_write(self._state, run_id), commit)
             return commit.events
 
     async def bind_conversation(
@@ -390,11 +555,14 @@ class _InMemoryRunRepository:
         conversation_id: int,
     ) -> None:
         async with self._state.lock:
-            _require_run(self._state, run_id).conversation_id = conversation_id
+            _require_run_write(
+                self._state,
+                run_id,
+            ).conversation_id = conversation_id
 
     async def append_event(self, run_id: RunId, event: AgentEvent) -> None:
         async with self._state.lock:
-            _require_run(self._state, run_id).events.append(event)
+            _require_run_write(self._state, run_id).events.append(event)
 
     async def reserve_model_attempt(
         self,
@@ -403,13 +571,17 @@ class _InMemoryRunRepository:
     ):
         invocation = required_text(invocation_id, "model invocation id")
         async with self._state.lock:
-            run = _require_run(self._state, run_id)
+            run = _require_run_write(self._state, run_id)
             if invocation in run.model_attempt_ids:
                 return _run_budget_snapshot(run)
-            limit = run.params.runtime_limits.max_model_invocation_attempts
-            if len(run.model_attempt_ids) >= limit:
+            root_run_id, runs = _scope_runs(self._state, run_id, run)
+            limit = _require_run(
+                self._state,
+                root_run_id,
+            ).params.runtime_limits.max_model_invocation_attempts
+            if sum(len(item.model_attempt_ids) for item in runs) >= limit:
                 raise ContractViolationError(
-                    "Run model invocation budget was exceeded",
+                    "Root Run model invocation budget was exceeded",
                     code="runtime_budget_exceeded",
                     details={"budgetKind": "model_attempts"},
                 )
@@ -421,7 +593,7 @@ class _InMemoryRunRepository:
         if usage is not None and not isinstance(usage, ModelTokenUsage):
             raise TypeError("model attempt usage must be ModelTokenUsage")
         async with self._state.lock:
-            run = _require_run(self._state, run_id)
+            run = _require_run_write(self._state, run_id)
             if invocation not in run.model_attempt_ids:
                 raise ContractViolationError(
                     "model attempt was not reserved",
@@ -430,17 +602,17 @@ class _InMemoryRunRepository:
             if invocation in run.model_usage_by_invocation:
                 if run.model_usage_by_invocation[invocation] == usage:
                     snapshot = _run_budget_snapshot(run)
-                    _require_run_token_budgets(run, snapshot)
+                    _require_root_token_budgets(self._state, run_id, run)
                     return snapshot
                 raise ContractViolationError("model attempt usage conflicts")
             run.model_usage_by_invocation[invocation] = usage
             snapshot = _run_budget_snapshot(run)
-            _require_run_token_budgets(run, snapshot)
+            _require_root_token_budgets(self._state, run_id, run)
             return snapshot
 
     async def append_trace(self, run_id: RunId, trace: TraceRecord) -> None:
         async with self._state.lock:
-            _require_run(self._state, run_id).traces.append(trace)
+            _require_run_write(self._state, run_id).traces.append(trace)
 
 
 class _InMemoryDelegationRepository:
@@ -682,7 +854,7 @@ class _InMemoryToolIdempotencyGateway:
     ) -> ToolHandlerResult:
         key = (run_id, tool_call.id)
         async with self._state.lock:
-            _require_run(self._state, run_id)
+            _require_run_write(self._state, run_id)
             receipt = self._state.tool_receipts.get(key)
             if receipt is not None:
                 self._require_same_call(receipt[0], tool_call)
@@ -711,6 +883,7 @@ class _InMemoryToolIdempotencyGateway:
                     "tool idempotency operation returned an invalid result"
                 )
             async with self._state.lock:
+                _require_run_write(self._state, key[0])
                 self._state.tool_receipts[key] = (tool_call, result)
             return result
         finally:
@@ -737,10 +910,15 @@ class _InMemoryAgentOutputRepository:
         started_event: AgentEvent,
     ) -> tuple[RunBeginResult, AgentOutputEvent]:
         async with self._state.lock:
-            run_id = self._state.next_run_id()
+            run_id = params.requested_run_id or self._state.next_run_id()
+            if run_id in self._state.runs:
+                raise ContractViolationError(
+                    "requested Run id already exists",
+                    code="run_identity_conflict",
+                )
             event = replace(started_event, run_id=run_id)
             self._state.runs[run_id] = _RunRecord(
-                params=params,
+                params=_scoped_run_params(self._state, run_id, params),
                 events=[event],
             )
             output = _append_event(
@@ -763,7 +941,7 @@ class _InMemoryAgentOutputRepository:
 
     async def open_stream(self, spec: OutputStreamSpec) -> OutputStreamSpec:
         async with self._state.lock:
-            run = _require_run(self._state, spec.run_id)
+            run = _require_run_write(self._state, spec.run_id)
             stream_id = self._state.stream_by_invocation.get(spec.invocation_id)
             existing = self._state.streams.get(spec.output_stream_id)
             if existing is None and stream_id is not None:
@@ -857,7 +1035,7 @@ class _InMemoryAgentOutputRepository:
             else None
         )
         async with self._state.lock:
-            record = _require_run(self._state, run_id)
+            record = _require_run_write(self._state, run_id)
             existing = _existing_event(self._state, lifecycle_draft)
             if existing is not None:
                 if record.status is not RunStatus(expected_status):
@@ -1125,6 +1303,33 @@ class _InMemoryAgentOutputRepository:
                 if event.sequence > after_sequence
             )[:limit]
 
+    async def list_root_events(
+        self,
+        root_run_id: RunId,
+        *,
+        after_root_sequence: int,
+        limit: int = 200,
+    ) -> tuple[AgentOutputEvent, ...]:
+        if after_root_sequence < 0:
+            raise ValueError("after root sequence must be non-negative")
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        async with self._state.lock:
+            root = _require_run(self._state, root_run_id)
+            if _run_scope_id(root_run_id, root) != root_run_id:
+                raise ContractViolationError(
+                    "Root journal query requires a Root Run",
+                    code="run_scope_conflict",
+                )
+            return tuple(
+                event
+                for event in self._state.root_output_events.get(root_run_id, ())
+                if (
+                    event.root_sequence is not None
+                    and event.root_sequence > after_root_sequence
+                )
+            )[:limit]
+
     async def load_validated_result(self, run_id: RunId) -> str:
         async with self._state.lock:
             record = _require_run(self._state, run_id)
@@ -1283,16 +1488,47 @@ def _run_budget_snapshot(run: _RunRecord):
     )
 
 
-def _require_run_token_budgets(run: _RunRecord, snapshot) -> None:
-    limits = run.params.runtime_limits
+def _require_root_token_budgets(
+    state: _MemoryState,
+    run_id: str,
+    run: _RunRecord,
+) -> None:
+    root_run_id, runs = _scope_runs(state, run_id, run)
+    limits = _require_run(state, root_run_id).params.runtime_limits
+    snapshots = tuple(_run_budget_snapshot(item) for item in runs)
+    if sum(item.unreported_usage_attempts for item in snapshots) and any(
+        limit is not None
+        for limit in (
+            limits.max_input_tokens,
+            limits.max_output_tokens,
+            limits.max_reasoning_tokens,
+        )
+    ):
+        raise ContractViolationError(
+            "Root Run Provider usage was not reported",
+            code="runtime_budget_exceeded",
+            details={"budgetKind": "provider_usage_unreported"},
+        )
     for kind, value, limit in (
-        ("input_tokens", snapshot.input_tokens, limits.max_input_tokens),
-        ("output_tokens", snapshot.output_tokens, limits.max_output_tokens),
-        ("reasoning_tokens", snapshot.reasoning_tokens, limits.max_reasoning_tokens),
+        (
+            "input_tokens",
+            sum(item.input_tokens for item in snapshots),
+            limits.max_input_tokens,
+        ),
+        (
+            "output_tokens",
+            sum(item.output_tokens for item in snapshots),
+            limits.max_output_tokens,
+        ),
+        (
+            "reasoning_tokens",
+            sum(item.reasoning_tokens for item in snapshots),
+            limits.max_reasoning_tokens,
+        ),
     ):
         if limit is not None and value > limit:
             raise ContractViolationError(
-                "Run Provider token budget was exceeded",
+                "Root Run Provider token budget was exceeded",
                 code="runtime_budget_exceeded",
                 details={"budgetKind": kind},
             )
@@ -1301,8 +1537,15 @@ def _require_run_token_budgets(run: _RunRecord, snapshot) -> None:
 class InMemoryAgentAdapters:
     """Compose process-local implementations of PurrA's host storage ports."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, agent_tree_clock_ms=None) -> None:
         state = _MemoryState()
+        from purra.agent_tree import InMemoryRunTreeRepository
+
+        self.run_tree = InMemoryRunTreeRepository(
+            transaction_lock=state.lock,
+            clock_ms=agent_tree_clock_ms,
+        )
+        state.run_tree_authority = self.run_tree
         durable = InMemoryDurableAdapters()
         self.runs: RunRepository = _InMemoryRunRepository(state)
         self.outputs: AgentOutputRepository = _InMemoryAgentOutputRepository(state)

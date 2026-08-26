@@ -44,6 +44,19 @@ class ToolHandler(Protocol):
 
 
 @runtime_checkable
+class ToolCallHandler(Protocol):
+    """Core system handler that also receives the immutable ToolCall identity."""
+
+    async def __call__(
+        self,
+        state: ExecutionState,
+        arguments: Mapping[str, Any],
+        tool_call: ToolCall,
+        signal: CancellationSignal | None = None,
+    ) -> ToolHandlerResult: ...
+
+
+@runtime_checkable
 class ScopeValidator(Protocol):
     async def __call__(
         self,
@@ -62,6 +75,18 @@ class CacheProbe(Protocol):
     ) -> bool: ...
 
 
+@runtime_checkable
+class OperationDisplayParamsResolver(Protocol):
+    """Return a small public display projection for one validated tool call."""
+
+    def __call__(
+        self,
+        state: ExecutionState,
+        arguments: Mapping[str, Any],
+        tool_call: ToolCall,
+    ) -> Mapping[str, Any]: ...
+
+
 @dataclass(frozen=True, slots=True)
 class ToolRegistration:
     schema: ToolSchema
@@ -78,8 +103,23 @@ class ToolRegistration:
     max_argument_chars: int | None = None
     planning_capability: ToolSchema | None = None
     host_planned_arguments: Mapping[str, Any] | None = None
+    call_handler: ToolCallHandler | None = None
+    operation_display_params: OperationDisplayParamsResolver | None = None
 
     def __post_init__(self) -> None:
+        if self.call_handler is not None and not isinstance(
+            self.call_handler,
+            ToolCallHandler,
+        ):
+            raise TypeError("tool call handler must implement ToolCallHandler")
+        if self.operation_display_params is not None and not isinstance(
+            self.operation_display_params,
+            OperationDisplayParamsResolver,
+        ):
+            raise TypeError(
+                "tool operation display params must implement "
+                "OperationDisplayParamsResolver"
+            )
         object.__setattr__(
             self,
             "host_managed_durability",

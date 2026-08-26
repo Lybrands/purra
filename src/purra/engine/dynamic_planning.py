@@ -274,12 +274,33 @@ class DynamicPlanningOrchestrator:
                 "round": round_number,
                 "planningKind": planning.kind.value,
                 "completedStepCount": len(completed_steps),
+                "workPlanStepCount": len(planning.work_plan.steps),
+                "executionPlanStepCount": len(compiled.execution_plan.steps),
+                "workPlanModelStepCount": sum(
+                    step.executor is StepExecutor.MODEL
+                    for step in planning.work_plan.steps
+                ),
+                "workPlanToolStepCount": sum(
+                    step.executor is StepExecutor.TOOL
+                    for step in planning.work_plan.steps
+                ),
+                "executionToolStepCount": sum(
+                    step.executor is StepExecutor.TOOL
+                    for step in compiled.execution_plan.steps
+                ),
+                "plannerRepairCount": max(
+                    0,
+                    planning.model_call_count - 1,
+                ),
                 "remainingStepCount": sum(
                     step.status in {StepStatus.PENDING, StepStatus.RUNNING}
                     for step in revised.steps
                 ),
                 "hostInsertedPrerequisiteCount": len(
                     compiled.inserted_tool_names
+                ),
+                "hostLoweredProtocolToolCount": len(
+                    compiled.lowered_tool_names
                 ),
             },
             duration_ms=duration_ms(started),

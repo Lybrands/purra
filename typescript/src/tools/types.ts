@@ -15,7 +15,12 @@ export interface ToolPolicy {
 export interface ToolContext {
   readonly call: ToolCall;
   readonly signal?: AbortSignal;
+  readonly runId?: string;
   readonly rootRunId?: string;
+  readonly agentId?: string;
+  readonly parentRunId?: string;
+  readonly leaseOwnerId?: string;
+  readonly leaseEpoch?: number;
   readonly enabledTools?: readonly string[];
 }
 

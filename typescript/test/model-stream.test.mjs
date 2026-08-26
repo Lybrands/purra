@@ -197,6 +197,188 @@ test("Agent enforces one invocation deadline for a never-returning gateway", asy
   );
 });
 
+test("semantic-only streams ignore idle limits and keep the absolute fuse", async () => {
+  let closed = 0;
+  const agent = new Agent({
+    model: {
+      async invoke() { throw new Error("stream should be used"); },
+      stream() {
+        return streamWithSupport("semantic_only", async function* () {
+          try {
+            await delay(30);
+            yield { contentDelta: "done", finishReason: "stop" };
+          } finally {
+            closed += 1;
+          }
+        });
+      },
+    },
+    runtimeLimits: {
+      activityIdleTimeoutMs: 5,
+      progressIdleTimeoutMs: 10,
+      invocationTimeoutMs: 80,
+    },
+  });
+
+  const result = await agent.invoke({ messages: [{ role: "user", content: "Wait" }] });
+  assert.equal(result.output, "done");
+  assert.equal(closed, 1);
+});
+
+test("working activity renews both leases and never enters stream budgets", async () => {
+  let closed = 0;
+  const agent = new Agent({
+    model: {
+      async invoke() { throw new Error("stream should be used"); },
+      stream() {
+        return streamWithSupport("working", async function* () {
+          try {
+            for (let index = 0; index < 3; index += 1) {
+              await delay(4);
+              yield { type: "activity", kind: "working" };
+            }
+            await delay(4);
+            yield { contentDelta: "ok", finishReason: "stop" };
+          } finally {
+            closed += 1;
+          }
+        });
+      },
+    },
+    runtimeLimits: {
+      activityIdleTimeoutMs: 7,
+      progressIdleTimeoutMs: 7,
+      invocationTimeoutMs: 80,
+      maxChunks: 1,
+    },
+  });
+
+  const result = await agent.invoke({ messages: [{ role: "user", content: "Work" }] });
+  assert.equal(result.output, "ok");
+  assert.equal(closed, 1);
+});
+
+test("undeclared activity fails before output with the stable code", async () => {
+  const agent = new Agent({
+    model: {
+      async invoke() { throw new Error("stream should be used"); },
+      stream() {
+        return streamWithSupport("semantic_only", async function* () {
+          yield { type: "activity", kind: "transport" };
+        });
+      },
+    },
+  });
+
+  await assert.rejects(
+    agent.invoke({ messages: [{ role: "user", content: "Wait" }] }),
+    (error) => error instanceof AgentError
+      && error.code === "model_stream_activity_unsupported",
+  );
+});
+
+test("Transport-only activity expires progress with the stable code", async () => {
+  let closed = 0;
+  const agent = new Agent({
+    model: {
+      async invoke() { throw new Error("stream should be used"); },
+      stream() {
+        return streamWithSupport("transport", async function* () {
+          try {
+            for (let index = 0; index < 20; index += 1) {
+              await delay(4);
+              yield { type: "activity", kind: "transport" };
+            }
+          } finally {
+            closed += 1;
+          }
+        });
+      },
+    },
+    runtimeLimits: {
+      activityIdleTimeoutMs: 8,
+      progressIdleTimeoutMs: 18,
+      invocationTimeoutMs: 100,
+    },
+  });
+
+  await assert.rejects(
+    agent.invoke({ messages: [{ role: "user", content: "Wait" }] }),
+    (error) => error instanceof AgentError
+      && error.code === "model_progress_deadline_exceeded",
+  );
+  await delay(10);
+  assert.equal(closed, 1);
+});
+
+test("declared stream silence expires activity with the stable code", async () => {
+  let closed = 0;
+  const agent = new Agent({
+    model: {
+      async invoke() { throw new Error("stream should be used"); },
+      stream() {
+        return streamWithSupport("transport", async function* () {
+          try {
+            await delay(100);
+          } finally {
+            closed += 1;
+          }
+        });
+      },
+    },
+    runtimeLimits: {
+      activityIdleTimeoutMs: 12,
+      progressIdleTimeoutMs: 40,
+      invocationTimeoutMs: 100,
+    },
+  });
+
+  const startedAt = performance.now();
+  await assert.rejects(
+    agent.invoke({ messages: [{ role: "user", content: "Wait" }] }),
+    (error) => error instanceof AgentError
+      && error.code === "model_activity_deadline_exceeded",
+  );
+  assert.ok(performance.now() - startedAt < 60);
+  assert.equal(closed, 0);
+  await delay(100);
+  assert.equal(closed, 1);
+});
+
+test("continuous semantic progress still stops at the absolute fuse", async () => {
+  let closed = 0;
+  const agent = new Agent({
+    model: {
+      async invoke() { throw new Error("stream should be used"); },
+      stream() {
+        return streamWithSupport("working", async function* () {
+          try {
+            for (let index = 0; index < 30; index += 1) {
+              await delay(4);
+              yield { contentDelta: "x" };
+            }
+          } finally {
+            closed += 1;
+          }
+        });
+      },
+    },
+    runtimeLimits: {
+      activityIdleTimeoutMs: 10,
+      progressIdleTimeoutMs: 10,
+      invocationTimeoutMs: 30,
+    },
+  });
+
+  await assert.rejects(
+    agent.invoke({ messages: [{ role: "user", content: "Stream" }] }),
+    (error) => error instanceof AgentError
+      && error.code === "model_invocation_deadline_exceeded",
+  );
+  await delay(10);
+  assert.equal(closed, 1);
+});
+
 test("Agent rejects the first oversized stream fragment before materializing it", async () => {
   const agent = new Agent({
     model: {
@@ -397,4 +579,12 @@ function objectSchema(properties = {}, required = []) {
     required,
     additionalProperties: Object.keys(properties).length === 0,
   };
+}
+
+function streamWithSupport(activitySupport, factory) {
+  return Object.assign(factory(), { activitySupport });
+}
+
+function delay(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }

@@ -15,6 +15,12 @@ export class DelegationPolicy {
     if (maxParallel > maxAgentsPerCall) {
       throw new TypeError("maxParallel cannot exceed maxAgentsPerCall");
     }
+    if (
+      options.allowRecursiveDelegation !== undefined
+      && typeof options.allowRecursiveDelegation !== "boolean"
+    ) {
+      throw new TypeError("allowRecursiveDelegation must be boolean");
+    }
     this.#snapshot = Object.freeze({
       enabled: true,
       maxAgentsPerCall,
@@ -23,9 +29,11 @@ export class DelegationPolicy {
       maxTitleChars: positive(options.maxTitleChars ?? 120, "maxTitleChars"),
       maxInstructionChars: positive(options.maxInstructionChars ?? 4_000, "maxInstructionChars"),
       maxObjectiveChars: positive(options.maxObjectiveChars ?? 4_000, "maxObjectiveChars"),
+      maxDepth: positive(options.maxDepth ?? 3, "maxDepth"),
+      maxAgentsPerRoot: positive(options.maxAgentsPerRoot ?? 16, "maxAgentsPerRoot"),
       contextMode: "isolated",
       toolMode: "read",
-      allowsRecursiveDelegation: false,
+      allowsRecursiveDelegation: options.allowRecursiveDelegation ?? false,
     });
   }
 

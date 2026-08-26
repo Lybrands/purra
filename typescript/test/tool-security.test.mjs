@@ -21,19 +21,40 @@ test("Tool Catalog rejects unsupported nested schemas at assembly", () => {
   );
 });
 
-test("an invalid argument rejects the whole batch before any handler", async () => {
+test("Tool Catalog admits boolean uniqueItems and rejects malformed values", () => {
+  for (const uniqueItems of [true, false]) {
+    assert.doesNotThrow(() => new Agent({
+      model: completion("done"),
+      tools: [readTool("valid", () => readResult(null), {
+        inputSchema: objectSchema({ values: { uniqueItems } }),
+      })],
+    }));
+  }
+
+  for (const uniqueItems of ["true", 1, {}, [], null]) {
+    assert.throws(
+      () => new Agent({
+        model: completion("done"),
+        tools: [readTool("broken", () => readResult(null), {
+          inputSchema: objectSchema({ values: { uniqueItems } }),
+        })],
+      }),
+      (error) => error instanceof AgentError
+        && error.code === "invalid_tool_schema"
+        && error.message.includes("uniqueItems"),
+    );
+  }
+});
+
+test("a uniqueItems violation rejects the whole batch before any handler", async () => {
   let executions = 0;
   const schema = objectSchema({
-    rows: {
-      type: "array",
-      minItems: 1,
-      items: objectSchema({ score: { type: "number", minimum: 0, maximum: 1 } }, ["score"]),
-    },
+    rows: { type: "array", uniqueItems: true },
   }, ["rows"]);
   const agent = new Agent({
     model: calls([
-      { id: "one", name: "bounded", arguments: { rows: [{ score: 0.5 }] } },
-      { id: "two", name: "bounded", arguments: { rows: [{ score: 2 }] } },
+      { id: "one", name: "bounded", arguments: { rows: ["a", "b"] } },
+      { id: "two", name: "bounded", arguments: { rows: ["do-not-echo", "do-not-echo"] } },
     ]),
     tools: [readTool("bounded", () => {
       executions += 1;
@@ -41,11 +62,18 @@ test("an invalid argument rejects the whole batch before any handler", async () 
     }, { inputSchema: schema })],
   });
 
-  await rejectsCode(agent.invoke(runInput()), "invalid_tool_arguments_schema");
+  await assert.rejects(
+    agent.invoke(runInput()),
+    (error) => error instanceof AgentError
+      && error.code === "invalid_tool_arguments_schema"
+      && error.message.includes("$.rows")
+      && error.message.includes("uniqueItems")
+      && !error.message.includes("do-not-echo"),
+  );
   assert.equal(executions, 0);
 });
 
-test("shared schema cases produce the Python admission outcomes", async () => {
+test("shared schema cases produce the cross-language outcomes", async () => {
   for (const row of sharedFixture.argumentSchemaCases) {
     let round = 0;
     let executions = 0;

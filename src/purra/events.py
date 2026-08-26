@@ -21,6 +21,7 @@ class CoreEventType(StrEnum):
     TOOL_CALL_COMPLETED = "tool.call_completed"
     TOOL_RESULTS = "tool.results"
     TOOL_ROUND_COMPLETED = "tool.round_completed"
+    AGENT_EXECUTION_CHECKPOINTED = "agent.execution_checkpointed"
     APPROVAL_REQUESTED = "approval.requested"
     APPROVAL_RESOLVED = "approval.resolved"
     DELEGATION_CREATED = "delegation.created"

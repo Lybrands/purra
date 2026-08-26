@@ -95,6 +95,132 @@
       },
       "arguments": { "code": "unsafe" },
       "errorCode": "invalid_tool_arguments_schema"
+    },
+    {
+      "name": "unique-distinct-strings",
+      "schema": {
+        "type": "object",
+        "properties": { "values": { "type": "array", "uniqueItems": true } },
+        "required": ["values"],
+        "additionalProperties": false
+      },
+      "arguments": { "values": ["a", "b"] },
+      "errorCode": null
+    },
+    {
+      "name": "unique-duplicate-strings",
+      "schema": {
+        "type": "object",
+        "properties": { "values": { "type": "array", "uniqueItems": true } },
+        "required": ["values"],
+        "additionalProperties": false
+      },
+      "arguments": { "values": ["a", "a"] },
+      "errorCode": "invalid_tool_arguments_schema"
+    },
+    {
+      "name": "unique-duplicate-objects-ignore-property-order",
+      "schema": {
+        "type": "object",
+        "properties": { "values": { "type": "array", "uniqueItems": true } },
+        "required": ["values"],
+        "additionalProperties": false
+      },
+      "arguments": {
+        "values": [
+          { "left": 1, "right": 2 },
+          { "right": 2, "left": 1 }
+        ]
+      },
+      "errorCode": "invalid_tool_arguments_schema"
+    },
+    {
+      "name": "unique-numeric-representations",
+      "schema": {
+        "type": "object",
+        "properties": { "values": { "type": "array", "uniqueItems": true } },
+        "required": ["values"],
+        "additionalProperties": false
+      },
+      "arguments": { "values": [1, 1.0] },
+      "errorCode": "invalid_tool_arguments_schema"
+    },
+    {
+      "name": "unique-boolean-and-number",
+      "schema": {
+        "type": "object",
+        "properties": { "values": { "type": "array", "uniqueItems": true } },
+        "required": ["values"],
+        "additionalProperties": false
+      },
+      "arguments": { "values": [true, 1] },
+      "errorCode": null
+    },
+    {
+      "name": "unique-duplicate-nested-arrays",
+      "schema": {
+        "type": "object",
+        "properties": { "values": { "type": "array", "uniqueItems": true } },
+        "required": ["values"],
+        "additionalProperties": false
+      },
+      "arguments": { "values": [[1, true], [1.0, true]] },
+      "errorCode": "invalid_tool_arguments_schema"
+    },
+    {
+      "name": "unique-distinct-nested-array-order",
+      "schema": {
+        "type": "object",
+        "properties": { "values": { "type": "array", "uniqueItems": true } },
+        "required": ["values"],
+        "additionalProperties": false
+      },
+      "arguments": { "values": [[1, true], [true, 1]] },
+      "errorCode": null
+    },
+    {
+      "name": "unique-disabled-allows-duplicates",
+      "schema": {
+        "type": "object",
+        "properties": { "values": { "type": "array", "uniqueItems": false } },
+        "required": ["values"],
+        "additionalProperties": false
+      },
+      "arguments": { "values": ["a", "a"] },
+      "errorCode": null
+    },
+    {
+      "name": "unique-applies-only-to-arrays",
+      "schema": {
+        "type": "object",
+        "properties": { "value": { "uniqueItems": true } },
+        "required": ["value"],
+        "additionalProperties": false
+      },
+      "arguments": { "value": "not-an-array" },
+      "errorCode": null
+    },
+    {
+      "name": "enum-numeric-representations",
+      "schema": {
+        "type": "object",
+        "properties": { "value": { "enum": [1.0] } },
+        "required": ["value"],
+        "additionalProperties": false
+      },
+      "arguments": { "value": 1 },
+      "errorCode": null
+    },
+    {
+      "name": "const-nested-boolean-number-distinction",
+      "schema": {
+        "type": "object",
+        "properties": { "value": { "const": { "flag": true } } },
+        "required": ["value"],
+        "additionalProperties": false
+      },
+      "arguments": { "value": { "flag": 1 } },
+      "errorCode": "invalid_tool_arguments_schema"
     }
   ]
 }

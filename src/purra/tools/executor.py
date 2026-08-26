@@ -213,7 +213,11 @@ class CoreToolExecutor:
                     results,
                     cache_hits,
                 )
-            operation_id = await self._start_tool_operation(request, parsed)
+            operation_id = await self._start_tool_operation(
+                request,
+                parsed,
+                registration,
+            )
 
             scope_failure = await self._validate_scope(
                 registration,
@@ -348,9 +352,17 @@ class CoreToolExecutor:
                     # handlers are an adapter boundary, however, and expect ordinary
                     # Python JSON containers (dict/list). Give each invocation a
                     # detached mutable copy without weakening Core's trusted snapshot.
+                    arguments = thaw_json_mapping(parsed.arguments)
+                    if registration.call_handler is not None:
+                        return await registration.call_handler(
+                            request.state,
+                            arguments,
+                            parsed.call,
+                            signal,
+                        )
                     return await registration.handler(
                         request.state,
-                        thaw_json_mapping(parsed.arguments),
+                        arguments,
                         signal,
                     )
 
@@ -535,9 +547,29 @@ class CoreToolExecutor:
         self,
         request: ToolBatchRequest,
         parsed: ParsedToolCall,
+        registration: ToolRegistration,
     ) -> str | None:
         if self._operations is None or request.run_id is None:
             return None
+        label_params = {
+            "toolCallId": parsed.call.id,
+            "toolName": parsed.call.name,
+        }
+        retry_of = request.retry_of_tool_call_ids.get(parsed.call.id)
+        if retry_of is not None:
+            label_params["retryOfToolCallId"] = retry_of
+        if registration.operation_display_params is not None:
+            projected = registration.operation_display_params(
+                request.state,
+                parsed.arguments,
+                parsed.call,
+            )
+            if not isinstance(projected, Mapping):
+                raise TypeError("tool operation display params must be a mapping")
+            for key, value in projected.items():
+                normalized_key = str(key or "").strip()
+                if normalized_key and normalized_key not in label_params:
+                    label_params[normalized_key] = value
         receipt = await self._operations.start(
             OperationKind.TOOL,
             OperationScope(
@@ -545,10 +577,7 @@ class CoreToolExecutor:
                 invocation_id=request.invocation_id,
                 display=OperationDisplay(
                     label_key="agent.operation.tool",
-                    label_params={
-                        "toolCallId": parsed.call.id,
-                        "toolName": parsed.call.name,
-                    },
+                    label_params=label_params,
                 ),
             ),
         )

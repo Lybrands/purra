@@ -21,6 +21,35 @@ from purra.agent_presets import (
     AgentPresetSnapshot,
     PromptSection,
 )
+from purra.agent_tree import (
+    AgentCapabilityGrant,
+    AgentNode,
+    AgentNodeState,
+    AgentRunAggregation,
+    AgentTreeRun,
+    AgentTreeRunStatus,
+    BeginRootAgentCommand,
+    ChildAgentSpec,
+    ContextCheckpoint,
+    ContinueAgentCommand,
+    ContinueAgentReceipt,
+    InMemoryRunTreeRepository,
+    RunTreeRepository,
+    SpawnAgentsCommand,
+    SpawnAgentsReceipt,
+    SpawnedAgent,
+)
+from purra.agent_tree_execution import (
+    AgentTreeExecutionResult,
+    AgentTreeRunExecutor,
+    AgentTreeRunSupervisor,
+    RunCommandService,
+)
+from purra.agent_execution_checkpoint import AgentExecutionCheckpoint
+from purra.agent_tree_lease import (
+    AgentRunLeaseClaim,
+    current_agent_run_lease,
+)
 from purra.contracts import PlanningResult, WorkPlan, WorkStep
 from purra.delegation import (
     DelegatedAgentExecutor,
@@ -58,11 +87,28 @@ from purra.run_state import canonicalize_execution_plan
 
 __all__ = [
     "AgentCore",
+    "AgentExecutionCheckpoint",
+    "AgentCapabilityGrant",
     "AgentComponentBinding",
+    "AgentNode",
+    "AgentNodeState",
     "AgentPreset",
     "AgentPresetSnapshot",
+    "AgentRunAggregation",
+    "AgentRunLeaseClaim",
+    "AgentTreeRun",
+    "AgentTreeExecutionResult",
+    "AgentTreeRunExecutor",
+    "AgentTreeRunSupervisor",
+    "AgentTreeRunStatus",
+    "BeginRootAgentCommand",
+    "ChildAgentSpec",
+    "ContextCheckpoint",
+    "ContinueAgentCommand",
+    "ContinueAgentReceipt",
     "InMemoryAgentAdapters",
     "InMemoryDurableAdapters",
+    "InMemoryRunTreeRepository",
     "AgentCoreRunOptions",
     "ContextStrategy",
     "DelegatedAgentExecutor",
@@ -85,6 +131,11 @@ __all__ = [
     "RunActivitySnapshot",
     "RunCancellationReceipt",
     "RunRecoverySnapshot",
+    "RunTreeRepository",
+    "RunCommandService",
+    "SpawnAgentsCommand",
+    "SpawnAgentsReceipt",
+    "SpawnedAgent",
     "ToolPlanningPolicy",
     "AgentRunHandle",
     "AgentModelResponseJudge",
@@ -98,4 +149,5 @@ __all__ = [
     "WorkStep",
     "decide_orphan_run",
     "canonicalize_execution_plan",
+    "current_agent_run_lease",
 ]

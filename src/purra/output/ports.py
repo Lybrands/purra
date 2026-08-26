@@ -26,6 +26,8 @@ if TYPE_CHECKING:
 
 @runtime_checkable
 class AgentOutputRepository(Protocol):
+    """Canonical output persistence with execution-local Child lease fencing."""
+
     async def begin_run_lifecycle(
         self,
         params: RunCreateParams,
@@ -84,6 +86,16 @@ class AgentOutputRepository(Protocol):
         after_sequence: int,
         limit: int = 200,
     ) -> tuple[AgentOutputEvent, ...]: ...
+
+    async def list_root_events(
+        self,
+        root_run_id: RunId,
+        *,
+        after_root_sequence: int,
+        limit: int = 200,
+    ) -> tuple[AgentOutputEvent, ...]:
+        """Replay the one canonical journal for a Root execution scope."""
+        ...
 
     async def load_validated_result(self, run_id: RunId) -> str: ...
 

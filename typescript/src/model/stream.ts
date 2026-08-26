@@ -3,7 +3,11 @@ import type {
   Message,
   ModelGateway,
   ModelRequest,
+  ModelStream,
+  ModelStreamActivity,
+  ModelStreamActivitySupport,
   ModelStreamChunk,
+  ModelStreamItem,
   ModelTokenUsage,
   ModelTurn,
   ToolCall,
@@ -24,6 +28,8 @@ interface ToolCallParts {
 }
 
 export interface ModelStreamLimits {
+  readonly activityIdleTimeoutMs: number | null;
+  readonly progressIdleTimeoutMs: number | null;
   readonly invocationTimeoutMs: number | null;
   readonly maxChunks: number;
   readonly maxContentChars: number;
@@ -32,7 +38,9 @@ export interface ModelStreamLimits {
 }
 
 const DEFAULT_STREAM_LIMITS: ModelStreamLimits = Object.freeze({
-  invocationTimeoutMs: 120_000,
+  activityIdleTimeoutMs: 30_000,
+  progressIdleTimeoutMs: 60_000,
+  invocationTimeoutMs: 300_000,
   maxChunks: 100_000,
   maxContentChars: 1_000_000,
   maxReasoningChars: 1_000_000,
@@ -63,7 +71,7 @@ export async function invokeModel(
       stop.signal,
     );
     throwIfCanceled(stop.signal);
-    return await consumeModelStream(stream, stop.signal, onChunk, limits);
+    return await consumeModelStream(stream, stop, onChunk, limits);
   } catch (error) {
     if (stop.signal.aborted) {
       if (stop.signal.reason instanceof AgentError) throw stop.signal.reason;
@@ -81,15 +89,17 @@ export async function invokeModel(
 }
 
 async function consumeModelStream(
-  stream: AsyncIterable<ModelStreamChunk>,
-  signal: AbortSignal | undefined,
+  stream: ModelStream,
+  stop: InvocationStop,
   onChunk: ((chunk: ModelStreamChunk) => Promise<void> | void) | undefined,
   limits: ModelStreamLimits,
 ): Promise<ModelTurn> {
   if (stream === null || typeof stream?.[Symbol.asyncIterator] !== "function") {
     throw new AgentError("invalid_model_response", "Model gateway returned an invalid stream");
   }
+  const support = activitySupport(stream.activitySupport);
   const iterator = stream[Symbol.asyncIterator]();
+  const liveness = new StreamLiveness(support, limits, stop.abort);
   const content: string[] = [];
   const reasoning: string[] = [];
   let contentChars = 0;
@@ -102,37 +112,48 @@ async function consumeModelStream(
 
   try {
     while (finishReason === undefined) {
-      const step = await nextWithSignal(iterator, signal);
+      const step = await nextWithSignal(iterator, stop.signal);
       if (step.done === true) break;
-      throwIfCanceled(signal);
-      const chunk = validateModelStreamChunk(step.value);
-      chunkCount += 1;
-      contentChars += chunk.contentDelta?.length ?? 0;
-      reasoningChars += chunk.reasoningDelta?.length ?? 0;
-      requireStreamLimit(chunkCount, limits.maxChunks, "chunk_count");
-      requireStreamLimit(contentChars, limits.maxContentChars, "content_chars");
-      requireStreamLimit(reasoningChars, limits.maxReasoningChars, "reasoning_chars");
-      for (const delta of chunk.toolCallDeltas ?? []) {
-        const current = calls.get(delta.index) ?? { arguments: [], argumentChars: 0 };
-        calls.set(delta.index, current);
-        current.argumentChars += delta.argumentsFragment?.length ?? 0;
-        requireStreamLimit(
-          current.argumentChars,
-          limits.maxToolArgumentChars,
-          "tool_argument_chars",
-        );
+      throwIfCanceled(stop.signal);
+      if (isActivity(step.value)) {
+        liveness.acceptActivity(step.value);
+        continue;
       }
-      await onChunk?.(chunk);
-      if (chunk.contentDelta !== undefined && chunk.contentDelta !== "") content.push(chunk.contentDelta);
-      if (chunk.reasoningDelta !== undefined && chunk.reasoningDelta !== "") reasoning.push(chunk.reasoningDelta);
-      usage = chunk.usage ?? usage;
-      finishReason = chunk.finishReason;
-      for (const delta of chunk.toolCallDeltas ?? []) {
-        malformed = mergeToolCallDelta(calls, delta) ?? malformed;
+      const chunk = validateModelStreamChunk(step.value);
+      const meaningful = isMeaningfulChunk(chunk);
+      if (meaningful) liveness.acceptSemanticProgress();
+      try {
+        chunkCount += 1;
+        contentChars += chunk.contentDelta?.length ?? 0;
+        reasoningChars += chunk.reasoningDelta?.length ?? 0;
+        requireStreamLimit(chunkCount, limits.maxChunks, "chunk_count");
+        requireStreamLimit(contentChars, limits.maxContentChars, "content_chars");
+        requireStreamLimit(reasoningChars, limits.maxReasoningChars, "reasoning_chars");
+        for (const delta of chunk.toolCallDeltas ?? []) {
+          const current = calls.get(delta.index) ?? { arguments: [], argumentChars: 0 };
+          calls.set(delta.index, current);
+          current.argumentChars += delta.argumentsFragment?.length ?? 0;
+          requireStreamLimit(
+            current.argumentChars,
+            limits.maxToolArgumentChars,
+            "tool_argument_chars",
+          );
+        }
+        await onChunk?.(chunk);
+        if (chunk.contentDelta !== undefined && chunk.contentDelta !== "") content.push(chunk.contentDelta);
+        if (chunk.reasoningDelta !== undefined && chunk.reasoningDelta !== "") reasoning.push(chunk.reasoningDelta);
+        usage = chunk.usage ?? usage;
+        finishReason = chunk.finishReason;
+        for (const delta of chunk.toolCallDeltas ?? []) {
+          malformed = mergeToolCallDelta(calls, delta) ?? malformed;
+        }
+      } finally {
+        if (meaningful) liveness.resume();
       }
     }
   } finally {
-    await closeIterator(iterator, signal?.aborted === true);
+    liveness.close();
+    await closeIterator(iterator, stop.signal.aborted);
   }
 
   if (finishReason === undefined) {
@@ -274,7 +295,7 @@ function requireStreamLimit(value: number, limit: number, kind: string): void {
 function invocationSignal(
   parent: AbortSignal | undefined,
   timeoutMs: number | null,
-): { readonly signal: AbortSignal; close(): void } {
+): InvocationStop {
   if (timeoutMs !== null && (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1)) {
     throw new TypeError("invocationTimeoutMs must be positive or null");
   }
@@ -290,9 +311,208 @@ function invocationSignal(
   }, timeoutMs);
   return {
     signal: controller.signal,
+    abort(error: AgentError): void {
+      controller.abort(error);
+    },
     close(): void {
       if (timer !== undefined) globalThis.clearTimeout(timer);
       parent?.removeEventListener("abort", forward);
     },
   };
+}
+
+interface InvocationStop {
+  readonly signal: AbortSignal;
+  abort(error: AgentError): void;
+  close(): void;
+}
+
+class StreamLiveness {
+  readonly #support: ModelStreamActivitySupport;
+  readonly #activityTimeoutMs: number | null;
+  readonly #progressTimeoutMs: number | null;
+  readonly #abort: (error: AgentError) => void;
+  readonly #startedAt = performance.now();
+  #activityTimer: ReturnType<typeof setTimeout> | undefined;
+  #progressTimer: ReturnType<typeof setTimeout> | undefined;
+  #firstActivityAt: number | undefined;
+  #lastActivityAt: number | undefined;
+  #firstProgressAt: number | undefined;
+  #lastProgressAt: number | undefined;
+  #maxActivityGapMs: number | null = null;
+  #maxProgressGapMs: number | null = null;
+  #closed = false;
+
+  public constructor(
+    support: ModelStreamActivitySupport,
+    limits: ModelStreamLimits,
+    abort: (error: AgentError) => void,
+  ) {
+    this.#support = support;
+    this.#activityTimeoutMs = optionalPositiveLimit(
+      limits.activityIdleTimeoutMs,
+      "activityIdleTimeoutMs",
+    );
+    this.#progressTimeoutMs = optionalPositiveLimit(
+      limits.progressIdleTimeoutMs,
+      "progressIdleTimeoutMs",
+    );
+    this.#abort = abort;
+    if (support !== "semantic_only") this.#armBoth();
+  }
+
+  public acceptActivity(activity: ModelStreamActivity): void {
+    if (this.#support === "semantic_only") {
+      throw unsupportedActivity(this.#support, activity.kind);
+    }
+    if (activity.kind !== "transport" && activity.kind !== "working") {
+      throw unsupportedActivity(this.#support, String(activity.kind));
+    }
+    if (activity.kind === "working" && this.#support !== "working") {
+      throw unsupportedActivity(this.#support, activity.kind);
+    }
+    const now = performance.now();
+    this.#recordActivity(now);
+    this.#armActivity();
+    if (activity.kind === "working") {
+      this.#recordProgress(now);
+      this.#armProgress();
+    }
+  }
+
+  public acceptSemanticProgress(): void {
+    if (this.#support === "semantic_only") return;
+    const now = performance.now();
+    this.#recordActivity(now);
+    this.#recordProgress(now);
+    this.#clearTimers();
+  }
+
+  public resume(): void {
+    if (this.#support !== "semantic_only" && !this.#closed) this.#armBoth();
+  }
+
+  public close(): void {
+    if (this.#closed) return;
+    this.#closed = true;
+    this.#clearTimers();
+  }
+
+  #recordActivity(now: number): void {
+    if (this.#lastActivityAt !== undefined) {
+      this.#maxActivityGapMs = Math.max(
+        this.#maxActivityGapMs ?? 0,
+        now - this.#lastActivityAt,
+      );
+    }
+    this.#firstActivityAt ??= now;
+    this.#lastActivityAt = now;
+  }
+
+  #recordProgress(now: number): void {
+    if (this.#lastProgressAt !== undefined) {
+      this.#maxProgressGapMs = Math.max(
+        this.#maxProgressGapMs ?? 0,
+        now - this.#lastProgressAt,
+      );
+    }
+    this.#firstProgressAt ??= now;
+    this.#lastProgressAt = now;
+  }
+
+  #armBoth(): void {
+    this.#armActivity();
+    this.#armProgress();
+  }
+
+  #armActivity(): void {
+    if (this.#activityTimer !== undefined) clearTimeout(this.#activityTimer);
+    this.#activityTimer = this.#activityTimeoutMs === null ? undefined : setTimeout(() => {
+      this.#expire("model_activity_deadline_exceeded", "activity");
+    }, this.#activityTimeoutMs);
+  }
+
+  #armProgress(): void {
+    if (this.#progressTimer !== undefined) clearTimeout(this.#progressTimer);
+    this.#progressTimer = this.#progressTimeoutMs === null ? undefined : setTimeout(() => {
+      this.#expire("model_progress_deadline_exceeded", "progress");
+    }, this.#progressTimeoutMs);
+  }
+
+  #expire(code: string, boundary: "activity" | "progress"): void {
+    if (this.#closed) return;
+    this.close();
+    const now = performance.now();
+    this.#abort(new AgentError(
+      code,
+      boundary === "activity"
+        ? "Model stream activity deadline has elapsed"
+        : "Model stream progress deadline has elapsed",
+      { cause: Object.freeze({
+        support: this.#support,
+        phase: "stream",
+        elapsedMs: now - this.#startedAt,
+        firstActivityMs: offset(this.#firstActivityAt, this.#startedAt),
+        lastActivityMs: offset(this.#lastActivityAt, this.#startedAt),
+        firstProgressMs: offset(this.#firstProgressAt, this.#startedAt),
+        lastProgressMs: offset(this.#lastProgressAt, this.#startedAt),
+        maxActivityGapMs: this.#maxActivityGapMs,
+        maxProgressGapMs: this.#maxProgressGapMs,
+        boundary,
+      }) },
+    ));
+  }
+
+  #clearTimers(): void {
+    if (this.#activityTimer !== undefined) clearTimeout(this.#activityTimer);
+    if (this.#progressTimer !== undefined) clearTimeout(this.#progressTimer);
+    this.#activityTimer = undefined;
+    this.#progressTimer = undefined;
+  }
+}
+
+function activitySupport(value: ModelStreamActivitySupport | undefined): ModelStreamActivitySupport {
+  const support = value ?? "semantic_only";
+  if (support !== "semantic_only" && support !== "transport" && support !== "working") {
+    throw new AgentError(
+      "model_stream_activity_unsupported",
+      "Model stream declared unsupported activity evidence",
+    );
+  }
+  return support;
+}
+
+function isActivity(value: ModelStreamItem): value is ModelStreamActivity {
+  return value !== null && typeof value === "object" && "type" in value && value.type === "activity";
+}
+
+function unsupportedActivity(support: string, kind: string): AgentError {
+  return new AgentError(
+    "model_stream_activity_unsupported",
+    `Model stream activity ${kind} is not supported by ${support}`,
+  );
+}
+
+function isMeaningfulChunk(chunk: ModelStreamChunk): boolean {
+  return (chunk.contentDelta?.length ?? 0) > 0
+    || (chunk.reasoningDelta?.length ?? 0) > 0
+    || (chunk.toolCallDeltas ?? []).some((delta) => (
+      delta.id !== undefined
+      || delta.type !== undefined
+      || delta.name !== undefined
+      || (delta.argumentsFragment?.length ?? 0) > 0
+    ))
+    || chunk.usage !== undefined
+    || chunk.finishReason !== undefined;
+}
+
+function optionalPositiveLimit(value: number | null, name: string): number | null {
+  if (value !== null && (!Number.isSafeInteger(value) || value < 1)) {
+    throw new TypeError(`${name} must be positive or null`);
+  }
+  return value;
+}
+
+function offset(value: number | undefined, start: number): number | null {
+  return value === undefined ? null : value - start;
 }

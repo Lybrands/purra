@@ -34,6 +34,7 @@ from purra.contracts import (
     PlanningKind,
     PlanningResult,
     RunStatus,
+    RuntimeLimits,
     StepExecutor,
     StepType,
     TaskSpec,
@@ -237,8 +238,8 @@ def _request() -> AgentRunRequest:
     )
 
 
-def _core(*, gateway, context, profile=None):
-    adapters = InMemoryAgentAdapters()
+def _core(*, gateway, context, profile=None, adapters=None, runtime_limits=None):
+    adapters = adapters or InMemoryAgentAdapters()
     resolved_profile = profile or ExecutionProfile()
     bindings = {
         "contextProvider": AgentComponentBinding("portable.context", "1"),
@@ -263,6 +264,7 @@ def _core(*, gateway, context, profile=None):
             revision="1",
             tool_catalog=InMemoryToolCatalog(()),
             context_provider=context,
+            runtime_limits=runtime_limits or RuntimeLimits(),
             execution_profile=resolved_profile,
             component_bindings=bindings,
             prompt_sections=(PromptSection(
@@ -272,6 +274,60 @@ def _core(*, gateway, context, profile=None):
             ),),
         ),
     )
+
+
+class _BudgetExhaustingGateway(_Gateway):
+    def __init__(self) -> None:
+        super().__init__("")
+        self.calls = 0
+
+    async def stream(self, messages, invocation, signal=None):
+        del messages, invocation, signal
+        self.calls += 1
+
+        async def chunks():
+            yield ModelStreamChunk(reasoning_delta="private reasoning")
+            yield ModelStreamChunk(
+                content_delta="answer",
+                finish_reason=ModelFinishReason.STOP,
+            )
+
+        return ModelStream(chunks=chunks(), model="portable-model")
+
+
+class _UnknownStreamFailureGateway(_Gateway):
+    def __init__(self) -> None:
+        super().__init__("")
+
+    async def stream(self, messages, invocation, signal=None):
+        del messages, invocation, signal
+
+        async def chunks():
+            raise OSError("socket vanished")
+            yield
+
+        return ModelStream(chunks=chunks(), model="portable-model")
+
+
+class _RetryableStreamFailureGateway(_Gateway):
+    def __init__(self) -> None:
+        super().__init__("")
+        self.calls = 0
+
+    async def stream(self, messages, invocation, signal=None):
+        del messages, invocation, signal
+        self.calls += 1
+
+        async def chunks():
+            if self.calls == 1:
+                yield ModelStreamChunk(reasoning_delta="private partial")
+                return
+            yield ModelStreamChunk(
+                content_delta="recovered",
+                finish_reason=ModelFinishReason.STOP,
+            )
+
+        return ModelStream(chunks=chunks(), model="portable-model")
 
 
 @pytest.mark.asyncio
@@ -288,6 +344,70 @@ async def test_portable_reactive_agent_runs_through_public_submit():
     assert result.final_response == "portable reactive answer"
     assert context.single_pass_calls == 1
     assert gateway.messages[0][0].content == "Be concise, explicit, and calm."
+
+
+@pytest.mark.asyncio
+async def test_provider_output_budget_failure_reaches_run_without_retry():
+    adapters = InMemoryAgentAdapters()
+    gateway = _BudgetExhaustingGateway()
+    core = _core(
+        gateway=gateway,
+        context=_Context(),
+        adapters=adapters,
+        runtime_limits=RuntimeLimits(max_provider_output_bytes=1),
+    )
+    try:
+        result = await (await core.submit(_request())).wait()
+        events = await adapters.outputs.list_events(
+            result.run_id,
+            after_sequence=0,
+        )
+    finally:
+        await core.close()
+
+    assert result.status is RunStatus.FAILED
+    assert result.error == "runtime_budget_exceeded", "\n".join(
+        f"{event.kind.value} status={event.payload.get('status')} "
+        f"error={event.payload.get('errorCode')} "
+        f"event={event.payload.get('eventType')}"
+        for event in events
+    )
+    assert gateway.calls == 1
+    assert sum(event.kind.value == "stream.aborted" for event in events) == 1
+    assert sum(
+        event.kind.value == "run.lifecycle"
+        and event.payload.get("status") == RunStatus.FAILED.value
+        for event in events
+    ) == 1
+
+
+@pytest.mark.asyncio
+async def test_unknown_provider_stream_failure_remains_generic():
+    core = _core(
+        gateway=_UnknownStreamFailureGateway(),
+        context=_Context(),
+    )
+    try:
+        result = await (await core.submit(_request())).wait()
+    finally:
+        await core.close()
+
+    assert result.status is RunStatus.FAILED
+    assert result.error == "model_stream_error"
+
+
+@pytest.mark.asyncio
+async def test_retryable_gateway_stream_failure_keeps_recovery_path():
+    gateway = _RetryableStreamFailureGateway()
+    core = _core(gateway=gateway, context=_Context())
+    try:
+        result = await (await core.submit(_request())).wait()
+    finally:
+        await core.close()
+
+    assert result.status is RunStatus.DONE
+    assert result.final_response == "recovered"
+    assert gateway.calls == 2
 
 
 @pytest.mark.asyncio
@@ -330,9 +450,11 @@ async def test_portable_planned_agent_uses_staged_task_context():
     gateway = _Gateway("portable planned answer")
     context = _Context()
     planner = _Planner()
+    adapters = InMemoryAgentAdapters()
     core = _core(
         gateway=gateway,
         context=context,
+        adapters=adapters,
         profile=ExecutionProfile(
             planner=planner,
             planning_policy=_AlwaysPlan(),
@@ -352,6 +474,17 @@ async def test_portable_planned_agent_uses_staged_task_context():
         "The portable fact is 42." in message.content
         for message in gateway.messages[0]
     )
+    planning_trace = next(
+        trace
+        for trace in adapters.runs._state.runs[result.run_id].traces
+        if trace.stage == "planning"
+    )
+    assert planning_trace.details["workPlanStepCount"] == 1
+    assert planning_trace.details["executionPlanStepCount"] == 1
+    assert planning_trace.details["workPlanModelStepCount"] == 1
+    assert planning_trace.details["workPlanToolStepCount"] == 0
+    assert planning_trace.details["executionToolStepCount"] == 0
+    assert planning_trace.details["plannerRepairCount"] == 0
 
 
 @pytest.mark.asyncio

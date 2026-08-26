@@ -86,7 +86,14 @@ Trusted planningContext may describe allowed semantic target fields; copy only
 semantics supported by the request and that context. Never estimate model calls,
 cost, duration, or whether the host should create a background task.
 
-Use 1-8 ordered action steps and no more than maxToolSteps from the host payload.
+Return the smallest non-redundant set of ordered, user-visible semantic steps
+needed to complete the request. Each step must represent a distinct result,
+evidence phase, or domain milestone. Do not split out reasoning, retries,
+approvals, persistence, internal validation, protocol lowering, or tool
+prerequisites as user-visible steps. Merge work that one tool batch or one
+semantic phase can complete. Do not add placeholder analysis or completion
+steps merely to make the plan look comprehensive. Use no more than maxToolSteps
+tool steps from the host payload. If maxPlanSteps is present, do not exceed it.
 Every tool step must contain exactly one expectedTools entry selected from the
 host tools and must use executor:"tool". Model steps must use executor:"model"
 and must omit expectedTools or use an empty list. Never list alternatives or a
@@ -135,7 +142,7 @@ Re-plan from the original request. Do not mechanically expand every listed
 tool. Choose the smallest non-redundant action sequence, use exactly one expectedTools
 entry and executor:"tool" in each tool step. Model steps must use
 executor:"model" and must not name expectedTools. Use at most {max_tool_steps}
-tool steps and {max_steps} total steps. Reading context already injected by the
+tool steps.{max_plan_steps_rule} Reading context already injected by the
 host is model analysis/review, not a read step; reserve read steps for the tool
 executor. Continue to follow host planningRules exactly: never broaden an
 explicit, complete selected-evidence scope with dashboard, list, search, or
@@ -341,6 +348,16 @@ class AgentPlanner:
     ) -> PlanningResult:
         raw = parse_planner_output(completion.message.content)
         result = normalize_work_plan(raw, capabilities, limits)
+        if turn is not None:
+            completed_ids = {step.id for step in turn.completed_steps}
+            reused_ids = completed_ids & {
+                step.id for step in result.work_plan.steps
+            }
+            if reused_ids:
+                raise RepairablePlannerOutputError(
+                    "revised plan reuses completed step ids: "
+                    + ", ".join(sorted(reused_ids))
+                )
         _validate_required_tool_selection(result, capabilities, turn)
         return result
 
@@ -368,7 +385,11 @@ class AgentPlanner:
                 content=PLANNER_REPAIR_PROMPT.format(
                     reason=str(error),
                     max_tool_steps=limits.max_tool_steps,
-                    max_steps=limits.max_steps,
+                    max_plan_steps_rule=(
+                        f" Use at most {limits.max_steps} total steps."
+                        if limits.max_steps is not None
+                        else ""
+                    ),
                 ),
             )
         )
@@ -442,6 +463,8 @@ def build_planner_messages(
         "availableTools": sorted(available_tool_names),
         "maxToolSteps": limits.max_tool_steps,
     }
+    if limits.max_steps is not None:
+        payload["maxPlanSteps"] = limits.max_steps
     if capabilities.planning_context_blocks:
         payload["planningContext"] = [
             {
@@ -687,9 +710,13 @@ def normalize_work_plan(
         )
 
     raw_steps = value.get("todos", value.get("steps"))
-    if not isinstance(raw_steps, list) or not (1 <= len(raw_steps) <= limits.max_steps):
+    if not isinstance(raw_steps, list) or not raw_steps:
         raise InvalidPlannerOutputError(
-            f"planner must return 1-{limits.max_steps} steps"
+            "planner must return at least one step"
+        )
+    if limits.max_steps is not None and len(raw_steps) > limits.max_steps:
+        raise RepairablePlannerOutputError(
+            f"planner must return at most {limits.max_steps} steps"
         )
 
     steps: list[WorkStep] = []
@@ -704,9 +731,9 @@ def normalize_work_plan(
             or f"step-{index + 1}"
         )
         if step_id in seen_ids:
-            suffix = index + 1
-            base = step_id[: max(1, limits.max_step_id_chars - len(str(suffix)) - 1)]
-            step_id = f"{base}-{suffix}"
+            raise RepairablePlannerOutputError(
+                f"planner step ids must be unique: {step_id}"
+            )
         seen_ids.add(step_id)
         title = (
             _clean_text(raw.get("title"), limits.max_title_chars)

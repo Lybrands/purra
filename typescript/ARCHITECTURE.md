@@ -23,8 +23,14 @@ stable contracts rather than identical class names.
   terminal authority.
 
 Reactive execution is the default. Planning, durable tasks, context budgeting,
-response validation, recovery, Artifacts, delegation, Operations, and
+response validation, recovery, Artifacts, Agent trees, Operations, and
 observability are explicit options around the same Root Run authority.
+
+For Reactive Child Runs, `run/` atomically stores a private model-ready
+checkpoint and journal event after each committed tool round. Agent-tree
+recovery attaches a new lease holder to that canonical Run and resumes the next
+model round. Missing checkpoints, half-finished Provider/tool work, and Planned
+execution fail closed instead of being replayed.
 
 ## Source ownership
 
@@ -39,7 +45,8 @@ observability are explicit options around the same Root Run authority.
 | `planning/`, `extensions/` | Planning contracts and optional model-backed helpers | Product prompts, Provider SDKs, durable recovery |
 | `durable/` | Task admission, leases, checkpoints, continuation, orphan coordination | Product partitioning, merging, production storage |
 | `artifacts/` | Recoverable output lifecycle, revisions, access, writer claims | Run completion and product schemas |
-| `delegation/` | Bounded delegation inside one Root Run | Child Runs, recursive delegation, write authority |
+| `agent-tree*.ts` | Stable Agent identity, immutable Child Runs, bounded scheduling, continuation, lease fencing | Product roles, prompts, or persistence choices |
+| `delegation/` | Legacy bounded same-Run delegation compatibility | Recursive Child Run authority |
 | `operations/` | Optional operation receipts and timing | Run terminal state and product progress |
 | `observability/`, `evaluation/` | Read-only projections and deterministic checks | Runtime control and generated content |
 | `testing/` | Public contract probes and process-local reference adapters | Provider SDKs and production persistence |

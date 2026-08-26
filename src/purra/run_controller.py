@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping
+from dataclasses import replace
 from typing import Awaitable, TypeVar
 
 from purra.contracts import (
@@ -16,6 +17,7 @@ from purra.contracts import (
     ToolBatchOutcome,
     TraceRecord,
 )
+from purra.agent_execution_checkpoint import AgentExecutionCheckpoint
 from purra.json_values import freeze_json_mapping, thaw_json_mapping
 from purra.events import AgentEvent, CoreEventType
 from purra.errors import RunCancellationConflictError
@@ -73,6 +75,57 @@ class AgentRunController:
         async with self._mutation_lock:
             return await self._begin_unlocked(params)
 
+    async def attach(self, snapshot: RunSnapshot) -> RunSnapshot:
+        """Attach a replacement executor to an existing non-terminal Run."""
+
+        if not isinstance(snapshot, RunSnapshot):
+            raise TypeError("run controller attachment requires RunSnapshot")
+        if snapshot.terminal:
+            raise RuntimeError("cannot attach a terminal run")
+        async with self._mutation_lock:
+            if self._snapshot is not None:
+                raise RuntimeError("run controller has already started")
+            self._snapshot = snapshot
+            return snapshot
+
+    async def save_execution_checkpoint(
+        self,
+        checkpoint: AgentExecutionCheckpoint,
+    ) -> None:
+        """Atomically persist a private model-ready cursor and journal fact."""
+
+        state = self._require_started()
+        if checkpoint.run_id != state.run_id:
+            raise ContractViolationError(
+                "Agent execution checkpoint belongs to another Run",
+                code="agent_execution_checkpoint_conflict",
+            )
+        event = AgentEvent(
+            type=CoreEventType.AGENT_EXECUTION_CHECKPOINTED,
+            run_id=state.run_id,
+            payload={
+                "schemaVersion": checkpoint.schema_version,
+                "phase": checkpoint.phase,
+                "executionProfile": checkpoint.execution_profile,
+                "nextRound": checkpoint.next_round,
+            },
+        )
+        persisted, canceled = await _await_repository_receipt(
+            self._repository.commit(
+                state.run_id,
+                RunCommit(
+                    execution_checkpoint=checkpoint,
+                    events=(event,),
+                ),
+            )
+        )
+        self._snapshot = replace(
+            state,
+            execution_checkpoint=checkpoint,
+        )
+        _raise_if_canceled(canceled)
+        await self._publish(persisted)
+
     async def _begin_unlocked(self, params: RunCreateParams) -> RunSnapshot:
         if self._snapshot is not None:
             raise RuntimeError("run controller has already started")
@@ -93,7 +146,18 @@ class AgentRunController:
         begun, canceled = await _await_repository_receipt(
             self._repository.begin(params, event_template)
         )
-        snapshot = RunStateMachine.initialize(begun.run_id)
+        if (
+            params.requested_run_id is not None
+            and begun.run_id != params.requested_run_id
+        ):
+            raise ContractViolationError(
+                "Run repository did not honor the requested Run id",
+                code="run_identity_conflict",
+            )
+        snapshot = replace(
+            RunStateMachine.initialize(begun.run_id),
+            agent_preset_snapshot=params.agent_preset_snapshot,
+        )
         self._snapshot = snapshot
         _raise_if_canceled(canceled)
         await self._publish((begun.event,))

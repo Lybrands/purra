@@ -83,8 +83,8 @@ export async function validateContinuation(input: {
   if (snapshot?.schemaVersion !== 1) {
     throw new AgentError("durable_recovery_snapshot_unsupported", "Recovery snapshot is unsupported");
   }
-  if (snapshot.preset.schemaVersion !== 3 || input.currentPreset.schemaVersion !== 3) {
-    throw new AgentError("agent_preset_snapshot_unsupported", "Durable continuation requires preset snapshot v3");
+  if (snapshot.preset.schemaVersion !== 4 || input.currentPreset.schemaVersion !== 4) {
+    throw new AgentError("agent_preset_snapshot_unsupported", "Durable continuation requires preset snapshot v4");
   }
   if (canonicalJson(snapshot.preset) !== canonicalJson(input.currentPreset)) {
     throw new AgentError("agent_preset_snapshot_mismatch", "Durable continuation preset does not match");

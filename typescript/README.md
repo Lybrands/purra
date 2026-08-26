@@ -41,6 +41,29 @@ Every tool declares an object Schema and effect policy. The runtime admits a
 complete batch before any handler starts; side-effecting tools require
 idempotency, and `confirm` tools also require host approval.
 
+## Child Agents
+
+Enable canonical Child Runs by supplying the Agent tree repository together
+with the Run and output adapters:
+
+```ts
+import { Agent, InMemoryAgentAdapters } from "purra";
+
+const adapters = new InMemoryAgentAdapters();
+const agent = new Agent({
+  model: yourModelGateway,
+  runRepository: adapters.runs,
+  outputPublisher: adapters.outputs,
+  agentTree: { repository: adapters.runTree },
+});
+```
+
+This enables `delegateToAgents` with stable Agent identity, bounded recursion,
+structured joins, continuation commands, Root-scoped budgets, and attributed
+output. `recoverAgentTreeRoot()` rebinds an active Root and scans all persisted
+descendants. In-memory adapters are for local execution and tests; restart-safe
+hosts must implement the same repository atomicity and lease contracts.
+
 ## Composition
 
 Reactive execution is the default; Planned and Durable execution are opt-in.

@@ -18,6 +18,7 @@ from purra.contracts import (
     ToolPolicy,
     ToolSchema,
 )
+from purra.operations import AgentOperationController
 from purra.ports import ToolRegistration
 from purra.testing import (
     assert_model_gateway_conforms,
@@ -25,6 +26,15 @@ from purra.testing import (
 )
 from purra.tools.executor import CoreToolExecutor
 from purra.tools.registry import InMemoryToolCatalog
+
+
+class _OperationOutput:
+    def __init__(self):
+        self.events = []
+
+    async def accept_operation_event(self, event):
+        self.events.append(event)
+        return event
 
 
 def _tool() -> ToolSchema:
@@ -147,6 +157,7 @@ async def test_model_gateway_probe_rejects_incomplete_tool_call():
 @pytest.mark.asyncio
 async def test_core_tool_executor_passes_shared_host_conformance():
     calls = 0
+    operation_output = _OperationOutput()
 
     async def read_thing(state, arguments, signal=None):
         nonlocal calls
@@ -155,11 +166,17 @@ async def test_core_tool_executor_passes_shared_host_conformance():
         state.domain["read"] = arguments["id"]
         return ToolHandlerResult('{"ok":true}')
 
-    executor = CoreToolExecutor(InMemoryToolCatalog((ToolRegistration(
-        schema=_tool(),
-        handler=read_thing,
-        policy=ToolPolicy(mode="read", title="Read thing"),
-    ),)))
+    executor = CoreToolExecutor(
+        InMemoryToolCatalog((ToolRegistration(
+            schema=_tool(),
+            handler=read_thing,
+            policy=ToolPolicy(mode="read", title="Read thing"),
+            operation_display_params=(
+                lambda state, arguments, tool_call: {"episodeNumber": 3}
+            ),
+        ),)),
+        operation_controller=AgentOperationController(operation_output),
+    )
     state = ExecutionState()
     result, events = await assert_tool_execution_gateway_conforms(
         gateway=executor,
@@ -173,6 +190,7 @@ async def test_core_tool_executor_passes_shared_host_conformance():
             ),),
             allowed_tool_names=frozenset({"readThing"}),
             state=state,
+            retry_of_tool_call_ids={"call-read": "call-read-invalid"},
         ),
     )
 
@@ -180,6 +198,12 @@ async def test_core_tool_executor_passes_shared_host_conformance():
     assert state.domain == {"read": "thing-1"}
     assert result.results[0].content == '{"ok":true}'
     assert events[-1].payload["toolCallId"] == "call-read"
+    assert operation_output.events[0].display["labelParams"] == {
+        "toolCallId": "call-read",
+        "toolName": "readThing",
+        "retryOfToolCallId": "call-read-invalid",
+        "episodeNumber": 3,
+    }
 
 
 @pytest.mark.asyncio

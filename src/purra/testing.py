@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 from purra.adapters import InMemoryAgentAdapters
+from purra.agent_execution_checkpoint import AgentExecutionCheckpoint
 from purra.artifacts import (
     ArtifactAppendCommand,
     ArtifactCreateCommand,
@@ -43,8 +44,10 @@ from purra.contracts import (
     ModelInvocation,
     ModelStream,
     ModelStreamChunk,
+    ModelTokenUsage,
     RunCreateParams,
     RunStatus,
+    RuntimeLimits,
     TaskContextRequest,
     ExecutionPlan,
     ToolBatchOutcome,
@@ -264,18 +267,163 @@ async def assert_host_adapters_conform(
             prompt="adapter conformance",
             mode="agent",
             turn_id="conformance-turn-1",
+            requested_run_id="conformance-run-1",
         ),
         AgentEvent(
             type=CoreEventType.RUN_STARTED,
             payload={"status": RunStatus.RUNNING.value},
         ),
     )
+    assert begun.run_id == "conformance-run-1"
     assert begun.event.run_id == begun.run_id
+    begun_snapshot = await runs.get(begun.run_id)
+    assert begun_snapshot.run_id == begun.run_id
+    assert begun_snapshot.status is RunStatus.RUNNING
     assert started.sequence == 1
+    assert started.root_run_id == begun.run_id
+    assert started.agent_id == begun.run_id
+    assert started.root_sequence == 1
+    assert started.source_event_key == f"run:{begun.run_id}:running"
     assert await outputs.list_events(
         begun.run_id,
         after_sequence=0,
     ) == (started,)
+    assert await outputs.list_root_events(
+        begun.run_id,
+        after_root_sequence=0,
+    ) == (started,)
+    checkpoint = AgentExecutionCheckpoint(
+        run_id=begun.run_id,
+        next_round=2,
+        round_limit=6,
+        messages=(AgentMessage(role=MessageRole.USER, content="resume"),),
+    )
+    checkpoint_event = AgentEvent(
+        type=CoreEventType.AGENT_EXECUTION_CHECKPOINTED,
+        run_id=begun.run_id,
+        payload={"nextRound": 2},
+    )
+    assert await runs.commit(
+        begun.run_id,
+        RunCommit(
+            execution_checkpoint=checkpoint,
+            events=(checkpoint_event,),
+        ),
+    ) == (checkpoint_event,)
+    assert (await runs.get(begun.run_id)).execution_checkpoint == checkpoint
+
+    authority_limits = RuntimeLimits(
+        max_model_invocation_attempts=2,
+        max_input_tokens=3,
+        max_provider_output_events=1,
+    )
+    authority_root = (await runs.begin(
+        RunCreateParams(
+            session_id=session_id,
+            prompt="root authority",
+            mode="agent",
+            requested_run_id="conformance-root-authority",
+            agent_id="conformance-root-agent",
+            runtime_limits=authority_limits,
+        ),
+        AgentEvent(type=CoreEventType.RUN_STARTED),
+    )).run_id
+    authority_children_list = []
+    for index in (1, 2, 3):
+        authority_children_list.append((await runs.begin(
+            RunCreateParams(
+                session_id=session_id,
+                prompt=f"child authority {index}",
+                mode="agent",
+                requested_run_id=f"conformance-child-authority-{index}",
+                root_run_id=authority_root,
+                agent_id=f"conformance-child-agent-{index}",
+                parent_run_id=authority_root,
+                runtime_limits=authority_limits,
+            ),
+            AgentEvent(type=CoreEventType.RUN_STARTED),
+        )).run_id)
+    authority_children = tuple(authority_children_list)
+    attempt_results = await asyncio.gather(
+        *(
+            runs.reserve_model_attempt(run_id, f"authority-invocation-{index}")
+            for index, run_id in enumerate(authority_children, 1)
+        ),
+        return_exceptions=True,
+    )
+    assert sum(not isinstance(item, Exception) for item in attempt_results) == 2
+    attempt_failure = next(
+        item for item in attempt_results if isinstance(item, Exception)
+    )
+    assert isinstance(attempt_failure, ContractViolationError)
+    assert attempt_failure.code == "runtime_budget_exceeded"
+    assert attempt_failure.details["budgetKind"] == "model_attempts"
+
+    settlement_results = await asyncio.gather(
+        *(
+            runs.settle_model_attempt(
+                authority_children[index],
+                f"authority-invocation-{index + 1}",
+                ModelTokenUsage(input_tokens=2, output_tokens=0),
+            )
+            for index, item in enumerate(attempt_results)
+            if not isinstance(item, Exception)
+        ),
+        return_exceptions=True,
+    )
+    assert sum(not isinstance(item, Exception) for item in settlement_results) == 1
+    token_failure = next(
+        item for item in settlement_results if isinstance(item, Exception)
+    )
+    assert isinstance(token_failure, ContractViolationError)
+    assert token_failure.code == "runtime_budget_exceeded"
+    assert token_failure.details["budgetKind"] == "input_tokens"
+
+    for index, run_id in enumerate(authority_children, 1):
+        await outputs.open_stream(OutputStreamSpec(
+            output_stream_id=f"authority-stream-{index}",
+            run_id=run_id,
+            turn_id=None,
+            invocation_id=f"authority-output-{index}",
+            intent=AgentOutputIntent.FINAL_PUBLIC,
+            commit_mode=OutputCommitMode.LIVE,
+        ))
+    output_results = await asyncio.gather(
+        *(
+            outputs.append_event(AgentOutputEventDraft.public_text(
+                run_id=run_id,
+                turn_id=None,
+                output_stream_id=f"authority-stream-{index}",
+                invocation_id=f"authority-output-{index}",
+                source_event_key=f"authority:provider:{index}",
+                source=OutputSource.PROVIDER,
+                channel=OutputChannel.FINAL,
+                delta=str(index),
+                occurred_at=_now(),
+            ))
+            for index, run_id in enumerate(authority_children, 1)
+        ),
+        return_exceptions=True,
+    )
+    assert sum(not isinstance(item, Exception) for item in output_results) == 1
+    output_failures = tuple(
+        item for item in output_results if isinstance(item, Exception)
+    )
+    assert len(output_failures) == 2
+    assert all(
+        isinstance(item, ContractViolationError)
+        and item.code == "runtime_budget_exceeded"
+        and item.details["budgetKind"] == "provider_output_events"
+        for item in output_failures
+    )
+    authority_journal = await outputs.list_root_events(
+        authority_root,
+        after_root_sequence=0,
+    )
+    assert [event.root_sequence for event in authority_journal] == [1]
+    assert authority_journal[0].root_run_id == authority_root
+    assert authority_journal[0].agent_id is not None
+    assert authority_journal[0].source_event_key is not None
 
     waiter = asyncio.create_task(
         publisher.wait_for_sequence(
@@ -430,6 +578,9 @@ async def assert_host_adapters_conform(
     assert await outputs.load_validated_result(terminal.run_id) == (
         "validated answer"
     )
+    terminal_snapshot = await runs.get(terminal.run_id)
+    assert terminal_snapshot.status is RunStatus.DONE
+    assert terminal_snapshot.final_response == "portable answer"
     assert await outputs.commit_run_lifecycle(
         terminal.run_id,
         commit,
@@ -639,6 +790,7 @@ async def assert_tool_execution_gateway_conforms(
             arguments_json="{}",
         ),),
         allowed_tool_names=frozenset({unknown_name}),
+        retry_of_tool_call_ids={},
     ))
     assert unknown.outcome is ToolBatchOutcome.REJECTED
     assert not events

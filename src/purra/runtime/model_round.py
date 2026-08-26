@@ -18,7 +18,11 @@ from purra.contracts import (
     TraceRecord,
 )
 from purra.cancellation import OperationCanceled
-from purra.errors import ModelGatewayError, UnsupportedModelFeatureError
+from purra.errors import (
+    CodedAgentCoreError,
+    ModelGatewayError,
+    UnsupportedModelFeatureError,
+)
 from purra.json_values import thaw_json_mapping
 from purra.model_invocation.contracts import AgentModelCall
 from purra.output import AgentOutputIntent, OutputCommitMode
@@ -168,15 +172,14 @@ def resolve_provider_failure(
             disable_required_tool_choice=required,
         )
 
-    error_code = (
-        error.code
-        if isinstance(error, ModelGatewayError)
-        else (
+    if isinstance(error, (ModelGatewayError, CodedAgentCoreError)):
+        error_code = error.code
+    else:
+        error_code = (
             "model_gateway_error"
             if phase is ProviderFailurePhase.OPENING
             else "model_stream_error"
         )
-    )
     decision = None
     if is_retryable_stream_interruption(error):
         decision = recovery_ledger.decide(RecoveryRequest(
