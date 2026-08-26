@@ -190,9 +190,9 @@ test("idempotency prevents a repeated model call id from repeating an effect", a
   let executions = 0;
   const agent = new Agent({
     model: {
-      async invoke() {
+      async invoke(request) {
         modelRound += 1;
-        if (modelRound === 3) return finalTurn("done");
+        if (modelRound >= 3 || request.tools.length === 0) return finalTurn("done");
         return callsTurn([{ id: "same", name: "write", arguments: { value: 1 } }]);
       },
     },
@@ -334,7 +334,11 @@ test("Agent.stream emits public deltas, tool lifecycle, and one final result", a
           };
           return;
         }
-        yield { contentDelta: "done", reasoningDelta: "still private", finishReason: "stop" };
+        yield {
+          contentDelta: round === 2 ? "private candidate" : "done",
+          reasoningDelta: "still private",
+          finishReason: "stop",
+        };
       },
     },
     tools: [readTool("read", () => readResult({ ok: true }))],
@@ -344,15 +348,40 @@ test("Agent.stream emits public deltas, tool lifecycle, and one final result", a
   for await (const event of agent.stream(runInput())) events.push(event);
 
   assert.deepEqual(events.map((event) => event.type), [
-    "model_delta",
     "tool_started",
     "tool_completed",
     "model_delta",
     "final",
   ]);
+  assert.equal(round, 3);
   assert.equal(events.some((event) => JSON.stringify(event).includes("private")), false);
   assert.equal(events.at(-1).result.output, "done");
   assert.equal(events.at(-1).result.messages.some((message) => "reasoning" in message), false);
+});
+
+test("public presentation disables tools and rejects a forged tool call", async () => {
+  const requests = [];
+  let executions = 0;
+  const agent = new Agent({
+    model: {
+      async invoke(request) {
+        requests.push(request);
+        if (requests.length === 1) {
+          return callsTurn([{ id: "one", name: "read", arguments: {} }]);
+        }
+        if (requests.length === 2) return finalTurn("private candidate");
+        return callsTurn([{ id: "forged", name: "read", arguments: {} }]);
+      },
+    },
+    tools: [readTool("read", () => {
+      executions += 1;
+      return readResult({ ok: true });
+    })],
+  });
+
+  await rejectsCode(agent.invoke(runInput()), "tool_call_during_public_presentation");
+  assert.deepEqual(requests[2].tools, []);
+  assert.equal(executions, 1);
 });
 
 test("closing Agent.stream cancels and closes the upstream iterator", async () => {

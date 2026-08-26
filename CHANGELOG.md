@@ -35,6 +35,19 @@
 - Keep `provider.delta_batch/v1`, output ordering, visibility, atomic append,
   digest, and terminal-event behavior unchanged.
 
+### Tool-capable output authorization
+
+- Align TypeScript with Python by treating final content from a tool-capable
+  model invocation as a private candidate, then running one bounded tool-free
+  public-presentation invocation.
+- Withhold candidate stream deltas and tool-round commentary, reject any forged
+  tool call during presentation, and exclude the private candidate and guidance
+  from the returned public message history.
+- Match Python validated-result semantics for canonical Agent Trees: Root and
+  Child Runs commit their validated result without a presentation invocation.
+  Normal Agent presentation remains metered through existing attempt, token,
+  deadline, and output budgets.
+
 ### Provider liveness and sustained streams
 
 - Replace the 120-second Provider invocation default with a non-renewable

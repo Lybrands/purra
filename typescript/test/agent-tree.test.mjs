@@ -157,9 +157,14 @@ test("Agent tree rejects the legacy delegation write authority", () => {
 
 test("Agent executes delegateToAgents through canonical Child Runs", async () => {
   const adapters = new InMemoryAgentAdapters();
+  let modelCalls = 0;
   const agent = new Agent({
     model: {
       async invoke(request) {
+        modelCalls += 1;
+        if (request.messages.at(-1)?.attributes?.publicPresentation === true) {
+          throw new Error("Agent Tree unexpectedly entered public presentation");
+        }
         if (request.messages.some((message) => message.content === "Review evidence.")) {
           return {
             message: { role: "assistant", content: "child result" },
@@ -210,6 +215,7 @@ test("Agent executes delegateToAgents through canonical Child Runs", async () =>
   const journal = await adapters.runs.listRootEvents(handle.runId, 0);
 
   assert.equal(result.output, "root done");
+  assert.equal(modelCalls, 3);
   assert.equal((await handle.snapshot()).preset.schemaVersion, 5);
   assert.equal(descendants.length, 1);
   assert.equal(descendants[0].status, "done");
@@ -235,6 +241,9 @@ test("Agent permits bounded recursive Child Runs", async () => {
       async invoke(request) {
         const system = request.messages.find((message) => message.role === "system")?.content;
         const afterTool = request.messages.at(-1)?.role === "tool";
+        if (request.messages.at(-1)?.attributes?.publicPresentation === true) {
+          throw new Error("Agent Tree unexpectedly entered public presentation");
+        }
         if (system === "Nested worker.") {
           return {
             message: { role: "assistant", content: "nested done" },

@@ -41,6 +41,13 @@ Every tool declares an object Schema and effect policy. The runtime admits a
 complete batch before any handler starts; side-effecting tools require
 idempotency, and `confirm` tools also require host approval.
 
+In a normal Agent run, a model round that receives tool schemas remains private
+even when it returns a final answer without calling a tool. PurrA performs one
+additional tool-free presentation round and publishes only that answer. The
+extra Provider call is subject to the Run deadline and model-attempt/token
+budgets; explicit budgets must reserve capacity for it. Provisional deltas from
+the tool-capable candidate are not emitted by `Agent.stream()`.
+
 ## Child Agents
 
 Enable canonical Child Runs by supplying the Agent tree repository together
@@ -60,9 +67,11 @@ const agent = new Agent({
 
 This enables `delegateToAgents` with stable Agent identity, bounded recursion,
 structured joins, continuation commands, Root-scoped budgets, and attributed
-output. `recoverAgentTreeRoot()` rebinds an active Root and scans all persisted
-descendants. In-memory adapters are for local execution and tests; restart-safe
-hosts must implement the same repository atomicity and lease contracts.
+output. Like Python, canonical Root and Child Runs use validated-result mode and
+do not add the normal public-presentation invocation. `recoverAgentTreeRoot()`
+rebinds an active Root and scans all persisted descendants. In-memory adapters
+are for local execution and tests; restart-safe hosts must implement the same
+repository atomicity and lease contracts.
 
 ## Composition
 

@@ -22,10 +22,19 @@ test("Agent consumes model chunks, tool deltas, usage, and output limits", async
         requests.push(request);
         return (async function* () {
           try {
-            if (request.messages.at(-1).role === "tool") {
+            if (request.tools.length === 0) {
               yield { contentDelta: "Weather: " };
               yield {
                 contentDelta: "sunny",
+                finishReason: "stop",
+                usage: { inputTokens: 12, outputTokens: 2 },
+              };
+              return;
+            }
+            if (request.messages.at(-1).role === "tool") {
+              yield { contentDelta: "private weather " };
+              yield {
+                contentDelta: "candidate",
                 finishReason: "stop",
                 usage: { inputTokens: 12, outputTokens: 2 },
               };
@@ -64,16 +73,18 @@ test("Agent consumes model chunks, tool deltas, usage, and output limits", async
   });
 
   assert.equal(result.output, "Weather: sunny");
-  assert.equal(result.rounds, 2);
-  assert.equal(closed, 2);
+  assert.equal(result.rounds, 3);
+  assert.equal(closed, 3);
   assert.deepEqual(requests[0].outputLimit, {
     maxTokens: 200,
     source: "user_override",
     profileMaxTokens: 1000,
   });
   assert.equal(requests[0].capabilitySnapshot.profileId, "fixture");
+  assert.deepEqual(requests[2].tools, []);
   assert.deepEqual(result.messages[1].toolCalls[0].arguments, { city: "Hangzhou" });
   assert.equal(requests[1].messages[1].reasoning, "private reasoning");
+  assert.equal(JSON.stringify(result.messages).includes("private weather candidate"), false);
   assert.equal(result.messages[1].reasoning, undefined);
 });
 

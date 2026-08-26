@@ -9,9 +9,15 @@ test("Agent completes one validated model/tool loop", async () => {
     model: {
       async invoke(request) {
         requests.push(request);
-        if (request.messages.at(-1).role === "tool") {
+        if (request.tools.length === 0) {
           return {
             message: { role: "assistant", content: "Weather: sunny" },
+            finishReason: "stop",
+          };
+        }
+        if (request.messages.at(-1).role === "tool") {
+          return {
+            message: { role: "assistant", content: "private weather candidate" },
             finishReason: "stop",
           };
         }
@@ -37,14 +43,24 @@ test("Agent completes one validated model/tool loop", async () => {
   const result = await agent.invoke({ messages: [{ role: "user", content: "Weather?" }] });
 
   assert.equal(result.output, "Weather: sunny");
-  assert.equal(result.rounds, 2);
-  assert.equal(requests.length, 2);
+  assert.equal(result.rounds, 3);
+  assert.equal(requests.length, 3);
   assert.deepEqual(requests[0].tools, [{
     name: "weather",
     description: "weather tool",
     inputSchema: objectSchema({ city: { type: "string" } }, ["city"]),
   }]);
   assert.equal(Object.hasOwn(requests[0].tools[0], "run"), false);
+  assert.deepEqual(requests[2].tools, []);
+  assert.equal(
+    requests[2].messages.some((message) => message.content === "private weather candidate"),
+    true,
+  );
+  assert.equal(
+    requests[2].messages.at(-1).content.includes("tool-free response"),
+    true,
+  );
+  assert.equal(JSON.stringify(result.messages).includes("private weather candidate"), false);
   assert.deepEqual(result.messages.at(-2), {
     role: "tool",
     content: { condition: "sunny" },

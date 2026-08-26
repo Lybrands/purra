@@ -13,6 +13,7 @@ import type { RunSession } from "../run/session.js";
 import { AgentOperationController } from "../operations/index.js";
 import { RecoveryPolicy } from "../recovery/index.js";
 import { AgentCanceledError, AgentError } from "../shared/errors.js";
+import { publicPresentationMessages } from "../shared/public-presentation.js";
 import { ToolCatalog } from "../tools/catalog.js";
 import type { ToolDefinition, ToolExecutionEvent } from "../tools/types.js";
 import type {
@@ -157,14 +158,16 @@ export class DynamicDelegatedAgentExecutor {
     signal: AbortSignal | undefined,
   ): Promise<DelegatedAgentResult> {
     const outputLimit = resolveInvocationOutputLimit(this.#capabilities, undefined);
-    for (let round = 1; round <= this.#maxRounds; round += 1) {
+    let publicPresentationPending = false;
+    let roundLimit = this.#maxRounds;
+    for (let round = 1; round <= roundLimit; round += 1) {
       if (signal?.aborted) throw new AgentCanceledError();
       const projected = context === undefined
         ? Object.freeze([...messages])
         : await context.project(messages, signal);
       const modelRequest = Object.freeze({
         messages: projected,
-        tools,
+        tools: publicPresentationPending ? Object.freeze([]) : tools,
         ...(this.#capabilities === undefined ? {} : { capabilitySnapshot: this.#capabilities }),
         ...(outputLimit === undefined ? {} : { outputLimit }),
       });
@@ -207,12 +210,25 @@ export class DynamicDelegatedAgentExecutor {
       messages.push(turn.message);
       const calls = turn.message.toolCalls ?? [];
       throwForIncompleteFinish(turn.finishReason, calls.length);
+      if (publicPresentationPending && calls.length > 0) {
+        throw new AgentError(
+          "tool_call_during_public_presentation",
+          "Tool calls are forbidden during public presentation",
+        );
+      }
       if (calls.length === 0) {
         if (turn.finishReason === "tool_calls") {
           throw new AgentError("invalid_model_response", "finishReason=tool_calls requires a tool call");
         }
         if (turn.message.content === null || (typeof turn.message.content === "string" && turn.message.content.trim() === "")) {
           throw new AgentError("empty_model_response", "Delegated Agent returned an empty response");
+        }
+        if (tools.length > 0 && !publicPresentationPending) {
+          messages.pop();
+          messages.push(...publicPresentationMessages(turn.message));
+          publicPresentationPending = true;
+          roundLimit += 1;
+          continue;
         }
         return Object.freeze({
           outcome: "completed",

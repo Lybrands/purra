@@ -314,20 +314,19 @@ test("submitted Run persists private model evidence and public output in order",
   assert.deepEqual(all.map((event) => event.sequence), all.map((_event, index) => index + 1));
   assert.equal(all[0].kind, "run.started");
   assert.deepEqual(all.slice(-2).map((event) => event.kind), ["final", "run.completed"]);
-  assert.equal(all.filter((event) => event.kind === "invocation.started").length, 2);
-  assert.equal(all.filter((event) => event.kind === "invocation.completed").length, 2);
+  assert.equal(all.filter((event) => event.kind === "invocation.started").length, 3);
+  assert.equal(all.filter((event) => event.kind === "invocation.completed").length, 3);
   assert.equal(all.some((event) => (
     event.kind === "provider.delta_batch"
     && event.payload.entries.some((entry) => entry.kind === "provider.reasoning_delta")
   )), true);
-  assert.equal(all.some((event) => event.kind === "commentary"), true);
+  assert.equal(all.some((event) => event.kind === "commentary"), false);
   assert.equal(all.some((event) => event.kind === "tool.started"), true);
   assert.equal(all.some((event) => event.kind === "tool.completed"), true);
   assert.equal(publicEvents.some((event) => event.channel === "reasoning"), false);
   assert.equal(publicEvents.some((event) => event.channel === "model"), false);
   assert.deepEqual(publicEvents.map((event) => event.kind), [
     "run.started",
-    "commentary",
     "tool.started",
     "tool.completed",
     "final",
@@ -343,8 +342,8 @@ test("submitted Run persists private model evidence and public output in order",
   assert.match(receipt.toolFingerprint, /^[a-f0-9]{64}$/);
   assert.match(receipt.evidenceFingerprint, /^[a-f0-9]{64}$/);
   assert.equal(JSON.stringify(receipt).includes("private-prompt"), false);
-  assert.equal((await handle.snapshot()).usage.inputTokens, 22);
-  assert.equal((await handle.snapshot()).usage.outputTokens, 4);
+  assert.equal((await handle.snapshot()).usage.inputTokens, 34);
+  assert.equal((await handle.snapshot()).usage.outputTokens, 6);
   assert.equal((await handle.cancel()).accepted, false);
 });
 

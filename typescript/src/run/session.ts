@@ -328,16 +328,6 @@ export class RunSession {
     }
   }
 
-  public async publishCommentary(receipt: ModelInvocationReceipt, content: JsonValue): Promise<void> {
-    await this.#persist({
-      sourceKey: `invocation:${receipt.invocationId}:commentary`,
-      kind: "commentary",
-      channel: "commentary",
-      visibility: this.#outwardVisibility,
-      payload: { content },
-    });
-  }
-
   async #withBatch<T>(
     receipt: ModelInvocationReceipt,
     operation: (batch: PendingOutputBatch) => Promise<T>,

@@ -106,7 +106,7 @@ test("invalid tool input is corrected once before any handler runs", async () =>
   });
 
   assert.equal((await agent.invoke({ messages: [{ role: "user", content: "run" }] })).output, "done");
-  assert.equal(modelCalls, 3);
+  assert.equal(modelCalls, 4);
   assert.equal(toolCalls, 1);
 });
 

@@ -19,6 +19,10 @@ import {
 import { AgentCanceledError, AgentError } from "../shared/errors.js";
 import { stableFingerprint } from "../shared/fingerprint.js";
 import {
+  isPrivatePresentationMessage,
+  publicPresentationMessages,
+} from "../shared/public-presentation.js";
+import {
   prepareContext,
   prepareStagedContext,
   resolveContextFactories,
@@ -525,7 +529,10 @@ export class Agent {
       options.deadlineAt,
       this.#runtimeLimits.runTimeoutMs,
     );
-    let budgets = resolveBudgets(options.budgets, this.#maxRounds);
+    let budgets = resolveBudgets(
+      options.budgets,
+      this.#maxRounds + (treeGrant === undefined ? 1 : 0),
+    );
     if (options.durableContinuation !== undefined) {
       if (this.#durable === undefined) {
         throw new AgentError("durable_continuation_unavailable", "Agent has no Durable composition");
@@ -1093,6 +1100,10 @@ export class Agent {
       input.maxOutputTokens,
     );
     let responseAttempts = resumeCheckpoint?.responseAttempts ?? 0;
+    let publicPresentationPending = false;
+    let roundLimit = this.#maxRounds;
+    const validatedResultMode = session !== undefined
+      && this.#agentTreeRoots.has(session.rootRunId);
     const recovery = new RecoveryLedger(this.#recoveryPolicy);
     if (resumeCheckpoint !== undefined) {
       if (
@@ -1110,7 +1121,7 @@ export class Agent {
 
     for (
       let round = resumeCheckpoint?.nextRound ?? 1;
-      round <= this.#maxRounds;
+      round <= roundLimit;
       round += 1
     ) {
       throwIfCanceled(input.signal);
@@ -1118,6 +1129,7 @@ export class Agent {
       let enabledTools: readonly string[] | undefined = planning?.state === undefined
         ? input.enabledTools
         : transition?.allowedToolNames ?? [];
+      if (publicPresentationPending) enabledTools = Object.freeze([]);
       if (session === undefined && this.#delegationCoordinator !== undefined) {
         enabledTools = Object.freeze((enabledTools ?? this.#tools.specsFor().map((tool) => tool.name))
           .filter((name) => name !== "delegateToAgents"));
@@ -1159,7 +1171,7 @@ export class Agent {
                 await session.persistChunk(receipt, chunkIndex, chunk);
                 chunkIndex += 1;
               }
-              if (!responseValidation.enabled) {
+              if (!responseValidation.enabled && tools.length === 0) {
                 if (emit !== undefined && chunk.contentDelta !== undefined && chunk.contentDelta !== "") {
                   visibleOutputEmitted = true;
                 }
@@ -1185,7 +1197,7 @@ export class Agent {
             const decision = await this.#decideRecovery(recovery, {
               cause,
               action: "retry_model",
-              remainingModelRounds: this.#maxRounds - round + 1,
+              remainingModelRounds: roundLimit - round + 1,
               cancellationRequested: input.signal?.aborted === true,
               visibleOutputEmitted,
             }, round, session);
@@ -1203,6 +1215,12 @@ export class Agent {
       const calls = assistant.toolCalls ?? [];
 
       throwForIncompleteFinish(turn.finishReason, calls.length);
+      if (publicPresentationPending && calls.length > 0) {
+        throw new AgentError(
+          "tool_call_during_public_presentation",
+          "Tool calls are forbidden during public presentation",
+        );
+      }
       if (calls.length === 0) {
         if (turn.finishReason === "tool_calls") {
           throw new AgentError("invalid_model_response", "finishReason=tool_calls requires a tool call");
@@ -1214,7 +1232,7 @@ export class Agent {
             cause: "missing_required_tool_call",
             action: "retry_model",
             scope,
-            remainingModelRounds: this.#maxRounds - round,
+            remainingModelRounds: roundLimit - round,
             cancellationRequested: input.signal?.aborted === true,
             visibleOutputEmitted,
           }, round, session);
@@ -1227,7 +1245,7 @@ export class Agent {
             cause: "missing_required_tool_call_replan",
             action: "replan",
             scope,
-            remainingModelRounds: this.#maxRounds - round,
+            remainingModelRounds: roundLimit - round,
             cancellationRequested: input.signal?.aborted === true,
             visibleOutputEmitted,
           }, round, session);
@@ -1249,7 +1267,7 @@ export class Agent {
           const decision = await this.#decideRecovery(recovery, {
             cause: "empty_model_response",
             action: "retry_model",
-            remainingModelRounds: this.#maxRounds - round,
+            remainingModelRounds: roundLimit - round,
             cancellationRequested: input.signal?.aborted === true,
             visibleOutputEmitted,
           }, round, session);
@@ -1260,7 +1278,6 @@ export class Agent {
           }
           throw new AgentError("empty_model_response", "Model returned an empty final response");
         }
-        planning?.state?.completeFinal();
         responseAttempts += 1;
         const rejection = await responseValidation.validate(
           assistant.content,
@@ -1271,7 +1288,7 @@ export class Agent {
           const decision = await this.#decideRecovery(recovery, {
             cause: rejection.recoveryCause,
             action: "retry_model",
-            remainingModelRounds: this.#maxRounds - round,
+            remainingModelRounds: roundLimit - round,
             retryable: responseAttempts < responseValidation.maxAttempts,
             cancellationRequested: input.signal?.aborted === true,
             visibleOutputEmitted,
@@ -1292,6 +1309,14 @@ export class Agent {
           messages.push(responseRepairMessage(rejection));
           continue;
         }
+        if (tools.length > 0 && !publicPresentationPending && !validatedResultMode) {
+          messages.pop();
+          messages.push(...publicPresentationMessages(assistant));
+          publicPresentationPending = true;
+          roundLimit += 1;
+          continue;
+        }
+        planning?.state?.completeFinal();
         return Object.freeze({
           output: assistant.content,
           messages: publicMessages(messages),
@@ -1306,9 +1331,6 @@ export class Agent {
         );
       }
       validateAssistantToolContent(assistant.content, this.#capabilities);
-      if (session !== undefined && receipt !== undefined && !isEmptyOutput(assistant.content)) {
-        await session.publishCommentary(receipt, assistant.content);
-      }
       try {
         planning?.state?.beginToolRound(calls.map((call) => call.name));
       } catch (error) {
@@ -1318,7 +1340,7 @@ export class Agent {
           cause: "unauthorized_tool",
           action: "retry_model",
           scope,
-          remainingModelRounds: this.#maxRounds - round,
+          remainingModelRounds: roundLimit - round,
           cancellationRequested: input.signal?.aborted === true,
           visibleOutputEmitted,
           effectState: "not_started",
@@ -1333,7 +1355,7 @@ export class Agent {
           cause: "unauthorized_tool_replan",
           action: "replan",
           scope,
-          remainingModelRounds: this.#maxRounds - round,
+          remainingModelRounds: roundLimit - round,
           cancellationRequested: input.signal?.aborted === true,
           visibleOutputEmitted,
           effectState: "not_started",
@@ -1387,7 +1409,7 @@ export class Agent {
           cause,
           action: "retry_model",
           scope: cause === "tool_input_invalid" ? "tool-input-sequence" : "tool-authorization-sequence",
-          remainingModelRounds: this.#maxRounds - round,
+          remainingModelRounds: roundLimit - round,
           cancellationRequested: input.signal?.aborted === true,
           visibleOutputEmitted,
           effectState: "not_started",
@@ -1412,7 +1434,7 @@ export class Agent {
           cause: "tool_execution_failed_replan",
           action: "replan",
           scope: `tool-round:${round}`,
-          remainingModelRounds: this.#maxRounds - round,
+          remainingModelRounds: roundLimit - round,
           cancellationRequested: input.signal?.aborted === true,
           visibleOutputEmitted,
           effectState,
@@ -1829,6 +1851,7 @@ function publicMessages(messages: readonly Message[]): readonly Message[] {
       && message.attributes?.responseRepair !== true
       && message.attributes?.recovery !== true
       && message.attributes?.responseCandidateRejected !== true
+      && !isPrivatePresentationMessage(message)
     ))
     .map(({ reasoning: _reasoning, ...message }) => Object.freeze(message)));
 }

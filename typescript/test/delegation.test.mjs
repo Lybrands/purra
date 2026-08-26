@@ -163,6 +163,12 @@ test("Agent delegation stays in one Root Run with isolated context and read tool
       if (delegated) {
         delegatedRequests.push(request);
         delegatedRound += 1;
+        if (request.tools.length === 0) {
+          return {
+            message: { role: "assistant", content: "delegated result" },
+            finishReason: "stop",
+          };
+        }
         assert.deepEqual(request.tools.map((tool) => tool.name), ["lookup"]);
         assert.equal(JSON.stringify(request.messages).includes("parent-private-secret"), false);
         if (delegatedRound === 1) {
@@ -240,12 +246,12 @@ test("Agent delegation stays in one Root Run with isolated context and read tool
   const events = [];
   for await (const event of handle.events({ visibility: "all" })) events.push(event);
 
-  assert.equal(delegatedRequests.length, 2);
+  assert.equal(delegatedRequests.length, 3);
   assert.deepEqual(
     events.filter((event) => event.kind === "delegation.status").map((event) => event.payload.status),
     ["queued", "running", "done"],
   );
-  assert.equal(events.filter((event) => event.kind === "invocation.started").length, 4);
+  assert.equal(events.filter((event) => event.kind === "invocation.started").length, 6);
   assert.equal(events.every((event) => event.runId === handle.runId), true);
   assert.equal(events.some((event) => event.payload.delegationId !== undefined), true);
 });
@@ -261,6 +267,9 @@ test("delegated Agents resolve managed context factories inside the same Root Ru
       }
       if (request.messages[0]?.attributes?.delegatedAgentDefinition === "model") {
         return { message: { role: "assistant", content: "delegated result" }, finishReason: "stop" };
+      }
+      if (request.tools.length === 0) {
+        return { message: { role: "assistant", content: "root result" }, finishReason: "stop" };
       }
       rootRound += 1;
       return rootRound === 1
@@ -308,7 +317,7 @@ test("delegated Agents resolve managed context factories inside the same Root Ru
   assert.deepEqual(factoryRunIds, [handle.runId, handle.runId]);
   const events = [];
   for await (const event of handle.events({ visibility: "all" })) events.push(event);
-  assert.equal(events.filter((event) => event.kind === "invocation.started").length, 5);
+  assert.equal(events.filter((event) => event.kind === "invocation.started").length, 6);
 });
 
 test("custom delegated executors receive only enabled read-tool names", async () => {
