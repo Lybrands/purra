@@ -174,7 +174,11 @@ async def test_live_full_text_validation_is_rejected_before_gateway_call():
         await manager.stream(
             (AgentMessage(role="user", content="answer"),),
             call,
-            ModelInvocationContext(run_id="run-1", turn_id="turn-1"),
+            ModelInvocationContext(
+                run_id="run-1",
+                turn_id="turn-1",
+                requested_reasoning_mode=ReasoningMode.DISABLED,
+            ),
         )
 
     assert gateway.calls == []
@@ -196,7 +200,11 @@ async def test_public_chunk_is_observed_before_runtime_consumes_it():
     managed = await manager.stream(
         (AgentMessage(role="user", content="answer"),),
         call,
-        ModelInvocationContext(run_id="run-1", turn_id="turn-1"),
+        ModelInvocationContext(
+            run_id="run-1",
+            turn_id="turn-1",
+            requested_reasoning_mode=ReasoningMode.DISABLED,
+        ),
     )
     chunk = await anext(managed.chunks)
 
@@ -236,7 +244,11 @@ async def test_receipt_fingerprints_model_input_tools_and_context_provenance():
                 parameters={"type": "object", "properties": {}},
             ),),
         ),
-        ModelInvocationContext(run_id="run-1", turn_id="turn-1"),
+        ModelInvocationContext(
+            run_id="run-1",
+            turn_id="turn-1",
+            requested_reasoning_mode=ReasoningMode.DISABLED,
+        ),
     )
 
     receipt = managed.receipt
@@ -266,7 +278,10 @@ async def test_provider_chunks_are_forwarded_once_and_finish_after_terminal():
             commit_mode=OutputCommitMode.PRIVATE,
             reasoning_mode=ReasoningMode.DISABLED,
         ),
-        ModelInvocationContext(run_id="run-1"),
+        ModelInvocationContext(
+            run_id="run-1",
+            requested_reasoning_mode=ReasoningMode.DISABLED,
+        ),
     )
 
     chunks = [chunk async for chunk in managed.chunks]
@@ -295,7 +310,10 @@ async def test_every_provider_attempt_has_one_authoritative_model_operation():
             commit_mode=OutputCommitMode.LIVE,
             reasoning_mode=ReasoningMode.DISABLED,
         ),
-        ModelInvocationContext(run_id="run-1"),
+        ModelInvocationContext(
+            run_id="run-1",
+            requested_reasoning_mode=ReasoningMode.DISABLED,
+        ),
     )
 
     assert [event.kind for event in operation_output.events] == [
@@ -332,7 +350,10 @@ async def test_stream_open_failure_still_closes_model_operation_once():
                 commit_mode=OutputCommitMode.LIVE,
                 reasoning_mode=ReasoningMode.DISABLED,
             ),
-            ModelInvocationContext(run_id="run-1"),
+            ModelInvocationContext(
+                run_id="run-1",
+                requested_reasoning_mode=ReasoningMode.DISABLED,
+            ),
         )
 
     assert len(operation_output.events) == 2
@@ -358,7 +379,10 @@ async def test_private_completion_is_observed_before_stream_commit():
             requires_full_text_validation=True,
             reasoning_mode=ReasoningMode.DISABLED,
         ),
-        ModelInvocationContext(run_id="run-1"),
+        ModelInvocationContext(
+            run_id="run-1",
+            requested_reasoning_mode=ReasoningMode.DISABLED,
+        ),
     )
 
     assert observer.accepted == [(
@@ -369,6 +393,30 @@ async def test_private_completion_is_observed_before_stream_commit():
         completed.receipt.output_stream_id,
         ModelFinishReason.STOP,
     )]
+
+
+@pytest.mark.asyncio
+async def test_reasoning_mode_conflict_is_rejected_before_gateway_call():
+    AgentModelCall, AgentModelInvocationManager, ModelInvocationContext = _types()
+    gateway = _CompletionGateway()
+    manager = AgentModelInvocationManager(gateway)
+
+    with pytest.raises(ContractViolationError) as captured:
+        await manager.complete(
+            (),
+            AgentModelCall(
+                request=_request(),
+                output_intent=AgentOutputIntent.STRUCTURED_PRIVATE,
+                commit_mode=OutputCommitMode.PRIVATE,
+                reasoning_mode=ReasoningMode.DISABLED,
+            ),
+            ModelInvocationContext(
+                run_id="run-conflict",
+                requested_reasoning_mode=ReasoningMode.ENABLED,
+            ),
+        )
+
+    assert captured.value.code == "model_reasoning_mode_conflict"
 
 
 @pytest.mark.asyncio

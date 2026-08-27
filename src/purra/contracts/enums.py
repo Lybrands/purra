@@ -118,6 +118,7 @@ class ToolChoiceMode(StrEnum):
 
 class ReasoningMode(StrEnum):
     DEFAULT = "default"
+    ENABLED = "enabled"
     DISABLED = "disabled"
 
 

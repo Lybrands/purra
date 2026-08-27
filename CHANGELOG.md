@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.1 - 2026-08-27
+
+### Model configuration ownership
+
+- Preserve the Run's exact `default`, `enabled`, or `disabled` reasoning mode
+  across planning, execution, private model tasks, response judging,
+  delegation, and continuation.
+- Reject any internal model call whose reasoning mode differs from its
+  immutable Run context before reaching a Provider.
+- Stop private response validation from replacing caller model options with a
+  framework-selected temperature and option subset.
+
 ## 0.4.0 - 2026-08-25
 
 ### Recursive Child Agents

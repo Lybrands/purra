@@ -1296,7 +1296,7 @@ class ApprovalResult:
 class RunExecutionIntent:
     """Immutable user and host intent shared by every attempt of one Run."""
 
-    requested_reasoning_mode: Literal["enabled", "disabled"]
+    requested_reasoning_mode: Literal["default", "enabled", "disabled"]
     output_contract: str
     tool_protocol_contract: str
     recovery_policy_id: str
@@ -1304,8 +1304,10 @@ class RunExecutionIntent:
 
     def __post_init__(self) -> None:
         mode = str(self.requested_reasoning_mode or "").strip().lower()
-        if mode not in {"enabled", "disabled"}:
-            raise ValueError("requested reasoning mode must be enabled or disabled")
+        if mode not in {"default", "enabled", "disabled"}:
+            raise ValueError(
+                "requested reasoning mode must be default, enabled or disabled"
+            )
         object.__setattr__(self, "requested_reasoning_mode", mode)
         for name in (
             "output_contract",

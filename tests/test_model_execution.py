@@ -11,17 +11,19 @@ from purra.contracts import (
     ModelCompletion,
     ModelFinishReason,
     ModelRequest,
+    ResponseValidationResult,
     ModelStream,
     ModelStreamChunk,
     ReasoningMode,
 )
 from purra.errors import ModelGatewayError, UnsupportedModelFeatureError
 from purra.model_execution import (
+    AgentModelResponseJudge,
     AgentModelTask,
     AgentModelTaskRunner,
 )
 from purra.model_invocation import AgentModelInvocationManager, ModelInvocationContext
-from purra.model_protocol import generic_capability_snapshot
+from purra.model_protocol import ReasoningControl, generic_capability_snapshot
 
 
 def _call() -> AgentModelTask:
@@ -35,14 +37,19 @@ def _call() -> AgentModelTask:
                 max_output_tokens=200,
             ),
         ),
-        reasoning_mode=ReasoningMode.DISABLED,
     )
 
 
-def _model_tasks(gateway) -> AgentModelTaskRunner:
+def _model_tasks(
+    gateway,
+    reasoning_mode: ReasoningMode = ReasoningMode.DISABLED,
+) -> AgentModelTaskRunner:
     return AgentModelTaskRunner(
         AgentModelInvocationManager(gateway),
-        ModelInvocationContext(run_id="model-task-test-run"),
+        ModelInvocationContext(
+            run_id="model-task-test-run",
+            requested_reasoning_mode=reasoning_mode,
+        ),
     )
 
 
@@ -90,6 +97,16 @@ class _ScriptedStreamGateway(_Gateway):
         return ModelStream(chunks=chunks(), model="model")
 
 
+class _AcceptingJudgePolicy:
+    def build_messages(self, *, content, messages):
+        del content, messages
+        return (AgentMessage(role=MessageRole.USER, content="judge"),)
+
+    def evaluate(self, *, judgment_content, candidate_content):
+        del judgment_content, candidate_content
+        return ResponseValidationResult()
+
+
 def test_complete_resolves_the_exact_provider_output_limit():
     async def run():
         gateway = _Gateway()
@@ -98,6 +115,39 @@ def test_complete_resolves_the_exact_provider_output_limit():
         assert result.output_limit.max_tokens == 200
         assert gateway.invocations[0].output_limit == result.output_limit
         assert gateway.invocations[0].max_output_tokens == 200
+
+    asyncio.run(run())
+
+
+def test_response_judge_inherits_reasoning_and_preserves_model_options():
+    async def run():
+        gateway = _Gateway()
+        request = _call().request
+        request = replace(
+            request,
+            capability_snapshot=replace(
+                request.capability_snapshot,
+                protocol=replace(
+                    request.protocol_capabilities,
+                    reasoning_control=ReasoningControl.ALWAYS_ENABLED,
+                ),
+            ),
+        )
+        request = replace(request, options={"temperature": 0.7, "top_p": 0.9})
+        judge = AgentModelResponseJudge(
+            model_tasks=_model_tasks(gateway, ReasoningMode.ENABLED),
+            model_request=request,
+            policy=_AcceptingJudgePolicy(),
+        )
+
+        await judge.judge(content="candidate", messages=())
+
+        invocation = gateway.invocations[0]
+        assert invocation.reasoning_mode is ReasoningMode.ENABLED
+        assert dict(invocation.request.options) == {
+            "temperature": 0.7,
+            "top_p": 0.9,
+        }
 
     asyncio.run(run())
 

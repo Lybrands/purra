@@ -13,6 +13,7 @@ from purra.contracts import (
     PlanningConstraints,
     PlanningResult,
     PlanningTurn,
+    ReasoningMode,
     ResponseValidationResult,
     TaskSpec,
 )
@@ -56,6 +57,7 @@ class WorkPlanner(Protocol):
         *,
         run_id: str | None = None,
         turn_id: str | None = None,
+        reasoning_mode: ReasoningMode = ReasoningMode.DEFAULT,
     ) -> PlanningResult: ...
 
 
@@ -72,6 +74,7 @@ class DynamicWorkPlanner(Protocol):
         *,
         run_id: str | None = None,
         turn_id: str | None = None,
+        reasoning_mode: ReasoningMode = ReasoningMode.DEFAULT,
     ) -> PlanningResult: ...
 
 

@@ -27,6 +27,7 @@ from purra.contracts import (
     PlanningConstraints,
     PlannerLimits,
     PlanningTurn,
+    ReasoningMode,
     StepExecutor,
     StepStatus,
     StepType,
@@ -39,7 +40,7 @@ from purra.contracts import (
     WorkStep,
 )
 from purra.errors import ContractViolationError, InvalidPlannerOutputError
-from purra.model_protocol import generic_capability_snapshot
+from purra.model_protocol import ReasoningControl, generic_capability_snapshot
 from purra.plan_compiler import compile_work_plan
 from purra.ports import ToolRegistration
 from purra.planner import (
@@ -68,13 +69,15 @@ class _ScriptedPlannerGateway:
     def __init__(self, outputs):
         self.outputs = list(outputs)
         self.message_rounds = []
+        self.invocations = []
 
     async def stream(self, messages, invocation, signal=None):
         raise AssertionError("planner must use complete")
 
     async def complete(self, messages, invocation, signal=None):
-        del invocation, signal
+        del signal
         self.message_rounds.append(tuple(messages))
+        self.invocations.append(invocation)
         return ModelCompletion(
             message=AgentMessage(role="assistant", content=self.outputs.pop(0)),
             model="test-model",
@@ -105,6 +108,23 @@ def _request() -> AgentRunRequest:
             ),
         ),
         domain_context=DomainContext(namespace="test.domain"),
+    )
+
+
+def _always_reasoning_request() -> AgentRunRequest:
+    request = _request()
+    return replace(
+        request,
+        model=replace(
+            request.model,
+            capability_snapshot=replace(
+                request.model.capability_snapshot,
+                protocol=replace(
+                    request.model.protocol_capabilities,
+                    reasoning_control=ReasoningControl.ALWAYS_ENABLED,
+                ),
+            ),
+        ),
     )
 
 
@@ -233,6 +253,23 @@ async def test_planner_repairs_a_host_rejected_normalized_result():
     )
     assert "None total steps" not in gateway.message_rounds[1][-1].content
     assert "total steps" not in gateway.message_rounds[1][-1].content
+
+
+@pytest.mark.asyncio
+async def test_planner_uses_the_run_reasoning_mode():
+    gateway = _ScriptedPlannerGateway([json.dumps({
+        "needsTodos": False,
+        "title": "Answer",
+        "goal": "Answer the question",
+    })])
+
+    await AgentPlanner(gateway).create_plan(
+        _always_reasoning_request(),
+        PlanningCapabilities(),
+        reasoning_mode=ReasoningMode.ENABLED,
+    )
+
+    assert gateway.invocations[0].reasoning_mode is ReasoningMode.ENABLED
 
 
 def test_planner_has_no_default_total_step_limit_but_honors_an_explicit_one():

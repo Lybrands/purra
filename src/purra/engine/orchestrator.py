@@ -1356,6 +1356,7 @@ class AgentCore:
                     controller=controller,
                     signal=signal,
                     turn_id=options.turn_id,
+                    reasoning_mode=options.reasoning_mode,
                 )
             else:
                 planning_result = PlanningPhaseResult.reactive()
@@ -1584,6 +1585,7 @@ class AgentCore:
             ModelInvocationContext(
                 run_id=controller.run_id,
                 turn_id=options.turn_id,
+                requested_reasoning_mode=options.reasoning_mode,
                 deadline_at_ms=options.deadline_at_ms,
             ),
         )
@@ -1956,6 +1958,7 @@ class AgentCore:
                 controller.run_id,
                 request,
                 prepared_request.messages,
+                options.reasoning_mode,
             )
         return _PreparedRuntimePhase(
             request=request,
@@ -2022,6 +2025,7 @@ class AgentCore:
                         context=ModelInvocationContext(
                             run_id=controller.run_id,
                             turn_id=options.turn_id,
+                            requested_reasoning_mode=options.reasoning_mode,
                             deadline_at_ms=options.deadline_at_ms,
                         ),
                         signal=signal,

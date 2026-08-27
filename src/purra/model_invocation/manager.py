@@ -146,7 +146,7 @@ class AgentModelInvocationManager:
         *,
         on_attempt: Callable[[Mapping[str, object]], Awaitable[None]] | None = None,
     ) -> ManagedInvocationStream:
-        self._validate_call(call, public_stream_allowed=True)
+        self._validate_call(call, context, public_stream_allowed=True)
         invocation = _invocation(call)
         receipt, spec = self._receipt_and_spec(messages, call, context, invocation)
         if on_attempt is not None:
@@ -231,7 +231,7 @@ class AgentModelInvocationManager:
         *,
         on_attempt: Callable[[Mapping[str, object]], Awaitable[None]] | None = None,
     ) -> ManagedInvocationCompletion:
-        self._validate_call(call, public_stream_allowed=False)
+        self._validate_call(call, context, public_stream_allowed=False)
         invocation = _invocation(call)
         receipt, spec = self._receipt_and_spec(messages, call, context, invocation)
         if on_attempt is not None:
@@ -322,11 +322,19 @@ class AgentModelInvocationManager:
     @staticmethod
     def _validate_call(
         call: AgentModelCall,
+        context: ModelInvocationContext,
         *,
         public_stream_allowed: bool,
     ) -> None:
         if not isinstance(call, AgentModelCall):
             raise TypeError("model invocation manager requires an AgentModelCall")
+        if not isinstance(context, ModelInvocationContext):
+            raise TypeError("model invocation requires a ModelInvocationContext")
+        if call.reasoning_mode is not context.requested_reasoning_mode:
+            raise ContractViolationError(
+                "model call reasoning mode differs from the Run request",
+                code="model_reasoning_mode_conflict",
+            )
         if call.requires_full_text_validation and call.commit_mode is OutputCommitMode.LIVE:
             raise ContractViolationError(
                 "full-text validation cannot use live output"

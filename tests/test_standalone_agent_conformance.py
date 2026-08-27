@@ -156,8 +156,9 @@ class _Planner:
         *,
         run_id=None,
         turn_id=None,
+        reasoning_mode=None,
     ):
-        del request, capabilities, signal, run_id, turn_id
+        del request, capabilities, signal, run_id, turn_id, reasoning_mode
         self.calls += 1
         return PlanningResult(
             kind=PlanningKind.PLANNED,

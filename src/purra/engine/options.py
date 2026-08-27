@@ -139,6 +139,16 @@ class AgentCoreRunOptions:
             RunProvenance,
         ):
             raise TypeError("run provenance must be a RunProvenance value")
+        if (
+            self.provenance is not None
+            and self.provenance.execution_intent is not None
+            and ReasoningMode(
+                self.provenance.execution_intent.requested_reasoning_mode
+            ) is not self.reasoning_mode
+        ):
+            raise ValueError(
+                "run reasoning mode differs from the persisted execution intent"
+            )
         if self.binding is not None and not isinstance(self.binding, RunBinding):
             raise TypeError("run binding must be a RunBinding value")
         if not isinstance(self.response_constraints, ResponseConstraints):

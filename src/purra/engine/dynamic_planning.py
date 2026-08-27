@@ -11,6 +11,7 @@ from purra.contracts import (
     AgentRunRequest,
     PlanningCapabilities,
     PlanningTurn,
+    ReasoningMode,
     StepExecutor,
     StepStatus,
     StepType,
@@ -52,6 +53,7 @@ class DynamicPlanningOrchestrator:
         enabled_names: frozenset[str],
         registrations: Sequence[ToolRegistration],
         turn_id: str | None = None,
+        reasoning_mode: ReasoningMode = ReasoningMode.DEFAULT,
     ) -> None:
         self._planner = planner
         self._request = request
@@ -60,6 +62,7 @@ class DynamicPlanningOrchestrator:
         self._enabled_names = enabled_names
         self._registrations = tuple(registrations)
         self._turn_id = str(turn_id or "").strip() or None
+        self._reasoning_mode = ReasoningMode(reasoning_mode)
         self._revision = 0
 
     async def replan_after_tool(
@@ -111,6 +114,7 @@ class DynamicPlanningOrchestrator:
                     signal,
                     run_id=self._controller.run_id,
                     turn_id=self._turn_id,
+                    reasoning_mode=self._reasoning_mode,
                 ),
                 signal,
             )

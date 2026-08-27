@@ -235,6 +235,7 @@ class AgentPlanner:
         *,
         run_id: str | None = None,
         turn_id: str | None = None,
+        reasoning_mode: ReasoningMode = ReasoningMode.DEFAULT,
     ) -> PlanningResult:
         return await self._create_from_messages(
             request,
@@ -245,6 +246,7 @@ class AgentPlanner:
             turn=None,
             run_id=run_id,
             turn_id=turn_id,
+            reasoning_mode=reasoning_mode,
         )
 
     async def revise_plan(
@@ -256,6 +258,7 @@ class AgentPlanner:
         *,
         run_id: str | None = None,
         turn_id: str | None = None,
+        reasoning_mode: ReasoningMode = ReasoningMode.DEFAULT,
     ) -> PlanningResult:
         max_tool_steps = min(
             self._limits.max_tool_steps,
@@ -276,6 +279,7 @@ class AgentPlanner:
             turn=turn,
             run_id=run_id,
             turn_id=turn_id,
+            reasoning_mode=reasoning_mode,
         )
 
     async def _create_from_messages(
@@ -289,6 +293,7 @@ class AgentPlanner:
         turn: PlanningTurn | None,
         run_id: str | None,
         turn_id: str | None,
+        reasoning_mode: ReasoningMode,
     ) -> PlanningResult:
         completion, model_call_parameters = await self._complete(
             messages,
@@ -296,6 +301,7 @@ class AgentPlanner:
             signal,
             run_id=run_id,
             turn_id=turn_id,
+            reasoning_mode=reasoning_mode,
         )
         active_messages = messages
         for repair_attempt in range(limits.max_repair_attempts + 1):
@@ -327,6 +333,7 @@ class AgentPlanner:
                     signal,
                     run_id=run_id,
                     turn_id=turn_id,
+                    reasoning_mode=reasoning_mode,
                 )
                 model_call_parameters += repair_call_parameters
         return PlanningResult(
@@ -372,6 +379,7 @@ class AgentPlanner:
         *,
         run_id: str | None,
         turn_id: str | None,
+        reasoning_mode: ReasoningMode,
     ) -> tuple[
         ModelCompletion,
         tuple[Mapping[str, Any], ...],
@@ -399,6 +407,7 @@ class AgentPlanner:
             signal,
             run_id=run_id,
             turn_id=turn_id,
+            reasoning_mode=reasoning_mode,
         )
         return completion, parameters, repair_messages
 
@@ -410,6 +419,7 @@ class AgentPlanner:
         *,
         run_id: str | None,
         turn_id: str | None,
+        reasoning_mode: ReasoningMode,
     ) -> tuple[ModelCompletion, tuple[Mapping[str, Any], ...]]:
         result = await self._model_manager.complete(
             messages,
@@ -418,11 +428,12 @@ class AgentPlanner:
                 output_intent=AgentOutputIntent.STRUCTURED_PRIVATE,
                 commit_mode=OutputCommitMode.PRIVATE,
                 requires_full_text_validation=True,
-                reasoning_mode=ReasoningMode.DISABLED,
+                reasoning_mode=reasoning_mode,
             ),
             ModelInvocationContext(
                 run_id=run_id or f"planner-{uuid4().hex}",
                 turn_id=turn_id,
+                requested_reasoning_mode=reasoning_mode,
             ),
             signal,
         )

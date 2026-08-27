@@ -20,6 +20,7 @@ from purra.contracts import (
     MessageRole,
     RuntimeLimits,
     RuntimeOutcome,
+    ReasoningMode,
     ToolCall,
     ToolExecutionLimits,
 )
@@ -61,6 +62,7 @@ from purra.tools import CoreToolExecutor, InMemoryToolCatalog
 @dataclass(frozen=True, slots=True)
 class _BoundRun:
     request: AgentRunRequest
+    reasoning_mode: ReasoningMode
 
 
 class DynamicDelegatedAgentExecutor:
@@ -128,11 +130,15 @@ class DynamicDelegatedAgentExecutor:
         run_id: str,
         request: AgentRunRequest,
         prepared_messages: Sequence[AgentMessage],
+        reasoning_mode: ReasoningMode,
     ) -> None:
         del prepared_messages
         if run_id in self._runs:
             raise ContractViolationError("delegation Run is already bound")
-        self._runs[run_id] = _BoundRun(request=request)
+        self._runs[run_id] = _BoundRun(
+            request=request,
+            reasoning_mode=ReasoningMode(reasoning_mode),
+        )
 
     def release_run(self, run_id: str) -> None:
         self._runs.pop(run_id, None)
@@ -158,6 +164,7 @@ class DynamicDelegatedAgentExecutor:
         invocation_context = ModelInvocationContext(
             run_id=request.run_id,
             turn_id=request.delegation_id,
+            requested_reasoning_mode=bound.reasoning_mode,
         )
         model_tasks = AgentModelTaskRunner(
             self._model_manager,
@@ -248,6 +255,7 @@ class DynamicDelegatedAgentExecutor:
             output_limit=output_limit,
             scope_tools_to_observer=False,
             response_transaction_mode=ResponseTransactionMode.VALIDATED_RESULT,
+            reasoning_mode=bound.reasoning_mode,
             signal=signal,
         ):
             if isinstance(update, AgentEvent):

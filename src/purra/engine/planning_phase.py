@@ -13,6 +13,7 @@ from purra.contracts import (
     PlanningCapabilities,
     PlanningKind,
     RuntimeLimits,
+    ReasoningMode,
     ExecutionPlan,
     StepExecutor,
     TraceRecord,
@@ -95,6 +96,7 @@ class PlanningCapability:
         controller: AgentRunController,
         signal: CancellationSignal | None,
         turn_id: str | None,
+        reasoning_mode: ReasoningMode,
     ) -> PlanningPhaseResult:
         started = perf_counter()
         capabilities: PlanningCapabilities | None = None
@@ -142,6 +144,7 @@ class PlanningCapability:
                         signal,
                         run_id=controller.run_id,
                         turn_id=turn_id,
+                        reasoning_mode=reasoning_mode,
                     ),
                     signal,
                 )
@@ -301,6 +304,7 @@ class PlanningCapability:
                         enabled_names=enabled_names,
                         registrations=registrations,
                         turn_id=turn_id,
+                        reasoning_mode=reasoning_mode,
                     )
                     if should_plan
                     and plan is not None

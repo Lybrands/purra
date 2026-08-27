@@ -132,12 +132,11 @@ class ModelProtocolCapabilities:
 
     def reasoning_mode_is_supported(self, mode: object) -> bool:
         value = str(getattr(mode, "value", mode) or "").strip().lower()
-        enabled = value in {"default", "enabled"}
         if self.reasoning_control is ReasoningControl.SELECTABLE:
             return value in {"default", "enabled", "disabled"}
         if self.reasoning_control is ReasoningControl.ALWAYS_ENABLED:
-            return enabled
-        return value == "disabled"
+            return value in {"default", "enabled"}
+        return value in {"default", "disabled"}
 
 
 @dataclass(frozen=True, slots=True)

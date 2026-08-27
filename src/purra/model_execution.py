@@ -23,7 +23,6 @@ from purra.contracts import (
     ResponseValidationResult,
 )
 from purra.errors import ModelGatewayError, ResponseJudgeContractError
-from purra.json_values import thaw_json_mapping
 from purra.model_invocation import (
     AgentModelCall,
     AgentModelInvocationManager,
@@ -52,7 +51,7 @@ class AgentModelTask:
 
     request: ModelRequest
     output_limit: InvocationOutputLimit | None = None
-    reasoning_mode: ReasoningMode = ReasoningMode.DEFAULT
+    reasoning_mode: ReasoningMode | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.request, ModelRequest):
@@ -64,11 +63,12 @@ class AgentModelTask:
         if not isinstance(limit, InvocationOutputLimit):
             raise TypeError("managed model call requires an InvocationOutputLimit")
         object.__setattr__(self, "output_limit", limit)
-        object.__setattr__(
-            self,
-            "reasoning_mode",
-            ReasoningMode(self.reasoning_mode),
-        )
+        if self.reasoning_mode is not None:
+            object.__setattr__(
+                self,
+                "reasoning_mode",
+                ReasoningMode(self.reasoning_mode),
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,7 +125,7 @@ class AgentModelTaskRunner:
     ) -> AgentModelTaskCompletion:
         managed = await self._manager.complete(
             messages,
-            _agent_call(call),
+            _agent_call(call, self._context.requested_reasoning_mode),
             self._context,
             signal,
             on_attempt=on_attempt,
@@ -148,7 +148,7 @@ class AgentModelTaskRunner:
     ) -> AgentModelTaskStream:
         managed = await self._manager.stream(
             messages,
-            _agent_call(call),
+            _agent_call(call, self._context.requested_reasoning_mode),
             self._context,
             signal,
             on_attempt=on_attempt,
@@ -276,8 +276,7 @@ class AgentModelResponseJudge:
             await self.model_tasks.complete(
                 judge_messages,
                 AgentModelTask(
-                    request=_deterministic_private_request(self.model_request),
-                    reasoning_mode=ReasoningMode.DISABLED,
+                    request=self.model_request,
                 ),
                 signal,
             )
@@ -296,29 +295,16 @@ class AgentModelResponseJudge:
         )
 
 
-def _deterministic_private_request(request: ModelRequest) -> ModelRequest:
-    caller_options = thaw_json_mapping(request.options)
-    options = {
-        key: caller_options[key]
-        for key in ("baseURL", "max_tokens")
-        if key in caller_options
-    }
-    options["temperature"] = 0
-    return ModelRequest(
-        provider=request.provider,
-        model=request.model,
-        capability_snapshot=request.capability_snapshot,
-        options=options,
-    )
-
-
-def _agent_call(call: AgentModelTask) -> AgentModelCall:
+def _agent_call(
+    call: AgentModelTask,
+    inherited_reasoning_mode: ReasoningMode,
+) -> AgentModelCall:
     return AgentModelCall(
         request=call.request,
         output_intent=AgentOutputIntent.STRUCTURED_PRIVATE,
         commit_mode=OutputCommitMode.PRIVATE,
         requires_full_text_validation=True,
-        reasoning_mode=call.reasoning_mode,
+        reasoning_mode=call.reasoning_mode or inherited_reasoning_mode,
         output_limit=call.output_limit,
     )
 

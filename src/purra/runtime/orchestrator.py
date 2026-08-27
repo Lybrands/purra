@@ -297,6 +297,7 @@ class AgentRuntime:
             run_id=run_id,
             turn_id=turn_id,
             force_tool_choice=force_tool_choice,
+            reasoning_mode=reasoning_mode,
             require_tool_call=require_tool_call,
             tool_context_contracts=tool_context_contracts,
             tool_argument_limits=tool_argument_limits,
@@ -1803,6 +1804,7 @@ class AgentRuntime:
         run_id: RunId | None,
         turn_id: str | None,
         force_tool_choice: bool,
+        reasoning_mode: ReasoningMode,
         require_tool_call: bool | None,
         tool_context_contracts: Mapping[str, ToolContextContract] | None,
         tool_argument_limits: Mapping[str, int] | None,
@@ -1848,6 +1850,7 @@ class AgentRuntime:
             invocation_context=ModelInvocationContext(
                 run_id=str(run_id or f"runtime-{uuid4().hex}"),
                 turn_id=turn_id,
+                requested_reasoning_mode=reasoning_mode,
                 tool_argument_limits=tool_argument_limits or {},
             ),
             execution_state=execution_state or ExecutionState(),

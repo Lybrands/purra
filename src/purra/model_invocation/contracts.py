@@ -29,6 +29,7 @@ from purra.output.contracts import AgentOutputIntent, OutputCommitMode
 class ModelInvocationContext:
     run_id: RunId
     turn_id: str | None = None
+    requested_reasoning_mode: ReasoningMode = ReasoningMode.DEFAULT
     deadline_at_ms: int | None = None
     deadline_code: str = "run_deadline_exceeded"
     attempt_source_key: str | None = None
@@ -37,6 +38,11 @@ class ModelInvocationContext:
     def __post_init__(self) -> None:
         object.__setattr__(self, "run_id", required_text(self.run_id, "run id"))
         object.__setattr__(self, "turn_id", optional_text(self.turn_id))
+        object.__setattr__(
+            self,
+            "requested_reasoning_mode",
+            ReasoningMode(self.requested_reasoning_mode),
+        )
         object.__setattr__(
             self,
             "attempt_source_key",
