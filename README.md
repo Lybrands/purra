@@ -38,6 +38,19 @@ The host supplies Provider adapters, tools, business authorization, and
 production persistence. See [Architecture](https://github.com/Lybrands/purra/blob/main/ARCHITECTURE.md)
 for runtime guarantees and ownership boundaries.
 
+## Output-token contracts
+
+PurrA 0.5.0 separates the per-invocation model limit from the cumulative Run
+budget. Python uses `max_call_output_tokens` and
+`max_run_output_tokens`; TypeScript uses
+`maxCallOutputTokens` and `maxRunOutputTokens`.
+
+Run creation must state the cumulative budget explicitly. Use `None` in Python
+or `null` in TypeScript only when the host deliberately chooses no finite
+cumulative token limit. Provider gateways must also acknowledge the exact
+per-invocation limit they applied; omission or mismatch is a contract error.
+PurrA 0.5.0 does not alias or migrate older output-token field names.
+
 ## Compatibility
 
 PurrA is pre-1.0. Breaking public-contract changes require a new minor release.

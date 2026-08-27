@@ -4,7 +4,8 @@ import type { DelegationRepository } from "../delegation/types.js";
 import { claimFromUnit } from "../durable/repository.js";
 import type { LongTaskRepository } from "../durable/types.js";
 import type { JsonValue, ModelGateway, ModelRequest } from "../model/types.js";
-import { copyCapabilitySnapshot, validateModelTurn } from "../model/validation.js";
+import { invokeModel } from "../model/stream.js";
+import { copyCapabilitySnapshot } from "../model/validation.js";
 import type { OutputEvent, OutputPublisher } from "../output/types.js";
 import { AgentError } from "../shared/errors.js";
 import { ToolCatalog } from "../tools/catalog.js";
@@ -24,7 +25,7 @@ export async function assertModelGatewayConforms(input: {
     messages: Object.freeze([{ role: "user" as const, content: "conformance probe" }]),
     tools: Object.freeze([]),
   });
-  const turn = validateModelTurn(await input.gateway.invoke(request));
+  const turn = await invokeModel(input.gateway, request, undefined, false);
   if (turn.finishReason !== "stop" || (turn.message.toolCalls?.length ?? 0) !== 0) {
     nonconforming("model_gateway_nonconforming", "Model probe requires one terminal assistant turn");
   }
@@ -149,7 +150,7 @@ export async function assertLongTaskRepositoryConforms(repository: LongTaskRepos
     budgets: Object.freeze({
       maxInvocationAttempts: 1,
       maxInputTokens: null,
-      maxOutputTokens: null,
+      maxRunOutputTokens: null,
       maxReasoningTokens: null,
     }),
   });

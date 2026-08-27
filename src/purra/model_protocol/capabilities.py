@@ -143,14 +143,15 @@ class ModelProtocolCapabilities:
 class ModelOutputCapabilities:
     """Objective model output limits and token-accounting facts."""
 
-    max_output_tokens: int | None = None
+    max_call_output_tokens: int | None = None
     thinking_token_accounting: ThinkingTokenAccounting = (
         ThinkingTokenAccounting.UNKNOWN
     )
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "max_output_tokens", optional_positive_int(
-            self.max_output_tokens, "model max output tokens"
+        object.__setattr__(self, "max_call_output_tokens", optional_positive_int(
+            self.max_call_output_tokens,
+            "model max tokens per invocation",
         ))
         object.__setattr__(
             self,
@@ -160,7 +161,7 @@ class ModelOutputCapabilities:
 
     def to_mapping(self) -> dict[str, object]:
         return {
-            "maxOutputTokens": self.max_output_tokens,
+            "maxCallOutputTokens": self.max_call_output_tokens,
             "thinkingTokenAccounting": self.thinking_token_accounting.value,
         }
 
@@ -173,7 +174,7 @@ class ModelCapabilitySnapshot:
     profile_id: str
     provider_protocol: str
     context_window_tokens: int
-    max_output_tokens: int | None
+    max_call_output_tokens: int | None
     thinking_token_accounting: ThinkingTokenAccounting
     protocol: ModelProtocolCapabilities
     actionable: bool = True
@@ -192,8 +193,9 @@ class ModelCapabilitySnapshot:
         object.__setattr__(self, "context_window_tokens", positive_int(
             self.context_window_tokens, "capability snapshot context window"
         ))
-        object.__setattr__(self, "max_output_tokens", optional_positive_int(
-            self.max_output_tokens, "capability snapshot max output tokens"
+        object.__setattr__(self, "max_call_output_tokens", optional_positive_int(
+            self.max_call_output_tokens,
+            "capability snapshot max tokens per invocation",
         ))
         object.__setattr__(
             self,
@@ -211,7 +213,7 @@ class ModelCapabilitySnapshot:
     @property
     def output(self) -> ModelOutputCapabilities:
         return ModelOutputCapabilities(
-            max_output_tokens=self.max_output_tokens,
+            max_call_output_tokens=self.max_call_output_tokens,
             thinking_token_accounting=self.thinking_token_accounting,
         )
 
@@ -221,7 +223,7 @@ class ModelCapabilitySnapshot:
             "profileId": self.profile_id,
             "providerProtocol": self.provider_protocol,
             "contextWindowTokens": self.context_window_tokens,
-            "maxOutputTokens": self.max_output_tokens,
+            "maxCallOutputTokens": self.max_call_output_tokens,
             "thinkingTokenAccounting": self.thinking_token_accounting.value,
             "protocol": self.protocol.to_mapping(),
             "actionable": self.actionable,
@@ -247,7 +249,7 @@ def generic_capability_snapshot() -> ModelCapabilitySnapshot:
         profile_id="generic",
         provider_protocol="custom",
         context_window_tokens=200_000,
-        max_output_tokens=None,
+        max_call_output_tokens=None,
         thinking_token_accounting=ThinkingTokenAccounting.UNKNOWN,
         protocol=ModelProtocolCapabilities(),
         actionable=True,

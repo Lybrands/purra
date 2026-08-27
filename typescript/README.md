@@ -17,6 +17,8 @@ import { Agent } from "purra";
 const agent = new Agent({ model: yourModelGateway });
 const run = await agent.submit({
   messages: [{ role: "user", content: "Hello" }],
+}, {
+  budgets: { maxRunOutputTokens: null },
 });
 
 for await (const event of run.events()) {
@@ -34,6 +36,22 @@ The host supplies the `ModelGateway`. `invoke()` returns a process-local result,
 `stream()` exposes provisional events, and `submit()` creates a canonical Run
 with replay, cancellation, and budgets. Built-in repositories are in-memory;
 inject production implementations for restart safety or multiple workers.
+
+## Output-token limits
+
+PurrA 0.5.0 uses different names for different scopes:
+
+- `maxCallOutputTokens` limits one Provider call.
+- `maxRunOutputTokens` limits all model output charged to a Run.
+
+`submit()` requires the cumulative budget to be explicit; `null` deliberately
+means no finite cumulative token limit. PurrA 0.5.0 does not alias or migrate
+older output-token field names.
+
+When PurrA sends `ModelRequest.outputLimit`, the `ModelGateway` must return the
+same value as `ModelTurn.appliedOutputLimit` or
+`ModelStream.appliedOutputLimit`. Missing or mismatched acknowledgments fail
+before model output is committed.
 
 ## Tools
 

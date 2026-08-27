@@ -119,7 +119,7 @@ function remainingBudgets(run: RunSnapshot): RunBudgets {
     run.usage.unreportedUsageAttempts > 0
     && (
       run.budgets.maxInputTokens !== null
-      || run.budgets.maxOutputTokens !== null
+      || run.budgets.maxRunOutputTokens !== null
       || run.budgets.maxReasoningTokens !== null
     )
   ) {
@@ -131,7 +131,10 @@ function remainingBudgets(run: RunSnapshot): RunBudgets {
   return Object.freeze({
     maxModelAttempts: remaining(run.budgets.maxModelAttempts, run.usage.modelAttempts),
     maxInputTokens: remaining(run.budgets.maxInputTokens, run.usage.inputTokens),
-    maxOutputTokens: remaining(run.budgets.maxOutputTokens, run.usage.outputTokens),
+    maxRunOutputTokens: remaining(
+      run.budgets.maxRunOutputTokens,
+      run.usage.outputTokens,
+    ),
     maxReasoningTokens: remaining(run.budgets.maxReasoningTokens, run.usage.reasoningTokens),
     maxOutputBytes: remaining(run.budgets.maxOutputBytes, run.usage.outputBytes),
     maxOutputEvents: remaining(run.budgets.maxOutputEvents, run.usage.outputEvents),
@@ -152,7 +155,10 @@ function copyBudgets(value: RunBudgets): RunBudgets {
   return Object.freeze({
     maxModelAttempts: nullablePositive(value.maxModelAttempts, "maxModelAttempts"),
     maxInputTokens: nullablePositive(value.maxInputTokens, "maxInputTokens"),
-    maxOutputTokens: nullablePositive(value.maxOutputTokens, "maxOutputTokens"),
+    maxRunOutputTokens: nullablePositive(
+      value.maxRunOutputTokens,
+      "maxRunOutputTokens",
+    ),
     maxReasoningTokens: nullablePositive(value.maxReasoningTokens, "maxReasoningTokens"),
     maxOutputBytes: nullablePositive(value.maxOutputBytes, "maxOutputBytes"),
     maxOutputEvents: nullablePositive(value.maxOutputEvents, "maxOutputEvents"),

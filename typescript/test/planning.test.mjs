@@ -14,6 +14,10 @@ const planningFixture = JSON.parse(readFileSync(
   "utf8",
 ));
 
+const RUN_OPTIONS = Object.freeze({
+  budgets: Object.freeze({ maxRunOutputTokens: null }),
+});
+
 test("Reactive Agent never invokes an unrelated Planner", async () => {
   let plannerCalls = 0;
   const planner = { createPlan() { plannerCalls += 1; throw new Error("must not run"); } };
@@ -54,7 +58,7 @@ test("Planned Agent compiles public capability into current private runtime auth
     planning: { planner, policy: new ToolPlanningPolicy() },
   });
 
-  const handle = await agent.submit({ messages: [user("weather")] });
+  const handle = await agent.submit({ messages: [user("weather")] }, RUN_OPTIONS);
   assert.equal((await handle.result).output, "sunny");
   assert.equal(plannerCalls, 1);
   assert.equal(toolCalls, 1);
@@ -237,7 +241,9 @@ test("staged task context is selected only after a valid TaskSpec", async () => 
       capabilities: capabilities(),
       async invoke(request) {
         received = request.messages;
-        return request.tools.length === 0 ? finalTurn("done") : callsTurn("read");
+        return request.tools.length === 0
+          ? finalTurn("done", request)
+          : callsTurn("read", request);
       },
     },
     tools: [readTool("read")],
@@ -480,11 +486,17 @@ function user(content) {
   return { role: "user", content };
 }
 
-function finalTurn(content) {
-  return { message: { role: "assistant", content }, finishReason: "stop" };
+function finalTurn(content, request) {
+  return {
+    message: { role: "assistant", content },
+    finishReason: "stop",
+    ...(request === undefined
+      ? {}
+      : { appliedOutputLimit: request.outputLimit?.maxTokens }),
+  };
 }
 
-function callsTurn(name) {
+function callsTurn(name, request) {
   return {
     message: {
       role: "assistant",
@@ -492,6 +504,9 @@ function callsTurn(name) {
       toolCalls: [{ id: `call-${name}`, name, arguments: {} }],
     },
     finishReason: "tool_calls",
+    ...(request === undefined
+      ? {}
+      : { appliedOutputLimit: request.outputLimit?.maxTokens }),
   };
 }
 
@@ -505,7 +520,7 @@ function capabilities() {
     profileId: "planning-test",
     providerProtocol: "fixture",
     contextWindowTokens: 8_000,
-    maxOutputTokens: 1_000,
+    maxCallOutputTokens: 1_000,
     thinkingTokenAccounting: "included",
     protocol: {
       reasoningControl: "unavailable",

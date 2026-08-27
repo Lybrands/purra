@@ -115,7 +115,10 @@ export function copyLongTaskBudgets(value: LongTaskBudgetLimits): LongTaskBudget
   return Object.freeze({
     maxInvocationAttempts: nullableNonNegative(value.maxInvocationAttempts, "maxInvocationAttempts"),
     maxInputTokens: nullableNonNegative(value.maxInputTokens, "maxInputTokens"),
-    maxOutputTokens: nullableNonNegative(value.maxOutputTokens, "maxOutputTokens"),
+    maxRunOutputTokens: nullableNonNegative(
+      value.maxRunOutputTokens,
+      "maxRunOutputTokens",
+    ),
     maxReasoningTokens: nullableNonNegative(value.maxReasoningTokens, "maxReasoningTokens"),
   });
 }

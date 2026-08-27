@@ -63,6 +63,7 @@ export async function invokeModel(
         gateway.invoke(request, stop.signal),
         stop.signal,
       ));
+      requireAppliedOutputLimit(request, turn.appliedOutputLimit, turn.usage);
       throwIfCanceled(stop.signal);
       return turn;
     }
@@ -71,7 +72,20 @@ export async function invokeModel(
       stop.signal,
     );
     throwIfCanceled(stop.signal);
-    return await consumeModelStream(stream, stop, onChunk, limits);
+    const appliedOutputLimit = stream.appliedOutputLimit === undefined
+      ? undefined
+      : stream.appliedOutputLimit === null
+      ? null
+      : positiveInteger(stream.appliedOutputLimit, "applied output limit");
+    requireAppliedOutputLimit(request, appliedOutputLimit);
+    return await consumeModelStream(
+      stream,
+      stop,
+      onChunk,
+      limits,
+      request,
+      appliedOutputLimit,
+    );
   } catch (error) {
     if (stop.signal.aborted) {
       if (stop.signal.reason instanceof AgentError) throw stop.signal.reason;
@@ -93,6 +107,8 @@ async function consumeModelStream(
   stop: InvocationStop,
   onChunk: ((chunk: ModelStreamChunk) => Promise<void> | void) | undefined,
   limits: ModelStreamLimits,
+  request: ModelRequest,
+  appliedOutputLimit: number | null | undefined,
 ): Promise<ModelTurn> {
   if (stream === null || typeof stream?.[Symbol.asyncIterator] !== "function") {
     throw new AgentError("invalid_model_response", "Model gateway returned an invalid stream");
@@ -172,11 +188,49 @@ async function consumeModelStream(
     ...(reasoningText.trim() === "" ? {} : { reasoning: reasoningText }),
     ...(toolCalls.length === 0 ? {} : { toolCalls }),
   };
-  return validateModelTurn({
+  const turn = validateModelTurn({
     message,
     finishReason,
+    ...(appliedOutputLimit === undefined ? {} : { appliedOutputLimit }),
     ...(usage === undefined ? {} : { usage }),
   });
+  requireAppliedOutputLimit(request, appliedOutputLimit, turn.usage);
+  return turn;
+}
+
+function requireAppliedOutputLimit(
+  request: ModelRequest,
+  appliedOutputLimit: number | null | undefined,
+  usage?: ModelTokenUsage,
+): void {
+  const expected = request.outputLimit?.maxTokens;
+  if (expected === undefined && appliedOutputLimit === undefined) return;
+  if (appliedOutputLimit !== expected) {
+    throw new AgentError(
+      "model_gateway_contract_violation",
+      `Model gateway applied output limit ${String(appliedOutputLimit)} instead of ${String(expected)}`,
+    );
+  }
+  if (
+    expected !== undefined
+    && usage?.outputTokens !== undefined
+    && usage.outputTokens > expected
+  ) {
+    throw new AgentError(
+      "model_gateway_contract_violation",
+      "Model gateway reported output usage above the applied invocation limit",
+    );
+  }
+}
+
+function positiveInteger(value: unknown, label: string): number {
+  if (!Number.isSafeInteger(value) || (value as number) < 1) {
+    throw new AgentError(
+      "model_gateway_contract_violation",
+      `${label} must be a positive integer or null`,
+    );
+  }
+  return value as number;
 }
 
 function mergeToolCallDelta(

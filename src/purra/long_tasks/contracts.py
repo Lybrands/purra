@@ -133,14 +133,14 @@ class LongTaskBudgetLimits:
 
     max_invocation_attempts: int | None = None
     max_input_tokens: int | None = None
-    max_output_tokens: int | None = None
+    max_run_output_tokens: int | None = None
     max_reasoning_tokens: int | None = None
 
     def __post_init__(self) -> None:
         for name in (
             "max_invocation_attempts",
             "max_input_tokens",
-            "max_output_tokens",
+            "max_run_output_tokens",
             "max_reasoning_tokens",
         ):
             object.__setattr__(
@@ -156,7 +156,9 @@ class LongTaskBudgetLimits:
         return {
             "maxInvocationAttempts": self.max_invocation_attempts,
             "maxInputTokens": self.max_input_tokens,
-            "maxOutputTokens": self.max_output_tokens,
+            "maxRunOutputTokens": (
+                self.max_run_output_tokens
+            ),
             "maxReasoningTokens": self.max_reasoning_tokens,
         }
 

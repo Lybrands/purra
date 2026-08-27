@@ -21,6 +21,10 @@ import {
   ToolPlanningPolicy,
 } from "purra";
 
+const RUN_OPTIONS = Object.freeze({
+  budgets: Object.freeze({ maxRunOutputTokens: null }),
+});
+
 let round = 0;
 const events = [];
 const handle = await new Agent({
@@ -95,7 +99,7 @@ const handle = await new Agent({
       },
     },
   },
-}).submit({ messages: [{ role: "user", content: "hello" }] });
+}).submit({ messages: [{ role: "user", content: "hello" }] }, RUN_OPTIONS);
 const result = await handle.result;
 for await (const event of handle.events()) events.push(event);
 const allEvents = [];
@@ -257,7 +261,7 @@ const delegationHandle = await new Agent({
     },
   },
   delegation: { policy: { maxAgentsPerCall: 1, maxParallel: 1 } },
-}).submit({ messages: [{ role: "user", content: "delegate" }] });
+}).submit({ messages: [{ role: "user", content: "delegate" }] }, RUN_OPTIONS);
 assert.equal((await delegationHandle.result).output, "installed root");
 const delegationEvents = [];
 for await (const event of delegationHandle.events()) delegationEvents.push(event);
@@ -320,7 +324,7 @@ const installedTreeAgent = new Agent({
 const installedTreeHandle = await installedTreeAgent.submit({
   messages: [{ role: "user", content: "Run the installed Agent tree." }],
   enabledTools: ["delegateToAgents"],
-});
+}, RUN_OPTIONS);
 assert.equal((await installedTreeHandle.result).output, "installed tree root done");
 assert.equal((await installedTreeHandle.snapshot()).preset.schemaVersion, 5);
 assert.deepEqual(
@@ -489,7 +493,7 @@ const managedHandle = await new Agent({
     }],
     maxAttempts: 1,
   },
-}).submit({ messages: [{ role: "user", content: "managed" }] });
+}).submit({ messages: [{ role: "user", content: "managed" }] }, RUN_OPTIONS);
 assert.equal((await managedHandle.result).output, "installed managed response");
 assert.deepEqual(managedFactoryRunIds, [
   managedHandle.runId,
@@ -518,7 +522,7 @@ function capabilities() {
     profileId: "installed",
     providerProtocol: "custom",
     contextWindowTokens: 16_000,
-    maxOutputTokens: 512,
+    maxCallOutputTokens: 512,
     thinkingTokenAccounting: "unknown",
     protocol: {
       reasoningControl: "selectable",
@@ -584,7 +588,7 @@ function durableInput() {
     budgets: {
       maxModelAttempts: 2,
       maxInputTokens: 100,
-      maxOutputTokens: 100,
+      maxRunOutputTokens: 100,
       maxReasoningTokens: 100,
       maxOutputBytes: 1_000,
       maxOutputEvents: 100,

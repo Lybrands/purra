@@ -15,6 +15,10 @@ const fixture = JSON.parse(await readFile(
   "utf8",
 ));
 
+const RUN_OPTIONS = Object.freeze({
+  budgets: Object.freeze({ maxRunOutputTokens: null }),
+});
+
 test("shared delegation policy and aggregation stay aligned with Python", async () => {
   assert.deepEqual(new DelegationPolicy().snapshot(), fixture.policy);
   for (const scenario of fixture.aggregationCases) {
@@ -241,7 +245,7 @@ test("Agent delegation stays in one Root Run with isolated context and read tool
   }).submit({
     messages: [{ role: "user", content: "parent-private-secret" }],
     enabledTools: ["lookup", "mutate", "delegateToAgents"],
-  });
+  }, RUN_OPTIONS);
   assert.equal((await handle.result).output, "root result");
   const events = [];
   for await (const event of handle.events({ visibility: "all" })) events.push(event);
@@ -263,16 +267,25 @@ test("delegated Agents resolve managed context factories inside the same Root Ru
     capabilities: capabilities(),
     async invoke(request) {
       if (request.messages[0]?.content === "derive context") {
-        return { message: { role: "assistant", content: "derived fact" }, finishReason: "stop" };
+        return acknowledged(
+          { message: { role: "assistant", content: "derived fact" }, finishReason: "stop" },
+          request,
+        );
       }
       if (request.messages[0]?.attributes?.delegatedAgentDefinition === "model") {
-        return { message: { role: "assistant", content: "delegated result" }, finishReason: "stop" };
+        return acknowledged(
+          { message: { role: "assistant", content: "delegated result" }, finishReason: "stop" },
+          request,
+        );
       }
       if (request.tools.length === 0) {
-        return { message: { role: "assistant", content: "root result" }, finishReason: "stop" };
+        return acknowledged(
+          { message: { role: "assistant", content: "root result" }, finishReason: "stop" },
+          request,
+        );
       }
       rootRound += 1;
-      return rootRound === 1
+      return acknowledged(rootRound === 1
         ? {
             message: {
               role: "assistant",
@@ -290,7 +303,7 @@ test("delegated Agents resolve managed context factories inside the same Root Ru
             },
             finishReason: "tool_calls",
           }
-        : { message: { role: "assistant", content: "root result" }, finishReason: "stop" };
+        : { message: { role: "assistant", content: "root result" }, finishReason: "stop" }, request);
     },
   };
   const handle = await new Agent({
@@ -311,7 +324,7 @@ test("delegated Agents resolve managed context factories inside the same Root Ru
   }).submit({
     messages: [{ role: "user", content: "delegate" }],
     enabledTools: ["delegateToAgents"],
-  });
+  }, RUN_OPTIONS);
 
   assert.equal((await handle.result).output, "root result");
   assert.deepEqual(factoryRunIds, [handle.runId, handle.runId]);
@@ -374,7 +387,7 @@ test("custom delegated executors receive only enabled read-tool names", async ()
   }).submit({
     messages: [{ role: "user", content: "delegate" }],
     enabledTools: ["read", "write", "delegateToAgents"],
-  });
+  }, RUN_OPTIONS);
   await handle.result;
   assert.deepEqual(delegatedTools, ["read"]);
 });
@@ -385,7 +398,7 @@ function capabilities() {
     profileId: "delegation-context-fixture",
     providerProtocol: "custom",
     contextWindowTokens: 16_000,
-    maxOutputTokens: 512,
+    maxCallOutputTokens: 512,
     thinkingTokenAccounting: "unknown",
     protocol: {
       reasoningControl: "selectable",
@@ -401,4 +414,8 @@ function capabilities() {
       usageSemantics: "normalized",
     },
   };
+}
+
+function acknowledged(turn, request) {
+  return { ...turn, appliedOutputLimit: request.outputLimit?.maxTokens };
 }

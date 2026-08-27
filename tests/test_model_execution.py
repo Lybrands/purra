@@ -34,7 +34,7 @@ def _call() -> AgentModelTask:
             capability_snapshot=replace(
                 generic_capability_snapshot(),
                 profile_id="test:model",
-                max_output_tokens=200,
+                max_call_output_tokens=200,
             ),
         ),
     )
@@ -64,6 +64,7 @@ class _Gateway:
         return ModelCompletion(
             message=AgentMessage(role="assistant", content="done"),
             model="model",
+            applied_output_limit=invocation.output_limit.max_tokens,
             finish_reason=self.finish_reason,
         )
 
@@ -75,7 +76,11 @@ class _Gateway:
             yield ModelStreamChunk(content_delta="done")
             yield ModelStreamChunk(finish_reason=self.finish_reason)
 
-        return ModelStream(chunks=chunks(), model="model")
+        return ModelStream(
+            chunks=chunks(),
+            model="model",
+            applied_output_limit=invocation.output_limit.max_tokens,
+        )
 
 
 class _ScriptedStreamGateway(_Gateway):
@@ -94,7 +99,11 @@ class _ScriptedStreamGateway(_Gateway):
             for chunk in round_chunks:
                 yield chunk
 
-        return ModelStream(chunks=chunks(), model="model")
+        return ModelStream(
+            chunks=chunks(),
+            model="model",
+            applied_output_limit=invocation.output_limit.max_tokens,
+        )
 
 
 class _AcceptingJudgePolicy:
@@ -114,7 +123,7 @@ def test_complete_resolves_the_exact_provider_output_limit():
         assert result.completion.message.content == "done"
         assert result.output_limit.max_tokens == 200
         assert gateway.invocations[0].output_limit == result.output_limit
-        assert gateway.invocations[0].max_output_tokens == 200
+        assert gateway.invocations[0].max_call_output_tokens == 200
 
     asyncio.run(run())
 

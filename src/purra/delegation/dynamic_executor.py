@@ -84,7 +84,9 @@ class DynamicDelegatedAgentExecutor:
         conversation_compactor: ConversationCompactor | None = None,
         conversation_compactor_factory=None,
         execution_state_factory: ExecutionStateFactory | None = None,
-        runtime_limits: RuntimeLimits = RuntimeLimits(),
+        runtime_limits: RuntimeLimits = RuntimeLimits(
+            max_run_output_tokens=None,
+        ),
         recovery_policy: RecoveryPolicy = RecoveryPolicy(),
         tool_execution_limits: ToolExecutionLimits = ToolExecutionLimits(),
     ) -> None:

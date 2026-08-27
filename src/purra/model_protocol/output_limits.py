@@ -45,7 +45,7 @@ def resolve_invocation_output_limit(
     snapshot: ModelCapabilitySnapshot,
     explicit_user_override: int | None,
 ) -> InvocationOutputLimit:
-    profile_maximum = snapshot.max_output_tokens
+    profile_maximum = snapshot.max_call_output_tokens
     if profile_maximum is None:
         raise UnsupportedModelFeatureError(
             "model profile does not declare a verified output limit",

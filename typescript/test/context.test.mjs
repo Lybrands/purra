@@ -17,6 +17,10 @@ const fixture = JSON.parse(readFileSync(
   "utf8",
 ));
 
+const RUN_OPTIONS = Object.freeze({
+  budgets: Object.freeze({ maxRunOutputTokens: null }),
+});
+
 test("shared context estimates and claim allocation match Python", () => {
   for (const row of fixture.jsonTokenCases) {
     assert.equal(estimateJsonTokens(row.value), row.tokens);
@@ -51,7 +55,7 @@ test("submitted context is budgeted, marked untrusted, and bound to invocation e
       capabilities: capabilities(),
       async invoke(request) {
         received = request.messages;
-        return finalTurn("done");
+        return finalTurn("done", request);
       },
     },
     context: {
@@ -79,7 +83,10 @@ test("submitted context is budgeted, marked untrusted, and bound to invocation e
     },
   });
 
-  const handle = await agent.submit({ messages: [{ role: "user", content: "Use facts" }] });
+  const handle = await agent.submit(
+    { messages: [{ role: "user", content: "Use facts" }] },
+    RUN_OPTIONS,
+  );
   const result = await handle.result;
   const events = await collect(handle.events({ visibility: "all" }));
   const receipt = events.find((event) => event.kind === "invocation.started").payload.receipt;
@@ -107,7 +114,7 @@ test("hard context overflow fails before Provider invocation", async () => {
   const agent = new Agent({
     model: {
       capabilities: capabilities(512, 128),
-      async invoke() { calls += 1; return finalTurn("no"); },
+      async invoke(request) { calls += 1; return finalTurn("no", request); },
     },
     context: {
       reserves: { safetyTokens: 64, runtimeTokens: 64, minimumMessageTokens: 64 },
@@ -115,7 +122,7 @@ test("hard context overflow fails before Provider invocation", async () => {
   });
   const handle = await agent.submit({
     messages: [{ role: "user", content: "x".repeat(5_000) }],
-  });
+  }, RUN_OPTIONS);
 
   await rejectsCode(handle.result, "protected_messages_exceed_compression_budget");
   assert.equal(calls, 0);
@@ -127,7 +134,7 @@ test("context allocation overflow fails before Provider invocation", async () =>
   const agent = new Agent({
     model: {
       capabilities: capabilities(),
-      async invoke() { calls += 1; return finalTurn("no"); },
+      async invoke(request) { calls += 1; return finalTurn("no", request); },
     },
     context: {
       claims: [{ name: "facts", desiredTokens: 16 }],
@@ -138,7 +145,10 @@ test("context allocation overflow fails before Provider invocation", async () =>
       },
     },
   });
-  const handle = await agent.submit({ messages: [{ role: "user", content: "run" }] });
+  const handle = await agent.submit(
+    { messages: [{ role: "user", content: "run" }] },
+    RUN_OPTIONS,
+  );
 
   await rejectsCode(handle.result, "context_block_exceeds_allocation");
   assert.equal(calls, 0);
@@ -154,8 +164,8 @@ test("default projection drops old turns but preserves the latest tool exchange"
         requests.push(request);
         round += 1;
         return round === 1
-          ? callsTurn([{ id: "call-1", name: "read", arguments: {} }])
-          : finalTurn("done");
+          ? callsTurn([{ id: "call-1", name: "read", arguments: {} }], request)
+          : finalTurn("done", request);
       },
     },
     tools: [readTool("read")],
@@ -186,7 +196,7 @@ test("host compression may add only a bounded untrusted summary", async () => {
   const agent = new Agent({
     model: {
       capabilities: capabilities(2_000, 200),
-      async invoke(request) { received = request.messages; return finalTurn("done"); },
+      async invoke(request) { received = request.messages; return finalTurn("done", request); },
     },
     context: {
       reserves: { safetyTokens: 100, runtimeTokens: 100, minimumMessageTokens: 50 },
@@ -212,7 +222,7 @@ test("host compression may add only a bounded untrusted summary", async () => {
     { role: "user", content: "x".repeat(4_000) },
     { role: "assistant", content: "old response" },
     { role: "user", content: "current" },
-  ] });
+  ] }, RUN_OPTIONS);
   await handle.result;
 
   assert.equal(compression.compressionRequired, true);
@@ -232,7 +242,10 @@ test("host compression may add only a bounded untrusted summary", async () => {
 
 test("compression cannot remove privileged input or split a tool exchange", async () => {
   const privileged = new Agent({
-    model: { capabilities: capabilities(), async invoke() { return finalTurn("no"); } },
+    model: {
+      capabilities: capabilities(),
+      async invoke(request) { return finalTurn("no", request); },
+    },
     context: {
       compression: {
         compress(request) {
@@ -253,9 +266,9 @@ test("compression cannot remove privileged input or split a tool exchange", asyn
   const protocol = new Agent({
     model: {
       capabilities: capabilities(),
-      async invoke() {
+      async invoke(request) {
         modelCalls += 1;
-        return callsTurn([{ id: "call-1", name: "read", arguments: {} }]);
+        return callsTurn([{ id: "call-1", name: "read", arguments: {} }], request);
       },
     },
     tools: [readTool("read")],
@@ -279,9 +292,12 @@ test("context compaction budget bounds repeated pressured rounds", async () => {
   const agent = new Agent({
     model: {
       capabilities: capabilities(3_000, 200),
-      async invoke() {
+      async invoke(request) {
         modelCalls += 1;
-        return callsTurn([{ id: `call-${modelCalls}`, name: "read", arguments: {} }]);
+        return callsTurn(
+          [{ id: `call-${modelCalls}`, name: "read", arguments: {} }],
+          request,
+        );
       },
     },
     tools: [readTool("read")],
@@ -333,13 +349,13 @@ test("context provider conformance covers single-pass and staged task retrieval"
   assert.deepEqual(calls, ["single", "planning", "task", "base-demand", "task-demand"]);
 });
 
-function capabilities(contextWindowTokens = 16_000, maxOutputTokens = 512) {
+function capabilities(contextWindowTokens = 16_000, maxCallOutputTokens = 512) {
   return {
     schemaVersion: 1,
     profileId: "context-fixture",
     providerProtocol: "custom",
     contextWindowTokens,
-    maxOutputTokens,
+    maxCallOutputTokens,
     thinkingTokenAccounting: "unknown",
     protocol: {
       reasoningControl: "selectable",
@@ -367,12 +383,20 @@ function readTool(name) {
   };
 }
 
-function callsTurn(toolCalls) {
-  return { message: { role: "assistant", content: "", toolCalls }, finishReason: "tool_calls" };
+function callsTurn(toolCalls, request) {
+  return {
+    message: { role: "assistant", content: "", toolCalls },
+    finishReason: "tool_calls",
+    appliedOutputLimit: request.outputLimit?.maxTokens,
+  };
 }
 
-function finalTurn(content) {
-  return { message: { role: "assistant", content }, finishReason: "stop" };
+function finalTurn(content, request) {
+  return {
+    message: { role: "assistant", content },
+    finishReason: "stop",
+    appliedOutputLimit: request.outputLimit?.maxTokens,
+  };
 }
 
 async function collect(iterable) {

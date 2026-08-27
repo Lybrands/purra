@@ -124,6 +124,8 @@ const handle = await new Agent({
 }).submit({
   messages: [{ role: "user", content: parentSecret }],
   enabledTools: ["delegateToAgents"],
+}, {
+  budgets: { maxRunOutputTokens: null },
 });
 const result = await handle.result;
 const descendants = await adapters.runTree.listDescendants(handle.runId);

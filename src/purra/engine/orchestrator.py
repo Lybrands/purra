@@ -408,6 +408,15 @@ class _AgentCoreTreeRunExecutor:
         )
 
 
+def _require_runtime_limits(value: RuntimeLimits | None) -> RuntimeLimits:
+    if value is None:
+        raise TypeError(
+            "AgentCore requires RuntimeLimits with an explicit "
+            "max_run_output_tokens value"
+        )
+    return value
+
+
 class AgentCore:
     """Compose context, model/tool runtime and optional execution capabilities.
 
@@ -439,7 +448,7 @@ class AgentCore:
         long_task_dispatcher: LongTaskDispatcher | None = None,
         approval_gateway: ApprovalGateway | None = None,
         tool_idempotency_gateway: ToolIdempotencyGateway | None = None,
-        runtime_limits: RuntimeLimits = RuntimeLimits(),
+        runtime_limits: RuntimeLimits | None = None,
         recovery_policy: RecoveryPolicy = RecoveryPolicy(),
         tool_execution_limits: ToolExecutionLimits = ToolExecutionLimits(),
         operation_controller: AgentOperationController | None = None,
@@ -472,7 +481,7 @@ class AgentCore:
                 delegation_policy is not None,
                 task_admission_evaluator is not None,
                 long_task_dispatcher is not None,
-                runtime_limits != RuntimeLimits(),
+                runtime_limits is not None,
                 recovery_policy != RecoveryPolicy(),
             )):
                 raise ValueError(
@@ -488,10 +497,8 @@ class AgentCore:
             delegation_policy = preset.delegation_policy
             runtime_limits = preset.runtime_limits
             recovery_policy = preset.recovery_policy
-        if delegation_policy is not None and not isinstance(
-            delegation_policy,
-            DelegationPolicy,
-        ):
+        runtime_limits = _require_runtime_limits(runtime_limits)
+        if delegation_policy is not None and not isinstance(delegation_policy, DelegationPolicy):
             raise TypeError(
                 "delegation_policy must be a DelegationPolicy or None"
             )

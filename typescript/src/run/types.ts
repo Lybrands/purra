@@ -28,7 +28,8 @@ export interface AgentPreset {
 export interface RunRequest {
   readonly messages: readonly Message[];
   readonly enabledTools?: readonly string[];
-  readonly maxOutputTokens?: number;
+  /** Maximum output tokens for each individual Provider invocation. */
+  readonly maxCallOutputTokens?: number;
   readonly contextEvidence?: readonly ContextEvidenceReceipt[];
   readonly metadata?: Readonly<Record<string, JsonValue>>;
 }
@@ -36,7 +37,8 @@ export interface RunRequest {
 export interface RunBudgetOptions {
   readonly maxModelAttempts?: number | null;
   readonly maxInputTokens?: number | null;
-  readonly maxOutputTokens?: number | null;
+  /** Cumulative model output charged across the entire Run; null is explicit. */
+  readonly maxRunOutputTokens: number | null;
   readonly maxReasoningTokens?: number | null;
   readonly maxOutputBytes?: number | null;
   readonly maxOutputEvents?: number | null;
@@ -45,7 +47,7 @@ export interface RunBudgetOptions {
 export interface RunBudgets {
   readonly maxModelAttempts: number | null;
   readonly maxInputTokens: number | null;
-  readonly maxOutputTokens: number | null;
+  readonly maxRunOutputTokens: number | null;
   readonly maxReasoningTokens: number | null;
   readonly maxOutputBytes: number | null;
   readonly maxOutputEvents: number | null;
@@ -61,12 +63,23 @@ export interface RunUsage {
   readonly outputEvents: number;
 }
 
-export interface RunOptions {
+interface RunOptionBase {
   readonly signal?: AbortSignal;
   readonly deadlineAt?: string | null;
-  readonly budgets?: RunBudgetOptions;
-  readonly durableContinuation?: DurableContinuation;
 }
+
+export interface NewRunOptions extends RunOptionBase {
+  readonly budgets: RunBudgetOptions;
+  readonly durableContinuation?: never;
+}
+
+export interface ContinuationRunOptions extends RunOptionBase {
+  readonly budgets?: never;
+  readonly deadlineAt?: never;
+  readonly durableContinuation: DurableContinuation;
+}
+
+export type RunOptions = NewRunOptions | ContinuationRunOptions;
 
 interface AgentPresetSnapshotBase {
   readonly presetId: string;

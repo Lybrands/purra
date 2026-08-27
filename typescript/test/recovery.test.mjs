@@ -10,6 +10,10 @@ import {
   RecoveryPolicy,
 } from "purra";
 
+const RUN_OPTIONS = Object.freeze({
+  budgets: Object.freeze({ maxRunOutputTokens: null }),
+});
+
 const fixture = JSON.parse(readFileSync(
   new URL("../../conformance/fixtures/recovery_protocol.json", import.meta.url),
   "utf8",
@@ -46,7 +50,10 @@ test("submitted Run persists recovery approval before the retried Provider attem
     },
   });
 
-  const handle = await agent.submit({ messages: [{ role: "user", content: "run" }] });
+  const handle = await agent.submit(
+    { messages: [{ role: "user", content: "run" }] },
+    RUN_OPTIONS,
+  );
   assert.equal((await handle.result).output, "done");
   const events = await collect(handle.events({ visibility: "all" }));
   const traceIndex = events.findIndex((event) => event.kind === "agentRunTrace");

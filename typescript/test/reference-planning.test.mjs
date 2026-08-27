@@ -10,6 +10,10 @@ import {
   ToolPlanningPolicy,
 } from "purra";
 
+const RUN_OPTIONS = Object.freeze({
+  budgets: Object.freeze({ maxRunOutputTokens: null }),
+});
+
 test("WorkPlan has no default total-step limit but honors an explicit host limit", () => {
   const workPlan = {
     title: "Nine milestones",
@@ -49,9 +53,9 @@ test("model Planner requests the smallest non-redundant semantic plan", async ()
       async invoke(request) {
         if (isPlannerRequest(request)) {
           instruction = String(request.messages[0]?.content ?? "");
-          return finalTurn(JSON.stringify({ workPlan: directPlan() }));
+          return acknowledged(request, finalTurn(JSON.stringify({ workPlan: directPlan() })));
         }
-        return finalTurn("done");
+        return acknowledged(request, finalTurn("done"));
       },
     },
     planning: {
@@ -78,12 +82,15 @@ test("model Planner repairs invalid JSON inside the submitted Run before executi
       async invoke(request) {
         if (isPlannerRequest(request)) {
           plannerCalls += 1;
-          return finalTurn(plannerCalls === 1 ? "not json" : JSON.stringify({
+          return acknowledged(request, finalTurn(plannerCalls === 1 ? "not json" : JSON.stringify({
             workPlan: toolPlan("lookup", "lookup-step"),
-          }));
+          })));
         }
         mainCalls += 1;
-        return mainCalls === 1 ? callsTurn("lookup", "lookup-call") : finalTurn("done");
+        return acknowledged(
+          request,
+          mainCalls === 1 ? callsTurn("lookup", "lookup-call") : finalTurn("done"),
+        );
       },
     },
     tools: [readTool("lookup", () => {
@@ -94,12 +101,18 @@ test("model Planner repairs invalid JSON inside the submitted Run before executi
       policy: new ToolPlanningPolicy(),
       plannerFactory(modelTasks) {
         plannerRunId = modelTasks.runId;
-        return new ModelWorkPlanner(modelTasks, { maxRepairAttempts: 1, maxOutputTokens: 256 });
+        return new ModelWorkPlanner(modelTasks, {
+          maxRepairAttempts: 1,
+          maxCallOutputTokens: 256,
+        });
       },
     },
   });
 
-  const handle = await agent.submit({ messages: [{ role: "user", content: "look it up" }] });
+  const handle = await agent.submit(
+    { messages: [{ role: "user", content: "look it up" }] },
+    RUN_OPTIONS,
+  );
   assert.equal((await handle.result).output, "done");
   assert.equal(plannerRunId, handle.runId);
   assert.equal(plannerCalls, 2);
@@ -119,10 +132,10 @@ test("model Planner stops after its fixed repair budget", async () => {
       async invoke(request) {
         if (isPlannerRequest(request)) {
           plannerCalls += 1;
-          return finalTurn("still not json");
+          return acknowledged(request, finalTurn("still not json"));
         }
         mainCalls += 1;
-        return finalTurn("unsafe");
+        return acknowledged(request, finalTurn("unsafe"));
       },
     },
     planning: {
@@ -148,12 +161,12 @@ test("model Planner accepts a fully fenced object but rejects surrounding prose"
       async invoke(request) {
         if (isPlannerRequest(request)) {
           plannerCalls += 1;
-          return finalTurn(`\`\`\`json\n${JSON.stringify({
+          return acknowledged(request, finalTurn(`\`\`\`json\n${JSON.stringify({
             workPlan: directPlan(),
-          })}\n\`\`\``);
+          })}\n\`\`\``));
         }
         mainCalls += 1;
-        return finalTurn("done");
+        return acknowledged(request, finalTurn("done"));
       },
     },
     planning: {
@@ -170,7 +183,10 @@ test("model Planner accepts a fully fenced object but rejects surrounding prose"
       capabilities: capabilities(),
       async invoke(request) {
         if (isPlannerRequest(request)) {
-          return finalTurn(`prefix ${JSON.stringify({ workPlan: toolPlan("lookup", "step") })}`);
+          return acknowledged(
+            request,
+            finalTurn(`prefix ${JSON.stringify({ workPlan: toolPlan("lookup", "step") })}`),
+          );
         }
         throw new Error("main model must not run");
       },
@@ -195,11 +211,11 @@ test("model Planner keeps direct execution inside the existing plan compiler", a
       async invoke(request) {
         if (isPlannerRequest(request)) {
           plannerCalls += 1;
-          return finalTurn(JSON.stringify({ workPlan: directPlan() }));
+          return acknowledged(request, finalTurn(JSON.stringify({ workPlan: directPlan() })));
         }
         mainCalls += 1;
         assert.equal(request.tools.length, 0);
-        return finalTurn("direct answer");
+        return acknowledged(request, finalTurn("direct answer"));
       },
     },
     planning: {
@@ -223,11 +239,17 @@ test("model Planner revisions cannot bypass current tool authority", async () =>
         if (isPlannerRequest(request)) {
           plannerCalls += 1;
           const name = plannerCalls === 1 ? "lookup" : "summarize";
-          return finalTurn(JSON.stringify({ workPlan: toolPlan(name, `${name}-step`) }));
+          return acknowledged(
+            request,
+            finalTurn(JSON.stringify({ workPlan: toolPlan(name, `${name}-step`) })),
+          );
         }
         const name = request.tools[0]?.name;
         mainTools.push(name ?? null);
-        return name === undefined ? finalTurn("revised answer") : callsTurn(name, `${name}-call`);
+        return acknowledged(
+          request,
+          name === undefined ? finalTurn("revised answer") : callsTurn(name, `${name}-call`),
+        );
       },
     },
     tools: [
@@ -260,10 +282,13 @@ test("model response judge withholds and repairs a candidate under the same subm
       async invoke(request) {
         if (String(request.messages[0]?.content).startsWith("judge:")) {
           judgeCalls += 1;
-          return finalTurn(judgeCalls === 1 ? "reject" : "accept");
+          return acknowledged(request, finalTurn(judgeCalls === 1 ? "reject" : "accept"));
         }
         mainCalls += 1;
-        return finalTurn(mainCalls === 1 ? "bad candidate" : "good candidate");
+        return acknowledged(
+          request,
+          finalTurn(mainCalls === 1 ? "bad candidate" : "good candidate"),
+        );
       },
     },
     responseValidation: {
@@ -284,7 +309,10 @@ test("model response judge withholds and repairs a candidate under the same subm
     },
   });
 
-  const handle = await agent.submit({ messages: [{ role: "user", content: "answer" }] });
+  const handle = await agent.submit(
+    { messages: [{ role: "user", content: "answer" }] },
+    RUN_OPTIONS,
+  );
   assert.equal((await handle.result).output, "good candidate");
   assert.equal(judgeRunId, handle.runId);
   assert.equal(mainCalls, 2);
@@ -353,13 +381,17 @@ function finalTurn(content) {
   return { message: { role: "assistant", content }, finishReason: "stop" };
 }
 
+function acknowledged(request, turn) {
+  return { ...turn, appliedOutputLimit: request.outputLimit?.maxTokens };
+}
+
 function capabilities() {
   return {
     schemaVersion: 1,
     profileId: "reference-planning-fixture",
     providerProtocol: "custom",
     contextWindowTokens: 16_000,
-    maxOutputTokens: 512,
+    maxCallOutputTokens: 512,
     thinkingTokenAccounting: "unknown",
     protocol: {
       reasoningControl: "selectable",

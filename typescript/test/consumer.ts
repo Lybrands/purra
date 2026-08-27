@@ -67,6 +67,8 @@ for await (const event of agent.stream({ messages: [{ role: "user", content: "he
 await assertRunRepositoryConforms(new InMemoryRunRepository());
 const handle: RunHandle = await agent.submit({
   messages: [{ role: "user", content: "hello" }],
+}, {
+  budgets: { maxRunOutputTokens: null },
 });
 (await handle.result).output satisfies JsonValue;
 for await (const event of handle.events()) {

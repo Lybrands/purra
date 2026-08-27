@@ -58,7 +58,7 @@ export interface ModelTaskRunnerOptions {
 }
 
 export interface ModelTaskOptions {
-  readonly maxOutputTokens?: number;
+  readonly maxCallOutputTokens?: number;
   readonly signal?: AbortSignal;
 }
 
@@ -127,7 +127,7 @@ export class ModelTaskRunner {
     messages: readonly Message[],
     options: ModelTaskOptions = {},
   ): Promise<ModelTaskCompletion> {
-    const request = this.#request(messages, options.maxOutputTokens);
+    const request = this.#request(messages, options.maxCallOutputTokens);
     const turn = await this.#invoke(request, options.signal, false);
     return Object.freeze({ turn, outputLimit: request.outputLimit });
   }
@@ -146,7 +146,7 @@ export class ModelTaskRunner {
 
     while (true) {
       attempts += 1;
-      const request = this.#request(active, options.maxOutputTokens);
+      const request = this.#request(active, options.maxCallOutputTokens);
       const turn = await this.#invoke(request, options.signal, true, async (chunk) => {
         if ((chunk.toolCallDeltas?.length ?? 0) > 0) {
           throw new AgentError("model_task_tool_call_unsupported", "Model task cannot call tools");
@@ -195,8 +195,14 @@ export class ModelTaskRunner {
     }
   }
 
-  #request(messages: readonly Message[], maxOutputTokens: number | undefined): ManagedModelRequest {
-    const outputLimit = resolveInvocationOutputLimit(this.#capabilities, maxOutputTokens);
+  #request(
+    messages: readonly Message[],
+    maxCallOutputTokens: number | undefined,
+  ): ManagedModelRequest {
+    const outputLimit = resolveInvocationOutputLimit(
+      this.#capabilities,
+      maxCallOutputTokens,
+    );
     if (outputLimit === undefined) {
       throw new AgentError(
         "model_output_limit_unknown",

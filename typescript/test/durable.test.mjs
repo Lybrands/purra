@@ -22,6 +22,10 @@ const durableFixture = JSON.parse(readFileSync(
   "utf8",
 ));
 
+const RUN_OPTIONS = Object.freeze({
+  budgets: Object.freeze({ maxRunOutputTokens: null }),
+});
+
 test("shared Durable classifications and exact lease boundary stay aligned", () => {
   assert.equal(durableFixture.protocolVersion, 4);
   assert.equal(durableFixture.agentPresetSnapshotVersion, 4);
@@ -39,13 +43,13 @@ test("shared Durable classifications and exact lease boundary stay aligned", () 
     const { usage, limits } = row;
     const missing = usage.unreportedUsageAttempts > 0 && [
       limits.maxInputTokens,
-      limits.maxOutputTokens,
+      limits.maxRunOutputTokens,
       limits.maxReasoningTokens,
     ].some((value) => value !== null);
     const actual = missing ? "provider_usage_unreported" : [
       ["model_attempts", usage.invocationCount, limits.maxInvocationAttempts],
       ["input_tokens", usage.inputTokens, limits.maxInputTokens],
-      ["output_tokens", usage.outputTokens, limits.maxOutputTokens],
+      ["output_tokens", usage.outputTokens, limits.maxRunOutputTokens],
       ["reasoning_tokens", usage.reasoningTokens, limits.maxReasoningTokens],
     ].find(([, used, maximum]) => (
       maximum !== null && (used > maximum || (row.inclusive && used >= maximum))
@@ -80,7 +84,10 @@ test("shared Runtime and output batch defaults stay aligned", async () => {
       },
     },
   });
-  const handle = await agent.submit({ messages: [{ role: "user", content: "defaults" }] });
+  const handle = await agent.submit(
+    { messages: [{ role: "user", content: "defaults" }] },
+    RUN_OPTIONS,
+  );
   await handle.result;
   const snapshot = await handle.snapshot();
   const events = [];
@@ -173,7 +180,7 @@ test("Long Task budgets fail before the next claim and preserve unreported usage
     budgets: {
       maxInvocationAttempts: 1,
       maxInputTokens: null,
-      maxOutputTokens: null,
+      maxRunOutputTokens: null,
       maxReasoningTokens: null,
     },
   });
@@ -193,7 +200,7 @@ test("Long Task budgets fail before the next claim and preserve unreported usage
     budgets: {
       maxInvocationAttempts: null,
       maxInputTokens: 10,
-      maxOutputTokens: null,
+      maxRunOutputTokens: null,
       maxReasoningTokens: null,
     },
   });
@@ -406,7 +413,7 @@ test("Durable admission is fail-closed before Provider and dispatcher authority"
     dispatcher,
   });
 
-  const handle = await agent.submit({ messages: [user("run durable")] });
+  const handle = await agent.submit({ messages: [user("run durable")] }, RUN_OPTIONS);
   const result = await handle.result;
   assert.equal(result.output, "durable done");
   assert.equal(result.durable.status, "completed");
@@ -428,7 +435,7 @@ test("Durable admission is fail-closed before Provider and dispatcher authority"
     dispatcher,
   });
   await rejectsCode(
-    (await invalid.submit({ messages: [user("invalid")] })).result,
+    (await invalid.submit({ messages: [user("invalid")] }, RUN_OPTIONS)).result,
     "durable_plan_coverage_invalid",
   );
   assert.equal(modelCalls, 0);
@@ -459,7 +466,7 @@ test("inline, clarify, and reject admission modes keep their authority boundarie
         async execute() { throw new Error("non-durable admission must not execute"); },
       },
     });
-    const result = await (await agent.submit({ messages: [user(row.mode)] })).result;
+    const result = await (await agent.submit({ messages: [user(row.mode)] }, RUN_OPTIONS)).result;
     assert.equal(result.output, row.expected);
     assert.equal(modelCalls, row.modelCalls);
     assert.equal(dispatchCalls, 0);
@@ -492,7 +499,7 @@ test("authenticated continuation skips planning and rejects incompatible authori
     }),
     dispatcher,
   });
-  const initial = await (await agent.submit({ messages: [user("start")] })).result;
+  const initial = await (await agent.submit({ messages: [user("start")] }, RUN_OPTIONS)).result;
   const snapshot = initial.durable.recoverySnapshot;
   const resumed = await (await agent.submit(
     { messages: [user("continue")] },
@@ -699,7 +706,7 @@ function runBudgets() {
   return {
     maxModelAttempts: 10,
     maxInputTokens: 1_000,
-    maxOutputTokens: 1_000,
+    maxRunOutputTokens: 1_000,
     maxReasoningTokens: 1_000,
     maxOutputBytes: 100_000,
     maxOutputEvents: 1_000,
@@ -710,7 +717,7 @@ function taskBudgets() {
   return {
     maxInvocationAttempts: 10,
     maxInputTokens: 1_000,
-    maxOutputTokens: 1_000,
+    maxRunOutputTokens: 1_000,
     maxReasoningTokens: 1_000,
   };
 }

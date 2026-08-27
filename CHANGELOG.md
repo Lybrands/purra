@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.5.0 - 2026-08-27
+
+### Unambiguous output-token contracts
+
+- Rename the per-model-invocation limit to
+  `max_call_output_tokens` in Python and
+  `maxCallOutputTokens` in TypeScript.
+- Rename the cumulative Run budget to
+  `max_run_output_tokens` in Python and
+  `maxRunOutputTokens` in TypeScript.
+- Require public Run creation to state the cumulative output budget explicitly;
+  use `None`/`null` to deliberately select no finite cumulative token limit.
+- Require Provider gateways to report the output limit they actually applied.
+  Missing or mismatched acknowledgments and reported usage above that limit fail
+  with `model_gateway_contract_violation` before output can be committed.
+- Do not provide aliases or persisted-state migration for the removed names;
+  0.5.0 hosts and snapshots must use the new contract.
+
 ## 0.4.1 - 2026-08-27
 
 ### Model configuration ownership

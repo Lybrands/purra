@@ -48,7 +48,11 @@ import type {
 import { InMemoryOutputPublisher } from "../output/publisher.js";
 import type { OutputBatchLimits, OutputPolicy, OutputPublisher } from "../output/types.js";
 import { allowAllOutput, RunSession } from "../run/session.js";
-import { InMemoryRunRepository, type RunRepository } from "../run/store.js";
+import {
+  InMemoryRunRepository,
+  normalizeRunSnapshot,
+  type RunRepository,
+} from "../run/store.js";
 import type {
   AgentExecutionCheckpoint,
   AgentPreset,
@@ -148,7 +152,7 @@ export interface AgentRuntimeLimits extends ModelStreamLimits {
 export interface AgentRunInput {
   readonly messages: readonly Message[];
   readonly signal?: AbortSignal;
-  readonly maxOutputTokens?: number;
+  readonly maxCallOutputTokens?: number;
   readonly enabledTools?: readonly string[];
 }
 
@@ -372,8 +376,8 @@ export class Agent {
     return this.#executeTransient(input);
   }
 
-  public submit(request: RunRequest, options: RunOptions = {}): Promise<RunHandle> {
-    return this.#submit(request, options);
+  public submit(request: RunRequest, options: RunOptions): Promise<RunHandle> {
+    return this.#submit(request, requireRunOptions(options));
   }
 
   public spawnAgents(command: SpawnAgentsCommand): Promise<SpawnAgentsReceipt> {
@@ -409,7 +413,7 @@ export class Agent {
   public async bindAgentTreeRoot(
     rootRunId: string,
     request: RunRequest,
-    options: RunOptions = {},
+    options: RunOptions,
   ): Promise<void> {
     const repository = this.#agentTreeRepository;
     if (repository === undefined) {
@@ -432,7 +436,7 @@ export class Agent {
       messages: copyMessages(request.messages),
       metadata: copyMapping(request.metadata ?? {}, "Run metadata"),
     });
-    const copiedOptions = Object.freeze({ ...options });
+    const copiedOptions = Object.freeze({ ...requireRunOptions(options) });
     const binding = Object.freeze({
       request: copiedRequest,
       options: copiedOptions,
@@ -451,7 +455,7 @@ export class Agent {
   public async recoverAgentTreeRoot(
     rootRunId: string,
     request: RunRequest,
-    options: RunOptions = {},
+    options: RunOptions,
   ): Promise<AgentRunAggregation> {
     await this.bindAgentTreeRoot(rootRunId, request, options);
     const repository = this.#agentTreeRepository!;
@@ -529,19 +533,10 @@ export class Agent {
       options.deadlineAt,
       this.#runtimeLimits.runTimeoutMs,
     );
-    let budgets = resolveBudgets(
-      options.budgets,
-      this.#maxRounds + (treeGrant === undefined ? 1 : 0),
-    );
+    let budgets: RunBudgets;
     if (options.durableContinuation !== undefined) {
       if (this.#durable === undefined) {
         throw new AgentError("durable_continuation_unavailable", "Agent has no Durable composition");
-      }
-      if (options.deadlineAt !== undefined || options.budgets !== undefined) {
-        throw new AgentError(
-          "durable_continuation_authority_override",
-          "Continuation cannot replace its persisted deadline or budgets",
-        );
       }
       continuation = await validateContinuation({
         continuation: options.durableContinuation,
@@ -550,6 +545,11 @@ export class Agent {
       });
       deadlineAt = continuation.deadlineAt;
       budgets = continuation.remainingBudgets;
+    } else {
+      budgets = resolveBudgets(
+        options.budgets,
+        this.#maxRounds + (treeGrant === undefined ? 1 : 0),
+      );
     }
     const metadata = copyMapping(request.metadata ?? {}, "Run metadata");
     const rootTreeRunId = treeGrant === undefined
@@ -596,7 +596,9 @@ export class Agent {
           "Only a claimed Child Run can resume an execution checkpoint",
         );
       }
-      const snapshot = await this.#runRepository.get(resumeCheckpoint.runId);
+      const snapshot = normalizeRunSnapshot(
+        await this.#runRepository.get(resumeCheckpoint.runId),
+      );
       const [persistedPreset, currentPreset, persistedCheckpoint, selectedCheckpoint] = await Promise.all([
         stableFingerprint(copyJsonValue(snapshot.preset as unknown as JsonValue)),
         stableFingerprint(copyJsonValue(preset as unknown as JsonValue)),
@@ -675,9 +677,9 @@ export class Agent {
         ...callerMessages,
       ]),
       signal: session.signal,
-      ...(request.maxOutputTokens === undefined
+      ...(request.maxCallOutputTokens === undefined
         ? {}
-        : { maxOutputTokens: request.maxOutputTokens }),
+        : { maxCallOutputTokens: request.maxCallOutputTokens }),
       ...(enabledTools === undefined ? {} : { enabledTools }),
     });
 
@@ -793,9 +795,16 @@ export class Agent {
         contextContentRef: checkpoint?.contentRef ?? "",
       }),
     });
-    const { durableContinuation: _ignored, signal: _rootSignal, ...baseOptions } = binding.options;
-    void _ignored;
-    void _rootSignal;
+    const baseOptions = binding.options.durableContinuation === undefined
+      ? Object.freeze({
+          budgets: binding.options.budgets,
+          ...(binding.options.deadlineAt === undefined
+            ? {}
+            : { deadlineAt: binding.options.deadlineAt }),
+        })
+      : Object.freeze({
+          budgets: binding.options.durableContinuation.snapshot.remainingBudgets,
+        });
     const handle = await this.#submit(
       childRequest,
       Object.freeze({
@@ -832,7 +841,7 @@ export class Agent {
   }> {
     let snapshot;
     try {
-      snapshot = await this.#runRepository.get(run.runId);
+      snapshot = normalizeRunSnapshot(await this.#runRepository.get(run.runId));
     } catch (error) {
       if (error instanceof AgentError && error.code === "run_not_found") return Object.freeze({});
       throw error;
@@ -1097,7 +1106,7 @@ export class Agent {
       ?? `${this.#idempotencyNamespace}:${++this.#invocationSequence}`;
     const outputLimit: InvocationOutputLimit | undefined = resolveInvocationOutputLimit(
       this.#capabilities,
-      input.maxOutputTokens,
+      input.maxCallOutputTokens,
     );
     let responseAttempts = resumeCheckpoint?.responseAttempts ?? 0;
     let publicPresentationPending = false;
@@ -1688,14 +1697,20 @@ export class Agent {
     metadata: Readonly<Record<string, JsonValue>>,
   ): Promise<PreparedContext | undefined> {
     if (contextOptions === undefined) return undefined;
-    if (this.#capabilities === undefined || this.#capabilities.maxOutputTokens === null) {
+    if (
+      this.#capabilities === undefined
+      || this.#capabilities.maxCallOutputTokens === null
+    ) {
       throw new AgentError(
         "context_model_capabilities_required",
         "Context budgeting requires model window and output-limit capabilities",
       );
     }
     const tools = this.#tools.specsFor(input.enabledTools);
-    const outputLimit = resolveInvocationOutputLimit(this.#capabilities, input.maxOutputTokens)!;
+    const outputLimit = resolveInvocationOutputLimit(
+      this.#capabilities,
+      input.maxCallOutputTokens,
+    )!;
     return prepareContext(contextOptions, {
       request: {
         messages: input.messages,
@@ -1764,14 +1779,20 @@ export class Agent {
     input: AgentRunInput,
     metadata: Readonly<Record<string, JsonValue>>,
   ): Parameters<typeof prepareContext>[1] {
-    if (this.#capabilities === undefined || this.#capabilities.maxOutputTokens === null) {
+    if (
+      this.#capabilities === undefined
+      || this.#capabilities.maxCallOutputTokens === null
+    ) {
       throw new AgentError(
         "context_model_capabilities_required",
         "Context budgeting requires model window and output-limit capabilities",
       );
     }
     const tools = this.#tools.specsFor(input.enabledTools);
-    const outputLimit = resolveInvocationOutputLimit(this.#capabilities, input.maxOutputTokens)!;
+    const outputLimit = resolveInvocationOutputLimit(
+      this.#capabilities,
+      input.maxCallOutputTokens,
+    )!;
     return Object.freeze({
       request: {
         messages: input.messages,
@@ -2151,14 +2172,41 @@ function resolveBudgets(
   value: RunOptions["budgets"],
   maxRounds: number,
 ): RunBudgets {
+  if (value === null || typeof value !== "object") {
+    throw new TypeError("Run options.budgets is required");
+  }
+  if (!Object.prototype.hasOwnProperty.call(value, "maxRunOutputTokens")) {
+    throw new TypeError(
+      "Run budgets.maxRunOutputTokens must be a number or explicit null",
+    );
+  }
   return Object.freeze({
     maxModelAttempts: budgetValue(value?.maxModelAttempts, maxRounds, "maxModelAttempts"),
     maxInputTokens: budgetValue(value?.maxInputTokens, null, "maxInputTokens"),
-    maxOutputTokens: budgetValue(value?.maxOutputTokens, null, "maxOutputTokens"),
+    maxRunOutputTokens: budgetValue(
+      value.maxRunOutputTokens,
+      null,
+      "maxRunOutputTokens",
+    ),
     maxReasoningTokens: budgetValue(value?.maxReasoningTokens, null, "maxReasoningTokens"),
     maxOutputBytes: budgetValue(value?.maxOutputBytes, 8 * 1024 * 1024, "maxOutputBytes"),
     maxOutputEvents: budgetValue(value?.maxOutputEvents, 10_000, "maxOutputEvents"),
   });
+}
+
+function requireRunOptions(value: RunOptions): RunOptions {
+  if (value === null || typeof value !== "object") {
+    throw new TypeError("Agent.submit requires Run options with explicit budgets");
+  }
+  if (value.durableContinuation === undefined) {
+    resolveBudgets(value.budgets, 1);
+  } else if (value.budgets !== undefined || value.deadlineAt !== undefined) {
+    throw new AgentError(
+      "durable_continuation_authority_override",
+      "Continuation cannot replace its persisted deadline or budgets",
+    );
+  }
+  return value;
 }
 
 function budgetValue(value: number | null | undefined, fallback: number | null, label: string): number | null {

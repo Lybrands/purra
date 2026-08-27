@@ -114,7 +114,7 @@ async def test_run_repository_reserves_attempts_and_keeps_authoritative_usage():
             session_id=None,
             prompt="budget",
             mode=None,
-            runtime_limits=RuntimeLimits(
+            runtime_limits=RuntimeLimits(max_run_output_tokens=None,
                 max_model_invocation_attempts=1,
                 max_input_tokens=3,
             ),
@@ -163,7 +163,7 @@ async def test_output_batch_is_atomic_and_consumes_canonical_provider_budget():
             session_id=None,
             prompt="output budget",
             mode=None,
-            runtime_limits=RuntimeLimits(max_provider_output_events=1),
+            runtime_limits=RuntimeLimits(max_run_output_tokens=None, max_provider_output_events=1),
         ),
         AgentEvent(type="run.started"),
     )
@@ -213,7 +213,7 @@ async def test_provider_output_bytes_use_canonical_utf8_and_reject_before_append
             session_id=None,
             prompt="byte budget",
             mode=None,
-            runtime_limits=RuntimeLimits(max_provider_output_bytes=1),
+            runtime_limits=RuntimeLimits(max_run_output_tokens=None, max_provider_output_bytes=1),
         ),
         AgentEvent(type="run.started"),
     )
@@ -246,7 +246,7 @@ async def test_provider_output_bytes_use_canonical_utf8_and_reject_before_append
 @pytest.mark.asyncio
 async def test_child_runs_share_root_budget_and_one_canonical_journal():
     adapters = InMemoryAgentAdapters()
-    limits = RuntimeLimits(
+    limits = RuntimeLimits(max_run_output_tokens=None,
         max_model_invocation_attempts=2,
         max_input_tokens=3,
         max_provider_output_events=1,

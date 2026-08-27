@@ -313,6 +313,7 @@ async def assert_host_adapters_conform(
     assert (await runs.get(begun.run_id)).execution_checkpoint == checkpoint
 
     authority_limits = RuntimeLimits(
+        max_run_output_tokens=None,
         max_model_invocation_attempts=2,
         max_input_tokens=3,
         max_provider_output_events=1,
@@ -704,6 +705,8 @@ async def assert_model_gateway_conforms(
     assert isinstance(gateway, ModelGateway)
     stream = await gateway.stream(messages, invocation, None)
     assert isinstance(stream, ModelStream)
+    if invocation.output_limit is not None:
+        assert stream.applied_output_limit == invocation.output_limit.max_tokens
     if expected_model is not None:
         assert stream.model == expected_model
     chunks = tuple([chunk async for chunk in stream.chunks])
@@ -733,6 +736,8 @@ async def assert_model_gateway_conforms(
 
     completion = await gateway.complete(messages, invocation, None)
     assert isinstance(completion, ModelCompletion)
+    if invocation.output_limit is not None:
+        assert completion.applied_output_limit == invocation.output_limit.max_tokens
     assert completion.message.role is MessageRole.ASSISTANT
     assert completion.finish_reason is not None
     if expected_model is not None:

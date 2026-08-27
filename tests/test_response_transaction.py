@@ -47,7 +47,7 @@ def _model_request() -> ModelRequest:
         capability_snapshot=replace(
             generic_capability_snapshot(),
             profile_id="test:model",
-            max_output_tokens=1_024,
+            max_call_output_tokens=1_024,
         ),
     )
 

@@ -35,6 +35,18 @@ Reactive 是默认执行方式，Planned 和 Durable 按需启用。宿主负责
 Provider 适配器、工具、业务授权与生产持久化；运行保证和所有权边界见
 [架构说明](https://github.com/Lybrands/purra/blob/main/ARCHITECTURE.md)。
 
+## 输出 Token 契约
+
+PurrA 0.5.0 明确区分单次模型调用上限与整个 Run 的累计预算。Python
+分别使用 `max_call_output_tokens` 和
+`max_run_output_tokens`；TypeScript 分别使用
+`maxCallOutputTokens` 和 `maxRunOutputTokens`。
+
+创建 Run 时必须显式给出累计预算；只有宿主明确选择“不设置有限累计上限”时，
+才使用 Python 的 `None` 或 TypeScript 的 `null`。Provider 网关还必须回报
+实际应用的单次上限；缺失或不匹配会在模型输出提交前触发契约错误。0.5.0
+不为旧输出 Token 字段提供别名或持久化迁移。
+
 ## 兼容性
 
 PurrA 目前处于 1.0 之前，破坏公共契约的变更必须升级 Minor 版本。

@@ -1632,7 +1632,7 @@ class InMemoryLongTaskRepository:
             limit is not None
             for limit in (
                 limits.max_input_tokens,
-                limits.max_output_tokens,
+                limits.max_run_output_tokens,
                 limits.max_reasoning_tokens,
             )
         ):
@@ -1642,7 +1642,11 @@ class InMemoryLongTaskRepository:
         for kind, value, limit in (
             ("model_attempts", usage.invocation_count, limits.max_invocation_attempts),
             ("input_tokens", usage.input_tokens, limits.max_input_tokens),
-            ("output_tokens", usage.output_tokens, limits.max_output_tokens),
+            (
+                "output_tokens",
+                usage.output_tokens,
+                limits.max_run_output_tokens,
+            ),
             ("reasoning_tokens", usage.reasoning_tokens, limits.max_reasoning_tokens),
         ):
             if limit is not None and value is not None and (

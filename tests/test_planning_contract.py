@@ -28,6 +28,7 @@ from purra.contracts import (
     PlannerLimits,
     PlanningTurn,
     ReasoningMode,
+    RuntimeLimits,
     StepExecutor,
     StepStatus,
     StepType,
@@ -81,6 +82,7 @@ class _ScriptedPlannerGateway:
         return ModelCompletion(
             message=AgentMessage(role="assistant", content=self.outputs.pop(0)),
             model="test-model",
+            applied_output_limit=invocation.output_limit.max_tokens,
             finish_reason=ModelFinishReason.STOP,
         )
 
@@ -104,7 +106,7 @@ def _request() -> AgentRunRequest:
             capability_snapshot=replace(
                 generic_capability_snapshot(),
                 profile_id="test:model",
-                max_output_tokens=4_096,
+                max_call_output_tokens=4_096,
             ),
         ),
         domain_context=DomainContext(namespace="test.domain"),
@@ -130,6 +132,7 @@ def _always_reasoning_request() -> AgentRunRequest:
 
 def test_planner_receives_only_budgeted_planning_context_blocks():
     request = AgentPreset(
+        runtime_limits=RuntimeLimits(max_run_output_tokens=None),
         id="portable",
         revision="1",
         tool_catalog=InMemoryToolCatalog(()),
@@ -439,11 +442,25 @@ def test_low_level_core_does_not_infer_a_policy_from_a_planner():
             model_gateway=_Gateway(),
             run_repository=adapters.runs,
             planner=_Planner(),
+            runtime_limits=RuntimeLimits(
+                max_run_output_tokens=None,
+            ),
+        )
+
+
+def test_agent_core_requires_an_explicit_cumulative_output_budget():
+    adapters = InMemoryAgentAdapters()
+
+    with pytest.raises(TypeError, match="max_run_output_tokens"):
+        AgentCore(
+            model_gateway=_Gateway(),
+            run_repository=adapters.runs,
         )
 
 
 def test_preset_snapshot_includes_planning_behavior():
     preset = AgentPreset(
+        runtime_limits=RuntimeLimits(max_run_output_tokens=None),
         id="portable",
         revision="1",
         tool_catalog=InMemoryToolCatalog(()),

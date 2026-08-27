@@ -12,7 +12,7 @@ import { AgentCanceledError, AgentError } from "../shared/errors.js";
 import { stableFingerprint } from "../shared/fingerprint.js";
 import type { ToolExecutionEvent } from "../tools/types.js";
 import type { DelegationLifecycleEvent } from "../delegation/types.js";
-import type { RunRepository } from "./store.js";
+import { normalizeRunSnapshot, type RunRepository } from "./store.js";
 import type {
   AgentExecutionCheckpoint,
   InvocationReceiptInput,
@@ -110,14 +110,15 @@ export class RunSession {
     batchLimits: OutputBatchLimits,
   ): Promise<RunSession> {
     const begun = await repository.begin(params);
+    const snapshot = normalizeRunSnapshot(begun.snapshot);
     await publisher.publishCommitted(begun.event);
     return new RunSession(
       repository,
       publisher,
       policy,
-      begun.snapshot.runId,
-      params.rootRunId ?? begun.snapshot.runId,
-      params.agentId ?? begun.snapshot.runId,
+      snapshot.runId,
+      params.rootRunId ?? snapshot.runId,
+      params.agentId ?? snapshot.runId,
       params.parentRunId,
       params.leaseOwnerId === undefined
         ? Object.freeze({})
@@ -125,7 +126,7 @@ export class RunSession {
             leaseOwnerId: params.leaseOwnerId,
             leaseEpoch: params.leaseEpoch,
           }),
-      begun.snapshot.deadlineAt,
+      snapshot.deadlineAt,
       batchLimits,
     );
   }
@@ -144,6 +145,7 @@ export class RunSession {
     },
     batchLimits: OutputBatchLimits,
   ): RunSession {
+    snapshot = normalizeRunSnapshot(snapshot);
     if (snapshot.status !== "running" || snapshot.executionCheckpoint === undefined) {
       throw new AgentError(
         "agent_run_resume_checkpoint_missing",
@@ -199,7 +201,7 @@ export class RunSession {
     return Object.freeze({
       runId: this.#runId,
       result,
-      snapshot: () => this.#repository.get(this.#runId),
+      snapshot: async () => normalizeRunSnapshot(await this.#repository.get(this.#runId)),
       cancel: () => this.cancel(),
       command: (command: RunCommand) => {
         if (command?.type !== "cancel") throw new TypeError("Unsupported Run command");
@@ -209,8 +211,8 @@ export class RunSession {
     });
   }
 
-  public snapshot(): Promise<RunSnapshot> {
-    return this.#repository.get(this.#runId);
+  public async snapshot(): Promise<RunSnapshot> {
+    return normalizeRunSnapshot(await this.#repository.get(this.#runId));
   }
 
   public async openInvocation(input: InvocationReceiptInput): Promise<ModelInvocationReceipt> {
@@ -302,6 +304,9 @@ export class RunSession {
         ...(turn.message.reasoning === undefined ? {} : { reasoning: turn.message.reasoning }),
         ...(turn.message.toolCalls === undefined ? {} : { toolCalls: turn.message.toolCalls }),
         finishReason: turn.finishReason,
+        ...(turn.appliedOutputLimit === undefined
+          ? {}
+          : { appliedOutputLimit: turn.appliedOutputLimit }),
         ...(turn.usage === undefined ? {} : { usage: turn.usage }),
       }) as Readonly<Record<string, JsonValue>>,
     });

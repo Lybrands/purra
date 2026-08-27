@@ -193,7 +193,9 @@ class SamplingModelGateway:
         return ModelStream(
             chunks=observed_chunks(),
             model=stream.model,
+            applied_output_limit=stream.applied_output_limit,
             metadata=stream.metadata,
+            activity_support=stream.activity_support,
         )
 
     async def complete(

@@ -107,6 +107,7 @@ class HostPlannedToolGateway:
         return ModelStream(
             chunks=_chunks(),
             model=invocation.request.model,
+            applied_output_limit=invocation.output_limit.max_tokens,
             metadata={"executionRoute": HOST_PLANNED_EXECUTION_ROUTE},
         )
 

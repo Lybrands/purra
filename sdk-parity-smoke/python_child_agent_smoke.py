@@ -26,6 +26,7 @@ from purra.contracts import (
     ModelRequest,
     ModelStream,
     ModelStreamChunk,
+    RuntimeLimits,
     RunStatus,
     ToolCallDelta,
     ToolEffectState,
@@ -149,16 +150,21 @@ async def main() -> None:
                     finish_reason=ModelFinishReason.STOP,
                 )
 
-            return ModelStream(chunks=chunks(), model="local-child-agent-smoke")
+            return ModelStream(
+                chunks=chunks(),
+                model="local-child-agent-smoke",
+                applied_output_limit=invocation.output_limit.max_tokens,
+            )
 
         async def complete(self, messages, invocation, signal=None):
-            del messages, invocation, signal
+            del messages, signal
             return ModelCompletion(
                 message=AgentMessage(
                     role=MessageRole.ASSISTANT,
                     content="unused",
                 ),
                 model="local-child-agent-smoke",
+                applied_output_limit=invocation.output_limit.max_tokens,
                 finish_reason=ModelFinishReason.STOP,
             )
 
@@ -198,6 +204,7 @@ async def main() -> None:
         run_tree_repository=adapters.run_tree,
         root_agent_id="sdk-parity-root-agent",
         preset=AgentPreset(
+            runtime_limits=RuntimeLimits(max_run_output_tokens=None),
             id="sdk-parity-child-agent-smoke",
             revision="1",
             tool_catalog=catalog,
@@ -218,7 +225,7 @@ async def main() -> None:
             capability_snapshot=replace(
                 generic_capability_snapshot(),
                 profile_id="local:child-agent-smoke",
-                max_output_tokens=256,
+                max_call_output_tokens=256,
             ),
             options={"max_tokens": 128},
         ),

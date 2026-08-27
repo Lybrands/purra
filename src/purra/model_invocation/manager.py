@@ -115,7 +115,9 @@ class AgentModelInvocationManager:
         output_observer: ModelInvocationOutputObserver | None = None,
         operation_controller: AgentOperationController | None = None,
         invocation_timeout_ms: int | None = 300_000,
-        runtime_limits: RuntimeLimits = RuntimeLimits(),
+        runtime_limits: RuntimeLimits = RuntimeLimits(
+            max_run_output_tokens=None,
+        ),
         max_tool_argument_chars: int = 1_000_000,
         budget_repository: RunRepository | None = None,
     ) -> None:
@@ -165,6 +167,10 @@ class AgentModelInvocationManager:
                 invocation_signal,
             )
             raise_if_stopped(invocation_signal)
+            _require_applied_output_limit(
+                invocation,
+                stream.applied_output_limit,
+            )
         except BaseException as error:
             selected_error = error
             try:
@@ -205,6 +211,7 @@ class AgentModelInvocationManager:
                     operation_id,
                     meter,
                     liveness,
+                    invocation.output_limit.max_tokens,
                     receipt,
                     close_invocation,
                 ),
@@ -254,6 +261,11 @@ class AgentModelInvocationManager:
                 invocation_signal,
             )
             raise_if_stopped(invocation_signal)
+            _require_applied_output_limit(
+                invocation,
+                completion.applied_output_limit,
+                completion.usage,
+            )
             reason = completion.finish_reason
             if reason is None:
                 raise ModelGatewayError(
@@ -463,6 +475,7 @@ class AgentModelInvocationManager:
         operation_id: str | None,
         meter: "_StreamMeter",
         liveness: "_StreamLiveness",
+        expected_output_limit: int,
         budget_receipt: ModelInvocationReceipt,
         close_signal: Callable[[], None],
     ) -> AsyncIterator[ModelStreamChunk]:
@@ -491,6 +504,10 @@ class AgentModelInvocationManager:
                 meaningful = liveness.accept_chunk(chunk)
                 meter.accept(chunk)
                 usage = chunk.usage or usage
+                _require_reported_usage_within_limit(
+                    expected_output_limit,
+                    chunk.usage,
+                )
                 tool_indices.update(delta.index for delta in chunk.tool_call_deltas)
                 await self._output.accept_provider_chunk(
                     receipt.output_stream_id,
@@ -662,6 +679,36 @@ def _invocation(call: AgentModelCall) -> ModelInvocation:
         output_limit=call.output_limit,
         reasoning_mode=call.reasoning_mode,
     )
+
+
+def _require_applied_output_limit(
+    invocation: ModelInvocation,
+    applied_output_limit: int | None,
+    usage=None,
+) -> None:
+    expected = invocation.output_limit.max_tokens
+    if applied_output_limit != expected:
+        raise ContractViolationError(
+            "Model gateway did not apply the requested invocation output limit",
+            code="model_gateway_contract_violation",
+            details={
+                "expectedOutputLimit": expected,
+                "appliedOutputLimit": applied_output_limit,
+            },
+        )
+    _require_reported_usage_within_limit(expected, usage)
+
+
+def _require_reported_usage_within_limit(expected: int, usage) -> None:
+    if usage is not None and usage.output_tokens > expected:
+        raise ContractViolationError(
+            "Model gateway reported output usage above the invocation limit",
+            code="model_gateway_contract_violation",
+            details={
+                "expectedOutputLimit": expected,
+                "reportedOutputTokens": usage.output_tokens,
+            },
+        )
 
 
 def _fingerprint(value: object) -> str:

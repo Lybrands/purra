@@ -56,6 +56,7 @@ from purra.contracts import (
     ModelStreamChunk,
     RunCreateParams,
     RunStatus,
+    RuntimeLimits,
     StepExecutor,
     StepType,
     TaskSpec,
@@ -168,6 +169,7 @@ class _IncidentDurableRunner:
 def test_preset_cannot_mix_with_low_level_agent_composition_arguments():
     adapters = InMemoryAgentAdapters()
     preset = AgentPreset(
+        runtime_limits=RuntimeLimits(max_run_output_tokens=None),
         id="operations",
         revision="1",
         tool_catalog=InMemoryToolCatalog(()),
@@ -227,6 +229,7 @@ async def test_recovery_rejects_a_different_preset_composition_before_run_start(
     adapters = InMemoryAgentAdapters()
     catalog = InMemoryToolCatalog(())
     original = AgentPreset(
+        runtime_limits=RuntimeLimits(max_run_output_tokens=None),
         id="operations",
         revision="1",
         tool_catalog=catalog,
@@ -235,6 +238,7 @@ async def test_recovery_rejects_a_different_preset_composition_before_run_start(
         prompt_sections=(PromptSection(name="identity", text="Original."),),
     )
     changed = AgentPreset(
+        runtime_limits=RuntimeLimits(max_run_output_tokens=None),
         id="operations",
         revision="1",
         tool_catalog=catalog,
@@ -313,6 +317,7 @@ async def test_legacy_snapshot_continuation_fails_before_provider_invocation():
         output_repository=adapters.outputs,
         output_publisher=adapters.publisher,
         preset=AgentPreset(
+            runtime_limits=RuntimeLimits(max_run_output_tokens=None),
             id="operations",
             revision="2",
             tool_catalog=InMemoryToolCatalog(()),
@@ -333,6 +338,8 @@ async def test_legacy_snapshot_continuation_fails_before_provider_invocation():
     assert gateway.rounds == []
 
     valid_snapshot = AgentPreset(
+
+        runtime_limits=RuntimeLimits(max_run_output_tokens=None),
         id="operations",
         revision="2",
         tool_catalog=InMemoryToolCatalog(()),
@@ -349,6 +356,9 @@ async def test_legacy_snapshot_continuation_fails_before_provider_invocation():
         run_repository=adapters.runs,
         output_repository=adapters.outputs,
         output_publisher=adapters.publisher,
+        runtime_limits=RuntimeLimits(
+            max_run_output_tokens=None,
+        ),
     )
     try:
         with pytest.raises(ContractViolationError) as loose_error:
@@ -369,7 +379,7 @@ async def test_legacy_snapshot_continuation_fails_before_provider_invocation():
 async def test_continuation_restores_preset_authority_from_source_run_journal():
     class AnswerGateway:
         async def stream(self, messages, invocation, signal=None):
-            del messages, invocation, signal
+            del messages, signal
 
             async def chunks():
                 yield ModelStreamChunk(
@@ -377,19 +387,25 @@ async def test_continuation_restores_preset_authority_from_source_run_journal():
                     finish_reason=ModelFinishReason.STOP,
                 )
 
-            return ModelStream(chunks=chunks(), model="operations-model")
+            return ModelStream(
+                chunks=chunks(),
+                model="operations-model",
+                applied_output_limit=invocation.output_limit.max_tokens,
+            )
 
         async def complete(self, messages, invocation, signal=None):
-            del messages, invocation, signal
+            del messages, signal
             return ModelCompletion(
                 message=AgentMessage(role=MessageRole.ASSISTANT, content="done"),
                 model="operations-model",
+                applied_output_limit=invocation.output_limit.max_tokens,
                 finish_reason=ModelFinishReason.STOP,
             )
 
     adapters = InMemoryAgentAdapters()
     catalog = InMemoryToolCatalog(())
     original = AgentPreset(
+        runtime_limits=RuntimeLimits(max_run_output_tokens=None),
         id="operations",
         revision="1",
         tool_catalog=catalog,
@@ -449,6 +465,7 @@ async def test_continuation_restores_preset_authority_from_source_run_journal():
         output_repository=adapters.outputs,
         output_publisher=adapters.publisher,
         preset=AgentPreset(
+            runtime_limits=RuntimeLimits(max_run_output_tokens=None),
             id="operations",
             revision="1",
             tool_catalog=catalog,
@@ -514,13 +531,18 @@ class _OperationsGateway:
                 finish_reason=ModelFinishReason.STOP,
             )
 
-        return ModelStream(chunks=chunks(), model="operations-model")
+        return ModelStream(
+            chunks=chunks(),
+            model="operations-model",
+            applied_output_limit=invocation.output_limit.max_tokens,
+        )
 
     async def complete(self, messages, invocation, signal=None):
-        del messages, invocation, signal
+        del messages, signal
         return ModelCompletion(
             message=AgentMessage(role="assistant", content="unused"),
             model="operations-model",
+            applied_output_limit=invocation.output_limit.max_tokens,
             finish_reason=ModelFinishReason.STOP,
         )
 
@@ -579,20 +601,25 @@ class _DelegationGateway:
                 finish_reason=ModelFinishReason.STOP,
             )
 
-        return ModelStream(chunks=chunks(), model="operations-model")
+        return ModelStream(
+            chunks=chunks(),
+            model="operations-model",
+            applied_output_limit=invocation.output_limit.max_tokens,
+        )
 
     async def complete(self, messages, invocation, signal=None):
-        del messages, invocation, signal
+        del messages, signal
         return ModelCompletion(
             message=AgentMessage(role="assistant", content="unused"),
             model="operations-model",
+            applied_output_limit=invocation.output_limit.max_tokens,
             finish_reason=ModelFinishReason.STOP,
         )
 
 
 class _RecursiveDelegationGateway:
     async def stream(self, messages, invocation, signal=None):
-        del invocation, signal
+        del signal
         messages = tuple(messages)
         level_one = any(message.content == "LEVEL_ONE" for message in messages)
         level_two = any(message.content == "LEVEL_TWO" for message in messages)
@@ -642,13 +669,18 @@ class _RecursiveDelegationGateway:
                 finish_reason=ModelFinishReason.STOP,
             )
 
-        return ModelStream(chunks=chunks(), model="operations-model")
+        return ModelStream(
+            chunks=chunks(),
+            model="operations-model",
+            applied_output_limit=invocation.output_limit.max_tokens,
+        )
 
     async def complete(self, messages, invocation, signal=None):
-        del messages, invocation, signal
+        del messages, signal
         return ModelCompletion(
             message=AgentMessage(role="assistant", content="unused"),
             model="operations-model",
+            applied_output_limit=invocation.output_limit.max_tokens,
             finish_reason=ModelFinishReason.STOP,
         )
 
@@ -667,7 +699,7 @@ def _request() -> AgentRunRequest:
             capability_snapshot=replace(
                 generic_capability_snapshot(),
                 profile_id="operations:model",
-                max_output_tokens=1_024,
+                max_call_output_tokens=1_024,
             ),
             options={"max_tokens": 512},
         ),
@@ -716,6 +748,7 @@ async def test_non_writing_host_keeps_identity_context_and_tool_authority_separa
         output_repository=adapters.outputs,
         output_publisher=adapters.publisher,
         preset=AgentPreset(
+            runtime_limits=RuntimeLimits(max_run_output_tokens=None),
             id="operations",
             revision="1",
             tool_catalog=catalog,
@@ -789,6 +822,7 @@ async def test_native_delegation_uses_model_defined_isolated_agent():
         delegation_repository=adapters.delegations,
         tool_idempotency_gateway=adapters.idempotency,
         preset=AgentPreset(
+            runtime_limits=RuntimeLimits(max_run_output_tokens=None),
             id="operations",
             revision="1",
             tool_catalog=InMemoryToolCatalog(()),
@@ -873,6 +907,7 @@ async def test_agent_tree_delegation_executes_a_canonical_child_run():
         run_tree_repository=tree,
         root_agent_id="operations-root-agent",
         preset=AgentPreset(
+            runtime_limits=RuntimeLimits(max_run_output_tokens=None),
             id="operations",
             revision="1",
             tool_catalog=InMemoryToolCatalog(()),
@@ -934,6 +969,9 @@ def test_agent_tree_rejects_the_legacy_delegation_write_authority():
             delegation_policy=DelegationPolicy(),
             delegation_repository=adapters.delegations,
             run_tree_repository=adapters.run_tree,
+            runtime_limits=RuntimeLimits(
+                max_run_output_tokens=None,
+            ),
         )
 
 
@@ -943,7 +981,7 @@ async def test_agent_core_host_commands_continue_a_canonical_child_agent():
 
     class _HostCommandGateway:
         async def stream(self, messages, invocation, signal=None):
-            del invocation, signal
+            del signal
             is_child = any(
                 message.content == "Host child." for message in messages
             )
@@ -958,10 +996,14 @@ async def test_agent_core_host_commands_continue_a_canonical_child_agent():
                     finish_reason=ModelFinishReason.STOP,
                 )
 
-            return ModelStream(chunks=chunks(), model="operations-model")
+            return ModelStream(
+                chunks=chunks(),
+                model="operations-model",
+                applied_output_limit=invocation.output_limit.max_tokens,
+            )
 
         async def complete(self, messages, invocation, signal=None):
-            del invocation, signal
+            del signal
             if any(message.content == "Host child." for message in messages):
                 content = "host child done"
             else:
@@ -973,6 +1015,7 @@ async def test_agent_core_host_commands_continue_a_canonical_child_agent():
                     content=content,
                 ),
                 model="operations-model",
+                applied_output_limit=invocation.output_limit.max_tokens,
                 finish_reason=ModelFinishReason.STOP,
             )
 
@@ -985,6 +1028,7 @@ async def test_agent_core_host_commands_continue_a_canonical_child_agent():
         run_tree_repository=adapters.run_tree,
         root_agent_id="host-command-root-agent",
         preset=AgentPreset(
+            runtime_limits=RuntimeLimits(max_run_output_tokens=None),
             id="host-commands",
             revision="1",
             tool_catalog=InMemoryToolCatalog(()),
@@ -1037,7 +1081,7 @@ async def test_root_completion_is_rejected_before_final_when_child_is_pending():
 
     class _PendingChildGateway:
         async def stream(self, messages, invocation, signal=None):
-            del messages, invocation, signal
+            del messages, signal
 
             async def chunks():
                 await root_gate.wait()
@@ -1046,10 +1090,14 @@ async def test_root_completion_is_rejected_before_final_when_child_is_pending():
                     finish_reason=ModelFinishReason.STOP,
                 )
 
-            return ModelStream(chunks=chunks(), model="operations-model")
+            return ModelStream(
+                chunks=chunks(),
+                model="operations-model",
+                applied_output_limit=invocation.output_limit.max_tokens,
+            )
 
         async def complete(self, messages, invocation, signal=None):
-            del messages, invocation, signal
+            del messages, signal
             await root_gate.wait()
             return ModelCompletion(
                 message=AgentMessage(
@@ -1057,6 +1105,7 @@ async def test_root_completion_is_rejected_before_final_when_child_is_pending():
                     content="must not become final",
                 ),
                 model="operations-model",
+                applied_output_limit=invocation.output_limit.max_tokens,
                 finish_reason=ModelFinishReason.STOP,
             )
 
@@ -1069,6 +1118,7 @@ async def test_root_completion_is_rejected_before_final_when_child_is_pending():
         run_tree_repository=adapters.run_tree,
         root_agent_id="quiescence-root-agent",
         preset=AgentPreset(
+            runtime_limits=RuntimeLimits(max_run_output_tokens=None),
             id="quiescence",
             revision="1",
             tool_catalog=InMemoryToolCatalog(()),
@@ -1120,7 +1170,7 @@ async def test_new_agent_core_rebinds_and_executes_a_committed_child_once():
     class _RecoveryGateway:
         async def stream(self, messages, invocation, signal=None):
             nonlocal executions
-            del messages, invocation, signal
+            del messages, signal
             executions += 1
 
             async def chunks():
@@ -1129,16 +1179,21 @@ async def test_new_agent_core_rebinds_and_executes_a_committed_child_once():
                     finish_reason=ModelFinishReason.STOP,
                 )
 
-            return ModelStream(chunks=chunks(), model="operations-model")
+            return ModelStream(
+                chunks=chunks(),
+                model="operations-model",
+                applied_output_limit=invocation.output_limit.max_tokens,
+            )
 
         async def complete(self, messages, invocation, signal=None):
-            del messages, invocation, signal
+            del messages, signal
             return ModelCompletion(
                 message=AgentMessage(
                     role=MessageRole.ASSISTANT,
                     content="recovered child done",
                 ),
                 model="operations-model",
+                applied_output_limit=invocation.output_limit.max_tokens,
                 finish_reason=ModelFinishReason.STOP,
             )
 
@@ -1185,6 +1240,7 @@ async def test_new_agent_core_rebinds_and_executes_a_committed_child_once():
         run_tree_repository=adapters.run_tree,
         root_agent_id="recovered-root-agent",
         preset=AgentPreset(
+            runtime_limits=RuntimeLimits(max_run_output_tokens=None),
             id="recovery",
             revision="1",
             tool_catalog=InMemoryToolCatalog(()),
@@ -1377,6 +1433,7 @@ async def test_agent_tree_allows_bounded_recursive_child_runs():
         run_tree_repository=tree,
         root_agent_id="recursive-root-agent",
         preset=AgentPreset(
+            runtime_limits=RuntimeLimits(max_run_output_tokens=None),
             id="recursive",
             revision="1",
             tool_catalog=InMemoryToolCatalog(()),

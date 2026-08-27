@@ -33,9 +33,15 @@ export function validateModelTurn(turn: ModelTurn): ModelTurn {
   }
   let message: Message;
   let usage: ModelTokenUsage | undefined;
+  let appliedOutputLimit: number | null | undefined;
   try {
     message = copyMessage(turn.message);
     usage = turn.usage === undefined ? undefined : copyTokenUsage(turn.usage);
+    appliedOutputLimit = turn.appliedOutputLimit === undefined
+      ? undefined
+      : turn.appliedOutputLimit === null
+      ? null
+      : positiveInteger(turn.appliedOutputLimit, "applied output limit");
   } catch (error) {
     throw new AgentError("invalid_model_response", "Model gateway returned invalid data", {
       cause: error,
@@ -47,6 +53,7 @@ export function validateModelTurn(turn: ModelTurn): ModelTurn {
   return Object.freeze({
     message,
     finishReason: turn.finishReason,
+    ...(appliedOutputLimit === undefined ? {} : { appliedOutputLimit }),
     ...(usage === undefined ? {} : { usage }),
   });
 }
@@ -91,9 +98,12 @@ export function copyCapabilitySnapshot(value: ModelCapabilitySnapshot): ModelCap
     throw new TypeError("Model capabilities must be an object");
   }
   const protocol = value.protocol;
-  const maxOutputTokens = value.maxOutputTokens === null
+  const maxCallOutputTokens = value.maxCallOutputTokens === null
     ? null
-    : positiveInteger(value.maxOutputTokens, "model max output tokens");
+    : positiveInteger(
+      value.maxCallOutputTokens,
+      "model max tokens per invocation",
+    );
   const source = optionalText(value.source);
   if (value.actionable !== undefined && typeof value.actionable !== "boolean") {
     throw new TypeError("Model capability actionable flag must be a boolean");
@@ -103,7 +113,7 @@ export function copyCapabilitySnapshot(value: ModelCapabilitySnapshot): ModelCap
     profileId: requiredText(value.profileId, "capability profile id"),
     providerProtocol: requiredText(value.providerProtocol, "provider protocol"),
     contextWindowTokens: positiveInteger(value.contextWindowTokens, "context window tokens"),
-    maxOutputTokens,
+    maxCallOutputTokens,
     thinkingTokenAccounting: enumValue(
       THINKING_TOKEN_ACCOUNTING,
       value.thinkingTokenAccounting,
@@ -161,7 +171,7 @@ export function resolveInvocationOutputLimit(
       "Model capabilities do not declare an output limit",
     );
   }
-  const profileMaximum = snapshot.maxOutputTokens;
+  const profileMaximum = snapshot.maxCallOutputTokens;
   if (profileMaximum === null) {
     throw new AgentError(
       "model_output_limit_unknown",

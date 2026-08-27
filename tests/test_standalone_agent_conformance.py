@@ -65,18 +65,23 @@ class _Gateway:
         self.messages = []
 
     async def stream(self, messages, invocation, signal=None):
-        del invocation, signal
+        del signal
         self.messages.append(tuple(messages))
-        return ModelStream(chunks=_chunks(self.response), model="portable-model")
+        return ModelStream(
+            chunks=_chunks(self.response),
+            model="portable-model",
+            applied_output_limit=invocation.output_limit.max_tokens,
+        )
 
     async def complete(self, messages, invocation, signal=None):
-        del messages, invocation, signal
+        del messages, signal
         return ModelCompletion(
             message=AgentMessage(
                 role=MessageRole.ASSISTANT,
                 content=self.response,
             ),
             model="portable-model",
+            applied_output_limit=invocation.output_limit.max_tokens,
             finish_reason=ModelFinishReason.STOP,
         )
 
@@ -230,7 +235,7 @@ def _request() -> AgentRunRequest:
             capability_snapshot=replace(
                 generic_capability_snapshot(),
                 profile_id="portable:model",
-                max_output_tokens=1_024,
+                max_call_output_tokens=1_024,
             ),
             options={"max_tokens": 512},
         ),
@@ -265,7 +270,7 @@ def _core(*, gateway, context, profile=None, adapters=None, runtime_limits=None)
             revision="1",
             tool_catalog=InMemoryToolCatalog(()),
             context_provider=context,
-            runtime_limits=runtime_limits or RuntimeLimits(),
+            runtime_limits=runtime_limits or RuntimeLimits(max_run_output_tokens=None),
             execution_profile=resolved_profile,
             component_bindings=bindings,
             prompt_sections=(PromptSection(
@@ -283,7 +288,7 @@ class _BudgetExhaustingGateway(_Gateway):
         self.calls = 0
 
     async def stream(self, messages, invocation, signal=None):
-        del messages, invocation, signal
+        del messages, signal
         self.calls += 1
 
         async def chunks():
@@ -293,7 +298,11 @@ class _BudgetExhaustingGateway(_Gateway):
                 finish_reason=ModelFinishReason.STOP,
             )
 
-        return ModelStream(chunks=chunks(), model="portable-model")
+        return ModelStream(
+            chunks=chunks(),
+            model="portable-model",
+            applied_output_limit=invocation.output_limit.max_tokens,
+        )
 
 
 class _UnknownStreamFailureGateway(_Gateway):
@@ -301,13 +310,17 @@ class _UnknownStreamFailureGateway(_Gateway):
         super().__init__("")
 
     async def stream(self, messages, invocation, signal=None):
-        del messages, invocation, signal
+        del messages, signal
 
         async def chunks():
             raise OSError("socket vanished")
             yield
 
-        return ModelStream(chunks=chunks(), model="portable-model")
+        return ModelStream(
+            chunks=chunks(),
+            model="portable-model",
+            applied_output_limit=invocation.output_limit.max_tokens,
+        )
 
 
 class _RetryableStreamFailureGateway(_Gateway):
@@ -316,7 +329,7 @@ class _RetryableStreamFailureGateway(_Gateway):
         self.calls = 0
 
     async def stream(self, messages, invocation, signal=None):
-        del messages, invocation, signal
+        del messages, signal
         self.calls += 1
 
         async def chunks():
@@ -328,7 +341,11 @@ class _RetryableStreamFailureGateway(_Gateway):
                 finish_reason=ModelFinishReason.STOP,
             )
 
-        return ModelStream(chunks=chunks(), model="portable-model")
+        return ModelStream(
+            chunks=chunks(),
+            model="portable-model",
+            applied_output_limit=invocation.output_limit.max_tokens,
+        )
 
 
 @pytest.mark.asyncio
@@ -355,7 +372,7 @@ async def test_provider_output_budget_failure_reaches_run_without_retry():
         gateway=gateway,
         context=_Context(),
         adapters=adapters,
-        runtime_limits=RuntimeLimits(max_provider_output_bytes=1),
+        runtime_limits=RuntimeLimits(max_run_output_tokens=None, max_provider_output_bytes=1),
     )
     try:
         result = await (await core.submit(_request())).wait()
@@ -423,6 +440,7 @@ async def test_preset_context_factory_is_resolved_once_per_run():
         output_repository=adapters.outputs,
         output_publisher=adapters.publisher,
         preset=AgentPreset(
+            runtime_limits=RuntimeLimits(max_run_output_tokens=None),
             id="portable",
             revision="1",
             tool_catalog=InMemoryToolCatalog(()),

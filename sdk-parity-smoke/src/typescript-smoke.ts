@@ -68,6 +68,8 @@ const lookup = {
 
 const handle = await new Agent({ model, tools: [lookup] }).submit({
   messages: [{ role: "user", content: "Check the local status." }],
+}, {
+  budgets: { maxRunOutputTokens: null },
 });
 const result = await handle.result;
 const eventKinds: string[] = [];

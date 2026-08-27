@@ -318,7 +318,7 @@ test("Artifact finalization never completes its owner Long Task", async () => {
     budgets: {
       maxInvocationAttempts: 2,
       maxInputTokens: 100,
-      maxOutputTokens: 100,
+      maxRunOutputTokens: 100,
       maxReasoningTokens: 100,
     },
   });

@@ -65,12 +65,16 @@ export interface ModelStreamActivity {
 export type ModelStreamItem = ModelStreamChunk | ModelStreamActivity;
 
 export interface ModelStream extends AsyncIterable<ModelStreamItem> {
+  /** Exact request output limit actually applied by the Provider host. */
+  readonly appliedOutputLimit?: number | null;
   readonly activitySupport?: ModelStreamActivitySupport;
 }
 
 export interface ModelTurn {
   readonly message: Message;
   readonly finishReason: ModelFinishReason;
+  /** Exact request output limit actually applied by the Provider host. */
+  readonly appliedOutputLimit?: number | null;
   readonly usage?: ModelTokenUsage;
 }
 
@@ -100,7 +104,7 @@ export interface ModelCapabilitySnapshot {
   readonly profileId: string;
   readonly providerProtocol: string;
   readonly contextWindowTokens: number;
-  readonly maxOutputTokens: number | null;
+  readonly maxCallOutputTokens: number | null;
   readonly thinkingTokenAccounting: ThinkingTokenAccounting;
   readonly protocol: ModelProtocolCapabilities;
   readonly actionable?: boolean;

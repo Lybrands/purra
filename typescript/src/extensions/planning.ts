@@ -16,11 +16,11 @@ import { AgentError } from "../shared/errors.js";
 
 export interface ModelWorkPlannerOptions {
   readonly maxRepairAttempts?: number;
-  readonly maxOutputTokens?: number;
+  readonly maxCallOutputTokens?: number;
 }
 
 export interface ModelResponseJudgeOptions {
-  readonly maxOutputTokens?: number;
+  readonly maxCallOutputTokens?: number;
 }
 
 const PLANNER_INSTRUCTION = [
@@ -38,7 +38,7 @@ const PLANNER_INSTRUCTION = [
 export class ModelWorkPlanner implements DynamicWorkPlanner {
   readonly #modelTasks: ModelTaskRunner;
   readonly #maxRepairAttempts: number;
-  readonly #maxOutputTokens: number | undefined;
+  readonly #maxCallOutputTokens: number | undefined;
 
   public constructor(modelTasks: ModelTaskRunner, options: ModelWorkPlannerOptions = {}) {
     if (modelTasks === null || typeof modelTasks?.complete !== "function") {
@@ -49,14 +49,17 @@ export class ModelWorkPlanner implements DynamicWorkPlanner {
       throw new TypeError("planner maxRepairAttempts must be between zero and three");
     }
     if (
-      options.maxOutputTokens !== undefined
-      && (!Number.isSafeInteger(options.maxOutputTokens) || options.maxOutputTokens < 1)
+      options.maxCallOutputTokens !== undefined
+      && (
+        !Number.isSafeInteger(options.maxCallOutputTokens)
+        || options.maxCallOutputTokens < 1
+      )
     ) {
-      throw new TypeError("planner maxOutputTokens must be a positive integer");
+      throw new TypeError("planner maxCallOutputTokens must be a positive integer");
     }
     this.#modelTasks = modelTasks;
     this.#maxRepairAttempts = maxRepairAttempts;
-    this.#maxOutputTokens = options.maxOutputTokens;
+    this.#maxCallOutputTokens = options.maxCallOutputTokens;
   }
 
   public createPlan(
@@ -85,7 +88,9 @@ export class ModelWorkPlanner implements DynamicWorkPlanner {
     let messages = plannerMessages(request, capabilities, turn);
     for (let repairAttempt = 0; ; repairAttempt += 1) {
       const completion = await this.#modelTasks.complete(messages, {
-        ...(this.#maxOutputTokens === undefined ? {} : { maxOutputTokens: this.#maxOutputTokens }),
+        ...(this.#maxCallOutputTokens === undefined
+          ? {}
+          : { maxCallOutputTokens: this.#maxCallOutputTokens }),
         ...(signal === undefined ? {} : { signal }),
       });
       try {
@@ -115,7 +120,7 @@ export class ModelWorkPlanner implements DynamicWorkPlanner {
 export class ModelResponseJudge implements ResponseJudge {
   readonly #modelTasks: ModelTaskRunner;
   readonly #policy: ResponseJudgePolicy;
-  readonly #maxOutputTokens: number | undefined;
+  readonly #maxCallOutputTokens: number | undefined;
 
   public constructor(
     modelTasks: ModelTaskRunner,
@@ -132,14 +137,17 @@ export class ModelResponseJudge implements ResponseJudge {
       throw new TypeError("ModelResponseJudge requires a ResponseJudgePolicy");
     }
     if (
-      options.maxOutputTokens !== undefined
-      && (!Number.isSafeInteger(options.maxOutputTokens) || options.maxOutputTokens < 1)
+      options.maxCallOutputTokens !== undefined
+      && (
+        !Number.isSafeInteger(options.maxCallOutputTokens)
+        || options.maxCallOutputTokens < 1
+      )
     ) {
-      throw new TypeError("judge maxOutputTokens must be a positive integer");
+      throw new TypeError("judge maxCallOutputTokens must be a positive integer");
     }
     this.#modelTasks = modelTasks;
     this.#policy = policy;
-    this.#maxOutputTokens = options.maxOutputTokens;
+    this.#maxCallOutputTokens = options.maxCallOutputTokens;
   }
 
   public async judge(input: {
@@ -150,7 +158,9 @@ export class ModelResponseJudge implements ResponseJudge {
     const completion = await this.#modelTasks.complete(
       this.#policy.buildMessages({ content: input.content, messages: input.messages }),
       {
-        ...(this.#maxOutputTokens === undefined ? {} : { maxOutputTokens: this.#maxOutputTokens }),
+        ...(this.#maxCallOutputTokens === undefined
+          ? {}
+          : { maxCallOutputTokens: this.#maxCallOutputTokens }),
         ...(input.signal === undefined ? {} : { signal: input.signal }),
       },
     );

@@ -73,7 +73,7 @@ def test_shared_output_limit_cases() -> None:
     for case in _FIXTURE["outputLimitCases"]:
         snapshot = replace(
             generic_capability_snapshot(),
-            max_output_tokens=case["profileMaxTokens"],
+            max_call_output_tokens=case["profileMaxTokens"],
         )
         if case["errorCode"] is not None:
             with pytest.raises(UnsupportedModelFeatureError) as captured:

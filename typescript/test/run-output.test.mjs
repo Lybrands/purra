@@ -10,8 +10,25 @@ import {
   InMemoryRunRepository,
 } from "purra";
 
+const RUN_OPTIONS = Object.freeze({
+  budgets: Object.freeze({ maxRunOutputTokens: null }),
+});
+
 test("in-memory Run repository passes the public conformance probe", async () => {
   await assertRunRepositoryConforms(new InMemoryRunRepository());
+});
+
+test("new Runs require an explicit Run output budget", () => {
+  const agent = new Agent({
+    model: { async invoke() { return finalTurn("unused"); } },
+  });
+  const request = { messages: [{ role: "user", content: "run" }] };
+
+  assert.throws(() => agent.submit(request), /explicit budgets/);
+  assert.throws(
+    () => agent.submit(request, { budgets: {} }),
+    /maxRunOutputTokens must be a number or explicit null/,
+  );
 });
 
 test("Run output batches are atomic, replayable, and budgeted before append", async () => {
@@ -40,7 +57,7 @@ test("Run output batches are atomic, replayable, and budgeted before append", as
     budgets: {
       maxModelAttempts: 1,
       maxInputTokens: null,
-      maxOutputTokens: null,
+      maxRunOutputTokens: null,
       maxReasoningTokens: null,
       maxOutputBytes: 10_000,
       maxOutputEvents: 1,
@@ -96,7 +113,7 @@ test("Child Runs share Root attempts, tokens, output budgets, and journal order"
   const budgets = {
     maxModelAttempts: 2,
     maxInputTokens: 3,
-    maxOutputTokens: null,
+    maxRunOutputTokens: null,
     maxReasoningTokens: null,
     maxOutputBytes: 10_000,
     maxOutputEvents: 1,
@@ -190,7 +207,7 @@ test("ten thousand one-character chunks coalesce deterministically", async () =>
   });
   const handle = await agent.submit(
     { messages: [{ role: "user", content: "many" }] },
-    { budgets: { maxOutputBytes: candidate } },
+    { budgets: { maxRunOutputTokens: null, maxOutputBytes: candidate } },
   );
   assert.equal((await handle.result).output.length, 10_000);
   assert.ok((await handle.snapshot()).usage.outputBytes * 2 <= candidate);
@@ -224,7 +241,7 @@ test("private Provider batches use the background latency ceiling", async () => 
   });
   const handle = await agent.submit(
     { messages: [{ role: "user", content: "background" }] },
-    { budgets: { maxOutputBytes: null } },
+    { budgets: { maxRunOutputTokens: null, maxOutputBytes: null } },
   );
 
   assert.equal((await handle.result).output, "ab");
@@ -250,7 +267,7 @@ test("Provider output budget failure stays coded, terminal, and non-retryable", 
   });
   const handle = await agent.submit(
     { messages: [{ role: "user", content: "budget" }] },
-    { budgets: { maxOutputBytes: 1 } },
+    { budgets: { maxRunOutputTokens: null, maxOutputBytes: 1 } },
   );
 
   await rejectsCode(handle.result, "runtime_budget_exceeded");
@@ -303,7 +320,7 @@ test("submitted Run persists private model evidence and public output in order",
   const handle = await agent.submit({
     messages: [{ role: "user", content: "find" }],
     contextEvidence: [{ evidenceId: "ev-1", source: "fixture", itemId: "item-1" }],
-  });
+  }, RUN_OPTIONS);
   const result = await handle.result;
   const all = await collect(handle.events({ visibility: "all" }));
   const publicEvents = await collect(handle.events());
@@ -361,7 +378,10 @@ test("failed terminal commit does not expose a final answer or completed state",
     runRepository: repository,
     model: { async invoke() { return finalTurn("uncommitted"); } },
   });
-  const handle = await agent.submit({ messages: [{ role: "user", content: "run" }] });
+  const handle = await agent.submit(
+    { messages: [{ role: "user", content: "run" }] },
+    RUN_OPTIONS,
+  );
 
   await rejectsCode(handle.result, "repository_failed");
   const events = await collect(handle.events({ visibility: "all" }));
@@ -381,7 +401,10 @@ test("Run begin failure prevents Provider and tool execution", async () => {
     tools: [readTool("read", () => { toolCalls += 1; return readResult(null); })],
   });
 
-  await assert.rejects(agent.submit({ messages: [{ role: "user", content: "run" }] }));
+  await assert.rejects(agent.submit(
+    { messages: [{ role: "user", content: "run" }] },
+    RUN_OPTIONS,
+  ));
   assert.equal(modelCalls, 0);
   assert.equal(toolCalls, 0);
 });
@@ -397,7 +420,10 @@ test("invocation receipt persistence failure prevents the Provider call", async 
     model: { async invoke() { modelCalls += 1; return finalTurn("no"); } },
   });
 
-  const handle = await agent.submit({ messages: [{ role: "user", content: "run" }] });
+  const handle = await agent.submit(
+    { messages: [{ role: "user", content: "run" }] },
+    RUN_OPTIONS,
+  );
   await rejectsCode(handle.result, "repository_failed");
   assert.equal(modelCalls, 0);
   assert.equal((await handle.snapshot()).status, "failed");
@@ -432,7 +458,10 @@ test("committed invocation receipt is published before Provider execution", asyn
     },
   });
 
-  const handle = await agent.submit({ messages: [{ role: "user", content: "run" }] });
+  const handle = await agent.submit(
+    { messages: [{ role: "user", content: "run" }] },
+    RUN_OPTIONS,
+  );
   assert.equal((await handle.result).output, "done");
   assert.equal(providerCalls, 1);
 });
@@ -452,7 +481,10 @@ test("tool-start persistence failure prevents the handler", async () => {
     tools: [readTool("read", () => { executions += 1; return readResult(null); })],
   });
 
-  const handle = await agent.submit({ messages: [{ role: "user", content: "run" }] });
+  const handle = await agent.submit(
+    { messages: [{ role: "user", content: "run" }] },
+    RUN_OPTIONS,
+  );
   await rejectsCode(handle.result, "repository_failed");
   assert.equal(executions, 0);
   assert.equal((await handle.snapshot()).status, "failed");
@@ -472,7 +504,10 @@ test("cancellation atomically aborts an open invocation and wins the terminal ra
       stream() { return { [Symbol.asyncIterator]: () => iterator }; },
     },
   });
-  const handle = await agent.submit({ messages: [{ role: "user", content: "wait" }] });
+  const handle = await agent.submit(
+    { messages: [{ role: "user", content: "wait" }] },
+    RUN_OPTIONS,
+  );
   await providerStarted;
   const receipt = await handle.cancel();
 
@@ -521,7 +556,10 @@ test("cancellation flushes a pending private batch and clears its timer", async 
       stream() { return { [Symbol.asyncIterator]: () => iterator }; },
     },
   });
-  const handle = await agent.submit({ messages: [{ role: "user", content: "wait" }] });
+  const handle = await agent.submit(
+    { messages: [{ role: "user", content: "wait" }] },
+    RUN_OPTIONS,
+  );
   await waiting;
 
   assert.equal((await handle.cancel()).accepted, true);
@@ -547,7 +585,7 @@ test("attempt budget prevents a second Provider call", async () => {
   });
   const handle = await agent.submit(
     { messages: [{ role: "user", content: "loop" }] },
-    { budgets: { maxModelAttempts: 1 } },
+    { budgets: { maxRunOutputTokens: null, maxModelAttempts: 1 } },
   );
 
   await rejectsCode(handle.result, "runtime_budget_exceeded");
@@ -570,7 +608,7 @@ test("reported token budget and final-output budget fail before completion commi
   });
   const tokenRun = await tokenAgent.submit(
     { messages: [{ role: "user", content: "run" }] },
-    { budgets: { maxInputTokens: 5 } },
+    { budgets: { maxRunOutputTokens: null, maxInputTokens: 5 } },
   );
   await rejectsCode(tokenRun.result, "runtime_budget_exceeded");
   assert.equal((await tokenRun.snapshot()).usage.inputTokens, 8);
@@ -579,7 +617,7 @@ test("reported token budget and final-output budget fail before completion commi
   const outputAgent = new Agent({ model: { async invoke() { return finalTurn("answer"); } } });
   const outputRun = await outputAgent.submit(
     { messages: [{ role: "user", content: "run" }] },
-    { budgets: { maxOutputBytes: 1 } },
+    { budgets: { maxRunOutputTokens: null, maxOutputBytes: 1 } },
   );
   await rejectsCode(outputRun.result, "runtime_budget_exceeded");
   const outputEvents = await collect(outputRun.events({ visibility: "all" }));
@@ -602,7 +640,10 @@ test("absolute deadline aborts Provider work and commits failed exactly once", a
   });
   const handle = await agent.submit(
     { messages: [{ role: "user", content: "wait" }] },
-    { deadlineAt: new Date(Date.now() + 10).toISOString() },
+    {
+      deadlineAt: new Date(Date.now() + 10).toISOString(),
+      budgets: { maxRunOutputTokens: null },
+    },
   );
 
   await rejectsCode(handle.result, "run_deadline_exceeded");
@@ -627,7 +668,10 @@ test("output policy cannot promote private reasoning", async () => {
       },
     },
   });
-  const handle = await agent.submit({ messages: [{ role: "user", content: "run" }] });
+  const handle = await agent.submit(
+    { messages: [{ role: "user", content: "run" }] },
+    RUN_OPTIONS,
+  );
 
   await rejectsCode(handle.result, "output_policy_violation");
   const events = await collect(handle.events({ visibility: "all" }));
@@ -646,7 +690,10 @@ test("output policy authorizes final output before the atomic terminal commit", 
     },
     model: { async invoke() { return finalTurn("private answer"); } },
   });
-  const handle = await agent.submit({ messages: [{ role: "user", content: "run" }] });
+  const handle = await agent.submit(
+    { messages: [{ role: "user", content: "run" }] },
+    RUN_OPTIONS,
+  );
 
   assert.equal((await handle.result).output, "private answer");
   const events = await collect(handle.events());

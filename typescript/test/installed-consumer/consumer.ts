@@ -166,6 +166,8 @@ const handle: RunHandle = await new Agent({
   },
 }).submit({
   messages: [{ role: "user", content: "hello" }],
+}, {
+  budgets: { maxRunOutputTokens: null },
 });
 const result = await handle.result;
 result.output satisfies JsonValue;
@@ -222,7 +224,7 @@ const durableReceipt: LongTaskDispatchReceipt = await durableDispatcher.dispatch
   budgets: {
     maxModelAttempts: 2,
     maxInputTokens: 100,
-    maxOutputTokens: 100,
+    maxRunOutputTokens: 100,
     maxReasoningTokens: 100,
     maxOutputBytes: 1_000,
     maxOutputEvents: 100,
@@ -396,7 +398,7 @@ function capabilities() {
     profileId: "installed",
     providerProtocol: "custom",
     contextWindowTokens: 16_000,
-    maxOutputTokens: 512,
+    maxCallOutputTokens: 512,
     thinkingTokenAccounting: "unknown" as const,
     protocol: {
       reasoningControl: "selectable" as const,

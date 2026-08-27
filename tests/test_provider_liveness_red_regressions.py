@@ -38,7 +38,7 @@ def test_runtime_limits_separate_activity_progress_and_absolute_bounds():
         "provider_progress_idle_timeout_ms",
         "provider_invocation_timeout_ms",
     } <= names
-    limits = RuntimeLimits()
+    limits = RuntimeLimits(max_run_output_tokens=None)
     assert limits.provider_activity_idle_timeout_ms == 30_000
     assert limits.provider_progress_idle_timeout_ms == 60_000
     assert limits.provider_invocation_timeout_ms == 300_000
@@ -68,7 +68,7 @@ class _TimedGateway:
         self.progressing = progressing
 
     async def stream(self, messages, invocation, signal=None):
-        del messages, invocation
+        del messages
 
         async def chunks():
             if self.progressing:
@@ -79,7 +79,11 @@ class _TimedGateway:
             await signal.wait()
             yield ModelStreamChunk(content_delta="late")
 
-        return ModelStream(chunks=chunks(), model="model")
+        return ModelStream(
+            chunks=chunks(),
+            model="model",
+            applied_output_limit=invocation.output_limit.max_tokens,
+        )
 
     async def complete(self, messages, invocation, signal=None):
         del messages, invocation, signal
@@ -93,7 +97,7 @@ def _call() -> AgentModelCall:
         capability_snapshot=replace(
             generic_capability_snapshot(),
             profile_id="test:model",
-            max_output_tokens=256,
+            max_call_output_tokens=256,
         ),
     )
     return AgentModelCall(
@@ -144,7 +148,7 @@ class _ActivityGateway:
         self.closed = 0
 
     async def stream(self, messages, invocation, signal=None):
-        del messages, invocation, signal
+        del messages, signal
 
         async def chunks():
             try:
@@ -159,6 +163,7 @@ class _ActivityGateway:
         return ModelStream(
             chunks=chunks(),
             model="model",
+            applied_output_limit=invocation.output_limit.max_tokens,
             activity_support=self.support,
         )
 
@@ -198,7 +203,7 @@ async def test_semantic_only_stream_uses_only_absolute_boundary():
     )
     chunks, observer = await _consume(
         gateway,
-        RuntimeLimits(
+        RuntimeLimits(max_run_output_tokens=None,
             provider_activity_idle_timeout_ms=5,
             provider_progress_idle_timeout_ms=10,
             provider_invocation_timeout_ms=80,
@@ -227,7 +232,7 @@ async def test_working_activity_renews_both_leases_without_entering_output():
     )
     chunks, observer = await _consume(
         gateway,
-        RuntimeLimits(
+        RuntimeLimits(max_run_output_tokens=None,
             provider_activity_idle_timeout_ms=7,
             provider_progress_idle_timeout_ms=7,
             provider_invocation_timeout_ms=80,
@@ -251,7 +256,7 @@ async def test_undeclared_activity_fails_before_output_with_stable_code():
     )
 
     with pytest.raises(ContractViolationError) as captured:
-        await _consume(gateway, RuntimeLimits(provider_invocation_timeout_ms=80))
+        await _consume(gateway, RuntimeLimits(max_run_output_tokens=None, provider_invocation_timeout_ms=80))
 
     assert captured.value.code == "model_stream_activity_unsupported"
     assert gateway.observer.accepted == []
@@ -272,7 +277,7 @@ async def test_transport_only_activity_expires_progress_and_settles_once():
     with pytest.raises(ExecutionDeadlineExceeded) as exceeded:
         await _consume(
             gateway,
-            RuntimeLimits(
+            RuntimeLimits(max_run_output_tokens=None,
                 provider_activity_idle_timeout_ms=8,
                 provider_progress_idle_timeout_ms=18,
                 provider_invocation_timeout_ms=100,
@@ -296,7 +301,7 @@ async def test_declared_stream_silence_expires_activity():
     with pytest.raises(ExecutionDeadlineExceeded) as exceeded:
         await _consume(
             gateway,
-            RuntimeLimits(
+            RuntimeLimits(max_run_output_tokens=None,
                 provider_activity_idle_timeout_ms=12,
                 provider_progress_idle_timeout_ms=40,
                 provider_invocation_timeout_ms=100,
@@ -322,7 +327,7 @@ async def test_continuous_progress_stops_at_absolute_boundary_once():
     with pytest.raises(ExecutionDeadlineExceeded) as exceeded:
         await _consume(
             gateway,
-            RuntimeLimits(
+            RuntimeLimits(max_run_output_tokens=None,
                 provider_activity_idle_timeout_ms=10,
                 provider_progress_idle_timeout_ms=10,
                 provider_invocation_timeout_ms=30,

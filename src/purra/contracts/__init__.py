@@ -208,7 +208,7 @@ class ModelInvocation:
             raise ValueError("required tool choice needs at least one tool")
 
     @property
-    def max_output_tokens(self) -> int | None:
+    def max_call_output_tokens(self) -> int | None:
         return self.output_limit.max_tokens if self.output_limit is not None else None
 
 
@@ -317,44 +317,58 @@ ModelStreamItem: TypeAlias = ModelStreamActivity | ModelStreamChunk
 
 @dataclass(slots=True)
 class ModelStream:
+    """Provider stream plus the exact output limit applied by the host."""
+
     chunks: AsyncIterator[ModelStreamItem]
     model: str
     metadata: Mapping[str, Any] = field(default_factory=dict)
     activity_support: ModelStreamActivitySupport = (
         ModelStreamActivitySupport.SEMANTIC_ONLY
     )
+    applied_output_limit: int | None = None
 
     def __post_init__(self) -> None:
         self.model = required_text(self.model, "model stream model name")
+        self.applied_output_limit = optional_positive_int(
+            self.applied_output_limit,
+            "model stream applied output limit",
+        )
         self.metadata = freeze_json_mapping(self.metadata)
         self.activity_support = ModelStreamActivitySupport(self.activity_support)
 
 
 @dataclass(frozen=True, slots=True)
 class ModelCompletion:
+    """Provider completion plus the exact output limit applied by the host."""
+
     message: AgentMessage
     model: str
     finish_reason: ModelFinishReason | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
     usage: ModelTokenUsage | None = None
+    applied_output_limit: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "model", required_text(
             self.model, "model completion model name"
         ))
+        object.__setattr__(
+            self,
+            "applied_output_limit",
+            optional_positive_int(
+                self.applied_output_limit,
+                "model completion applied output limit",
+            ),
+        )
         if self.finish_reason is not None:
             object.__setattr__(
                 self,
                 "finish_reason",
                 ModelFinishReason(self.finish_reason),
             )
-        if self.usage is not None and not isinstance(
-            self.usage,
-            ModelTokenUsage,
-        ):
-            raise TypeError("model completion usage must be ModelTokenUsage")
         object.__setattr__(self, "metadata", freeze_json_mapping(self.metadata))
-
+        if self.usage is not None and not isinstance(self.usage, ModelTokenUsage):
+            raise TypeError("model completion usage must be ModelTokenUsage")
 
 @dataclass(frozen=True, slots=True)
 class AgentRunRequest:
@@ -1473,7 +1487,11 @@ class RunCreateParams:
     binding: RunBinding | None = None
     turn_id: str | None = None
     deadline_at_ms: int | None = None
-    runtime_limits: "RuntimeLimits" = field(default_factory=lambda: RuntimeLimits())
+    runtime_limits: "RuntimeLimits" = field(
+        default_factory=lambda: RuntimeLimits(
+            max_run_output_tokens=None,
+        )
+    )
     agent_preset_snapshot: Mapping[str, Any] = field(default_factory=dict)
     requested_run_id: RunId | None = None
     root_run_id: RunId | None = None
@@ -1605,8 +1623,13 @@ class RuntimeLimits:
     stronger contract: it committed valid partial work while keeping the same
     plan step active. Such rounds may unlock the separately bounded progress
     allowance without turning malformed or stalled loops into unbounded runs.
+
+    ``max_run_output_tokens`` covers all model invocations charged
+    to one Run. ``None`` is an explicit choice to leave that cumulative token
+    budget without a finite ceiling; it is not a per-invocation model limit.
     """
 
+    max_run_output_tokens: int | None
     max_model_rounds: int = 6
     max_progress_rounds: int = 32
     provider_activity_idle_timeout_ms: int | None = 30_000
@@ -1615,7 +1638,6 @@ class RuntimeLimits:
     root_run_timeout_ms: int | None = 900_000
     max_model_invocation_attempts: int = 64
     max_input_tokens: int | None = None
-    max_output_tokens: int | None = None
     max_reasoning_tokens: int | None = None
     max_provider_output_events: int = 10_000
     max_provider_output_bytes: int = 8 * 1024 * 1024
@@ -1658,7 +1680,7 @@ class RuntimeLimits:
             )
         for name in (
             "max_input_tokens",
-            "max_output_tokens",
+            "max_run_output_tokens",
             "max_reasoning_tokens",
         ):
             object.__setattr__(

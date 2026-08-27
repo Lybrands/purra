@@ -17,6 +17,7 @@ from purra.contracts import (
     ModelRequest,
     ModelStream,
     ModelStreamChunk,
+    RuntimeLimits,
     ToolCallDelta,
     ToolEffectState,
     ToolHandlerResult,
@@ -30,7 +31,7 @@ from purra.tools import InMemoryToolCatalog
 
 class LocalModelGateway:
     async def stream(self, messages, invocation, signal=None):
-        del invocation, signal
+        del signal
 
         async def chunks():
             if not any(message.role is MessageRole.TOOL for message in messages):
@@ -49,16 +50,21 @@ class LocalModelGateway:
                 finish_reason=ModelFinishReason.STOP,
             )
 
-        return ModelStream(chunks=chunks(), model="local-example")
+        return ModelStream(
+            chunks=chunks(),
+            model="local-example",
+            applied_output_limit=invocation.output_limit.max_tokens,
+        )
 
     async def complete(self, messages, invocation, signal=None):
-        del messages, invocation, signal
+        del messages, signal
         return ModelCompletion(
             message=AgentMessage(
                 role=MessageRole.ASSISTANT,
                 content="PurrA is ready.",
             ),
             model="local-example",
+            applied_output_limit=invocation.output_limit.max_tokens,
             finish_reason=ModelFinishReason.STOP,
         )
 
@@ -93,6 +99,7 @@ async def main() -> None:
         output_repository=adapters.outputs,
         output_publisher=adapters.publisher,
         preset=AgentPreset(
+            runtime_limits=RuntimeLimits(max_run_output_tokens=None),
             id="quickstart",
             revision="1",
             tool_catalog=catalog,
@@ -109,7 +116,7 @@ async def main() -> None:
             capability_snapshot=replace(
                 generic_capability_snapshot(),
                 profile_id="local:example",
-                max_output_tokens=256,
+                max_call_output_tokens=256,
             ),
             options={"max_tokens": 128},
         ),

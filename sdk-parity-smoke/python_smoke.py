@@ -21,6 +21,7 @@ from purra.contracts import (
     ModelRequest,
     ModelStream,
     ModelStreamChunk,
+    RuntimeLimits,
     RunStatus,
     ToolCallDelta,
     ToolEffectState,
@@ -48,7 +49,7 @@ async def main() -> None:
     class LocalModelGateway:
         async def stream(self, messages, invocation, signal=None):
             nonlocal model_calls
-            del invocation, signal
+            del signal
             model_calls += 1
 
             async def chunks():
@@ -70,16 +71,21 @@ async def main() -> None:
                     finish_reason=ModelFinishReason.STOP,
                 )
 
-            return ModelStream(chunks=chunks(), model="local-parity-smoke")
+            return ModelStream(
+                chunks=chunks(),
+                model="local-parity-smoke",
+                applied_output_limit=invocation.output_limit.max_tokens,
+            )
 
         async def complete(self, messages, invocation, signal=None):
-            del messages, invocation, signal
+            del messages, signal
             return ModelCompletion(
                 message=AgentMessage(
                     role=MessageRole.ASSISTANT,
                     content="PurrA is ready.",
                 ),
                 model="local-parity-smoke",
+                applied_output_limit=invocation.output_limit.max_tokens,
                 finish_reason=ModelFinishReason.STOP,
             )
 
@@ -117,6 +123,7 @@ async def main() -> None:
         output_repository=adapters.outputs,
         output_publisher=adapters.publisher,
         preset=AgentPreset(
+            runtime_limits=RuntimeLimits(max_run_output_tokens=None),
             id="sdk-parity-smoke",
             revision="1",
             tool_catalog=catalog,
@@ -133,7 +140,7 @@ async def main() -> None:
             capability_snapshot=replace(
                 generic_capability_snapshot(),
                 profile_id="local:parity-smoke",
-                max_output_tokens=256,
+                max_call_output_tokens=256,
             ),
             options={"max_tokens": 128},
         ),

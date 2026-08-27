@@ -41,7 +41,7 @@ def _invocation() -> ModelInvocation:
         capability_snapshot=replace(
             generic_capability_snapshot(),
             profile_id="sample:model",
-            max_output_tokens=256,
+            max_call_output_tokens=256,
         ),
     ))
 

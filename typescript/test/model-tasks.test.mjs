@@ -8,6 +8,10 @@ import {
   ModelTaskRunner,
 } from "purra";
 
+const RUN_OPTIONS = Object.freeze({
+  budgets: Object.freeze({ maxRunOutputTokens: null }),
+});
+
 test("standalone model tasks resolve an exact output limit and Operation", async () => {
   const requests = [];
   const operations = [];
@@ -17,7 +21,7 @@ test("standalone model tasks resolve an exact output limit and Operation", async
       capabilities: capabilities(),
       async invoke(request) {
         requests.push(request);
-        return finalTurn("done");
+        return finalTurn("done", request);
       },
     },
     operations: new AgentOperationController({
@@ -27,7 +31,7 @@ test("standalone model tasks resolve an exact output limit and Operation", async
 
   const result = await runner.complete(
     [{ role: "user", content: "private task" }],
-    { maxOutputTokens: 256 },
+    { maxCallOutputTokens: 256 },
   );
 
   assert.equal(result.turn.message.content, "done");
@@ -51,7 +55,7 @@ test("managed task receipt failure prevents the Provider call", async () => {
     runId: "managed-run",
     model: {
       capabilities: capabilities("unavailable"),
-      async invoke() { calls += 1; return finalTurn("unsafe"); },
+      async invoke(request) { calls += 1; return finalTurn("unsafe", request); },
     },
     authority: {
       runId: "managed-run",
@@ -78,14 +82,16 @@ test("streamText replays private reasoning and retries empty official output wit
     model: {
       capabilities: capabilities(),
       async invoke() { throw new Error("stream should be used"); },
-      async *stream(request) {
-        requests.push(request);
-        if (requests.length === 1) {
-          yield { reasoningDelta: "private reasoning", finishReason: "stop" };
-          return;
-        }
-        yield { contentDelta: "final ", reasoningDelta: "continued" };
-        yield { contentDelta: "answer", finishReason: "stop" };
+      stream(request) {
+        return acknowledgedStream(request, (async function* () {
+          requests.push(request);
+          if (requests.length === 1) {
+            yield { reasoningDelta: "private reasoning", finishReason: "stop" };
+            return;
+          }
+          yield { contentDelta: "final ", reasoningDelta: "continued" };
+          yield { contentDelta: "answer", finishReason: "stop" };
+        })());
       },
     },
   });
@@ -113,9 +119,11 @@ test("streamText never retries an interrupted stream after content was observed"
     model: {
       capabilities: capabilities(),
       async invoke() { throw new Error("stream should be used"); },
-      async *stream() {
-        attempts += 1;
-        yield { contentDelta: "visible" };
+      stream(request) {
+        return acknowledgedStream(request, (async function* () {
+          attempts += 1;
+          yield { contentDelta: "visible" };
+        })());
       },
     },
   });
@@ -138,9 +146,11 @@ test("canceling a model task records a canceled Operation", async () => {
     model: {
       capabilities: capabilities(),
       async invoke() { throw new Error("stream should be used"); },
-      async *stream(_request, signal) {
-        yield { reasoningDelta: "working" };
-        await new Promise((resolve) => signal.addEventListener("abort", resolve, { once: true }));
+      stream(request, signal) {
+        return acknowledgedStream(request, (async function* () {
+          yield { reasoningDelta: "working" };
+          await new Promise((resolve) => signal.addEventListener("abort", resolve, { once: true }));
+        })());
       },
     },
   });
@@ -163,7 +173,9 @@ test("submitted context factory receives a runner bound to the same durable Run"
       capabilities: capabilities("unavailable"),
       async invoke(request) {
         calls += 1;
-        return calls === 1 ? finalTurn("managed fact") : finalTurn("done");
+        return calls === 1
+          ? finalTurn("managed fact", request)
+          : finalTurn("done", request);
       },
     },
     context: {
@@ -186,7 +198,10 @@ test("submitted context factory receives a runner bound to the same durable Run"
     },
   });
 
-  const handle = await agent.submit({ messages: [{ role: "user", content: "run" }] });
+  const handle = await agent.submit(
+    { messages: [{ role: "user", content: "run" }] },
+    RUN_OPTIONS,
+  );
   assert.equal((await handle.result).output, "done");
   assert.equal(factoryRunId, handle.runId);
   assert.equal(calls, 2);
@@ -199,7 +214,10 @@ test("submitted context factory receives a runner bound to the same durable Run"
 
 test("direct context ports and factories are mutually exclusive", () => {
   assert.throws(() => new Agent({
-    model: { capabilities: capabilities("unavailable"), async invoke() { return finalTurn("done"); } },
+    model: {
+      capabilities: capabilities("unavailable"),
+      async invoke(request) { return finalTurn("done", request); },
+    },
     context: {
       provider: { buildContext() { return { blocks: [] }; } },
       providerFactory() { return { buildContext() { return { blocks: [] }; } }; },
@@ -213,7 +231,7 @@ function capabilities(streaming = "supported") {
     profileId: "model-task-fixture",
     providerProtocol: "custom",
     contextWindowTokens: 16_000,
-    maxOutputTokens: 512,
+    maxCallOutputTokens: 512,
     thinkingTokenAccounting: "unknown",
     protocol: {
       reasoningControl: "selectable",
@@ -231,8 +249,18 @@ function capabilities(streaming = "supported") {
   };
 }
 
-function finalTurn(content) {
-  return { message: { role: "assistant", content }, finishReason: "stop" };
+function finalTurn(content, request) {
+  return {
+    message: { role: "assistant", content },
+    finishReason: "stop",
+    appliedOutputLimit: request.outputLimit?.maxTokens,
+  };
+}
+
+function acknowledgedStream(request, stream) {
+  return Object.assign(stream, {
+    appliedOutputLimit: request.outputLimit?.maxTokens,
+  });
 }
 
 async function collect(iterable) {

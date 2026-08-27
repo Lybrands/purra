@@ -20,7 +20,7 @@ test("Agent consumes model chunks, tool deltas, usage, and output limits", async
       },
       stream(request) {
         requests.push(request);
-        return (async function* () {
+        const stream = (async function* () {
           try {
             if (request.tools.length === 0) {
               yield { contentDelta: "Weather: " };
@@ -58,6 +58,9 @@ test("Agent consumes model chunks, tool deltas, usage, and output limits", async
             closed += 1;
           }
         })();
+        return Object.assign(stream, {
+          appliedOutputLimit: request.outputLimit?.maxTokens,
+        });
       },
     },
     tools: [readTool("weather", (input) => {
@@ -69,7 +72,7 @@ test("Agent consumes model chunks, tool deltas, usage, and output limits", async
 
   const result = await agent.invoke({
     messages: [{ role: "user", content: "Weather?" }],
-    maxOutputTokens: 200,
+    maxCallOutputTokens: 200,
   });
 
   assert.equal(result.output, "Weather: sunny");
@@ -527,13 +530,19 @@ test("shared output-limit cases produce the Python request or error", async () =
         capabilities: capabilities(row.profileMaxTokens, "unavailable"),
         async invoke(request) {
           requests.push(request);
-          return { message: { role: "assistant", content: "done" }, finishReason: "stop" };
+          return {
+            message: { role: "assistant", content: "done" },
+            finishReason: "stop",
+            appliedOutputLimit: request.outputLimit?.maxTokens,
+          };
         },
       },
     });
     const input = {
       messages: [{ role: "user", content: "Run" }],
-      ...(row.userOverride === null ? {} : { maxOutputTokens: row.userOverride }),
+      ...(row.userOverride === null
+        ? {}
+        : { maxCallOutputTokens: row.userOverride }),
     };
     if (row.errorCode !== null) {
       await assert.rejects(
@@ -548,13 +557,56 @@ test("shared output-limit cases produce the Python request or error", async () =
   }
 });
 
-function capabilities(maxOutputTokens, streaming = "supported") {
+test("Model gateways must acknowledge the exact applied output limit", async () => {
+  const missing = new Agent({
+    model: {
+      capabilities: capabilities(200),
+      async invoke() { throw new Error("stream should be used"); },
+      stream() {
+        return (async function* () {
+          yield { contentDelta: "unsafe", finishReason: "stop" };
+        })();
+      },
+    },
+  });
+  await assert.rejects(
+    missing.invoke({ messages: [{ role: "user", content: "run" }] }),
+    (error) => error instanceof AgentError && error.code === "model_gateway_contract_violation",
+  );
+
+  for (const turn of [
+    {
+      message: { role: "assistant", content: "wrong limit" },
+      finishReason: "stop",
+      appliedOutputLimit: 199,
+    },
+    {
+      message: { role: "assistant", content: "impossible usage" },
+      finishReason: "stop",
+      appliedOutputLimit: 200,
+      usage: { inputTokens: 1, outputTokens: 201 },
+    },
+  ]) {
+    const falseAcknowledgment = new Agent({
+      model: {
+        capabilities: capabilities(200, "unavailable"),
+        async invoke() { return turn; },
+      },
+    });
+    await assert.rejects(
+      falseAcknowledgment.invoke({ messages: [{ role: "user", content: "run" }] }),
+      (error) => error instanceof AgentError && error.code === "model_gateway_contract_violation",
+    );
+  }
+});
+
+function capabilities(maxCallOutputTokens, streaming = "supported") {
   return {
     schemaVersion: 1,
     profileId: "fixture",
     providerProtocol: "custom",
     contextWindowTokens: 4000,
-    maxOutputTokens,
+    maxCallOutputTokens,
     thinkingTokenAccounting: "unknown",
     protocol: {
       reasoningControl: "selectable",

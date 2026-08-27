@@ -1500,7 +1500,7 @@ def _require_root_token_budgets(
         limit is not None
         for limit in (
             limits.max_input_tokens,
-            limits.max_output_tokens,
+            limits.max_run_output_tokens,
             limits.max_reasoning_tokens,
         )
     ):
@@ -1518,7 +1518,7 @@ def _require_root_token_budgets(
         (
             "output_tokens",
             sum(item.output_tokens for item in snapshots),
-            limits.max_output_tokens,
+            limits.max_run_output_tokens,
         ),
         (
             "reasoning_tokens",

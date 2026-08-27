@@ -56,7 +56,7 @@ def _limit():
         capability_snapshot=replace(
             generic_capability_snapshot(),
             profile_id="test:model",
-            max_output_tokens=200,
+            max_call_output_tokens=200,
         ),
     )
     from purra.model_invocation import AgentModelCall
@@ -732,7 +732,7 @@ async def test_eight_mib_candidate_clears_the_incident_corpus_with_two_x_headroo
             session_id=None,
             prompt="calibrate Provider output",
             mode=None,
-            runtime_limits=RuntimeLimits(max_provider_output_bytes=candidate),
+            runtime_limits=RuntimeLimits(max_run_output_tokens=None, max_provider_output_bytes=candidate),
         ),
         AgentEvent(type="run.started"),
     )
@@ -780,7 +780,7 @@ async def test_eight_mib_candidate_rejects_oversize_before_provider_append():
             session_id=None,
             prompt="reject oversized Provider output",
             mode=None,
-            runtime_limits=RuntimeLimits(max_provider_output_bytes=candidate),
+            runtime_limits=RuntimeLimits(max_run_output_tokens=None, max_provider_output_bytes=candidate),
         ),
         AgentEvent(type="run.started"),
     )

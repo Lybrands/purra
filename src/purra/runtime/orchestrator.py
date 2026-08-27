@@ -223,7 +223,9 @@ class AgentRuntime:
         tool_execution_gateway: ToolExecutionGateway | None = None,
         observer: RuntimeObserver | None = None,
         context_compressor: ConversationCompactor | None = None,
-        limits: RuntimeLimits = RuntimeLimits(),
+        limits: RuntimeLimits = RuntimeLimits(
+            max_run_output_tokens=None,
+        ),
         recovery_policy: RecoveryPolicy = RecoveryPolicy(),
         operation_controller: AgentOperationController | None = None,
         output_observer: ModelInvocationOutputObserver | None = None,
@@ -1384,7 +1386,9 @@ class AgentRuntime:
                     "actualTotalTokens": usage.total_tokens,
                     "cachedInputTokens": usage.cached_input_tokens,
                     "reasoningOutputTokens": usage.reasoning_output_tokens,
-                    "requestedOutputTokens": invocation.max_output_tokens,
+                    "requestedCallOutputTokens": (
+                        invocation.max_call_output_tokens
+                    ),
                     "finishReason": (
                         finish_reason.value if finish_reason is not None else None
                     ),
@@ -1409,7 +1413,9 @@ class AgentRuntime:
                         "actualUsageRound": attempt.logical_round,
                         "inputTokenEstimateAtUsage": local_input_estimate,
                         "usageSource": "provider",
-                        "requestedOutputTokens": invocation.max_output_tokens,
+                        "requestedCallOutputTokens": (
+                            invocation.max_call_output_tokens
+                        ),
                         "finishReason": (
                             finish_reason.value
                             if finish_reason is not None

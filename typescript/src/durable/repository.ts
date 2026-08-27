@@ -496,14 +496,14 @@ export class InMemoryLongTaskRepository implements LongTaskRepository {
       usage.unreportedUsageAttempts > 0
       && (
         budgets.maxInputTokens !== null
-        || budgets.maxOutputTokens !== null
+        || budgets.maxRunOutputTokens !== null
         || budgets.maxReasoningTokens !== null
       )
     ) return "provider_usage_unreported";
     const rows = [
       ["model_attempts", usage.invocationCount, budgets.maxInvocationAttempts],
       ["input_tokens", usage.inputTokens, budgets.maxInputTokens],
-      ["output_tokens", usage.outputTokens, budgets.maxOutputTokens],
+      ["output_tokens", usage.outputTokens, budgets.maxRunOutputTokens],
       ["reasoning_tokens", usage.reasoningTokens, budgets.maxReasoningTokens],
     ] as const;
     return rows.find(([, used, maximum]) => (

@@ -63,7 +63,7 @@ export interface LongTaskUsage {
 export interface LongTaskBudgetLimits {
   readonly maxInvocationAttempts: number | null;
   readonly maxInputTokens: number | null;
-  readonly maxOutputTokens: number | null;
+  readonly maxRunOutputTokens: number | null;
   readonly maxReasoningTokens: number | null;
 }
 

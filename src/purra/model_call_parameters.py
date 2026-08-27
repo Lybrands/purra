@@ -34,7 +34,9 @@ def build_model_call_parameters(
         "provider": invocation.request.provider,
         "model": invocation.request.model,
         "options": options,
-        "maxOutputTokens": invocation.max_output_tokens,
+        "maxCallOutputTokens": (
+            invocation.max_call_output_tokens
+        ),
         "reasoningMode": invocation.reasoning_mode.value,
         "toolChoice": invocation.tool_choice.value,
         "toolNames": [tool.name for tool in invocation.tools],
@@ -45,7 +47,7 @@ def build_model_call_parameters(
         result["profileId"] = invocation.request.profile_id
     capabilities = invocation.request.capability_snapshot.output
     if (
-        capabilities.max_output_tokens is not None
+        capabilities.max_call_output_tokens is not None
         or capabilities.thinking_token_accounting.value != "unknown"
     ):
         result["modelOutputCapabilities"] = capabilities.to_mapping()

@@ -13,6 +13,7 @@ from purra.contracts import (
     ModelRequest,
     ModelStream,
     ModelStreamChunk,
+    ModelTokenUsage,
     ReasoningMode,
     RuntimeLimits,
     ToolCallDelta,
@@ -51,7 +52,7 @@ def _request() -> ModelRequest:
         capability_snapshot=replace(
             generic_capability_snapshot(),
             profile_id="test:model",
-            max_output_tokens=200,
+            max_call_output_tokens=200,
         ),
     )
 
@@ -68,7 +69,11 @@ class _Gateway:
             yield ModelStreamChunk(content_delta="甲乙")
             yield ModelStreamChunk(finish_reason=ModelFinishReason.STOP)
 
-        return ModelStream(chunks=chunks(), model="model")
+        return ModelStream(
+            chunks=chunks(),
+            model="model",
+            applied_output_limit=invocation.output_limit.max_tokens,
+        )
 
     async def complete(self, messages, invocation, signal=None):
         raise AssertionError("complete should not be called")
@@ -76,23 +81,24 @@ class _Gateway:
 
 class _CompletionGateway(_Gateway):
     async def complete(self, messages, invocation, signal=None):
-        del messages, invocation, signal
+        del messages, signal
         return ModelCompletion(
             message=AgentMessage(role="assistant", content='{"plan":true}'),
             model="model",
+            applied_output_limit=invocation.output_limit.max_tokens,
             finish_reason=ModelFinishReason.STOP,
         )
 
 
 class _NeverReturningGateway(_Gateway):
     async def complete(self, messages, invocation, signal=None):
-        del messages, invocation
+        del messages
         assert signal is not None
         await signal.wait()
         await asyncio.Event().wait()
 
     async def stream(self, messages, invocation, signal=None):
-        del messages, invocation
+        del messages
         assert signal is not None
 
         async def chunks():
@@ -100,7 +106,11 @@ class _NeverReturningGateway(_Gateway):
                 await signal.wait()
                 yield ModelStreamChunk(content_delta="late")
 
-        return ModelStream(chunks=chunks(), model="model")
+        return ModelStream(
+            chunks=chunks(),
+            model="model",
+            applied_output_limit=invocation.output_limit.max_tokens,
+        )
 
 
 class _ChunkGateway(_Gateway):
@@ -109,13 +119,17 @@ class _ChunkGateway(_Gateway):
         self._chunks = tuple(chunks)
 
     async def stream(self, messages, invocation, signal=None):
-        del messages, invocation, signal
+        del messages, signal
 
         async def chunks():
             for chunk in self._chunks:
                 yield chunk
 
-        return ModelStream(chunks=chunks(), model="model")
+        return ModelStream(
+            chunks=chunks(),
+            model="model",
+            applied_output_limit=invocation.output_limit.max_tokens,
+        )
 
 
 class _Observer:
@@ -396,6 +410,74 @@ async def test_private_completion_is_observed_before_stream_commit():
 
 
 @pytest.mark.asyncio
+async def test_stream_rejects_a_missing_applied_output_limit_acknowledgment():
+    AgentModelCall, AgentModelInvocationManager, ModelInvocationContext = _types()
+
+    class MissingAcknowledgmentGateway(_Gateway):
+        async def stream(self, messages, invocation, signal=None):
+            del messages, invocation, signal
+
+            async def chunks():
+                yield ModelStreamChunk(finish_reason=ModelFinishReason.STOP)
+
+            return ModelStream(chunks=chunks(), model="model")
+
+    manager = AgentModelInvocationManager(MissingAcknowledgmentGateway())
+    with pytest.raises(ContractViolationError) as captured:
+        await manager.stream(
+            (),
+            AgentModelCall(
+                request=_request(),
+                output_intent=AgentOutputIntent.STRUCTURED_PRIVATE,
+                commit_mode=OutputCommitMode.PRIVATE,
+            ),
+            ModelInvocationContext(run_id="run-missing-output-limit-ack"),
+        )
+
+    assert captured.value.code == "model_gateway_contract_violation"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("applied_output_limit", "usage"),
+    (
+        (199, None),
+        (200, ModelTokenUsage(input_tokens=1, output_tokens=201)),
+    ),
+)
+async def test_completion_rejects_a_false_output_limit_acknowledgment(
+    applied_output_limit,
+    usage,
+):
+    AgentModelCall, AgentModelInvocationManager, ModelInvocationContext = _types()
+
+    class FalseAcknowledgmentGateway(_CompletionGateway):
+        async def complete(self, messages, invocation, signal=None):
+            del messages, invocation, signal
+            return ModelCompletion(
+                message=AgentMessage(role="assistant", content="done"),
+                model="model",
+                applied_output_limit=applied_output_limit,
+                finish_reason=ModelFinishReason.STOP,
+                usage=usage,
+            )
+
+    manager = AgentModelInvocationManager(FalseAcknowledgmentGateway())
+    with pytest.raises(ContractViolationError) as captured:
+        await manager.complete(
+            (),
+            AgentModelCall(
+                request=_request(),
+                output_intent=AgentOutputIntent.STRUCTURED_PRIVATE,
+                commit_mode=OutputCommitMode.PRIVATE,
+            ),
+            ModelInvocationContext(run_id="run-false-output-limit-ack"),
+        )
+
+    assert captured.value.code == "model_gateway_contract_violation"
+
+
+@pytest.mark.asyncio
 async def test_reasoning_mode_conflict_is_rejected_before_gateway_call():
     AgentModelCall, AgentModelInvocationManager, ModelInvocationContext = _types()
     gateway = _CompletionGateway()
@@ -508,7 +590,7 @@ async def test_stream_limit_rejects_the_first_exceeding_fragment_before_output()
             ModelStreamChunk(content_delta="cd"),
         )),
         output_observer=observer,
-        runtime_limits=RuntimeLimits(max_stream_content_chars=3),
+        runtime_limits=RuntimeLimits(max_run_output_tokens=None, max_stream_content_chars=3),
     )
     managed = await manager.stream(
         (),

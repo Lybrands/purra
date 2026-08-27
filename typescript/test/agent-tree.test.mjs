@@ -16,6 +16,10 @@ const fixture = JSON.parse(readFileSync(
   "utf8",
 ));
 
+const RUN_OPTIONS = Object.freeze({
+  budgets: Object.freeze({ maxRunOutputTokens: null }),
+});
+
 function grant(options = {}) {
   return new AgentCapabilityGrant({
     canSpawnAgents: true,
@@ -209,7 +213,7 @@ test("Agent executes delegateToAgents through canonical Child Runs", async () =>
   const handle = await agent.submit({
     messages: [{ role: "user", content: "Use a reviewer." }],
     enabledTools: ["delegateToAgents"],
-  });
+  }, RUN_OPTIONS);
   const result = await handle.result;
   const descendants = await adapters.runTree.listDescendants(handle.runId);
   const journal = await adapters.runs.listRootEvents(handle.runId, 0);
@@ -300,7 +304,7 @@ test("Agent permits bounded recursive Child Runs", async () => {
   const handle = await agent.submit({
     messages: [{ role: "user", content: "Delegate recursively." }],
     enabledTools: ["delegateToAgents"],
-  });
+  }, RUN_OPTIONS);
   const result = await handle.result;
   const descendants = await adapters.runTree.listDescendants(handle.runId);
 
@@ -356,7 +360,7 @@ test("Agent host commands continue a canonical Child Agent", async () => {
   });
   const handle = await agent.submit({
     messages: [{ role: "user", content: "Wait for host commands." }],
-  });
+  }, RUN_OPTIONS);
   const child = (await agent.spawnAgents({
     parentRunId: handle.runId,
     idempotencyKey: "host-spawn",
@@ -408,7 +412,7 @@ test("Root completion is rejected before final output while a Child Run is pendi
   });
   const handle = await agent.submit({
     messages: [{ role: "user", content: "Do not finish early." }],
-  });
+  }, RUN_OPTIONS);
   const child = (await agent.spawnAgents({
     parentRunId: handle.runId,
     idempotencyKey: "pending-child",
@@ -460,7 +464,7 @@ test("new Agent instance rebinds and executes one committed Child Run", async ()
     budgets: {
       maxModelAttempts: 4,
       maxInputTokens: null,
-      maxOutputTokens: null,
+      maxRunOutputTokens: null,
       maxReasoningTokens: null,
       maxOutputBytes: 10_000,
       maxOutputEvents: 100,
@@ -522,13 +526,13 @@ test("new Agent instance rebinds and executes one committed Child Run", async ()
     }
     return originalComplete(runId, options);
   };
-  await assert.rejects(agent.recoverAgentTreeRoot(rootRunId, recoveryRequest));
+  await assert.rejects(agent.recoverAgentTreeRoot(rootRunId, recoveryRequest, RUN_OPTIONS));
   assert.equal((await adapters.runs.get(child.run.runId)).status, "completed");
   assert.equal((await adapters.runTree.getRun(rootRunId)).status, "waiting");
   now = 30_100;
   adapters.runTree.completeRun = originalComplete;
-  const aggregate = await agent.recoverAgentTreeRoot(rootRunId, recoveryRequest);
-  const replay = await agent.recoverAgentTreeRoot(rootRunId, recoveryRequest);
+  const aggregate = await agent.recoverAgentTreeRoot(rootRunId, recoveryRequest, RUN_OPTIONS);
+  const replay = await agent.recoverAgentTreeRoot(rootRunId, recoveryRequest, RUN_OPTIONS);
   const continued = await agent.continueAgent({
     requesterRunId: rootRunId,
     idempotencyKey: "resume-without-cursor",
@@ -556,7 +560,7 @@ test("new Agent instance rebinds and executes one committed Child Run", async ()
     metadata: {},
   });
   now += 10;
-  const gap = await agent.recoverAgentTreeRoot(rootRunId, recoveryRequest);
+  const gap = await agent.recoverAgentTreeRoot(rootRunId, recoveryRequest, RUN_OPTIONS);
   const resumable = await agent.continueAgent({
     requesterRunId: rootRunId,
     idempotencyKey: "resume-from-model-ready-checkpoint",
@@ -606,11 +610,11 @@ test("new Agent instance rebinds and executes one committed Child Run", async ()
     leaseEpoch: checkpointed.leaseEpoch,
   });
   now += 10;
-  const resumed = await agent.recoverAgentTreeRoot(rootRunId, recoveryRequest);
+  const resumed = await agent.recoverAgentTreeRoot(rootRunId, recoveryRequest, RUN_OPTIONS);
   await rejectsCode(agent.bindAgentTreeRoot(rootRunId, {
     ...recoveryRequest,
     metadata: { binding: "different" },
-  }), "run_identity_conflict");
+  }, RUN_OPTIONS), "run_identity_conflict");
   const recoveredRun = await adapters.runTree.getRun(child.run.runId);
 
   assert.equal(
@@ -929,7 +933,7 @@ test("expired Agent tree lease fences canonical Run budget and output writes", a
   const budgets = {
     maxModelAttempts: 2,
     maxInputTokens: null,
-    maxOutputTokens: null,
+    maxRunOutputTokens: null,
     maxReasoningTokens: null,
     maxOutputBytes: 1_000,
     maxOutputEvents: 2,

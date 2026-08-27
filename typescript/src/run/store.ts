@@ -7,6 +7,7 @@ import type {
   InvocationSettlement,
   ModelInvocationReceipt,
   RunBeginParams,
+  RunBudgets,
   RunCancellationReceipt,
   RunLeaseClaim,
   RunSnapshot,
@@ -556,7 +557,7 @@ export async function assertRunRepositoryConforms(repository: RunRepository): Pr
     budgets: {
       maxModelAttempts: 1,
       maxInputTokens: null,
-      maxOutputTokens: null,
+      maxRunOutputTokens: null,
       maxReasoningTokens: null,
       maxOutputBytes: 1_000,
       maxOutputEvents: 10,
@@ -737,13 +738,13 @@ function tokenBudgetKind(run: StoredRun, inclusive: boolean): string | undefined
     usage.unreportedUsageAttempts > 0
     && (
       budgets.maxInputTokens !== null
-      || budgets.maxOutputTokens !== null
+      || budgets.maxRunOutputTokens !== null
       || budgets.maxReasoningTokens !== null
     )
   ) return "provider_usage_unreported";
   const rows = [
     ["input_tokens", usage.inputTokens, budgets.maxInputTokens],
-    ["output_tokens", usage.outputTokens, budgets.maxOutputTokens],
+    ["output_tokens", usage.outputTokens, budgets.maxRunOutputTokens],
     ["reasoning_tokens", usage.reasoningTokens, budgets.maxReasoningTokens],
   ] as const;
   return rows.find(([, used, maximum]) => (
@@ -802,13 +803,45 @@ function updateUsage(run: StoredRun, patch: Partial<RunSnapshot["usage"]>): void
 function freezeSnapshot(snapshot: RunSnapshot): RunSnapshot {
   return Object.freeze({
     ...snapshot,
-    budgets: Object.freeze({ ...snapshot.budgets }),
+    budgets: normalizeRunBudgets(snapshot.budgets),
     usage: Object.freeze({ ...snapshot.usage }),
     preset: Object.freeze({ ...snapshot.preset }),
     ...(snapshot.executionCheckpoint === undefined
       ? {}
       : { executionCheckpoint: copyExecutionCheckpoint(snapshot.executionCheckpoint) }),
   });
+}
+
+export function normalizeRunSnapshot(snapshot: RunSnapshot): RunSnapshot {
+  if (snapshot === null || typeof snapshot !== "object") {
+    throw new TypeError("Run snapshot must be an object");
+  }
+  return freezeSnapshot(snapshot);
+}
+
+export function normalizeRunBudgets(value: RunBudgets): RunBudgets {
+  if (value === null || typeof value !== "object") {
+    throw new TypeError("Run budgets must be an object");
+  }
+  const record = value as unknown as Readonly<Record<string, unknown>>;
+  return Object.freeze({
+    maxModelAttempts: nullablePositiveBudget(record.maxModelAttempts, "maxModelAttempts"),
+    maxInputTokens: nullablePositiveBudget(record.maxInputTokens, "maxInputTokens"),
+    maxRunOutputTokens: nullablePositiveBudget(
+      record.maxRunOutputTokens,
+      "maxRunOutputTokens",
+    ),
+    maxReasoningTokens: nullablePositiveBudget(record.maxReasoningTokens, "maxReasoningTokens"),
+    maxOutputBytes: nullablePositiveBudget(record.maxOutputBytes, "maxOutputBytes"),
+    maxOutputEvents: nullablePositiveBudget(record.maxOutputEvents, "maxOutputEvents"),
+  });
+}
+
+function nullablePositiveBudget(value: unknown, label: string): number | null {
+  if (value === null) return null;
+  const normalized = nonNegativeInteger(value, label);
+  if (normalized < 1) throw new TypeError(`${label} must be positive or null`);
+  return normalized;
 }
 
 function copyExecutionCheckpoint(

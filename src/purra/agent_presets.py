@@ -193,6 +193,7 @@ class AgentPreset:
     id: str
     revision: str
     tool_catalog: ToolCatalog
+    runtime_limits: RuntimeLimits
     execution_profile: ExecutionProfile = field(
         default_factory=ExecutionProfile
     )
@@ -206,7 +207,6 @@ class AgentPreset:
         default_factory=dict
     )
     delegation_policy: DelegationPolicy | None = None
-    runtime_limits: RuntimeLimits = RuntimeLimits()
     recovery_policy: RecoveryPolicy = RecoveryPolicy()
 
     def __post_init__(self) -> None:
@@ -407,7 +407,9 @@ class AgentPreset:
                 "rootRunTimeoutMs": self.runtime_limits.root_run_timeout_ms,
                 "maxModelInvocationAttempts": self.runtime_limits.max_model_invocation_attempts,
                 "maxInputTokens": self.runtime_limits.max_input_tokens,
-                "maxOutputTokens": self.runtime_limits.max_output_tokens,
+                "maxRunOutputTokens": (
+                    self.runtime_limits.max_run_output_tokens
+                ),
                 "maxReasoningTokens": self.runtime_limits.max_reasoning_tokens,
                 "maxProviderOutputEvents": self.runtime_limits.max_provider_output_events,
                 "maxProviderOutputBytes": self.runtime_limits.max_provider_output_bytes,
@@ -499,7 +501,6 @@ class AgentPreset:
         self.execution_profile.snapshot_mapping(
             self._execution_component_binding
         )
-
 
 def _fingerprint(value: Mapping[str, Any]) -> str:
     encoded = json.dumps(

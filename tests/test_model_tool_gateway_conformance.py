@@ -8,6 +8,7 @@ from purra.contracts import (
     ModelCompletion,
     ModelFinishReason,
     ModelInvocation,
+    InvocationOutputLimit,
     ModelRequest,
     ModelStream,
     ModelStreamChunk,
@@ -55,12 +56,17 @@ def _invocation() -> ModelInvocation:
         request=ModelRequest(provider="portable", model="portable-model"),
         tools=(_tool(),),
         tool_choice="required",
+        output_limit=InvocationOutputLimit(
+            max_tokens=256,
+            source="workflow_policy",
+            profile_max_tokens=256,
+        ),
     )
 
 
 class _PortableModelGateway:
     async def stream(self, messages, invocation, signal=None):
-        del messages, invocation, signal
+        del messages, signal
 
         async def chunks():
             yield ModelStreamChunk(tool_call_deltas=(ToolCallDelta(
@@ -77,10 +83,14 @@ class _PortableModelGateway:
                 finish_reason=ModelFinishReason.TOOL_CALLS,
             )
 
-        return ModelStream(chunks=chunks(), model="portable-model")
+        return ModelStream(
+            chunks=chunks(),
+            model="portable-model",
+            applied_output_limit=invocation.output_limit.max_tokens,
+        )
 
     async def complete(self, messages, invocation, signal=None):
-        del messages, invocation, signal
+        del messages, signal
         return ModelCompletion(
             message=AgentMessage(
                 role="assistant",
@@ -91,6 +101,7 @@ class _PortableModelGateway:
                 ),),
             ),
             model="portable-model",
+            applied_output_limit=invocation.output_limit.max_tokens,
             finish_reason=ModelFinishReason.TOOL_CALLS,
         )
 
@@ -113,12 +124,16 @@ async def test_model_gateway_passes_stream_and_tool_call_conformance():
 async def test_model_gateway_probe_rejects_stream_without_terminal_reason():
     class InterruptedGateway(_PortableModelGateway):
         async def stream(self, messages, invocation, signal=None):
-            del messages, invocation, signal
+            del messages, signal
 
             async def chunks():
                 yield ModelStreamChunk(content_delta="unfinished")
 
-            return ModelStream(chunks=chunks(), model="portable-model")
+            return ModelStream(
+                chunks=chunks(),
+                model="portable-model",
+                applied_output_limit=invocation.output_limit.max_tokens,
+            )
 
     with pytest.raises(AssertionError):
         await assert_model_gateway_conforms(
@@ -132,7 +147,7 @@ async def test_model_gateway_probe_rejects_stream_without_terminal_reason():
 async def test_model_gateway_probe_rejects_incomplete_tool_call():
     class IncompleteToolGateway(_PortableModelGateway):
         async def stream(self, messages, invocation, signal=None):
-            del messages, invocation, signal
+            del messages, signal
 
             async def chunks():
                 yield ModelStreamChunk(
@@ -144,7 +159,11 @@ async def test_model_gateway_probe_rejects_incomplete_tool_call():
                     finish_reason=ModelFinishReason.TOOL_CALLS,
                 )
 
-            return ModelStream(chunks=chunks(), model="portable-model")
+            return ModelStream(
+                chunks=chunks(),
+                model="portable-model",
+                applied_output_limit=invocation.output_limit.max_tokens,
+            )
 
     with pytest.raises(AssertionError, match="missing_tool_call_id"):
         await assert_model_gateway_conforms(

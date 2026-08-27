@@ -50,6 +50,7 @@ from purra.contracts import (
     ModelStreamActivityKind,
     ModelStreamActivitySupport,
     ModelStreamChunk,
+    RuntimeLimits,
     RunStatus,
 )
 from purra.model_protocol import generic_capability_snapshot
@@ -66,21 +67,23 @@ async def _chunks():
 
 class _Gateway:
     async def stream(self, messages, invocation, signal=None):
-        del messages, invocation, signal
+        del messages, signal
         return ModelStream(
             chunks=_chunks(),
             model="smoke-model",
+            applied_output_limit=invocation.output_limit.max_tokens,
             activity_support=ModelStreamActivitySupport.WORKING,
         )
 
     async def complete(self, messages, invocation, signal=None):
-        del messages, invocation, signal
+        del messages, signal
         return ModelCompletion(
             message=AgentMessage(
                 role=MessageRole.ASSISTANT,
                 content="installed PurrA is runnable",
             ),
             model="smoke-model",
+            applied_output_limit=invocation.output_limit.max_tokens,
             finish_reason=ModelFinishReason.STOP,
         )
 
@@ -88,7 +91,7 @@ class _Gateway:
 async def _run() -> None:
     package_path = Path(purra.__file__).resolve()
     assert "site-packages" in package_path.parts, package_path
-    assert version("purra") == "0.4.1"
+    assert version("purra") == "0.5.0"
 
     adapters = InMemoryAgentAdapters()
     core = AgentCore(
@@ -97,6 +100,7 @@ async def _run() -> None:
         output_repository=adapters.outputs,
         output_publisher=adapters.publisher,
         preset=AgentPreset(
+            runtime_limits=RuntimeLimits(max_run_output_tokens=None),
             id="installed-smoke",
             revision="1",
             tool_catalog=InMemoryToolCatalog(()),
@@ -113,7 +117,7 @@ async def _run() -> None:
             capability_snapshot=replace(
                 generic_capability_snapshot(),
                 profile_id="smoke:model",
-                max_output_tokens=1_024,
+                max_call_output_tokens=1_024,
             ),
             options={"max_tokens": 256},
         ),
