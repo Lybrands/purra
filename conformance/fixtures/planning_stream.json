@@ -1,0 +1,150 @@
+{
+  "schemaVersion": 1,
+  "protocol": "purra.planning-stream/v1",
+  "limits": {
+    "maxRecordBytes": 262144,
+    "maxTotalBytes": 1048576,
+    "maxProgressRecords": 16,
+    "maxTextCharacters": 280
+  },
+  "valid": [
+    {
+      "name": "progress-and-plan",
+      "wire": "{\"v\":1,\"type\":\"progress\",\"text\":\"准备核对“证据”与路径 \\\\，再安排工作。🐈\"}\n{\"v\":1,\"type\":\"plan\",\"plan\":{\"fixture\":\"private\"}}\n",
+      "texts": [
+        "准备核对“证据”与路径 \\，再安排工作。🐈"
+      ],
+      "plan": {
+        "fixture": "private"
+      }
+    },
+    {
+      "name": "progress-and-plan-at-eof",
+      "wire": "{\"v\":1,\"type\":\"progress\",\"text\":\"准备核对证据。\"}\n{\"v\":1,\"type\":\"plan\",\"plan\":{\"fixture\":\"private\"}}",
+      "texts": [
+        "准备核对证据。"
+      ],
+      "plan": {
+        "fixture": "private"
+      }
+    },
+    {
+      "name": "silent-plan",
+      "wire": "{\"v\":1,\"type\":\"plan\",\"plan\":{\"fixture\":\"private\"}}\n",
+      "texts": [],
+      "plan": {
+        "fixture": "private"
+      }
+    },
+    {
+      "name": "invalid-progress-is-omitted-before-plan",
+      "wire": "{\"v\":1,\"type\":\"progress\",\"text\":\"a\\nb\"}\n{\"v\":1,\"type\":\"plan\",\"plan\":{\"fixture\":\"private\"}}\n",
+      "texts": [],
+      "rejectedProgressRecords": 1,
+      "plan": {
+        "fixture": "private"
+      }
+    },
+    {
+      "name": "numeric-version-and-json-whitespace",
+      "wire": " {\"v\":1.0,\"type\":\"plan\",\"plan\":{}} \r\n",
+      "texts": [],
+      "plan": {}
+    }
+  ],
+  "invalid": [
+    {
+      "name": "unknown",
+      "wire": "{\"v\":1,\"type\":\"reasoning\",\"text\":\"SECRET\"}\n"
+    },
+    {
+      "name": "version",
+      "wire": "{\"v\":2,\"type\":\"progress\",\"text\":\"SECRET\"}\n"
+    },
+    {
+      "name": "extra-private-field",
+      "wire": "{\"v\":1,\"type\":\"progress\",\"text\":\"准备核对“证据”与路径 \\\\，再安排工作。🐈\",\"reasoning\":\"SECRET\"}\n"
+    },
+    {
+      "name": "no-plan",
+      "wire": "{\"v\":1,\"type\":\"progress\",\"text\":\"准备核对“证据”与路径 \\\\，再安排工作。🐈\"}\n"
+    },
+    {
+      "name": "partial-progress",
+      "wire": "{\"v\":1,\"type\":\"progress\",\"text\":\"准备核对“证据”与路径 \\\\，再安排工作。🐈\"}"
+    },
+    {
+      "name": "duplicate-plan",
+      "wire": "{\"v\":1,\"type\":\"plan\",\"plan\":{\"fixture\":\"private\"}}\n{\"v\":1,\"type\":\"plan\",\"plan\":{\"fixture\":\"private\"}}\n"
+    },
+    {
+      "name": "progress-after-plan",
+      "wire": "{\"v\":1,\"type\":\"plan\",\"plan\":{\"fixture\":\"private\"}}\n{\"v\":1,\"type\":\"progress\",\"text\":\"准备核对“证据”与路径 \\\\，再安排工作。🐈\"}\n"
+    },
+    {
+      "name": "bare-json",
+      "wire": "{\"workPlan\":{}}\n"
+    },
+    {
+      "name": "blank-record",
+      "wire": "\n"
+    },
+    {
+      "name": "oversized-text",
+      "wire": "{\"v\":1,\"type\":\"progress\",\"text\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"}\n"
+    },
+    {
+      "name": "record-count",
+      "wire": "{\"v\":1,\"type\":\"progress\",\"text\":\"准备核对“证据”与路径 \\\\，再安排工作。🐈\"}\n{\"v\":1,\"type\":\"progress\",\"text\":\"准备核对“证据”与路径 \\\\，再安排工作。🐈\"}\n{\"v\":1,\"type\":\"progress\",\"text\":\"准备核对“证据”与路径 \\\\，再安排工作。🐈\"}\n{\"v\":1,\"type\":\"progress\",\"text\":\"准备核对“证据”与路径 \\\\，再安排工作。🐈\"}\n{\"v\":1,\"type\":\"progress\",\"text\":\"准备核对“证据”与路径 \\\\，再安排工作。🐈\"}\n{\"v\":1,\"type\":\"progress\",\"text\":\"准备核对“证据”与路径 \\\\，再安排工作。🐈\"}\n{\"v\":1,\"type\":\"progress\",\"text\":\"准备核对“证据”与路径 \\\\，再安排工作。🐈\"}\n{\"v\":1,\"type\":\"progress\",\"text\":\"准备核对“证据”与路径 \\\\，再安排工作。🐈\"}\n{\"v\":1,\"type\":\"progress\",\"text\":\"准备核对“证据”与路径 \\\\，再安排工作。🐈\"}\n{\"v\":1,\"type\":\"progress\",\"text\":\"准备核对“证据”与路径 \\\\，再安排工作。🐈\"}\n{\"v\":1,\"type\":\"progress\",\"text\":\"准备核对“证据”与路径 \\\\，再安排工作。🐈\"}\n{\"v\":1,\"type\":\"progress\",\"text\":\"准备核对“证据”与路径 \\\\，再安排工作。🐈\"}\n{\"v\":1,\"type\":\"progress\",\"text\":\"准备核对“证据”与路径 \\\\，再安排工作。🐈\"}\n{\"v\":1,\"type\":\"progress\",\"text\":\"准备核对“证据”与路径 \\\\，再安排工作。🐈\"}\n{\"v\":1,\"type\":\"progress\",\"text\":\"准备核对“证据”与路径 \\\\，再安排工作。🐈\"}\n{\"v\":1,\"type\":\"progress\",\"text\":\"准备核对“证据”与路径 \\\\，再安排工作。🐈\"}\n{\"v\":1,\"type\":\"progress\",\"text\":\"准备核对“证据”与路径 \\\\，再安排工作。🐈\"}\n{\"v\":1,\"type\":\"plan\",\"plan\":{\"fixture\":\"private\"}}\n"
+    },
+    {
+      "name": "boolean-version",
+      "wire": "{\"v\":true,\"type\":\"plan\",\"plan\":{}}\n"
+    },
+    {
+      "name": "nonfinite-json-number",
+      "wire": "{\"v\":1,\"type\":\"plan\",\"plan\":{\"value\":NaN}}\n"
+    },
+    {
+      "name": "control-text",
+      "wire": "{\"v\":1,\"type\":\"progress\",\"text\":\"a\\nb\"}\n"
+    }
+  ],
+  "managedRuns": [
+    {
+      "name": "complete",
+      "attempts": [
+        [
+          "progress",
+          "plan"
+        ]
+      ],
+      "status": "done"
+    },
+    {
+      "name": "repair",
+      "attempts": [
+        [
+          "progress"
+        ],
+        [
+          "progress",
+          "plan"
+        ]
+      ],
+      "status": "done"
+    },
+    {
+      "name": "repair-exhausted",
+      "attempts": [
+        [
+          "progress"
+        ],
+        [
+          "progress"
+        ]
+      ],
+      "status": "failed"
+    }
+  ]
+}

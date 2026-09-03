@@ -59,6 +59,14 @@ class LongTaskRepository(Protocol):
         limit: int = 20,
     ) -> Sequence[LongTaskRecord]: ...
 
+    async def find_by_idempotency_key(
+        self,
+        namespace: str,
+        idempotency_key: str,
+    ) -> LongTaskRecord | None:
+        """Load the one task addressed by its namespace-scoped command key."""
+        ...
+
     async def find_active(
         self,
         *,

@@ -11,6 +11,7 @@ from purra.contracts import (
     AgentRunRequest,
     ContextBundle,
     PlanningCapabilities,
+    PlanningConstraints,
     PlanningKind,
     RuntimeLimits,
     ReasoningMode,
@@ -49,13 +50,13 @@ from purra.ports import (
 from purra.run_controller import AgentRunController
 from purra.task_admission import TaskAdmissionDecision
 from purra.timing import duration_ms
+from purra.planning_context import planning_operation
 
 
 @dataclass(frozen=True, slots=True)
 class PlanningPhaseResult:
     """Everything later execution stages may consume from planning."""
 
-    should_plan: bool = False
     execution_plan: ExecutionPlan | None = None
     capabilities: PlanningCapabilities | None = None
     admission: TaskAdmissionDecision | None = None
@@ -75,10 +76,14 @@ class PlanningCapability:
         self,
         *,
         planner: WorkPlanner | None,
-        policy: PlanningPolicy,
+        policy: PlanningPolicy | None,
         runtime_limits: RuntimeLimits,
         task_orchestration: TaskOrchestrationCapability | None,
+        operations=None,
+        model_manager=None,
     ) -> None:
+        self._operations = operations
+        self._model_manager = model_manager
         self._planner = planner
         self._policy = policy
         self._runtime_limits = runtime_limits
@@ -116,9 +121,10 @@ class PlanningCapability:
                     display_locale,
                 ),
             )
-            constraints = self._policy.planning_constraints(
-                request,
-                base_capabilities,
+            constraints = (
+                self._policy.planning_constraints(request, base_capabilities)
+                if self._policy is not None
+                else PlanningConstraints()
             )
             validate_planning_constraints(
                 base_capabilities,
@@ -129,100 +135,109 @@ class PlanningCapability:
                 base_capabilities,
                 constraints=constraints,
             )
-            should_plan = bool(self._policy.should_plan(request, capabilities))
             plan: ExecutionPlan | None = None
             planning_kind: PlanningKind | None = None
-            if should_plan:
-                if self._planner is None:
-                    raise ContractViolationError(
-                        "planning policy requested a plan without a planner"
-                    )
-                planning = await await_with_cancellation(
-                    self._planner.create_plan(
-                        request,
-                        capabilities,
-                        signal,
-                        run_id=controller.run_id,
-                        turn_id=turn_id,
-                        reasoning_mode=reasoning_mode,
-                    ),
-                    signal,
+            if self._planner is None:
+                raise ContractViolationError(
+                    "Planned execution requires a configured planner"
                 )
-                if planning.model_call_parameters:
-                    for parameters in planning.model_call_parameters:
+            # Core enters this capability after Auto activation or an explicit
+            # Planned request. This branch narrows the optional planner type.
+            if self._planner is not None:
+                async with planning_operation(controller=controller, operations=self._operations,
+                        model_manager=self._model_manager, revision=0, signal=signal) as phase:
+                    planning = await await_with_cancellation(
+                        self._planner.create_plan(
+                            request,
+                            capabilities,
+                            signal,
+                            run_id=controller.run_id,
+                            turn_id=turn_id,
+                            reasoning_mode=reasoning_mode,
+                        ),
+                        signal,
+                    )
+                    phase.validation_started = perf_counter()
+                    if planning.model_call_parameters:
+                        for parameters in planning.model_call_parameters:
+                            await controller.record_event(
+                                CoreEventType.MODEL_CALL_RECORDED,
+                                {
+                                    "phase": "planning",
+                                    "count": 1,
+                                    "toolNames": [],
+                                    "toolChoice": "none",
+                                    "parameters": dict(parameters),
+                                },
+                            )
+                    elif planning.model_call_count > 0:
                         await controller.record_event(
                             CoreEventType.MODEL_CALL_RECORDED,
                             {
                                 "phase": "planning",
-                                "count": 1,
+                                "count": planning.model_call_count,
                                 "toolNames": [],
                                 "toolChoice": "none",
-                                "parameters": dict(parameters),
                             },
                         )
-                elif planning.model_call_count > 0:
-                    await controller.record_event(
-                        CoreEventType.MODEL_CALL_RECORDED,
-                        {
-                            "phase": "planning",
-                            "count": planning.model_call_count,
-                            "toolNames": [],
-                            "toolChoice": "none",
-                        },
-                    )
-                if (
-                    planning.work_plan.task_spec is not None
-                    and isinstance(
-                        self._policy,
-                        WorkPlanningConstraintProvider,
-                    )
-                ):
-                    constraints = self._policy.planning_constraints_for_task(
-                        request,
-                        capabilities,
-                        planning.work_plan.task_spec,
-                    )
-                    validate_task_constraint_refinement(
-                        capabilities.constraints,
-                        constraints,
-                    )
-                    validate_planning_constraints(
-                        base_capabilities,
-                        constraints,
-                        runtime_tool_names=enabled_names,
-                    )
-                    capabilities = replace(
-                        capabilities,
+                    if (
+                        planning.work_plan.task_spec is not None
+                        and isinstance(
+                            self._policy,
+                            WorkPlanningConstraintProvider,
+                        )
+                    ):
+                        constraints = self._policy.planning_constraints_for_task(
+                            request,
+                            capabilities,
+                            planning.work_plan.task_spec,
+                        )
+                        validate_task_constraint_refinement(
+                            capabilities.constraints,
+                            constraints,
+                        )
+                        validate_planning_constraints(
+                            base_capabilities,
+                            constraints,
+                            runtime_tool_names=enabled_names,
+                        )
+                        capabilities = replace(
+                            capabilities,
+                            constraints=constraints,
+                        )
+                    compiled = compile_work_plan(
+                        planning.work_plan,
+                        registrations,
                         constraints=constraints,
+                        satisfied_tool_names=(
+                            constraints.execution_satisfied_tool_names
+                        ),
+                        enabled_tool_names=enabled_names,
                     )
-                compiled = compile_work_plan(
-                    planning.work_plan,
-                    registrations,
-                    constraints=constraints,
-                    satisfied_tool_names=(
-                        constraints.execution_satisfied_tool_names
-                    ),
-                    enabled_tool_names=enabled_names,
-                )
-                plan = compiled.execution_plan
-                planning_kind = planning.kind
-                validate_plan_authority(
-                    plan,
-                    enabled_names,
-                    constraints=constraints,
-                    max_tool_steps=max(
-                        0,
-                        self._runtime_limits.max_model_rounds - 2,
-                    ),
-                )
-                if self._task_orchestration is not None:
-                    admission = await self._task_orchestration.evaluate(
-                        request,
+                    plan = compiled.execution_plan
+                    planning_kind = planning.kind
+                    validate_plan_authority(
                         plan,
-                        controller,
-                        signal,
+                        enabled_names,
+                        constraints=constraints,
+                        max_tool_steps=max(
+                            0,
+                            self._runtime_limits.max_model_rounds - 2,
+                        ),
                     )
-                await controller.install_plan(plan)
+                    if self._task_orchestration is not None:
+                        admission = await self._task_orchestration.evaluate(
+                            request,
+                            plan,
+                            controller,
+                            signal,
+                        )
+                    if admission is not None and (
+                        admission.mode.value in {"reject", "clarify"} or admission.requires_confirmation
+                    ):
+                        phase.fail("planning_not_admitted")
+                    else:
+                        await controller.install_plan(plan)
             await controller.record_trace(TraceRecord(
                 stage="planning",
                 outcome=(planning_kind.value if planning_kind else "skipped"),
@@ -249,10 +264,8 @@ class PlanningCapability:
                     "allowModelOnlyFallback": (
                         constraints.allow_model_only_fallback
                     ),
-                    "planned": should_plan,
-                    "workPlanStepCount": (
-                        len(planning.work_plan.steps) if should_plan else 0
-                    ),
+                    "planned": True,
+                    "workPlanStepCount": len(planning.work_plan.steps),
                     "executionPlanStepCount": (
                         len(plan.steps) if plan is not None else 0
                     ),
@@ -261,14 +274,12 @@ class PlanningCapability:
                             step.executor is StepExecutor.MODEL
                             for step in planning.work_plan.steps
                         )
-                        if should_plan else 0
                     ),
                     "workPlanToolStepCount": (
                         sum(
                             step.executor is StepExecutor.TOOL
                             for step in planning.work_plan.steps
                         )
-                        if should_plan else 0
                     ),
                     "executionToolStepCount": (
                         sum(
@@ -279,25 +290,25 @@ class PlanningCapability:
                     ),
                     "plannerRepairCount": (
                         max(0, planning.model_call_count - 1)
-                        if should_plan else 0
                     ),
                     "hostInsertedPrerequisiteCount": (
-                        len(compiled.inserted_tool_names) if should_plan else 0
+                        len(compiled.inserted_tool_names)
                     ),
                     "hostLoweredProtocolToolCount": (
-                        len(compiled.lowered_tool_names) if should_plan else 0
+                        len(compiled.lowered_tool_names)
                     ),
                 },
                 duration_ms=duration_ms(started),
             ))
             return PlanningPhaseResult(
-                should_plan=should_plan,
                 execution_plan=plan,
                 capabilities=capabilities,
                 admission=admission,
                 dynamic_planning=(
                     DynamicPlanningOrchestrator(
                         planner=self._planner,
+                        operations=self._operations,
+                        model_manager=self._model_manager,
                         request=request,
                         capabilities=capabilities,
                         controller=controller,
@@ -306,8 +317,7 @@ class PlanningCapability:
                         turn_id=turn_id,
                         reasoning_mode=reasoning_mode,
                     )
-                    if should_plan
-                    and plan is not None
+                    if plan is not None
                     and isinstance(self._planner, DynamicWorkPlanner)
                     else None
                 ),
@@ -328,7 +338,6 @@ class PlanningCapability:
                 started=started,
                 safe_details={
                     "reasonCode": error.code,
-                    "validationReason": str(error)[:240],
                 },
             )
             if (
@@ -344,7 +353,7 @@ class PlanningCapability:
                     },
                     duration_ms=duration_ms(started),
                 ))
-                await controller.fail("planning_invalid")
+                await controller.fail(error.code)
                 return PlanningPhaseResult(terminal=True)
             plan = safe_model_only_plan(
                 title="安全降级回复",
@@ -362,7 +371,6 @@ class PlanningCapability:
                 duration_ms=duration_ms(started),
             ))
             return PlanningPhaseResult(
-                should_plan=True,
                 execution_plan=plan,
                 capabilities=capabilities,
                 fallback_model_only=True,
@@ -383,7 +391,7 @@ class PlanningCapability:
                 error=error,
                 started=started,
             )
-            await controller.fail("planning_failed")
+            await controller.fail(getattr(error, "code", "planning_failed"))
             return PlanningPhaseResult(terminal=True)
 
 
@@ -408,6 +416,7 @@ async def _record_exception(
         outcome=outcome,
         details={
             "errorType": type(error).__name__,
+            "reasonCode": getattr(error, "code", "planning_failed"),
             **overflow_details,
             **(safe_details or {}),
         },

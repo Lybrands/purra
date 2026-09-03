@@ -520,6 +520,7 @@ class RunTreeRepository(Protocol):
         lease_owner_id: str | None = None,
         lease_epoch: int | None = None,
     ) -> AgentTreeRun: ...
+    async def suspend_run(self, run_id: str, *, lease_owner_id: str, lease_epoch: int) -> AgentTreeRun: ...
     async def complete_run(
         self,
         run_id: str,
@@ -812,6 +813,7 @@ class InMemoryRunTreeRepository:
                 and run.lease_expires_at_ms is not None
                 and now >= run.lease_expires_at_ms
             )
+            reclaimable = reclaimable or (run.status is AgentTreeRunStatus.WAITING and run.lease_owner_id is None and run.lease_epoch > 0)
             if run.status is not AgentTreeRunStatus.QUEUED and not reclaimable:
                 return None
             root = self._require_active_agent(
@@ -834,6 +836,14 @@ class InMemoryRunTreeRepository:
             )
             self._runs[run.run_id] = claimed
             return claimed
+
+    async def suspend_run(self, run_id: str, *, lease_owner_id: str, lease_epoch: int) -> AgentTreeRun:
+        async with self._lock:
+            run = self._require_run(run_id)
+            self._require_claim_unlocked(run, lease_owner_id=lease_owner_id, lease_epoch=lease_epoch)
+            suspended = replace(run, status=AgentTreeRunStatus.WAITING, lease_owner_id=None, lease_expires_at_ms=None)
+            self._runs[run_id] = suspended
+            return suspended
 
     async def renew_run_lease(
         self,
@@ -1120,6 +1130,7 @@ class InMemoryRunTreeRepository:
                         run.root_run_id == root
                         and (
                             run.status is AgentTreeRunStatus.QUEUED
+                            or (run.status is AgentTreeRunStatus.WAITING and run.lease_owner_id is None and run.lease_epoch > 0)
                             or (
                                 run.status is AgentTreeRunStatus.RUNNING
                                 and self._lease_expired_unlocked(run, now)

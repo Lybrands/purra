@@ -1,3 +1,4 @@
+import { encodeStorageState, decodeStorageState } from "../shared/storage-state.js";
 import { copyJsonValue } from "../model/validation.js";
 import { AgentError } from "../shared/errors.js";
 import { stableFingerprint } from "../shared/fingerprint.js";
@@ -54,6 +55,16 @@ export class InMemoryArtifactStore implements
   readonly #clockMs: () => number;
   readonly #tokenFactory: () => string;
   readonly #runIsAvailable: (runId: string) => boolean;
+
+  /** Opaque version-pinned storage data, never a public output projection. */
+  public exportState(): string { return encodeStorageState({ artifacts: this.#artifacts, owners: this.#owners, claims: this.#claims }); }
+  public importState(text: string): void {
+    const shape = { artifacts: this.#artifacts, owners: this.#owners, claims: this.#claims };
+    const saved = decodeStorageState(text) as typeof shape;
+    this.#artifacts.clear(); for (const [key, value] of saved.artifacts) this.#artifacts.set(key, value);
+    this.#owners.clear(); for (const [key, value] of saved.owners) this.#owners.set(key, value);
+    this.#claims.clear(); for (const [key, value] of saved.claims) this.#claims.set(key, value);
+  }
 
   public constructor(options: {
     readonly clockMs?: () => number;

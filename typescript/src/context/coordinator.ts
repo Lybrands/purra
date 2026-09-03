@@ -21,6 +21,7 @@ import type {
   ContextRequest,
   ContextStrategy,
   PreparedContext,
+  PreparedContextSnapshot,
   StagedContextPreparation,
   StagedContextProvider,
   TaskContextRequest,
@@ -194,25 +195,75 @@ export async function prepareStagedContext(
   });
 }
 
+export function copyPreparedContextSnapshot(value: PreparedContextSnapshot): PreparedContextSnapshot {
+  if (
+    value === null || typeof value !== "object"
+    || value.contextAllocations === null || typeof value.contextAllocations !== "object"
+    || Array.isArray(value.contextAllocations)
+  ) throw new TypeError("Invalid prepared context snapshot");
+  const claims = normalizeClaims(Object.entries(value.contextAllocations).map(([name, tokens]) => ({
+    name, desiredTokens: tokens, minimumTokens: tokens,
+  })));
+  const contextAllocations = Object.freeze(Object.fromEntries(claims.map((claim) => [claim.name, claim.desiredTokens])));
+  const { blocks } = copyBundle({ blocks: value.blocks }, { contextAllocations });
+  const summary = value.summary === null ? null : copySummary(value.summary, blocks);
+  collectEvidence([...blocks, ...(summary === null ? [] : [summary])]);
+  return Object.freeze({
+    blocks,
+    contextAllocations,
+    compactions: nonNegativeInteger(value.compactions, "context snapshot compactions"),
+    summary,
+  });
+}
+
+export function restoreContext(
+  options: ContextOptions,
+  input: ContextPreparationInput,
+  snapshot: PreparedContextSnapshot,
+): PreparedContext {
+  throwIfCanceled(input.signal);
+  const saved = copyPreparedContextSnapshot(snapshot);
+  // Reuse resolved allocations, not the live provider. Recompute fixed reserves
+  // against the currently bound model, tools and per-call output limit.
+  const budget = allocateContextBudget({
+    windowTokens: input.windowTokens,
+    outputReserveTokens: input.outputReserveTokens,
+    tools: input.tools,
+    claims: Object.entries(saved.contextAllocations).map(([name, tokens]) => ({
+      name, desiredTokens: tokens, minimumTokens: tokens,
+    })),
+    ...(options.reserves === undefined ? {} : { reserves: options.reserves }),
+  });
+  return preparedContext(options, budget, saved.blocks, saved.compactions, saved.summary);
+}
+
 function preparedContext(
   options: ContextOptions,
   budget: ContextBudget,
   blocks: readonly ContextBlock[],
+  initialCompactions = 0,
+  initialSummary: ContextBlock | null = null,
 ): PreparedContext {
   const evidence = collectEvidence(blocks);
-  let projectedEvidence = evidence;
+  let summary = initialSummary;
+  let projectedEvidence = summary === null ? evidence : collectEvidence([...blocks, summary]);
   const triggerRatio = ratio(options.triggerRatio ?? 0.85, "context trigger ratio");
   const maxCompactions = positiveInteger(options.maxCompactions ?? 4, "max context compactions");
-  let compactions = 0;
+  let compactions = initialCompactions;
 
   return Object.freeze({
     budget,
     get evidence(): readonly ContextEvidenceReceipt[] { return projectedEvidence; },
+    snapshot(): PreparedContextSnapshot {
+      return Object.freeze({ blocks, contextAllocations: budget.contextAllocations, compactions, summary });
+    },
     async project(messages: readonly Message[], signal?: AbortSignal): Promise<readonly Message[]> {
       throwIfCanceled(signal);
       const source = Object.freeze(copyMessages(messages));
       const fixedContext = blocks.map(contextMessage);
-      const contextTokens = Math.max(0, estimateMessagesTokens(fixedContext) - 2);
+      const contextTokens = Math.max(0, estimateMessagesTokens([
+        ...fixedContext, ...(summary === null ? [] : [contextMessage(summary)]),
+      ]) - 2);
       const availableMessageTokens = Math.max(0, budget.providerInputTokens - contextTokens);
       const messageTokens = estimateMessagesTokens(source);
       const projectedInputTokens = messageTokens + contextTokens;
@@ -225,7 +276,7 @@ function preparedContext(
           ? "pressure_threshold" as const
           : "below_threshold" as const;
       let candidate = source;
-      let summary: ContextBlock | undefined;
+      let nextSummary = summary;
 
       if (options.compression !== undefined) {
         if (compressionRequired && ++compactions > maxCompactions) {
@@ -236,6 +287,7 @@ function preparedContext(
         }
         const result = await abortable(options.compression.compress(Object.freeze({
           messages: source,
+          previousSummary: summary,
           budget,
           contextTokens,
           availableMessageTokens,
@@ -250,7 +302,9 @@ function preparedContext(
         }
         candidate = Object.freeze(copyMessages(result.messages));
         validateCompression(source, candidate);
-        summary = result.summary === undefined ? undefined : copyBlock(result.summary);
+        if (result.summary !== undefined) {
+          nextSummary = result.summary === null ? null : copySummary(result.summary, blocks);
+        }
       } else if (compressionRequired) {
         if (++compactions > maxCompactions) {
           throw new AgentError(
@@ -269,13 +323,13 @@ function preparedContext(
       }
 
       validateToolProtocol(candidate);
-      projectedEvidence = summary === undefined
+      const nextEvidence = nextSummary === null
         ? evidence
-        : collectEvidence([...blocks, summary]);
+        : collectEvidence([...blocks, nextSummary]);
 
       const projected = assembleMessages(candidate, [
         ...fixedContext,
-        ...(summary === undefined ? [] : [contextMessage(summary)]),
+        ...(nextSummary === null ? [] : [contextMessage(nextSummary)]),
       ]);
       if (estimateMessagesTokens(projected) > budget.providerInputTokens) {
         throw new AgentError(
@@ -285,6 +339,8 @@ function preparedContext(
           "Context projection exceeds the provider input budget",
         );
       }
+      summary = nextSummary;
+      projectedEvidence = nextEvidence;
       return projected;
     },
   });
@@ -335,7 +391,7 @@ function contextMessage(block: ContextBlock): Message {
   });
 }
 
-function copyBundle(value: ContextBundle, budget: ContextBudget): ContextBundle {
+function copyBundle(value: ContextBundle, budget: Pick<ContextBudget, "contextAllocations">): ContextBundle {
   if (value === null || typeof value !== "object" || !Array.isArray(value.blocks)) {
     throw new AgentError("context_provider_invalid", "Context provider must return a ContextBundle");
   }
@@ -357,6 +413,14 @@ function copyBundle(value: ContextBundle, budget: ContextBudget): ContextBundle 
     ? undefined
     : copyJsonValue(value.diagnostics) as Readonly<Record<string, import("../model/types.js").JsonValue>>;
   return Object.freeze({ blocks, ...(diagnostics === undefined ? {} : { diagnostics }) });
+}
+
+function copySummary(value: ContextBlock, blocks: readonly ContextBlock[]): ContextBlock {
+  const summary = copyBlock(value);
+  if (blocks.some((block) => block.name === summary.name)) {
+    throw new TypeError("Context summary must not replace a fixed context block");
+  }
+  return Object.freeze({ ...summary, untrusted: true });
 }
 
 function copyBlock(value: ContextBlock): ContextBlock {

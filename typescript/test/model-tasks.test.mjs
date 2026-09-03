@@ -5,6 +5,7 @@ import {
   Agent,
   AgentError,
   AgentOperationController,
+  estimateMessagesTokens,
   ModelTaskRunner,
 } from "purra";
 
@@ -49,6 +50,34 @@ test("standalone model tasks resolve an exact output limit and Operation", async
   assert.equal(operations[1].status, "succeeded");
 });
 
+test("private model tasks reject input plus output reserve beyond the model window", async () => {
+  let calls = 0;
+  const runner = new ModelTaskRunner({
+    runId: "input-budget",
+    model: {
+      capabilities: capabilities(),
+      async invoke(request) { calls++; return finalTurn("unsafe", request); },
+      async *stream() { calls++; yield { contentDelta: "unsafe", finishReason: "stop" }; },
+    },
+  });
+  const messages = [{ role: "user", content: "x".repeat(40_000) }];
+  await assert.rejects(runner.complete(messages), { code: "model_task_input_exceeds_budget" });
+  await assert.rejects(runner.streamText(messages), { code: "model_task_input_exceeds_budget" });
+  assert.equal(calls, 0);
+  const small = [{ role: "user", content: "x".repeat(1_000) }];
+  const bounded = new ModelTaskRunner({
+    runId: "reserve-boundary",
+    model: {
+      capabilities: { ...capabilities(), contextWindowTokens: estimateMessagesTokens(small) + 511 },
+      async invoke(request) { calls++; return finalTurn("safe", request); },
+    },
+  });
+  await assert.rejects(bounded.complete(small), { code: "model_task_input_exceeds_budget" });
+  assert.equal(calls, 0);
+  assert.equal((await bounded.complete(small, { maxCallOutputTokens: 256 })).turn.message.content, "safe");
+  assert.equal(calls, 1);
+});
+
 test("managed task receipt failure prevents the Provider call", async () => {
   let calls = 0;
   const runner = new ModelTaskRunner({
@@ -72,6 +101,86 @@ test("managed task receipt failure prevents the Provider call", async () => {
     /receipt unavailable/,
   );
   assert.equal(calls, 0);
+});
+
+test("model tasks revalidate bound evidence before invoking the Provider", async () => {
+  let calls = 0;
+  const evidence = [{
+    evidenceId: "mem0:store:item-1:2",
+    contextBlock: "memory",
+    source: "mem0/scope",
+    itemId: "item-1",
+    version: "2",
+  }];
+  const validations = [];
+  const runner = new ModelTaskRunner({
+    runId: "evidence-task",
+    model: {
+      capabilities: capabilities("unavailable"),
+      async invoke(request) { calls += 1; return finalTurn("unsafe", request); },
+    },
+    evidenceValidator: {
+      validateEvidence(receipts) {
+        validations.push(receipts);
+        throw new AgentError("external_evidence_stale", "stale evidence");
+      },
+    },
+  });
+  runner.bindEvidence(evidence);
+
+  await assert.rejects(
+    runner.complete([{ role: "user", content: "compress" }]),
+    { code: "external_evidence_stale" },
+  );
+  assert.equal(calls, 0);
+  assert.deepEqual(validations, [evidence]);
+});
+
+test("context compression model tasks inherit the Run evidence set", async () => {
+  let calls = 0;
+  const validations = [];
+  const evidence = {
+    evidenceId: "mem0:store:item-1:2",
+    source: "mem0/scope",
+    itemId: "item-1",
+    version: "2",
+  };
+  const agent = new Agent({
+    model: {
+      capabilities: capabilities("unavailable"),
+      async invoke(request) { calls += 1; return finalTurn("unsafe", request); },
+    },
+    evidenceValidator: {
+      validateEvidence(receipts) {
+        validations.push(receipts);
+        throw new AgentError("external_evidence_stale", "stale evidence");
+      },
+    },
+    context: {
+      provider: {
+        describeContextDemands() { return [{ name: "memory", desiredTokens: 64 }]; },
+        buildContext() {
+          return { blocks: [{ name: "memory", content: "remembered", evidence: [evidence] }] };
+        },
+      },
+      triggerRatio: 0.001,
+      compressionFactory(modelTasks) {
+        return {
+          async compress(request) {
+            await modelTasks.complete([{ role: "user", content: "compress" }]);
+            return { messages: request.messages };
+          },
+        };
+      },
+    },
+  });
+
+  await assert.rejects(
+    agent.invoke({ messages: [{ role: "user", content: "answer" }] }),
+    { code: "external_evidence_stale" },
+  );
+  assert.equal(calls, 0);
+  assert.deepEqual(validations, [[{ ...evidence, contextBlock: "memory" }]]);
 });
 
 test("streamText replays private reasoning and retries empty official output within policy", async () => {

@@ -51,6 +51,7 @@ class ModelProtocolCapabilities:
     parallel_tool_calls: FeatureSupport = FeatureSupport.SUPPORTED
     streaming: FeatureSupport = FeatureSupport.SUPPORTED
     cancellation: FeatureSupport = FeatureSupport.SUPPORTED
+    public_progress: FeatureSupport = FeatureSupport.UNKNOWN
     assistant_content_with_tool_calls: AssistantContentWithToolCalls = (
         AssistantContentWithToolCalls.OPTIONAL
     )
@@ -75,6 +76,7 @@ class ModelProtocolCapabilities:
             "parallel_tool_calls",
             "streaming",
             "cancellation",
+            "public_progress",
         ):
             object.__setattr__(self, name, FeatureSupport(getattr(self, name)))
         object.__setattr__(
@@ -113,6 +115,7 @@ class ModelProtocolCapabilities:
             "parallelToolCalls": self.parallel_tool_calls.value,
             "streaming": self.streaming.value,
             "cancellation": self.cancellation.value,
+            "publicProgress": self.public_progress.value,
             "assistantContentWithToolCalls": (
                 self.assistant_content_with_tool_calls.value
             ),

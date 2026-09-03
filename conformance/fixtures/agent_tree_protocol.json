@@ -70,7 +70,7 @@
     "crossRootScope": true
   },
   "recovery": {
-    "executionCheckpointSchemaVersion": 1,
+    "executionCheckpointSchemaVersions": { "python": 1, "typescript": 2 },
     "resumablePhase": "model_ready",
     "resumableExecutionProfile": "reactive",
     "inFlightProviderOrToolPolicy": "fail_stop"

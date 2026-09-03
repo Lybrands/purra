@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from hashlib import sha256
 import json
 import time
@@ -13,6 +13,7 @@ from uuid import uuid4
 
 from purra.cancellation import (
     ExecutionStopSignal,
+    OperationCanceled,
     await_with_cancellation,
     raise_if_stopped,
 )
@@ -29,8 +30,12 @@ from purra.contracts import (
     ToolCallDelta,
     RuntimeLimits,
 )
-from purra.errors import ContractViolationError, ModelGatewayError
+from purra.errors import ContractViolationError, InvalidPlannerOutputError, ModelGatewayError
 from purra.evidence import context_evidence_receipts
+from purra.model_invocation.evidence import (
+    current_model_input_evidence,
+    merge_context_evidence,
+)
 from purra.json_values import thaw_json_mapping
 from purra.model_call_parameters import describe_model_call
 from purra.model_invocation.contracts import (
@@ -52,9 +57,15 @@ from purra.output.contracts import (
     OutputCommitMode,
     OutputStreamSpec,
 )
-from purra.ports import CancellationSignal, ModelGateway
+from purra.ports import (
+    CancellationSignal,
+    ModelGateway,
+    ModelInputEvidenceValidator,
+)
 from purra.ports import RunRepository
-from purra.stream_ownership import OwnedAsyncIterator
+from purra.stream_ownership import OwnedAsyncIterator, close_async_resource
+from purra.planning_stream import PLANNING_STREAM_SCHEMA, PlanningStreamParser
+from purra.model_protocol import FeatureSupport
 
 
 class ModelInvocationOutputObserver(Protocol):
@@ -87,6 +98,11 @@ class ModelInvocationOutputObserver(Protocol):
         output_stream_id: str,
     ) -> object: ...
 
+    async def publish_model_stream_final(
+        self,
+        output_stream_id: str,
+    ) -> object: ...
+
 
 class _NullOutputObserver:
     async def open_model_stream(self, receipt, spec):
@@ -102,6 +118,9 @@ class _NullOutputObserver:
         del output_stream_id, error_code
 
     async def publish_model_stream_commentary(self, output_stream_id):
+        del output_stream_id
+
+    async def publish_model_stream_final(self, output_stream_id):
         del output_stream_id
 
 
@@ -120,6 +139,7 @@ class AgentModelInvocationManager:
         ),
         max_tool_argument_chars: int = 1_000_000,
         budget_repository: RunRepository | None = None,
+        evidence_validator: ModelInputEvidenceValidator | None = None,
     ) -> None:
         if not isinstance(gateway, ModelGateway):
             raise TypeError("model invocation manager requires a ModelGateway")
@@ -138,6 +158,13 @@ class AgentModelInvocationManager:
             raise ValueError("model stream tool argument limit must be positive")
         self._max_tool_argument_chars = int(max_tool_argument_chars)
         self._budget_repository = budget_repository
+        if evidence_validator is not None and not isinstance(
+            evidence_validator, ModelInputEvidenceValidator
+        ):
+            raise TypeError(
+                "evidence_validator must implement ModelInputEvidenceValidator"
+            )
+        self._evidence_validator = evidence_validator
 
     async def stream(
         self,
@@ -147,6 +174,8 @@ class AgentModelInvocationManager:
         signal: CancellationSignal | None = None,
         *,
         on_attempt: Callable[[Mapping[str, object]], Awaitable[None]] | None = None,
+        _on_chunk=None,
+        _diagnostics: dict | None = None,
     ) -> ManagedInvocationStream:
         self._validate_call(call, context, public_stream_allowed=True)
         invocation = _invocation(call)
@@ -157,13 +186,29 @@ class AgentModelInvocationManager:
         invocation_signal = self._invocation_signal(context, signal)
         stream_opened = False
         attempt_reserved = False
+        stream = None
+        liveness = None
         try:
+            await self._validate_evidence(receipt, invocation_signal)
             await self._reserve_attempt(receipt)
             attempt_reserved = True
+            if context.planning_scope is not None:
+                from purra.planning_context import current_planning_context
+                phase = current_planning_context()
+                if phase is not None and phase.scope == context.planning_scope:
+                    phase.model_attempts += 1
             await self._output.open_model_stream(receipt, spec)
             stream_opened = True
+            gateway_started = time.monotonic()
+            if _diagnostics is not None:
+                _diagnostics["gatewayStartedAtMs"] = int(time.time() * 1000)
+            async def open_gateway_stream():
+                nonlocal stream
+                stream = await self._gateway.stream(messages, invocation, invocation_signal)
+                return stream
+
             stream = await await_with_cancellation(
-                self._gateway.stream(messages, invocation, invocation_signal),
+                open_gateway_stream(),
                 invocation_signal,
             )
             raise_if_stopped(invocation_signal)
@@ -171,9 +216,21 @@ class AgentModelInvocationManager:
                 invocation,
                 stream.applied_output_limit,
             )
+            meter = self._stream_meter(context)
+            liveness = _StreamLiveness(
+                invocation_signal,
+                support=stream.activity_support,
+                activity_timeout_ms=self._limits.provider_activity_idle_timeout_ms,
+                progress_timeout_ms=self._limits.provider_progress_idle_timeout_ms,
+                started=gateway_started,
+            )
+
+            liveness.accept_transport_diagnostics(stream.transport_diagnostics)
         except BaseException as error:
             selected_error = error
             try:
+                if stream is not None:
+                    await _close_async_iterator(stream.chunks)
                 if attempt_reserved:
                     try:
                         await self._settle_attempt(receipt, None)
@@ -185,22 +242,34 @@ class AgentModelInvocationManager:
                         _error_code(selected_error),
                     )
             finally:
-                await self._fail_operation(operation_id, selected_error)
+                if liveness is not None:
+                    liveness.close()
                 invocation_signal.close()
+                await self._fail_operation(operation_id, selected_error)
+                if stream_opened and _diagnostics is not None:
+                    record = getattr(self._output, "record_model_diagnostics", None)
+                    if record is not None:
+                        try:
+                            await record(receipt, _diagnostics)
+                        except BaseException:
+                            pass  # Preserve the original open/transport failure.
             if selected_error is not error:
                 raise selected_error from error
             raise
-        meter = self._stream_meter(context)
-        liveness = _StreamLiveness(
-            invocation_signal,
-            support=stream.activity_support,
-            activity_timeout_ms=self._limits.provider_activity_idle_timeout_ms,
-            progress_timeout_ms=self._limits.provider_progress_idle_timeout_ms,
-        )
 
         def close_invocation() -> None:
             liveness.close()
             invocation_signal.close()
+
+        async def close_unstarted() -> None:
+            close_invocation()
+            try:
+                await self._settle_attempt(receipt, None)
+            finally:
+                try:
+                    await self._output.abort_model_stream(receipt.output_stream_id, "invocation_consumer_closed")
+                finally:
+                    await self._cancel_operation(operation_id, "invocation_consumer_closed")
 
         return ManagedInvocationStream(
             chunks=OwnedAsyncIterator(
@@ -212,13 +281,100 @@ class AgentModelInvocationManager:
                     meter,
                     liveness,
                     invocation.output_limit.max_tokens,
+                    call.request.protocol_capabilities.public_progress
+                    is FeatureSupport.SUPPORTED,
                     receipt,
                     close_invocation,
+                    _on_chunk,
+                    _diagnostics,
                 ),
                 stream.chunks,
                 terminal_predicate=lambda chunk: chunk.finish_reason is not None,
+                on_unstarted_close=close_unstarted,
             ),
             receipt=receipt,
+        )
+
+    async def plan(
+        self, messages, call: AgentModelCall, context: ModelInvocationContext,
+        signal: CancellationSignal | None = None, *, validate_plan=None,
+        on_attempt=None,
+    ) -> ManagedInvocationCompletion:
+        """One managed planning attempt, with no hidden empty-response retries.
+
+        Only complete typed progress records are projected. The supplied complete
+        plan validator runs before the invocation commits; Core still compiles and
+        admits the semantic result before ending the planning operation.
+        """
+        if call.request.protocol_capabilities.streaming is not FeatureSupport.SUPPORTED:
+            raise ModelGatewayError("Planner requires a streaming Gateway", code="model_stream_unavailable")
+        parser = PlanningStreamParser()
+        started = time.monotonic()
+        diagnostics = {"gatewayStartedAtMs": None, "firstActivityMs": None, "firstProgressMs": None,
+                       "firstSemanticChunkMs": None, "invocationDurationMs": None,
+                       "attemptStartedAtMs": int(time.time() * 1000), "firstPublicProgressMs": None, "planReceivedMs": None,
+                       "rejectedPublicProgressRecords": 0,
+                       "validationMs": None, "httpRequestSentAtMs": None,
+                       "httpFirstByteAtMs": None, "sdkHttpAttempts": None}
+        plan = None
+        rejected_output = ""
+
+        async def accept(receipt, chunk, invocation_signal):
+            nonlocal plan, rejected_output
+            if len(rejected_output) < 65_536:
+                rejected_output += chunk.content_delta[:65_536 - len(rejected_output)]
+            if chunk.tool_call_deltas:
+                raise ModelGatewayError("Planner cannot call tools", code="unexpected_model_tool_calls")
+            records = parser.feed(chunk.content_delta)
+            diagnostics["rejectedPublicProgressRecords"] = parser.rejected_progress_records
+            if parser.plan_received and diagnostics["planReceivedMs"] is None:
+                diagnostics["planReceivedMs"] = round((time.monotonic() - started) * 1000)
+            for record in records:
+                raise_if_stopped(invocation_signal)
+                if context.planning_scope is not None:
+                    publish = getattr(self._output, "accept_planning_progress", None)
+                    if publish is not None:
+                        event = await publish(receipt.output_stream_id, record, invocation_signal)
+                        if event is not None and diagnostics["firstPublicProgressMs"] is None:
+                            diagnostics["firstPublicProgressMs"] = round((time.monotonic() - started) * 1000)
+            if chunk.finish_reason is not None:
+                termination = classify_model_termination(chunk.finish_reason, tool_call_count=0)
+                if termination.incomplete:
+                    raise ModelGatewayError("Incomplete planning stream", code=termination.error_code or "model_output_truncated")
+                plan = parser.finish()
+                diagnostics["rejectedPublicProgressRecords"] = parser.rejected_progress_records
+                if diagnostics["planReceivedMs"] is None:
+                    diagnostics["planReceivedMs"] = round(
+                        (time.monotonic() - started) * 1000
+                    )
+                validation_started = time.monotonic()
+                try:
+                    if validate_plan is not None:
+                        validate_plan(plan)
+                finally:
+                    diagnostics["validationMs"] = round((time.monotonic() - validation_started) * 1000)
+
+        stream = await self.stream(messages, replace(call, output_protocol=PLANNING_STREAM_SCHEMA),
+                                   context, signal, on_attempt=on_attempt,
+                                   _on_chunk=accept, _diagnostics=diagnostics)
+        from purra.contracts import MessageRole
+        usage = None
+        reason = None
+        try:
+            async for chunk in stream.chunks:
+                usage = chunk.usage or usage
+                reason = chunk.finish_reason or reason
+        except InvalidPlannerOutputError as error:
+            error.rejected_output = rejected_output or None
+            raise
+        finally:
+            await stream.chunks.aclose()
+        return ManagedInvocationCompletion(
+            completion=ModelCompletion(
+                message=AgentMessage(role=MessageRole.ASSISTANT, content=json.dumps(thaw_json_mapping(plan))),
+                model=call.request.model, usage=usage, finish_reason=reason,
+                applied_output_limit=call.output_limit.max_tokens,
+            ), receipt=stream.receipt,
         )
 
     async def publish_model_stream_commentary(
@@ -226,6 +382,14 @@ class AgentModelInvocationManager:
         output_stream_id: str,
     ) -> object:
         return await self._output.publish_model_stream_commentary(
+            str(output_stream_id)
+        )
+
+    async def publish_model_stream_final(
+        self,
+        output_stream_id: str,
+    ) -> object:
+        return await self._output.publish_model_stream_final(
             str(output_stream_id)
         )
 
@@ -252,6 +416,7 @@ class AgentModelInvocationManager:
         attempt_settled = False
         meter = self._stream_meter(context)
         try:
+            await self._validate_evidence(receipt, invocation_signal)
             await self._reserve_attempt(receipt)
             attempt_reserved = True
             await self._output.open_model_stream(receipt, spec)
@@ -396,7 +561,13 @@ class AgentModelInvocationManager:
                 for tool in invocation.tools
             ]),
             budget_key=context.attempt_source_key,
-            context_evidence=context_evidence_receipts(messages),
+            output_protocol=call.output_protocol,
+            planning_scope=context.planning_scope,
+            planning_attempt=context.planning_attempt,
+            context_evidence=merge_context_evidence(
+                context_evidence_receipts(messages),
+                current_model_input_evidence(),
+            ),
             call_parameters=(parameters,),
         )
         return receipt, OutputStreamSpec(
@@ -406,7 +577,27 @@ class AgentModelInvocationManager:
             invocation_id=invocation_id,
             intent=call.output_intent,
             commit_mode=call.commit_mode,
+            output_protocol=call.output_protocol,
+            planning_scope=context.planning_scope,
+            planning_attempt=context.planning_attempt,
         )
+
+    async def _validate_evidence(
+        self,
+        receipt: ModelInvocationReceipt,
+        signal: CancellationSignal | None,
+    ) -> None:
+        if not receipt.context_evidence:
+            return
+        validator = self._evidence_validator
+        if validator is None:
+            return
+        raise_if_stopped(signal)
+        await validator.validate_evidence(
+            receipt.context_evidence,
+            signal=signal,
+        )
+        raise_if_stopped(signal)
 
     def _invocation_signal(
         self,
@@ -476,8 +667,11 @@ class AgentModelInvocationManager:
         meter: "_StreamMeter",
         liveness: "_StreamLiveness",
         expected_output_limit: int,
+        public_progress_allowed: bool,
         budget_receipt: ModelInvocationReceipt,
         close_signal: Callable[[], None],
+        on_chunk=None,
+        diagnostics: dict | None = None,
     ) -> AsyncIterator[ModelStreamChunk]:
         finish_reason: ModelFinishReason | None = None
         tool_indices: set[int] = set()
@@ -501,6 +695,11 @@ class AgentModelInvocationManager:
                         code="model_stream_item_invalid",
                     )
                 chunk = item
+                if chunk.progress_delta and not public_progress_allowed:
+                    raise ContractViolationError(
+                        "model gateway emitted undeclared public progress",
+                        code="model_gateway_contract_violation",
+                    )
                 meaningful = liveness.accept_chunk(chunk)
                 meter.accept(chunk)
                 usage = chunk.usage or usage
@@ -509,10 +708,12 @@ class AgentModelInvocationManager:
                     chunk.usage,
                 )
                 tool_indices.update(delta.index for delta in chunk.tool_call_deltas)
-                await self._output.accept_provider_chunk(
-                    receipt.output_stream_id,
-                    chunk,
-                )
+                await await_with_cancellation(self._output.accept_provider_chunk(
+                    receipt.output_stream_id, chunk,
+                ), signal)
+                if on_chunk is not None:
+                    await await_with_cancellation(on_chunk(receipt, chunk, signal), signal)
+                raise_if_stopped(signal)
                 if chunk.finish_reason is not None:
                     liveness.close()
                     attempt_settled = True
@@ -613,6 +814,11 @@ class AgentModelInvocationManager:
                             )
             finally:
                 close_signal()
+                if diagnostics is not None:
+                    diagnostics.update(liveness.diagnostics())
+                    record = getattr(self._output, "record_model_diagnostics", None)
+                    if record is not None:
+                        await record(receipt, diagnostics)
             if consumer_error is not None:
                 raise consumer_error
 
@@ -627,6 +833,7 @@ class AgentModelInvocationManager:
             OperationScope(
                 run_id=receipt.run_id,
                 invocation_id=receipt.invocation_id,
+                parent_operation_id=(receipt.planning_scope.operation_id if receipt.planning_scope else None),
                 display=OperationDisplay(
                     label_key="agent.operation.model",
                     label_params={"model": receipt.model},
@@ -644,7 +851,10 @@ class AgentModelInvocationManager:
         operation_id: str | None,
         error: BaseException,
     ) -> None:
-        await self._fail_operation_code(operation_id, _error_code(error))
+        if isinstance(error, (OperationCanceled, asyncio.CancelledError)):
+            await self._cancel_operation(operation_id, "request_canceled")
+        else:
+            await self._fail_operation_code(operation_id, _error_code(error))
 
     async def _fail_operation_code(
         self,
@@ -743,6 +953,7 @@ def _completion_chunk(completion: ModelCompletion) -> ModelStreamChunk | None:
     if not (
         chunk.content_delta
         or chunk.reasoning_delta
+        or chunk.progress_delta
         or chunk.tool_call_deltas
         or chunk.usage is not None
     ):
@@ -751,14 +962,14 @@ def _completion_chunk(completion: ModelCompletion) -> ModelStreamChunk | None:
 
 
 def _error_code(error: BaseException) -> str:
+    if isinstance(error, (OperationCanceled, asyncio.CancelledError)):
+        return "request_canceled"
     code = str(getattr(error, "code", "") or "").strip()
     return code or "model_invocation_failed"
 
 
 async def _close_async_iterator(iterator: object) -> None:
-    close = getattr(iterator, "aclose", None)
-    if callable(close):
-        await close()
+    await close_async_resource(iterator)
 
 
 class _StreamLiveness:
@@ -769,14 +980,16 @@ class _StreamLiveness:
         support: ModelStreamActivitySupport,
         activity_timeout_ms: int | None,
         progress_timeout_ms: int | None,
+        started: float | None = None,
     ) -> None:
         self._signal = signal
         self._support = ModelStreamActivitySupport(support)
         self._activity_timeout_ms = activity_timeout_ms
         self._progress_timeout_ms = progress_timeout_ms
-        self._started = time.monotonic()
+        self._started = time.monotonic() if started is None else started
         self._first_activity_ms: int | None = None
         self._first_progress_ms: int | None = None
+        self._first_semantic_ms: int | None = None
         self._last_activity_ms: int | None = None
         self._last_progress_ms: int | None = None
         self._max_activity_gap_ms: int | None = None
@@ -784,6 +997,7 @@ class _StreamLiveness:
         self._activity_timer: asyncio.TimerHandle | None = None
         self._progress_timer: asyncio.TimerHandle | None = None
         self._closed = False
+        self._transport_diagnostics = None
         self.resume()
 
     def accept_activity(self, item: ModelStreamActivity) -> None:
@@ -800,6 +1014,7 @@ class _StreamLiveness:
                 "model stream yielded undeclared working activity",
                 code="model_stream_activity_unsupported",
             )
+        self.accept_transport_diagnostics(item.transport_diagnostics)
         now = self._elapsed_ms()
         self._record_activity(now)
         self._arm_activity()
@@ -811,6 +1026,13 @@ class _StreamLiveness:
         if not _is_meaningful_chunk(chunk):
             return False
         now = self._elapsed_ms()
+        if (
+            chunk.content_delta
+            or chunk.reasoning_delta
+            or chunk.progress_delta
+            or chunk.tool_call_deltas
+        ) and self._first_semantic_ms is None:
+            self._first_semantic_ms = now
         self._record_activity(now)
         self._record_progress(now)
         self._cancel_idle_timers()
@@ -827,6 +1049,22 @@ class _StreamLiveness:
             return
         self._closed = True
         self._cancel_idle_timers()
+
+    def accept_transport_diagnostics(self, evidence) -> None:
+        if evidence is None:
+            return
+        from purra.model_protocol import ModelTransportDiagnostics
+        if not isinstance(evidence, ModelTransportDiagnostics):
+            raise ContractViolationError("invalid transport diagnostics", code="model_gateway_contract_violation")
+        self._transport_diagnostics = evidence
+
+    def diagnostics(self) -> dict[str, object]:
+        return {**(self._transport_diagnostics.to_mapping() if self._transport_diagnostics else {}),
+                "activitySupport": self._support.value,
+                "firstActivityMs": self._first_activity_ms,
+                "firstProgressMs": self._first_progress_ms,
+                "firstSemanticChunkMs": self._first_semantic_ms,
+                "invocationDurationMs": self._elapsed_ms()}
 
     def _record_activity(self, now: int) -> None:
         if self._first_activity_ms is None:
@@ -916,6 +1154,7 @@ def _is_meaningful_chunk(chunk: ModelStreamChunk) -> bool:
     return bool(
         chunk.content_delta
         or chunk.reasoning_delta
+        or chunk.progress_delta
         or chunk.usage is not None
         or chunk.finish_reason is not None
         or any(

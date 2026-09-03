@@ -1,0 +1,42 @@
+{
+  "name": "purra-interaction",
+  "version": "0.5.0",
+  "type": "module",
+  "license": "MIT",
+  "description": "Durable pre-execution user clarification for PurrA",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "peerDependencies": {
+    "purra": "0.5.0",
+    "purra-sqlite": "0.5.0"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.1",
+    "purra": "file:../../../typescript",
+    "typescript": "7.0.2",
+    "purra-sqlite": "file:../../sqlite/typescript"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "node --test test/*.test.mjs",
+    "check": "npm run build && npm test",
+    "prepack": "npm run build"
+  },
+  "peerDependenciesMeta": {
+    "purra-sqlite": {
+      "optional": true
+    }
+  }
+}

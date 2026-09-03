@@ -34,11 +34,13 @@ import type {
 } from "../durable/types.js";
 import type { RecoveryDecision } from "../recovery/index.js";
 import { recoveryDecisionDetails } from "../recovery/index.js";
+import { AgentOperationController, type OperationEvent } from "../operations/index.js";
+import { PLANNING_STREAM_SCHEMA, type PlanningProgress } from "../planning/stream.js";
 
 interface PendingProviderDelta {
   readonly sourceChunkIndex: number;
   readonly sourcePartIndex: number;
-  readonly kind: "provider.content_delta" | "provider.reasoning_delta" | "provider.tool_call_delta";
+  readonly kind: "provider.content_delta" | "provider.reasoning_delta" | "provider.progress_delta" | "provider.tool_call_delta";
   readonly channel: "model" | "reasoning";
   readonly visibility: "private";
   readonly payload: Readonly<Record<string, JsonValue>>;
@@ -53,8 +55,11 @@ interface PendingOutputBatch {
 }
 
 const OUTPUT_BATCH_SCHEMA = "purra.provider-delta-batch/v1";
+const AGENT_PROGRESS_SCHEMA = "purra.agent-progress/v1";
+const MAX_AGENT_PROGRESS_CHARS = 160;
 
 export class RunSession {
+  public operations = new AgentOperationController(this);
   readonly #repository: RunRepository;
   readonly #publisher: OutputPublisher;
   readonly #policy: OutputPolicy;
@@ -140,8 +145,8 @@ export class RunSession {
       readonly rootRunId: string;
       readonly agentId: string;
       readonly parentRunId?: string;
-      readonly leaseOwnerId: string;
-      readonly leaseEpoch: number;
+      readonly leaseOwnerId?: string;
+      readonly leaseEpoch?: number;
     },
     batchLimits: OutputBatchLimits,
   ): RunSession {
@@ -160,9 +165,9 @@ export class RunSession {
       scope.rootRunId,
       scope.agentId,
       scope.parentRunId,
-      {
+      scope.leaseOwnerId === undefined ? {} : {
         leaseOwnerId: scope.leaseOwnerId,
-        leaseEpoch: scope.leaseEpoch,
+        ...(scope.leaseEpoch === undefined ? {} : { leaseEpoch: scope.leaseEpoch }),
       },
       snapshot.deadlineAt,
       batchLimits,
@@ -197,6 +202,10 @@ export class RunSession {
     return this.#deadlineExceeded;
   }
 
+  public releaseWaitingExecution(): void {
+    this.#clearDeadline();
+  }
+
   public handle(result: Promise<RunResult>): RunHandle {
     return Object.freeze({
       runId: this.#runId,
@@ -222,13 +231,16 @@ export class RunSession {
       stableFingerprint(copyJsonValue(input.tools)),
       stableFingerprint(copyJsonValue(input.evidence)),
     ]);
-    const requestFingerprint = await stableFingerprint({
+    const requestFingerprint = await stableFingerprint(copyJsonValue({
       messageFingerprint,
       toolFingerprint,
       evidenceFingerprint,
       capabilityProfileId: input.capabilityProfileId,
       outputLimit: input.outputLimit,
-    });
+      ...(input.outputProtocol === undefined ? {} : { outputProtocol: input.outputProtocol }),
+      ...(input.planningScope === undefined ? {} : { planningScope: input.planningScope }),
+      ...(input.planningAttempt === undefined ? {} : { planningAttempt: input.planningAttempt }),
+    }));
     const opened = await this.#repository.openInvocation(this.#runId, {
       schemaVersion: 1,
       runId: this.#runId,
@@ -240,6 +252,9 @@ export class RunSession {
       contextEvidence: Object.freeze(input.evidence.map((receipt) => Object.freeze({ ...receipt }))),
       capabilityProfileId: input.capabilityProfileId,
       outputLimit: input.outputLimit,
+      ...(input.outputProtocol === undefined ? {} : { outputProtocol: input.outputProtocol }),
+      ...(input.planningScope === undefined ? {} : { planningScope: input.planningScope }),
+      ...(input.planningAttempt === undefined ? {} : { planningAttempt: input.planningAttempt }),
     }, this.#leaseClaim);
     this.#receipts.set(opened.receipt.invocationId, opened.receipt);
     await this.#publisher.publishCommitted(opened.event);
@@ -251,6 +266,15 @@ export class RunSession {
     index: number,
     chunk: ModelStreamChunk,
   ): Promise<void> {
+    if (chunk.progressDelta !== undefined && chunk.progressDelta !== "") {
+      requirePublicProgress(chunk.progressDelta);
+      if (receipt.outputProtocol === PLANNING_STREAM_SCHEMA) {
+        throw new AgentError(
+          "agent_progress_protocol_conflict",
+          "Planning streams cannot emit agent progress",
+        );
+      }
+    }
     const entries = providerDeltaEntries(index, chunk);
     await this.#withBatch(receipt, async (batch) => {
       batch.entries.push(...entries);
@@ -259,7 +283,8 @@ export class RunSession {
         0,
       );
       if (
-        chunk.usage !== undefined
+        (chunk.progressDelta !== undefined && chunk.progressDelta !== "")
+        || chunk.usage !== undefined
         || chunk.finishReason !== undefined
         || batch.payloadBytes >= this.#batchLimits.maxPayloadBytes
         || batch.entries.length >= this.#batchLimits.maxFragments
@@ -269,13 +294,28 @@ export class RunSession {
         this.#scheduleBatchFlush(receipt, batch);
       }
     });
+    if (chunk.progressDelta !== undefined && chunk.progressDelta !== "") {
+      await this.#persist({
+        sourceKey: `agent-progress:${receipt.invocationId}:${index}`,
+        kind: "agent.progress",
+        channel: "commentary",
+        visibility: this.#outwardVisibility,
+        payload: {
+          schemaVersion: AGENT_PROGRESS_SCHEMA,
+          source: "provider",
+          invocationId: receipt.invocationId,
+          sourceChunkIndex: index,
+          text: chunk.progressDelta,
+        },
+      });
+    }
     if (chunk.usage !== undefined) {
       await this.#persist({
         sourceKey: `invocation:${receipt.invocationId}:chunk:${index}:usage`,
         kind: "model.usage",
         channel: "model",
         visibility: "private",
-        payload: copyJsonValue({ usage: chunk.usage }) as Readonly<Record<string, JsonValue>>,
+        payload: copyJsonValue({ invocationId: receipt.invocationId, usage: chunk.usage }) as Readonly<Record<string, JsonValue>>,
       });
     }
     if (chunk.finishReason !== undefined) {
@@ -317,12 +357,14 @@ export class RunSession {
     status: "completed" | "failed",
     turn?: ModelTurn,
     errorCode?: string,
+    usage?: import("../model/types.js").ModelTokenUsage,
   ): Promise<void> {
     await this.#flushInvocation(receipt);
+    const reportedUsage = usage ?? turn?.usage;
     const settled = await this.#repository.settleInvocation(this.#runId, {
       invocationId: receipt.invocationId,
       status,
-      ...(turn?.usage === undefined ? {} : { usage: turn.usage }),
+      ...(reportedUsage === undefined ? {} : { usage: reportedUsage }),
       ...(errorCode === undefined ? {} : { errorCode }),
     }, this.#leaseClaim);
     this.#receipts.delete(receipt.invocationId);
@@ -331,6 +373,63 @@ export class RunSession {
     if (settled.budgetError !== undefined) {
       throw new AgentError(settled.budgetError, "Run token budget is exhausted");
     }
+  }
+
+  public async persistPlanningProgress(receipt: ModelInvocationReceipt, progress: PlanningProgress): Promise<boolean> {
+    if (this.signal.aborted) throw new AgentCanceledError();
+    if (receipt.runId !== this.#runId || this.#receipts.get(receipt.invocationId) !== receipt
+      || receipt.outputProtocol !== PLANNING_STREAM_SCHEMA || receipt.planningScope === undefined) {
+      throw new AgentError("planning_scope_conflict", "Planning projection requires an active bound invocation");
+    }
+    await this.#flushInvocation(receipt);
+    const event = await this.#persist({
+      sourceKey: `planning:${receipt.invocationId}:${progress.recordIndex}`,
+      kind: "planning.progress", channel: "commentary", visibility: this.#outwardVisibility,
+      payload: { schemaVersion: PLANNING_STREAM_SCHEMA, source: "provider", invocationId: receipt.invocationId,
+        operationId: receipt.planningScope.operationId, revision: receipt.planningScope.revision,
+        attempt: receipt.planningAttempt ?? 0, ...progress },
+    });
+    return event?.visibility === "public";
+  }
+
+  public async publishModelCommentary(
+    receipt: ModelInvocationReceipt,
+    text: string,
+  ): Promise<void> {
+    if (text.trim() === "") return;
+    await this.#persist({
+      sourceKey: `auto-planning-intent:${receipt.invocationId}`,
+      kind: "commentary",
+      channel: "commentary",
+      visibility: this.#outwardVisibility,
+      payload: {
+        source: "provider",
+        invocationId: receipt.invocationId,
+        text,
+      },
+    });
+  }
+
+  public async recordModelDiagnostics(receipt: ModelInvocationReceipt, metrics: Readonly<Record<string, JsonValue>>): Promise<void> {
+    if ((await this.snapshot()).status !== "running") return;
+    await this.#persist({ sourceKey: `diagnostics:${receipt.invocationId}`, kind: "model.diagnostics",
+      channel: "model", visibility: "private", payload: {
+        invocationId: receipt.invocationId, planningScope: copyJsonValue(receipt.planningScope ?? null),
+        attempt: receipt.planningAttempt ?? 0, ...metrics,
+      } });
+  }
+
+  public async countPlanningAttempts(operationId: string): Promise<number> {
+    const events = await this.#repository.listEvents(this.#runId, 0);
+    return events.filter((event) => event.kind === "invocation.started"
+      && (event.payload.receipt as unknown as ModelInvocationReceipt)?.planningScope?.operationId === operationId).length;
+  }
+
+  public async acceptOperationEvent(event: OperationEvent): Promise<void> {
+    if (event.runId !== this.#runId) throw new AgentError("operation_scope_conflict", "Operation belongs to another Run");
+    await this.#persist({ sourceKey: `operation:${event.operationId}:${event.type}`,
+      kind: event.type, channel: "lifecycle", visibility: this.#outwardVisibility,
+      payload: copyJsonValue(event) as Readonly<Record<string, JsonValue>> });
   }
 
   async #withBatch<T>(
@@ -374,9 +473,13 @@ export class RunSession {
     const drafts = await providerBatchDrafts(receipt, batch.entries);
     const authorized = (await Promise.all(drafts.map((draft) => this.#authorize(draft))))
       .filter((draft): draft is OutputEventDraft => draft !== null);
-    const events = authorized.length === 0
-      ? []
-      : await this.#repository.appendBatch(this.#runId, authorized, this.#leaseClaim);
+    let events: readonly OutputEvent[];
+    try {
+      events = authorized.length === 0 ? [] : await this.#repository.appendBatch(this.#runId, authorized, this.#leaseClaim);
+    } catch (error) {
+      if (error instanceof AgentError) throw error;
+      throw new AgentError("output_persistence_failed", "Canonical output batch could not be persisted", { cause: error });
+    }
     batch.entries.splice(0);
     batch.payloadBytes = 0;
     if (batch.timer !== undefined) globalThis.clearTimeout(batch.timer);
@@ -395,7 +498,7 @@ export class RunSession {
 
   public async publishTool(event: ToolExecutionEvent, round: number): Promise<void> {
     await this.#persist({
-      sourceKey: `tool:${round}:${event.toolCallId}:${event.type}`,
+      sourceKey: `tool:${this.#runId}:${round}:${event.toolCallId}:${event.type}`,
       kind: event.type === "tool_started" ? "tool.started" : "tool.completed",
       channel: "tool",
       visibility: this.#outwardVisibility,
@@ -438,18 +541,20 @@ export class RunSession {
   }
 
   public async publishPlan(plan: WorkPlan, revision: number): Promise<void> {
+    await this.#persist({ sourceKey: `plan:${this.#runId}:${revision}:private`, kind: "plan.updated",
+      channel: "plan", visibility: "private", payload: copyJsonValue({ revision, plan }) as Readonly<Record<string, JsonValue>> });
     await this.#persist({
-      sourceKey: `plan:${revision}`,
+      sourceKey: `plan:${this.#runId}:${revision}`,
       kind: "plan.updated",
       channel: "plan",
       visibility: this.#outwardVisibility,
-      payload: copyJsonValue({ revision, plan }) as Readonly<Record<string, JsonValue>>,
+      payload: copyJsonValue({ revision, title: plan.title, steps: plan.steps.map(({ id, title }) => ({ id, title })) }) as Readonly<Record<string, JsonValue>>,
     });
   }
 
   public async publishAdmission(decision: TaskAdmissionDecision, continuation = false): Promise<void> {
     await this.#persist({
-      sourceKey: `admission:${continuation ? "continuation" : "initial"}`,
+      sourceKey: `admission:${this.#runId}:${continuation ? "continuation" : "initial"}`,
       kind: "task_admission.decided",
       channel: "lifecycle",
       visibility: this.#outwardVisibility,
@@ -467,7 +572,7 @@ export class RunSession {
 
   public async publishRecoveryDecision(decision: RecoveryDecision, round: number): Promise<void> {
     await this.#persist({
-      sourceKey: `recovery:${round}:${decision.cause}:${decision.scope}:${decision.attempt}:${decision.reasonCode}`,
+      sourceKey: `recovery:${this.#runId}:${round}:${decision.cause}:${decision.scope}:${decision.attempt}:${decision.reasonCode}`,
       kind: "agentRunTrace",
       channel: "lifecycle",
       visibility: "private",
@@ -594,12 +699,16 @@ export class RunSession {
   async #persist(draft: OutputEventDraft): Promise<OutputEvent | undefined> {
     const authorized = await this.#authorize(draft);
     if (authorized === null) return undefined;
-    const event = await this.#repository.appendEvent(
-      this.#runId,
-      authorized,
-      this.#leaseClaim,
-    );
-    await this.#publisher.publishCommitted(event);
+    if ((draft.kind === "planning.progress" || draft.kind === "agent.progress") && this.signal.aborted) throw new AgentCanceledError();
+    let event: OutputEvent;
+    try {
+      event = await this.#repository.appendEvent(this.#runId, authorized, this.#leaseClaim);
+    } catch (error) {
+      if (error instanceof AgentError) throw error;
+      throw new AgentError("output_persistence_failed", "Canonical output could not be persisted", { cause: error });
+    }
+    try { await this.#publisher.publishCommitted(event); }
+    catch (error) { throw new AgentError("output_publish_failed", "Committed output could not be published", { cause: error }); }
     return event;
   }
 
@@ -671,7 +780,32 @@ function providerDeltaEntries(
       payload: copyJsonValue({ deltas: chunk.toolCallDeltas }) as Readonly<Record<string, JsonValue>>,
     }));
   }
+  if (chunk.progressDelta !== undefined && chunk.progressDelta !== "") {
+    entries.push(Object.freeze({
+      sourceChunkIndex: index,
+      sourcePartIndex: 3,
+      kind: "provider.progress_delta",
+      channel: "model",
+      visibility: "private",
+      payload: Object.freeze({ delta: chunk.progressDelta }),
+    }));
+  }
   return Object.freeze(entries);
+}
+
+function requirePublicProgress(text: string): void {
+  if (
+    text.trim() !== text
+    || text === ""
+    || text.includes("\n")
+    || text.includes("\r")
+    || text.length > MAX_AGENT_PROGRESS_CHARS
+  ) {
+    throw new AgentError(
+      "agent_progress_invalid",
+      "Provider progress must be one trimmed line within the public limit",
+    );
+  }
 }
 
 async function providerBatchDrafts(
@@ -704,6 +838,8 @@ async function providerBatchDrafts(
       channel: group[0]!.channel,
       visibility: group[0]!.visibility,
       payload: copyJsonValue({
+        invocationId: receipt.invocationId,
+        source: "provider",
         schemaVersion: OUTPUT_BATCH_SCHEMA,
         sourceChunkStart: start,
         sourceChunkEnd: end,
@@ -740,6 +876,14 @@ function validatePolicyResult(original: OutputEventDraft, authorized: OutputEven
     || authorized.channel !== original.channel
   ) {
     throw new AgentError("output_policy_violation", "Output policy changed event authority fields");
+  }
+  if (
+    (original.kind === "planning.progress"
+      || original.kind === "agent.progress"
+      || (original.kind === "commentary" && original.payload?.source === "provider"))
+    && JSON.stringify(original.payload) !== JSON.stringify(authorized.payload)
+  ) {
+    throw new AgentError("output_policy_violation", "Output policy cannot rewrite Provider text or provenance");
   }
   if (original.visibility === "private" && authorized.visibility !== "private") {
     throw new AgentError("output_policy_violation", "Output policy cannot publish private output");

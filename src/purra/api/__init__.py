@@ -11,8 +11,6 @@ from purra.engine import (
     ContextStrategy,
     DurableTaskContinuation,
     ExecutionProfile,
-    ReactivePlanningPolicy,
-    ToolPlanningPolicy,
 )
 from purra.adapters import InMemoryAgentAdapters, InMemoryDurableAdapters
 from purra.agent_presets import (
@@ -50,7 +48,13 @@ from purra.agent_tree_lease import (
     AgentRunLeaseClaim,
     current_agent_run_lease,
 )
-from purra.contracts import PlanningResult, WorkPlan, WorkStep
+from purra.contracts import (
+    ContextEvidenceReceipt,
+    PlanningMode,
+    PlanningResult,
+    WorkPlan,
+    WorkStep,
+)
 from purra.delegation import (
     DelegatedAgentExecutor,
     DelegatedAgentRequest,
@@ -71,7 +75,7 @@ from purra.orphan_recovery import (
     OrphanRecoveryCoordinator,
     OrphanRunSettlement,
 )
-from purra.ports import WorkPlanner
+from purra.ports import ModelInputEvidenceValidator, WorkPlanner
 from purra.run_recovery import RunRecoverySnapshot
 from purra.run_control import (
     OrphanRunCandidate,
@@ -111,6 +115,8 @@ __all__ = [
     "InMemoryRunTreeRepository",
     "AgentCoreRunOptions",
     "ContextStrategy",
+    "ContextEvidenceReceipt",
+    "PlanningMode",
     "DelegatedAgentExecutor",
     "DelegatedAgentRequest",
     "DelegatedAgentResult",
@@ -119,7 +125,6 @@ __all__ = [
     "DynamicDelegatedAgentExecutor",
     "DurableTaskContinuation",
     "ExecutionProfile",
-    "ReactivePlanningPolicy",
     "PromptSection",
     "OrphanRunCandidate",
     "OrphanRecoveryCoordinator",
@@ -136,7 +141,6 @@ __all__ = [
     "SpawnAgentsCommand",
     "SpawnAgentsReceipt",
     "SpawnedAgent",
-    "ToolPlanningPolicy",
     "AgentRunHandle",
     "AgentModelResponseJudge",
     "AgentModelTask",
@@ -146,8 +150,16 @@ __all__ = [
     "PlanningResult",
     "WorkPlan",
     "WorkPlanner",
+    "ModelInputEvidenceValidator",
     "WorkStep",
     "decide_orphan_run",
     "canonicalize_execution_plan",
     "current_agent_run_lease",
 ]
+
+from purra.planning_context import PlanningContext, current_planning_context
+from purra.interaction import UserInputRequired
+from purra.planning_stream import PLANNING_STREAM_SCHEMA, PlanningScope, PlanningProgress, PlanningStreamParser, PlanningStreamError
+
+__all__ += ["PlanningContext", "current_planning_context", "PLANNING_STREAM_SCHEMA", "PlanningScope", "PlanningProgress", "PlanningStreamParser", "PlanningStreamError"]
+__all__ += ["UserInputRequired"]

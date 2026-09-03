@@ -342,6 +342,20 @@ class AgentRunController:
                 )
             )
 
+    async def finish_durable_execution(
+        self,
+        *,
+        covered_step_ids: tuple[str, ...],
+    ) -> None:
+        async with self._mutation_lock:
+            state = self._require_started()
+            await self._apply(
+                RunStateMachine.finish_durable_execution(
+                    state,
+                    covered_step_ids=covered_step_ids,
+                )
+            )
+
     async def sync_durable_execution(
         self,
         statuses: Mapping[str, StepStatus],

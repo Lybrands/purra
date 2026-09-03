@@ -1,9 +1,8 @@
-"""Run a deterministic PurrA Agent with one read-only host tool."""
+"""Run a deterministic PurrA Agent with one host-provided Retriever."""
 
 from __future__ import annotations
 
 import asyncio
-import json
 from dataclasses import replace
 
 from purra.api import AgentCore, AgentPreset, InMemoryAgentAdapters
@@ -19,13 +18,9 @@ from purra.contracts import (
     ModelStreamChunk,
     RuntimeLimits,
     ToolCallDelta,
-    ToolEffectState,
-    ToolHandlerResult,
-    ToolPolicy,
-    ToolSchema,
 )
 from purra.model_protocol import generic_capability_snapshot
-from purra.ports import ToolRegistration
+from purra.retrieval import RetrievalHit, RetrieverTool
 from purra.tools import InMemoryToolCatalog
 
 
@@ -39,8 +34,8 @@ class LocalModelGateway:
                     tool_call_deltas=(ToolCallDelta(
                         index=0,
                         id="lookup-1",
-                        name="lookup",
-                        arguments_fragment='{"key":"status"}',
+                        name="searchKnowledge",
+                        arguments_fragment='{"query":"status"}',
                     ),),
                     finish_reason=ModelFinishReason.TOOL_CALLS,
                 )
@@ -69,29 +64,24 @@ class LocalModelGateway:
         )
 
 
-async def lookup(state, arguments, signal=None):
-    del state, signal
-    return ToolHandlerResult(
-        json.dumps({"key": arguments["key"], "value": "ready"}),
-        effect_state=ToolEffectState.NOT_STARTED,
-    )
+class LocalRetriever:
+    async def retrieve(self, request, signal=None):
+        del request, signal
+        return (RetrievalHit(
+            id="status",
+            content="PurrA is ready.",
+            source="local-example",
+        ),)
 
 
 async def main() -> None:
-    catalog = InMemoryToolCatalog((ToolRegistration(
-        schema=ToolSchema(
-            name="lookup",
-            description="Look up one local value.",
-            parameters={
-                "type": "object",
-                "properties": {"key": {"type": "string"}},
-                "required": ["key"],
-                "additionalProperties": False,
-            },
-        ),
-        handler=lookup,
-        policy=ToolPolicy(mode="read", title="Look up"),
-    ),))
+    retriever_tool = RetrieverTool(
+        retriever=LocalRetriever(),
+        name="searchKnowledge",
+        description="Search the configured local knowledge source.",
+        scope={"namespace": "example.quickstart"},
+    )
+    catalog = InMemoryToolCatalog((retriever_tool.registration,))
     adapters = InMemoryAgentAdapters()
     agent = AgentCore(
         model_gateway=LocalModelGateway(),

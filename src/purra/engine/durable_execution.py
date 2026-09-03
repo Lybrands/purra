@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import suppress
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Protocol
 
 from purra.cancellation import await_with_cancellation
@@ -25,6 +25,7 @@ from purra.task_admission import (
     ExecutionMode,
     LongTaskDispatcher,
     LongTaskDispatchReceipt,
+    LongTaskExecutionResult,
     LongTaskExecutionStatus,
     LongTaskExecutionUpdate,
     TaskAdmissionDecision,
@@ -35,6 +36,13 @@ class BufferedEventSink(Protocol):
     def drain(self) -> tuple[AgentEvent, ...]: ...
 
 
+@dataclass(frozen=True, slots=True)
+class DurableExecutionCompletion:
+    """Completed durable work awaiting Core's terminal response transaction."""
+
+    result: LongTaskExecutionResult
+
+
 async def complete_durable_continuation(
     controller: AgentRunController,
     request: AgentRunRequest,
@@ -42,7 +50,9 @@ async def complete_durable_continuation(
     dispatcher: LongTaskDispatcher | None,
     sink: BufferedEventSink,
     signal: CancellationSignal | None,
-) -> AsyncIterator[AgentEvent]:
+    *,
+    defer_successful_completion: bool = False,
+) -> AsyncIterator[AgentEvent | DurableExecutionCompletion]:
     """Resume an admitted durable receipt without re-planning or dispatching."""
 
     plan = continuation.source.execution_plan
@@ -69,6 +79,7 @@ async def complete_durable_continuation(
         sink=sink,
         signal=signal,
         existing_receipt=continuation.receipt,
+        defer_successful_completion=defer_successful_completion,
     ):
         yield event
 
@@ -83,7 +94,8 @@ async def complete_admitted_task(
     sink: BufferedEventSink,
     signal: CancellationSignal | None,
     existing_receipt: LongTaskDispatchReceipt | None = None,
-) -> AsyncIterator[AgentEvent]:
+    defer_successful_completion: bool = False,
+) -> AsyncIterator[AgentEvent | DurableExecutionCompletion]:
     """Run durable work under the originating Run and its event stream."""
 
     if admission.mode is ExecutionMode.INLINE:
@@ -255,13 +267,20 @@ async def complete_admitted_task(
                 yield event
             return
 
+        completion: DurableExecutionCompletion | None = None
         if result.status is LongTaskExecutionStatus.COMPLETED:
             # Durable execution has now genuinely completed. This transition
             # closes the Planner steps atomically at the end of the work.
-            await controller.complete_durable_execution(
-                result.final_response,
-                covered_step_ids=admission.covered_step_ids,
-            )
+            if defer_successful_completion:
+                await controller.finish_durable_execution(
+                    covered_step_ids=admission.covered_step_ids,
+                )
+                completion = DurableExecutionCompletion(result)
+            else:
+                await controller.complete_durable_execution(
+                    result.final_response,
+                    covered_step_ids=admission.covered_step_ids,
+                )
         elif result.status is LongTaskExecutionStatus.FAILED:
             await controller.fail(result.error or "long_task_execution_failed")
         else:
@@ -272,6 +291,8 @@ async def complete_admitted_task(
             )
         for event in sink.drain():
             yield event
+        if completion is not None:
+            yield completion
         return
     await controller.complete(
         admission.message

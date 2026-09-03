@@ -10,6 +10,7 @@ import type {
   ModelStreamItem,
   ModelTokenUsage,
   ModelTurn,
+  ModelTransportDiagnostics,
   ToolCall,
   ToolCallDelta,
 } from "./types.js";
@@ -47,6 +48,22 @@ const DEFAULT_STREAM_LIMITS: ModelStreamLimits = Object.freeze({
   maxToolArgumentChars: 1_000_000,
 });
 
+export function constrainModelInvocationTimeout(
+  limits: ModelStreamLimits | undefined,
+  maximumMs: number,
+): ModelStreamLimits {
+  if (!Number.isSafeInteger(maximumMs) || maximumMs < 1) {
+    throw new TypeError("invocation timeout maximum must be positive");
+  }
+  const base = limits ?? DEFAULT_STREAM_LIMITS;
+  return Object.freeze({
+    ...base,
+    invocationTimeoutMs: base.invocationTimeoutMs === null
+      ? maximumMs
+      : Math.min(base.invocationTimeoutMs, maximumMs),
+  });
+}
+
 export async function invokeModel(
   gateway: ModelGateway,
   request: ModelRequest,
@@ -54,8 +71,14 @@ export async function invokeModel(
   useStream: boolean,
   onChunk?: (chunk: ModelStreamChunk) => Promise<void> | void,
   limits: ModelStreamLimits = DEFAULT_STREAM_LIMITS,
+  onDiagnostics?: (metrics: Readonly<Record<string, number | string | null>>) => void,
 ): Promise<ModelTurn> {
   const stop = invocationSignal(signal, limits.invocationTimeoutMs);
+  const started = performance.now();
+  const gatewayStartedAtMs = Date.now();
+  let timings: Readonly<Record<string, number | string | null>> = { firstActivityMs: null, firstProgressMs: null, firstSemanticChunkMs: null };
+  let openedStream: ModelStream | undefined;
+  let streamConsumed = false;
   try {
     throwIfCanceled(stop.signal);
     if (!useStream) {
@@ -68,7 +91,15 @@ export async function invokeModel(
       return turn;
     }
     const stream = await awaitWithSignal(
-      Promise.resolve(gateway.stream!(request, stop.signal)),
+      Promise.resolve(gateway.stream!(request, stop.signal)).then(async (value) => {
+        openedStream = value;
+        if (stop.signal.aborted) {
+          openedStream = undefined;
+          if (typeof value?.[Symbol.asyncIterator] === "function") await closeIterator(value[Symbol.asyncIterator](), true);
+          throwIfCanceled(stop.signal);
+        }
+        return value;
+      }),
       stop.signal,
     );
     throwIfCanceled(stop.signal);
@@ -78,6 +109,7 @@ export async function invokeModel(
       ? null
       : positiveInteger(stream.appliedOutputLimit, "applied output limit");
     requireAppliedOutputLimit(request, appliedOutputLimit);
+    streamConsumed = true;
     return await consumeModelStream(
       stream,
       stop,
@@ -85,6 +117,8 @@ export async function invokeModel(
       limits,
       request,
       appliedOutputLimit,
+      started,
+      (value) => { timings = value; },
     );
   } catch (error) {
     if (stop.signal.aborted) {
@@ -99,6 +133,11 @@ export async function invokeModel(
     );
   } finally {
     stop.close();
+    if (!streamConsumed && typeof openedStream?.[Symbol.asyncIterator] === "function") {
+      await closeIterator(openedStream[Symbol.asyncIterator](), stop.signal.aborted);
+    }
+    onDiagnostics?.({ ...timings, gatewayStartedAtMs, invocationDurationMs: performance.now() - started,
+      httpRequestSentAtMs: null, httpFirstByteAtMs: null, sdkHttpAttempts: null, ...timings });
   }
 }
 
@@ -109,13 +148,14 @@ async function consumeModelStream(
   limits: ModelStreamLimits,
   request: ModelRequest,
   appliedOutputLimit: number | null | undefined,
+  started: number,
+  onDiagnostics: (metrics: Readonly<Record<string, number | string | null>>) => void,
 ): Promise<ModelTurn> {
   if (stream === null || typeof stream?.[Symbol.asyncIterator] !== "function") {
     throw new AgentError("invalid_model_response", "Model gateway returned an invalid stream");
   }
-  const support = activitySupport(stream.activitySupport);
   const iterator = stream[Symbol.asyncIterator]();
-  const liveness = new StreamLiveness(support, limits, stop.abort);
+  let liveness: StreamLiveness | undefined;
   const content: string[] = [];
   const reasoning: string[] = [];
   let contentChars = 0;
@@ -123,10 +163,13 @@ async function consumeModelStream(
   let chunkCount = 0;
   let finishReason: ModelStreamChunk["finishReason"];
   let usage: ModelTokenUsage | undefined;
+  let providerData: Message["providerData"];
   let malformed: string | undefined;
   const calls = new Map<number, ToolCallParts>();
 
   try {
+    liveness = new StreamLiveness(activitySupport(stream.activitySupport), limits, stop.abort, started);
+    liveness.acceptTransportDiagnostics(stream.transportDiagnostics);
     while (finishReason === undefined) {
       const step = await nextWithSignal(iterator, stop.signal);
       if (step.done === true) break;
@@ -137,7 +180,7 @@ async function consumeModelStream(
       }
       const chunk = validateModelStreamChunk(step.value);
       const meaningful = isMeaningfulChunk(chunk);
-      if (meaningful) liveness.acceptSemanticProgress();
+      if (meaningful) liveness.acceptSemanticProgress(chunk);
       try {
         chunkCount += 1;
         contentChars += chunk.contentDelta?.length ?? 0;
@@ -155,10 +198,12 @@ async function consumeModelStream(
             "tool_argument_chars",
           );
         }
-        await onChunk?.(chunk);
+        if (onChunk !== undefined) await awaitWithSignal(Promise.resolve(onChunk(chunk)), stop.signal);
+        throwIfCanceled(stop.signal);
         if (chunk.contentDelta !== undefined && chunk.contentDelta !== "") content.push(chunk.contentDelta);
         if (chunk.reasoningDelta !== undefined && chunk.reasoningDelta !== "") reasoning.push(chunk.reasoningDelta);
         usage = chunk.usage ?? usage;
+        providerData = chunk.providerData ?? providerData;
         finishReason = chunk.finishReason;
         for (const delta of chunk.toolCallDeltas ?? []) {
           malformed = mergeToolCallDelta(calls, delta) ?? malformed;
@@ -168,7 +213,8 @@ async function consumeModelStream(
       }
     }
   } finally {
-    liveness.close();
+    liveness?.close();
+    if (liveness !== undefined) onDiagnostics(liveness.diagnostics());
     await closeIterator(iterator, stop.signal.aborted);
   }
 
@@ -187,6 +233,7 @@ async function consumeModelStream(
     content: contentText,
     ...(reasoningText.trim() === "" ? {} : { reasoning: reasoningText }),
     ...(toolCalls.length === 0 ? {} : { toolCalls }),
+    ...(providerData === undefined ? {} : { providerData }),
   };
   const turn = validateModelTurn({
     message,
@@ -303,7 +350,10 @@ async function nextWithSignal<T>(
 
 async function awaitWithSignal<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
   if (signal === undefined) return promise;
-  throwIfCanceled(signal);
+  if (signal.aborted) {
+    void promise.catch(() => undefined);
+    throwIfCanceled(signal);
+  }
   let rejectCanceled: (() => void) | undefined;
   const canceled = new Promise<never>((_resolve, reject) => {
     rejectCanceled = () => reject(new AgentCanceledError());
@@ -318,15 +368,16 @@ async function awaitWithSignal<T>(promise: Promise<T>, signal: AbortSignal | und
 
 async function closeIterator<T>(iterator: AsyncIterator<T>, canceled: boolean): Promise<void> {
   if (typeof iterator.return !== "function") return;
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     const closing = Promise.resolve(iterator.return());
-    if (canceled) {
-      void closing.catch(() => undefined);
-      return;
-    }
-    await closing;
+    // Drain cooperative adapters, including a pending next(), without allowing
+    // an uncooperative SDK to hold local Run terminalization indefinitely.
+    await Promise.race([closing, new Promise<void>((resolve) => { timer = setTimeout(resolve, 1000); })]);
   } catch {
     // Cleanup must not replace the selected public outcome.
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
   }
 }
 
@@ -386,7 +437,8 @@ class StreamLiveness {
   readonly #activityTimeoutMs: number | null;
   readonly #progressTimeoutMs: number | null;
   readonly #abort: (error: AgentError) => void;
-  readonly #startedAt = performance.now();
+  readonly #startedAt: number;
+  #firstSemanticAt: number | undefined;
   #activityTimer: ReturnType<typeof setTimeout> | undefined;
   #progressTimer: ReturnType<typeof setTimeout> | undefined;
   #firstActivityAt: number | undefined;
@@ -396,12 +448,15 @@ class StreamLiveness {
   #maxActivityGapMs: number | null = null;
   #maxProgressGapMs: number | null = null;
   #closed = false;
+  #transport: ModelTransportDiagnostics | undefined;
 
   public constructor(
     support: ModelStreamActivitySupport,
     limits: ModelStreamLimits,
     abort: (error: AgentError) => void,
+    started = performance.now(),
   ) {
+    this.#startedAt = started;
     this.#support = support;
     this.#activityTimeoutMs = optionalPositiveLimit(
       limits.activityIdleTimeoutMs,
@@ -425,6 +480,7 @@ class StreamLiveness {
     if (activity.kind === "working" && this.#support !== "working") {
       throw unsupportedActivity(this.#support, activity.kind);
     }
+    this.acceptTransportDiagnostics(activity.transportDiagnostics);
     const now = performance.now();
     this.#recordActivity(now);
     this.#armActivity();
@@ -434,8 +490,8 @@ class StreamLiveness {
     }
   }
 
-  public acceptSemanticProgress(): void {
-    if (this.#support === "semantic_only") return;
+  public acceptSemanticProgress(chunk: ModelStreamChunk): void {
+    if (chunk.contentDelta || chunk.reasoningDelta || chunk.progressDelta || chunk.toolCallDeltas?.length) this.#firstSemanticAt ??= performance.now();
     const now = performance.now();
     this.#recordActivity(now);
     this.#recordProgress(now);
@@ -450,6 +506,24 @@ class StreamLiveness {
     if (this.#closed) return;
     this.#closed = true;
     this.#clearTimers();
+  }
+
+  public acceptTransportDiagnostics(evidence: ModelTransportDiagnostics | undefined): void {
+    if (evidence === undefined) return;
+    if (evidence === null || typeof evidence !== "object" || Array.isArray(evidence)
+      || Object.keys(evidence).some((key) => !["requestSentAtMs", "firstByteAtMs", "httpAttempts"].includes(key))
+      || Object.values(evidence).some((value) => !Number.isSafeInteger(value) || value < 1)
+      || (evidence.requestSentAtMs !== undefined && evidence.firstByteAtMs !== undefined && evidence.firstByteAtMs < evidence.requestSentAtMs)) {
+      throw new AgentError("model_gateway_contract_violation", "Invalid transport diagnostics");
+    }
+    this.#transport = Object.freeze({ ...evidence });
+  }
+
+  public diagnostics(): Readonly<Record<string, number | string | null>> {
+    return { httpRequestSentAtMs: this.#transport?.requestSentAtMs ?? null,
+      httpFirstByteAtMs: this.#transport?.firstByteAtMs ?? null, sdkHttpAttempts: this.#transport?.httpAttempts ?? null,
+      activitySupport: this.#support, firstActivityMs: offset(this.#firstActivityAt, this.#startedAt),
+      firstProgressMs: offset(this.#firstProgressAt, this.#startedAt), firstSemanticChunkMs: offset(this.#firstSemanticAt, this.#startedAt) };
   }
 
   #recordActivity(now: number): void {
@@ -550,6 +624,7 @@ function unsupportedActivity(support: string, kind: string): AgentError {
 function isMeaningfulChunk(chunk: ModelStreamChunk): boolean {
   return (chunk.contentDelta?.length ?? 0) > 0
     || (chunk.reasoningDelta?.length ?? 0) > 0
+    || (chunk.progressDelta?.length ?? 0) > 0
     || (chunk.toolCallDeltas ?? []).some((delta) => (
       delta.id !== undefined
       || delta.type !== undefined

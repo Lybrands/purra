@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import replace
 from importlib.metadata import version
 from pathlib import Path
@@ -11,6 +12,10 @@ import purra
 from purra.api import (
     AgentCapabilityGrant,
     AgentCore,
+    AgentPlanner,
+    PlanningStreamParser,
+    PLANNING_STREAM_SCHEMA,
+    current_planning_context,
     AgentExecutionCheckpoint,
     AgentPreset,
     AgentTreeExecutionResult,
@@ -41,6 +46,7 @@ from purra.contracts import (
     AgentMessage,
     AgentRunRequest,
     DomainContext,
+    ExecutionState,
     MessageRole,
     ModelCompletion,
     ModelFinishReason,
@@ -51,9 +57,14 @@ from purra.contracts import (
     ModelStreamActivitySupport,
     ModelStreamChunk,
     RuntimeLimits,
+    PlanningConstraints,
+    PlanningMode,
+    ToolPlanningRequirement,
+    ModelTransportDiagnostics,
     RunStatus,
 )
 from purra.model_protocol import generic_capability_snapshot
+from purra.retrieval import RetrievalHit, RetrieverTool
 from purra.tools import InMemoryToolCatalog
 
 
@@ -67,9 +78,12 @@ async def _chunks():
 
 class _Gateway:
     async def stream(self, messages, invocation, signal=None):
-        del messages, signal
+        planning = any("planning component" in message.content for message in messages)
+        async def planned():
+            yield ModelStreamChunk(content_delta=json.dumps({"v": 1, "type": "progress", "text": "I will check the scope."}) + "\n")
+            yield ModelStreamChunk(content_delta=json.dumps({"v": 1, "type": "plan", "plan": {"needsTodos": False, "reason": "PRIVATE_PLAN"}}) + "\n", finish_reason=ModelFinishReason.STOP)
         return ModelStream(
-            chunks=_chunks(),
+            chunks=planned() if planning else _chunks(),
             model="smoke-model",
             applied_output_limit=invocation.output_limit.max_tokens,
             activity_support=ModelStreamActivitySupport.WORKING,
@@ -88,10 +102,45 @@ class _Gateway:
         )
 
 
+class _InstalledRetriever:
+    async def retrieve(self, request, signal=None):
+        del signal
+        return (RetrievalHit(
+            id="installed-hit",
+            content=f"installed retrieval: {request.query}",
+            source="installed-smoke",
+            version=1,
+        ),)
+
+
 async def _run() -> None:
     package_path = Path(purra.__file__).resolve()
     assert "site-packages" in package_path.parts, package_path
     assert version("purra") == "0.5.0"
+    assert PlanningMode.AUTO.value == "auto"
+    assert ToolPlanningRequirement.REQUIRED.value == "required"
+
+    retriever_tool = RetrieverTool(
+        retriever=_InstalledRetriever(),
+        name="searchInstalledKnowledge",
+        description="Search installed knowledge.",
+        scope={"namespace": "installed-smoke"},
+    )
+    assert InMemoryToolCatalog((retriever_tool.registration,)).names == {
+        "searchInstalledKnowledge"
+    }
+    retrieval_result = await retriever_tool.registration.handler(
+        ExecutionState(run_id="installed-retrieval-run"),
+        {"query": "ready"},
+    )
+    assert json.loads(retrieval_result.content)["hits"][0] == {
+        "id": "installed-hit",
+        "content": "installed retrieval: ready",
+        "source": "installed-smoke",
+        "version": 1,
+        "untrusted": True,
+        "metadata": {},
+    }
 
     adapters = InMemoryAgentAdapters()
     core = AgentCore(
@@ -155,6 +204,33 @@ async def _run() -> None:
     assert AgentExecutionCheckpoint.from_mapping(
         execution_checkpoint.to_mapping()
     ) == execution_checkpoint
+
+    assert PLANNING_STREAM_SCHEMA == "purra.planning-stream/v1"
+    assert current_planning_context() is None
+    assert all(value is None for value in ModelTransportDiagnostics().to_mapping().values())
+    parser = PlanningStreamParser()
+    parser.feed('{"v":1,"type":"plan","plan":{}}\n')
+    assert parser.finish() == {}
+    class Policy:
+        def planning_constraints(self, request, capabilities): return PlanningConstraints(allow_model_only_fallback=False)
+    planned_storage = InMemoryAgentAdapters()
+    gateway = _Gateway()
+    planned_core = AgentCore(model_gateway=gateway, planner=AgentPlanner(gateway), planning_policy=Policy(),
+        run_repository=planned_storage.runs, output_repository=planned_storage.outputs,
+        output_publisher=planned_storage.publisher, runtime_limits=RuntimeLimits(max_run_output_tokens=None))
+    try:
+        planned_handle = await planned_core.submit(replace(
+            request,
+            context_window=32768,
+            planning_mode=PlanningMode.PLANNED,
+        ))
+        public = [e async for e in planned_handle.subscribe()]
+        assert (await planned_handle.wait()).status is RunStatus.DONE
+        assert any(e.kind.value == "planning.progress" for e in public)
+        assert "PRIVATE_PLAN" not in str(public)
+        assert public == [e async for e in planned_handle.subscribe()]
+    finally:
+        await planned_core.close()
 
     tree = InMemoryRunTreeRepository()
 

@@ -28,6 +28,7 @@ from purra.json_values import (
     freeze_json_value,
     thaw_json_value,
 )
+from purra.planning_stream import PlanningScope, PLANNING_STREAM_SCHEMA
 from purra.normalization import optional_text, positive_int, required_text
 
 
@@ -71,9 +72,13 @@ class OutputEventKind(StrEnum):
     STREAM_OPENED = "stream.opened"
     PROVIDER_CONTENT_DELTA = "provider.content_delta"
     PROVIDER_REASONING_DELTA = "provider.reasoning_delta"
+    PROVIDER_PROGRESS_DELTA = "provider.progress_delta"
     PROVIDER_TOOL_CALL_DELTA = "provider.tool_call_delta"
     PROVIDER_DELTA_BATCH = "provider.delta_batch"
     PROVIDER_USAGE = "provider.usage"
+    PLANNING_PROGRESS = "planning.progress"
+    AGENT_PROGRESS = "agent.progress"
+    MODEL_DIAGNOSTICS = "model.diagnostics"
     STREAM_COMMITTED = "stream.committed"
     STREAM_ABORTED = "stream.aborted"
     OPERATION_STARTED = "operation.started"
@@ -89,6 +94,8 @@ class OutputEventKind(StrEnum):
 TERMINAL_STREAM_ABORT_ERROR_CODE = "run_terminalized"
 TERMINAL_STREAM_ABORT_CAUSE = "run_terminal_commit"
 PROVIDER_DELTA_BATCH_SCHEMA = "purra.provider-delta-batch/v1"
+AGENT_PROGRESS_SCHEMA = "purra.agent-progress/v1"
+MAX_AGENT_PROGRESS_CHARS = 160
 
 
 class ResponseTransactionMode(StrEnum):
@@ -252,6 +259,9 @@ class OutputStreamSpec:
     invocation_id: str
     intent: AgentOutputIntent
     commit_mode: OutputCommitMode
+    output_protocol: str | None = None
+    planning_scope: PlanningScope | None = None
+    planning_attempt: int = 0
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -266,6 +276,14 @@ class OutputStreamSpec:
             "invocation_id",
             required_text(self.invocation_id, "invocation id"),
         )
+        if self.output_protocol is not None and (
+            self.output_protocol != PLANNING_STREAM_SCHEMA
+            or self.intent != AgentOutputIntent.STRUCTURED_PRIVATE
+            or self.commit_mode != OutputCommitMode.PRIVATE
+        ):
+            raise ValueError("planning protocol requires structured private output")
+        if self.planning_scope is not None and self.planning_scope.run_id != self.run_id:
+            raise ValueError("planning scope belongs to another Run")
         intent = AgentOutputIntent(self.intent)
         commit_mode = OutputCommitMode(self.commit_mode)
         if intent in _PUBLIC_INTENTS and commit_mode is not OutputCommitMode.LIVE:
@@ -616,6 +634,7 @@ class DelegationOutputEvent:
 _PROVIDER_DELTA_KINDS = frozenset({
     OutputEventKind.PROVIDER_CONTENT_DELTA,
     OutputEventKind.PROVIDER_REASONING_DELTA,
+    OutputEventKind.PROVIDER_PROGRESS_DELTA,
     OutputEventKind.PROVIDER_TOOL_CALL_DELTA,
 })
 
@@ -690,6 +709,35 @@ def _validate_public_text(
     output_stream_id: str | None,
     invocation_id: str | None,
 ) -> None:
+    if kind is OutputEventKind.AGENT_PROGRESS:
+        text = payload.get("text")
+        if (
+            source is not OutputSource.PROVIDER
+            or channel is not OutputChannel.COMMENTARY
+            or visibility is not OutputVisibility.PUBLIC
+            or not output_stream_id
+            or not invocation_id
+            or payload.get("schemaVersion") != AGENT_PROGRESS_SCHEMA
+            or set(payload) != {"schemaVersion", "text", "sourceChunkIndex"}
+            or not isinstance(text, str)
+            or text != text.strip()
+            or not text
+            or "\n" in text
+            or "\r" in text
+            or len(text) > MAX_AGENT_PROGRESS_CHARS
+            or type(payload.get("sourceChunkIndex")) is not int
+            or payload.get("sourceChunkIndex", 0) < 1
+        ):
+            raise ValueError("agent progress requires a bounded Provider projection")
+        return
+    if kind is OutputEventKind.PLANNING_PROGRESS:
+        if (source is not OutputSource.PROVIDER or channel is not OutputChannel.COMMENTARY
+                or visibility is not OutputVisibility.PUBLIC or not output_stream_id or not invocation_id
+                or payload.get("schemaVersion") != PLANNING_STREAM_SCHEMA
+                or set(payload) != {"schemaVersion", "operationId", "revision", "attempt", "text", "recordIndex", "sourceStart", "sourceEnd"}
+                or not isinstance(payload.get("text"), str)):
+            raise ValueError("planning progress requires a Provider projection")
+        return
     if (
         visibility is not OutputVisibility.PUBLIC
         or channel not in _TEXT_CHANNELS

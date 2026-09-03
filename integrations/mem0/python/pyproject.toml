@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=77.0.3"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "purra-mem0"
+version = "0.5.0"
+description = "Scoped Mem0 OSS memory integration for PurrA"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+dependencies = ["purra==0.5.0", "mem0ai==2.0.19"]
+
+[project.optional-dependencies]
+managed = ["langchain==0.3.30", "langchain-core==0.3.86"]
+test = ["pytest>=8.3.0", "pytest-asyncio>=0.24.0"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "../../../src"]
+addopts = "-ra -q"

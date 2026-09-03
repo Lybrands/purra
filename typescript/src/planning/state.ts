@@ -35,6 +35,17 @@ export class CoreExecutionState implements PlanExecutionState {
     });
   }
 
+  public static restore(plan: ExecutionPlan): CoreExecutionState {
+    const state = new CoreExecutionState(plan);
+    if (plan.steps.filter(step => step.status === "running").length > 1
+      || (!plan.steps.some(step => step.status === "running") && plan.steps.some(step => step.status === "pending"))
+      || plan.steps.some(step => !["pending", "running", "done"].includes(step.status))) {
+      throw new AgentError("invalid_execution_plan", "Checkpoint requires one active plan transition");
+    }
+    state.#steps = plan.steps.map(step => Object.freeze({ ...step }));
+    return state;
+  }
+
   public get completedSteps(): readonly ExecutionStep[] {
     return Object.freeze(this.#steps.filter((step) => step.status === "done"));
   }

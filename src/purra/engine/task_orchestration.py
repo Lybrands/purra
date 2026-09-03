@@ -8,6 +8,7 @@ from purra.cancellation import await_with_cancellation
 from purra.contracts import AgentRunRequest, ExecutionPlan
 from purra.engine.durable_execution import (
     BufferedEventSink,
+    DurableExecutionCompletion,
     complete_admitted_task,
     complete_durable_continuation,
     validate_task_admission_coverage,
@@ -64,7 +65,9 @@ class TaskOrchestrationCapability:
         continuation: DurableTaskContinuation,
         sink: BufferedEventSink,
         signal: CancellationSignal | None,
-    ) -> AsyncIterator[AgentEvent]:
+        *,
+        defer_successful_completion: bool = False,
+    ) -> AsyncIterator[AgentEvent | DurableExecutionCompletion]:
         async for event in complete_durable_continuation(
             controller,
             request,
@@ -72,6 +75,7 @@ class TaskOrchestrationCapability:
             self._dispatcher,
             sink,
             signal,
+            defer_successful_completion=defer_successful_completion,
         ):
             yield event
 
@@ -84,7 +88,8 @@ class TaskOrchestrationCapability:
         admission: TaskAdmissionDecision,
         sink: BufferedEventSink,
         signal: CancellationSignal | None,
-    ) -> AsyncIterator[AgentEvent]:
+        defer_successful_completion: bool = False,
+    ) -> AsyncIterator[AgentEvent | DurableExecutionCompletion]:
         async for event in complete_admitted_task(
             controller=controller,
             request=request,
@@ -93,6 +98,7 @@ class TaskOrchestrationCapability:
             dispatcher=self._dispatcher,
             sink=sink,
             signal=signal,
+            defer_successful_completion=defer_successful_completion,
         ):
             yield event
 

@@ -1,10 +1,12 @@
-import type { ContextEvidenceReceipt } from "../context/types.js";
+import type { PlanningScope } from "../planning/stream.js";
+import type { ContextEvidenceReceipt, PreparedContextSnapshot } from "../context/types.js";
 import type { JsonValue, Message, ModelTokenUsage, ToolSpec } from "../model/types.js";
 import type { OutputEvent, OutputEventQuery } from "../output/types.js";
 import type { DurableContinuation, DurableRunResult } from "../durable/types.js";
 import type { RecoveryCause } from "../recovery/index.js";
 
 export type RunStatus = "running" | "completed" | "failed" | "canceled";
+export type PlanningMode = "auto" | "reactive" | "planned";
 
 export interface RunResult {
   readonly output: JsonValue;
@@ -27,6 +29,8 @@ export interface AgentPreset {
 
 export interface RunRequest {
   readonly messages: readonly Message[];
+  /** Selects adaptive, direct, or governed execution. Omitted requests use Auto. */
+  readonly planningMode?: PlanningMode;
   readonly enabledTools?: readonly string[];
   /** Maximum output tokens for each individual Provider invocation. */
   readonly maxCallOutputTokens?: number;
@@ -132,12 +136,19 @@ export interface RunSnapshot {
 }
 
 export interface AgentExecutionCheckpoint {
-  readonly schemaVersion: 1;
+  readonly inputRevision?: number;
+  readonly schemaVersion: 2;
   readonly runId: string;
   readonly phase: "model_ready";
-  readonly executionProfile: "reactive";
+  readonly executionProfile: "reactive" | "auto" | "planned";
+  readonly planning?: import("../planning/coordinator.js").PlanningCheckpoint;
+  readonly roundLimit?: number;
+  readonly pendingReplan?: { readonly round: number; readonly reason: string; readonly errorCode?: string };
+  readonly initialPlanningOpen: boolean;
   readonly nextRound: number;
   readonly messages: readonly Message[];
+  readonly context: PreparedContextSnapshot | null;
+  readonly contextEvidence: readonly ContextEvidenceReceipt[];
   readonly responseAttempts: number;
   readonly recoveryAttempts: readonly {
     readonly cause: RecoveryCause;
@@ -173,6 +184,9 @@ export interface RunHandle {
 }
 
 export interface ModelInvocationReceipt {
+  readonly outputProtocol?: "purra.planning-stream/v1";
+  readonly planningScope?: PlanningScope;
+  readonly planningAttempt?: number;
   readonly schemaVersion: 1;
   readonly runId: string;
   readonly invocationId: string;
@@ -208,6 +222,9 @@ export interface RunBeginParams {
 }
 
 export interface InvocationReceiptInput {
+  readonly outputProtocol?: "purra.planning-stream/v1";
+  readonly planningScope?: PlanningScope;
+  readonly planningAttempt?: number;
   readonly messages: readonly Message[];
   readonly tools: readonly ToolSpec[];
   readonly evidence: readonly ContextEvidenceReceipt[];

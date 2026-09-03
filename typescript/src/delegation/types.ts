@@ -1,4 +1,5 @@
 import type { ContextOptions } from "../context/types.js";
+import type { ModelInputEvidenceValidator } from "../context/types.js";
 import type { AgentOperationController } from "../operations/index.js";
 import type { RecoveryPolicy } from "../recovery/index.js";
 import type { JsonValue, ModelGateway } from "../model/types.js";
@@ -151,4 +152,5 @@ export interface DynamicDelegatedAgentExecutorOptions {
   readonly maxRounds?: number;
   readonly recovery?: RecoveryPolicy;
   readonly operations?: AgentOperationController;
+  readonly evidenceValidator?: ModelInputEvidenceValidator;
 }

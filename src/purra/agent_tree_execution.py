@@ -22,6 +22,7 @@ from purra.agent_tree import (
     SpawnAgentsReceipt,
 )
 from purra.cancellation import OperationCanceled, await_with_cancellation, is_canceled
+from purra.interaction import UserInputRequired
 from purra.errors import ContractViolationError
 from purra.normalization import positive_int, required_text
 from purra.ports import CancellationSignal
@@ -153,6 +154,7 @@ class _AgentTreeSchedulingCapability:
         root_run_id = requester.root_run_id
         pending = set(target_ids)
         active: dict[asyncio.Task[None], str] = {}
+        attempted: set[str] = set()
         joined = False
         try:
             while pending:
@@ -169,7 +171,7 @@ class _AgentTreeSchedulingCapability:
                     joined = True
                     return aggregate
                 for candidate in await self._repository.list_runnable(root_run_id):
-                    if candidate.run_id not in pending:
+                    if candidate.run_id not in pending or candidate.run_id in attempted:
                         continue
                     claimed = await self._repository.claim_run(
                         candidate.run_id,
@@ -180,7 +182,11 @@ class _AgentTreeSchedulingCapability:
                         continue
                     task = asyncio.create_task(self._execute_claimed(claimed, signal))
                     active[task] = claimed.run_id
+                    attempted.add(claimed.run_id)
                 if not active:
+                    if pending <= attempted:
+                        joined = True
+                        return aggregate
                     raise ContractViolationError(
                         "Child Run scheduler made no progress",
                         code="agent_run_scheduler_stalled",
@@ -253,6 +259,9 @@ class _AgentTreeSchedulingCapability:
         except asyncio.CancelledError:
             await self._repository.cancel_subtree(run.run_id)
             raise
+        except UserInputRequired:
+            await self._repository.suspend_run(run.run_id, lease_owner_id=run.lease_owner_id, lease_epoch=run.lease_epoch)
+            return
         except Exception as error:
             await self._repository.fail_run(
                 run.run_id,

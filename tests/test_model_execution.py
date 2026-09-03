@@ -128,6 +128,12 @@ def test_complete_resolves_the_exact_provider_output_limit():
     asyncio.run(run())
 
 
+def test_model_task_runner_exposes_the_core_owned_run_id():
+    model_tasks = _model_tasks(_Gateway())
+
+    assert model_tasks.run_id == "model-task-test-run"
+
+
 def test_response_judge_inherits_reasoning_and_preserves_model_options():
     async def run():
         gateway = _Gateway()

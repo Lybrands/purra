@@ -60,6 +60,21 @@ class AgentOperationController:
     def running_operation_ids(self) -> tuple[str, ...]:
         return tuple(self._running)
 
+    def with_output(self, output: OperationEventProcessor) -> AgentOperationController:
+        """Bind Core persistence first while preserving a Host operation observer."""
+        if self._output is output:
+            return self
+        observer = self._output
+
+        class CombinedOutput:
+            async def accept_operation_event(self, event):
+                receipt = await output.accept_operation_event(event)
+                await observer.accept_operation_event(event)
+                return receipt
+
+        return AgentOperationController(CombinedOutput(), wall_clock=self._wall_clock,
+                                        monotonic_clock=self._monotonic_clock)
+
     async def start(
         self,
         kind: OperationKind,
@@ -76,6 +91,7 @@ class AgentOperationController:
             invocation_id=scope.invocation_id,
             kind=normalized_kind,
             started_at=started_at,
+            parent_operation_id=scope.parent_operation_id,
             display=scope.display.as_mapping(),
         )
         receipt = OperationReceipt(
@@ -165,6 +181,7 @@ class AgentOperationController:
                 operation_id=normalized_id,
                 run_id=running.receipt.run_id,
                 invocation_id=running.receipt.invocation_id,
+                parent_operation_id=running.receipt.started_event.parent_operation_id,
                 status=status,
                 finished_at=self._aware_wall_time(),
                 duration_ms=duration_ms,
@@ -175,6 +192,18 @@ class AgentOperationController:
             del self._running[normalized_id]
             self._terminal.add(normalized_id)
             return finished
+
+    async def release_terminal_run(self, run_id: str) -> None:
+        """Discard local handles after canonical Run terminalization fenced them.
+
+        This emits no events and does not manufacture successful operations.
+        The caller must already hold the repository's terminal Run receipt.
+        """
+        async with self._lock:
+            for operation_id, running in tuple(self._running.items()):
+                if running.receipt.run_id == run_id:
+                    del self._running[operation_id]
+                    self._terminal.add(operation_id)
 
     def _aware_wall_time(self) -> datetime:
         value = self._wall_clock()

@@ -56,6 +56,7 @@ class RunSnapshot:
     error: str | None = None
     execution_checkpoint: AgentExecutionCheckpoint | None = None
     agent_preset_snapshot: Mapping[str, Any] = field(default_factory=dict)
+    deadline_at_ms: int | None = None
 
     def __post_init__(self) -> None:
         run_id = required_text(self.run_id, "run snapshot run id")
@@ -539,6 +540,39 @@ class RunStateMachine:
             status=RunStatus.DONE,
             final_response=final_response,
         )
+
+    @staticmethod
+    def finish_durable_execution(
+        state: RunSnapshot,
+        *,
+        covered_step_ids: tuple[str, ...],
+    ) -> RunTransition:
+        """Finish durable steps while leaving the Run open for presentation."""
+
+        if state.terminal:
+            return _unchanged(state)
+        covered = frozenset(covered_step_ids)
+        planned = frozenset(step.id for step in state.steps)
+        if planned != covered:
+            raise RuntimeError(
+                "durable completion must match the admitted plan steps"
+            )
+        changes = tuple(
+            (
+                index,
+                replace(
+                    step,
+                    status=StepStatus.DONE,
+                    result_summary=(
+                        step.result_summary
+                        or "Durable execution fulfilled this admitted step."
+                    ),
+                ),
+            )
+            for index, step in enumerate(state.steps)
+            if step.id in covered and step.status is not StepStatus.DONE
+        )
+        return _with_step_changes(state, changes)
 
     @staticmethod
     def sync_durable_execution(

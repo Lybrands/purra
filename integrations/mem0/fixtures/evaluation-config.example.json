@@ -1,0 +1,14 @@
+{
+  "chat": {
+    "base_url": "https://YOUR-CHAT-PROVIDER.example/v1",
+    "model": "YOUR-CHAT-MODEL",
+    "key_env": "PURRA_EVAL_LLM_KEY",
+    "extra": {"temperature": 0}
+  },
+  "embedding": {
+    "base_url": "https://YOUR-EMBEDDING-PROVIDER.example/v1",
+    "model": "YOUR-EMBEDDING-MODEL",
+    "key_env": "PURRA_EVAL_EMBEDDING_KEY",
+    "dimensions": 1024
+  }
+}

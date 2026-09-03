@@ -20,6 +20,7 @@ def test_complete_run_api_is_importable_from_the_package_boundary():
         AgentRunHandle,
         AgentRunLeaseClaim,
         ContextStrategy,
+        ContextEvidenceReceipt,
         DelegatedAgentExecutor,
         DelegatedAgentRequest,
         DelegatedAgentResult,
@@ -29,7 +30,7 @@ def test_complete_run_api_is_importable_from_the_package_boundary():
         ExecutionProfile,
         InMemoryAgentAdapters,
         InMemoryRunTreeRepository,
-        ReactivePlanningPolicy,
+        PlanningMode,
         PromptSection,
         OrphanRunCandidate,
         OrphanRecoveryCoordinator,
@@ -42,9 +43,9 @@ def test_complete_run_api_is_importable_from_the_package_boundary():
         RunCancellationReceipt,
         RunRecoverySnapshot,
         RunCommandService,
-        ToolPlanningPolicy,
         WorkPlan,
         WorkPlanner,
+        ModelInputEvidenceValidator,
         WorkStep,
         canonicalize_execution_plan,
         current_agent_run_lease,
@@ -79,6 +80,10 @@ def test_complete_run_api_is_importable_from_the_package_boundary():
     assert AgentCoreRunOptions.__module__.startswith("purra.")
     assert AgentRunHandle.__module__.startswith("purra.")
     assert ContextStrategy.SINGLE_PASS.value == "single_pass"
+    assert ContextEvidenceReceipt(
+        "evidence-1", "memory", "fixture", "item-1", 1
+    ).version == 1
+    assert ModelInputEvidenceValidator is not None
     assert DelegationContextMode.ISOLATED.value == "isolated"
     assert DelegationPolicy().max_agents_per_call == 3
     assert DelegatedAgentExecutor.__module__.startswith("purra.")
@@ -90,8 +95,9 @@ def test_complete_run_api_is_importable_from_the_package_boundary():
     assert InMemoryRunTreeRepository.__module__.startswith("purra.")
     assert adapters.runs is not adapters.outputs
     assert adapters.outputs is not adapters.publisher
-    assert ReactivePlanningPolicy.__module__.startswith("purra.")
-    assert ToolPlanningPolicy.__module__.startswith("purra.")
+    assert PlanningMode.AUTO.value == "auto"
+    assert PlanningMode.REACTIVE.value == "reactive"
+    assert PlanningMode.PLANNED.value == "planned"
     assert AgentPlanner.__module__.startswith("purra.")
     assert WorkPlan.__module__.startswith("purra.")
     assert WorkStep.__module__.startswith("purra.")
@@ -157,6 +163,37 @@ def test_public_host_contract_is_importable_without_runtime_internals():
     assert all(value.__module__.startswith("purra.") for value in public_contracts)
 
 
+def test_retrieval_contract_is_importable_from_its_public_facade():
+    import purra.retrieval as retrieval
+    from purra.retrieval import (
+        RetrievalError,
+        RetrievalHit,
+        RetrievalRequest,
+        Retriever,
+        RetrieverTool,
+    )
+    from purra.testing import assert_retriever_conforms
+
+    public_contracts = (
+        RetrievalError,
+        RetrievalHit,
+        RetrievalRequest,
+        Retriever,
+        RetrieverTool,
+        assert_retriever_conforms,
+    )
+    assert all(value.__module__.startswith("purra.") for value in public_contracts)
+    assert tuple(retrieval.__all__) == (
+        "RetrievalError",
+        "RetrievalHit",
+        "RetrievalRequest",
+        "Retriever",
+        "RetrieverTool",
+    )
+    assert not hasattr(retrieval, "build_retriever_tool_registration")
+    assert not hasattr(retrieval, "create_retriever_tool")
+
+
 def test_facades_do_not_reexport_private_implementation_helpers():
     import purra.engine as engine
     import purra.runtime as runtime
@@ -187,6 +224,7 @@ def test_public_facades_have_explicit_non_module_exports():
         "output",
         "ports",
         "recovery",
+        "retrieval",
         "runtime",
         "task_admission",
         "tools",
@@ -206,3 +244,21 @@ def test_public_facades_have_explicit_non_module_exports():
             for exported in exports
             if isinstance(getattr(module, exported), ModuleType)
         ], name
+
+
+def test_planning_stream_public_contract_is_importable():
+    from purra.api import (PLANNING_STREAM_SCHEMA, PlanningScope, PlanningProgress,
+                          PlanningContext, PlanningStreamParser, PlanningStreamError, current_planning_context)
+    from purra.contracts import ModelTransportDiagnostics
+    from purra.model_invocation import AgentModelInvocationManager
+    assert PLANNING_STREAM_SCHEMA == "purra.planning-stream/v1"
+    assert callable(AgentModelInvocationManager.plan)
+    assert current_planning_context() is None
+    assert PlanningScope("run", "operation").revision == 0
+    assert PlanningProgress("Intent", 1, 0, 10).record_index == 1
+    assert all(value is None for value in ModelTransportDiagnostics().to_mapping().values())
+    assert issubclass(PlanningStreamError, Exception)
+    assert PlanningContext.__module__.startswith("purra.")
+    parser = PlanningStreamParser()
+    parser.feed('{"v":1,"type":"plan","plan":{}}\n')
+    assert parser.finish() == {}

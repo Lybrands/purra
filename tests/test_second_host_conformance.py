@@ -774,7 +774,7 @@ async def test_non_writing_host_keeps_identity_context_and_tool_authority_separa
     assert result.status is RunStatus.DONE
     assert result.final_response.startswith("Status: degraded.")
     assert observed_arguments == [{"serviceId": "payments"}]
-    assert len(gateway.rounds) == 3
+    assert len(gateway.rounds) == 2
     snapshot = events[0].payload["agentPreset"]
     assert snapshot["id"] == "operations"
     assert snapshot["revision"] == "1"
@@ -802,11 +802,7 @@ async def test_non_writing_host_keeps_identity_context_and_tool_authority_separa
     assert tool_result.origin is MessageOrigin.HOST_TOOL_RESULT
     assert json.loads(tool_result.content)["online"] is True
 
-    final_messages, final_invocation = gateway.rounds[2]
-    assert final_messages[0] == first_messages[0]
-    assert not final_invocation.tools
-    assert final_messages[-1].role is MessageRole.DEVELOPER
-    assert "final user-facing answer" in final_messages[-1].content
+    assert gateway.rounds[1][1].tools
 
 
 @pytest.mark.asyncio

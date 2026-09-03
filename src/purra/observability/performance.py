@@ -185,11 +185,9 @@ def _approval_waits_by_tool_round(
 ) -> tuple[int, ...]:
     """Return the confirmed approval-wait portion of each tool round.
 
-    New traces may carry an exact ``approvalWaitMs``. Persisted typed approval
-    events provide a status fallback for older traces. A bare ``declined``
-    tool outcome is also safe because that Core outcome means the handler did
-    not execute. Other failed/canceled tool outcomes remain active unless
-    approval evidence proves otherwise.
+    A ``declined`` tool outcome means the handler did not execute. Other
+    failed/canceled tool outcomes remain active unless approval evidence
+    proves otherwise.
     """
 
     statuses_by_round: list[tuple[str, ...]] = []

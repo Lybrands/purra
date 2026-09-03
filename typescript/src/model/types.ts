@@ -28,6 +28,8 @@ export interface Message {
   readonly toolCallId?: string;
   readonly toolCalls?: readonly ToolCall[];
   readonly attributes?: Readonly<Record<string, JsonValue>>;
+  /** Private provider continuation state; omitted from public message projections. */
+  readonly providerData?: Readonly<Record<string, JsonValue>>;
 }
 
 export interface ModelTokenUsage {
@@ -49,15 +51,25 @@ export interface ToolCallDelta {
 export interface ModelStreamChunk {
   readonly contentDelta?: string;
   readonly reasoningDelta?: string;
+  readonly progressDelta?: string;
   readonly toolCallDeltas?: readonly ToolCallDelta[];
   readonly finishReason?: ModelFinishReason;
   readonly usage?: ModelTokenUsage;
+  /** Opaque provider continuation data, accepted only on the terminal chunk. */
+  readonly providerData?: Readonly<Record<string, JsonValue>>;
 }
 
 export type ModelStreamActivityKind = "transport" | "working";
 export type ModelStreamActivitySupport = "semantic_only" | "transport" | "working";
 
+export interface ModelTransportDiagnostics {
+  readonly requestSentAtMs?: number;
+  readonly firstByteAtMs?: number;
+  readonly httpAttempts?: number;
+}
+
 export interface ModelStreamActivity {
+  readonly transportDiagnostics?: ModelTransportDiagnostics;
   readonly type: "activity";
   readonly kind: ModelStreamActivityKind;
 }
@@ -65,6 +77,7 @@ export interface ModelStreamActivity {
 export type ModelStreamItem = ModelStreamChunk | ModelStreamActivity;
 
 export interface ModelStream extends AsyncIterable<ModelStreamItem> {
+  readonly transportDiagnostics?: ModelTransportDiagnostics;
   /** Exact request output limit actually applied by the Provider host. */
   readonly appliedOutputLimit?: number | null;
   readonly activitySupport?: ModelStreamActivitySupport;
@@ -93,6 +106,7 @@ export interface ModelProtocolCapabilities {
   readonly parallelToolCalls: FeatureSupport;
   readonly streaming: FeatureSupport;
   readonly cancellation: FeatureSupport;
+  readonly publicProgress?: FeatureSupport;
   readonly assistantContentWithToolCalls: AssistantContentWithToolCalls;
   readonly jsonSchemaLevel: string;
   readonly streamFinishSemantics: string;

@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 from purra.context_strategies import ContextStrategy
-from purra.planning_policies import ReactivePlanningPolicy
 from purra.ports import PlanningPolicy, WorkPlanner
 from purra.task_admission import LongTaskDispatcher, TaskAdmissionEvaluator
 
@@ -19,9 +18,7 @@ class ExecutionProfile:
     """Bundle optional orchestration capabilities without Kernel services."""
 
     planner: WorkPlanner | None = None
-    planning_policy: PlanningPolicy = field(
-        default_factory=ReactivePlanningPolicy
-    )
+    planning_policy: PlanningPolicy | None = None
     context_strategy: ContextStrategy = ContextStrategy.SINGLE_PASS
     task_admission_evaluator: TaskAdmissionEvaluator | None = None
     long_task_dispatcher: LongTaskDispatcher | None = None
@@ -33,18 +30,14 @@ class ExecutionProfile:
             ContextStrategy(self.context_strategy),
         )
 
-        if self.planning_enabled and self.planner is None:
+        if self.planner is None and self.planning_policy is not None:
             raise ValueError(
-                "planned execution profile requires an explicit planner"
-            )
-        if not self.planning_enabled and self.planner is not None:
-            raise ValueError(
-                "reactive execution profile cannot configure an unused planner"
+                "planning policy requires a configured planner"
             )
 
     @property
     def planning_enabled(self) -> bool:
-        return not isinstance(self.planning_policy, ReactivePlanningPolicy)
+        return self.planner is not None
 
     def snapshot_mapping(
         self,

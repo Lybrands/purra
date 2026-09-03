@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from collections.abc import Callable, Awaitable
 
 from purra.agent_execution_checkpoint import AgentExecutionCheckpoint
 from purra.agent_tree import AgentCapabilityGrant
@@ -91,6 +92,7 @@ class AgentCoreRunOptions:
     agent_tree_lease_epoch: int | None = None
     agent_capability_grant: AgentCapabilityGrant | None = None
     agent_execution_checkpoint: AgentExecutionCheckpoint | None = None
+    checkpoint_handler: Callable[[AgentExecutionCheckpoint], Awaitable[AgentExecutionCheckpoint]] | None = None
 
     def __post_init__(self) -> None:
         claims = tuple(self.context_claims)
@@ -252,6 +254,7 @@ class AgentCoreRunOptions:
             raise TypeError("Agent execution checkpoint is invalid")
         if (
             self.agent_execution_checkpoint is not None
+            and self.agent_tree_run_id is not None
             and self.agent_tree_run_id
             != self.agent_execution_checkpoint.run_id
         ):

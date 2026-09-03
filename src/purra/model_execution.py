@@ -113,6 +113,12 @@ class AgentModelTaskRunner:
         self._manager = manager
         self._context = context
 
+    @property
+    def run_id(self) -> str:
+        """Return the immutable Core-owned Run identity for host adapters."""
+
+        return self._context.run_id
+
     async def complete(
         self,
         messages: Sequence[AgentMessage],

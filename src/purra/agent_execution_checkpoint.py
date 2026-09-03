@@ -25,8 +25,8 @@ from purra.normalization import positive_int, required_text
 class AgentExecutionCheckpoint:
     """One fully committed boundary immediately before a model round.
 
-    Version 1 deliberately covers Reactive execution only. Provider streams,
-    in-flight tools and Planned execution are not resumable from this contract.
+    Provider streams and in-flight external writes are not resumable here.
+    Planned authority remains in the Run; planning_state holds its coordinator.
     """
 
     run_id: str
@@ -46,17 +46,26 @@ class AgentExecutionCheckpoint:
     public_presentation_pending: bool = False
     last_tool_outcome: ToolBatchOutcome = ToolBatchOutcome.COMPLETED
     pending_tool_input_retries: tuple[tuple[str, str], ...] = ()
-    schema_version: int = 1
+    initial_planning_open: bool = True
+    schema_version: int = 2
     phase: str = "model_ready"
     execution_profile: str = "reactive"
+    input_revision: int = 0
+    planning_state: Mapping[str, Any] = field(default_factory=dict)
+    dynamic_replan_pending: bool = False
+    pending_recovery_error_code: str | None = None
+    failed_tool_recovery_error_code: str | None = None
 
     def __post_init__(self) -> None:
-        if self.schema_version != 1:
-            raise ValueError("Agent execution checkpoint schema version must be 1")
+        if type(self.input_revision) is not int or self.input_revision < 0:
+            raise ValueError("checkpoint input revision must be non-negative")
+        if self.schema_version != 2:
+            raise ValueError("Agent execution checkpoint schema version must be 2")
         if self.phase != "model_ready":
             raise ValueError("Agent execution checkpoint phase must be model_ready")
-        if self.execution_profile != "reactive":
-            raise ValueError("Only Reactive Agent execution can be checkpointed")
+        if self.execution_profile not in {"reactive", "auto", "planned"}:
+            raise ValueError("Invalid checkpoint execution profile")
+        object.__setattr__(self, "planning_state", freeze_json_mapping(self.planning_state))
         object.__setattr__(self, "run_id", required_text(
             self.run_id,
             "Agent execution checkpoint Run id",
@@ -108,6 +117,7 @@ class AgentExecutionCheckpoint:
             "declined_response_pending",
             "response_repair_pending",
             "public_presentation_pending",
+            "initial_planning_open",
         ):
             object.__setattr__(self, name, bool(getattr(self, name)))
         object.__setattr__(
@@ -139,6 +149,7 @@ class AgentExecutionCheckpoint:
             "phase": self.phase,
             "executionProfile": self.execution_profile,
             "nextRound": self.next_round,
+            "inputRevision": self.input_revision,
             "messages": [_message_to_mapping(item) for item in self.messages],
             "executionStateDomain": thaw_json_mapping(
                 self.execution_state_domain
@@ -166,10 +177,19 @@ class AgentExecutionCheckpoint:
                 {"toolCallId": call_id, "toolName": tool_name}
                 for call_id, tool_name in self.pending_tool_input_retries
             ],
+            "initialPlanningOpen": self.initial_planning_open,
+            "planningState": thaw_json_mapping(self.planning_state),
+            "dynamicReplanPending": self.dynamic_replan_pending,
+            "pendingRecoveryErrorCode": self.pending_recovery_error_code,
+            "failedToolRecoveryErrorCode": self.failed_tool_recovery_error_code,
         }
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "AgentExecutionCheckpoint":
+        if not isinstance(value.get("initialPlanningOpen"), bool):
+            raise TypeError(
+                "checkpoint initialPlanningOpen must be a boolean"
+            )
         raw_attempts = value.get("recoveryAttempts") or ()
         if not isinstance(raw_attempts, (list, tuple)):
             raise TypeError("checkpoint recovery attempts must be a sequence")
@@ -185,6 +205,7 @@ class AgentExecutionCheckpoint:
             phase=str(value.get("phase") or ""),
             execution_profile=str(value.get("executionProfile") or ""),
             next_round=int(value.get("nextRound") or 0),
+            input_revision=value.get("inputRevision", 0),
             messages=tuple(
                 _message_from_mapping(item)
                 for item in raw_messages
@@ -235,6 +256,11 @@ class AgentExecutionCheckpoint:
                 for item in raw_retries
                 if isinstance(item, Mapping)
             ),
+            initial_planning_open=value["initialPlanningOpen"],
+            planning_state=_mapping(value.get("planningState"), "checkpoint planning state"),
+            dynamic_replan_pending=bool(value.get("dynamicReplanPending", False)),
+            pending_recovery_error_code=value.get("pendingRecoveryErrorCode"),
+            failed_tool_recovery_error_code=value.get("failedToolRecoveryErrorCode"),
         )
 
 
@@ -255,6 +281,7 @@ def _message_to_mapping(message: AgentMessage) -> dict[str, Any]:
         "origin": message.origin.value,
         "attributes": thaw_json_mapping(message.attributes),
         "hostMetadata": thaw_json_mapping(message.host_metadata),
+        "providerData": thaw_json_mapping(message.provider_data),
     }
 
 
@@ -286,6 +313,7 @@ def _message_from_mapping(value: Mapping[str, Any]) -> AgentMessage:
         ),
         origin=MessageOrigin(str(value.get("origin") or "caller")),
         attributes=_mapping(value.get("attributes"), "checkpoint attributes"),
+        provider_data=_mapping(value.get("providerData"), "checkpoint provider data"),
         host_metadata=_mapping(
             value.get("hostMetadata"),
             "checkpoint host metadata",

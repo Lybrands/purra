@@ -28,6 +28,7 @@ from purra.contracts.enums import (
     MessageRole,
     ModelFinishReason,
     PlanningKind,
+    PlanningMode,
     ReasoningMode,
     RunId,
     RunStatus,
@@ -42,6 +43,7 @@ from purra.contracts.enums import (
     ToolEffectState,
     ToolExecutionMode,
     ToolPlanningDisposition,
+    ToolPlanningRequirement,
     ToolRiskLevel,
     ToolStepDisposition,
 )
@@ -75,6 +77,7 @@ class AgentMessage:
     origin: MessageOrigin = MessageOrigin.CALLER
     attributes: Mapping[str, Any] = field(default_factory=dict)
     host_metadata: Mapping[str, Any] = field(default_factory=dict)
+    provider_data: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         try:
@@ -90,6 +93,7 @@ class AgentMessage:
         if role is MessageRole.TOOL and not self.tool_call_id:
             raise ValueError("tool message requires tool_call_id")
         object.__setattr__(self, "attributes", freeze_json_mapping(self.attributes))
+        object.__setattr__(self, "provider_data", freeze_json_mapping(self.provider_data))
         object.__setattr__(
             self,
             "host_metadata",
@@ -107,6 +111,7 @@ class AgentMessage:
         content = raw.pop("content", None)
         reasoning = raw.pop("reasoning", raw.pop("reasoning_content", None))
         tool_call_id = raw.pop("tool_call_id", None)
+        provider_data = raw.pop("provider_data", {})
         tool_calls = tuple(
             _tool_call_from_mapping(item)
             for item in (raw.pop("tool_calls", ()) or ())
@@ -119,6 +124,7 @@ class AgentMessage:
             tool_calls=tool_calls,
             tool_call_id=tool_call_id,
             attributes=raw,
+            provider_data=provider_data,
         )
 
     def to_mapping(self) -> dict[str, Any]:
@@ -137,6 +143,8 @@ class AgentMessage:
             ]
         if self.tool_call_id is not None:
             value["tool_call_id"] = self.tool_call_id
+        if self.provider_data:
+            value["provider_data"] = thaw_json_mapping(self.provider_data)
         return value
 
 
@@ -274,11 +282,17 @@ class ModelTokenUsage:
 class ModelStreamChunk:
     content_delta: str = ""
     reasoning_delta: str = ""
+    progress_delta: str = ""
     tool_call_deltas: tuple[ToolCallDelta, ...] = ()
     finish_reason: ModelFinishReason | None = None
     usage: ModelTokenUsage | None = None
+    # Opaque provider continuation data, emitted only with the terminal chunk.
+    provider_data: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
+        for name in ("content_delta", "reasoning_delta", "progress_delta"):
+            if not isinstance(getattr(self, name), str):
+                raise TypeError(f"model stream {name.replace('_', ' ')} must be text")
         object.__setattr__(self, "tool_call_deltas", tuple(self.tool_call_deltas))
         if self.finish_reason is not None:
             object.__setattr__(
@@ -291,6 +305,13 @@ class ModelStreamChunk:
             ModelTokenUsage,
         ):
             raise TypeError("model stream usage must be ModelTokenUsage")
+        if self.provider_data is not None:
+            if self.finish_reason is None:
+                raise ValueError("provider data requires a terminal chunk")
+            attributes = freeze_json_mapping(self.provider_data)
+            if len(str(thaw_json_mapping(attributes))) > 1_000_000:
+                raise ValueError("provider data exceeds the size limit")
+            object.__setattr__(self, "provider_data", attributes)
 
 
 class ModelStreamActivityKind(StrEnum):
@@ -304,12 +325,18 @@ class ModelStreamActivitySupport(StrEnum):
     WORKING = "working"
 
 
+from purra.model_protocol.diagnostics import ModelTransportDiagnostics
+
+
 @dataclass(frozen=True, slots=True)
 class ModelStreamActivity:
     kind: ModelStreamActivityKind
+    transport_diagnostics: ModelTransportDiagnostics | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "kind", ModelStreamActivityKind(self.kind))
+        if self.transport_diagnostics is not None and not isinstance(self.transport_diagnostics, ModelTransportDiagnostics):
+            raise TypeError("activity transport diagnostics must be typed")
 
 
 ModelStreamItem: TypeAlias = ModelStreamActivity | ModelStreamChunk
@@ -322,12 +349,15 @@ class ModelStream:
     chunks: AsyncIterator[ModelStreamItem]
     model: str
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    transport_diagnostics: ModelTransportDiagnostics | None = None
     activity_support: ModelStreamActivitySupport = (
         ModelStreamActivitySupport.SEMANTIC_ONLY
     )
     applied_output_limit: int | None = None
 
     def __post_init__(self) -> None:
+        if self.transport_diagnostics is not None and not isinstance(self.transport_diagnostics, ModelTransportDiagnostics):
+            raise TypeError("stream transport diagnostics must be typed")
         self.model = required_text(self.model, "model stream model name")
         self.applied_output_limit = optional_positive_int(
             self.applied_output_limit,
@@ -379,6 +409,7 @@ class AgentRunRequest:
     mode: str | None = None
     context_window: int | None = None
     tools_enabled: bool = False
+    planning_mode: PlanningMode = PlanningMode.AUTO
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -392,6 +423,7 @@ class AgentRunRequest:
         object.__setattr__(self, "messages", messages)
         object.__setattr__(self, "mode", _optional_text(self.mode))
         object.__setattr__(self, "tools_enabled", bool(self.tools_enabled))
+        object.__setattr__(self, "planning_mode", PlanningMode(self.planning_mode))
         object.__setattr__(self, "metadata", freeze_json_mapping(self.metadata))
         object.__setattr__(self, "context_window", optional_positive_int(
             self.context_window, "context window"
@@ -589,6 +621,8 @@ class PlannerLimits:
     max_goal_chars: int = 160
     max_tool_steps: int = 4
     max_repair_attempts: int = 1
+    max_call_output_tokens: int | None = None
+    attempt_timeout_ms: int | None = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -602,6 +636,22 @@ class PlannerLimits:
         object.__setattr__(self, "max_steps", optional_positive_int(
             self.max_steps, "max_steps"
         ))
+        object.__setattr__(
+            self,
+            "max_call_output_tokens",
+            optional_positive_int(
+                self.max_call_output_tokens,
+                "max_call_output_tokens",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "attempt_timeout_ms",
+            optional_positive_int(
+                self.attempt_timeout_ms,
+                "attempt_timeout_ms",
+            ),
+        )
         max_tool_steps = int(self.max_tool_steps)
         if max_tool_steps < 0 or (
             self.max_steps is not None
@@ -814,6 +864,54 @@ class ContextBlock:
             "host_metadata",
             freeze_json_mapping(self.host_metadata),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class ContextEvidenceReceipt:
+    """Versioned external evidence that contributed to model input."""
+
+    evidence_id: str
+    context_block: str
+    source: str
+    item_id: str
+    version: int | None = None
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "evidence_id", required_text(self.evidence_id, "evidence id")
+        )
+        object.__setattr__(
+            self,
+            "context_block",
+            required_text(self.context_block, "evidence context block"),
+        )
+        object.__setattr__(
+            self, "source", required_text(self.source, "evidence source")
+        )
+        object.__setattr__(
+            self, "item_id", required_text(self.item_id, "evidence item id")
+        )
+        object.__setattr__(
+            self,
+            "version",
+            optional_positive_int(self.version, "evidence version"),
+        )
+        object.__setattr__(self, "metadata", freeze_json_mapping(self.metadata))
+
+    def to_mapping(self) -> dict[str, Any]:
+        return {
+            key: value
+            for key, value in {
+                "evidenceId": self.evidence_id,
+                "contextBlock": self.context_block,
+                "source": self.source,
+                "itemId": self.item_id,
+                "version": self.version,
+                "metadata": dict(self.metadata),
+            }.items()
+            if value not in (None, "", {})
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -1087,6 +1185,7 @@ class ToolHandlerResult:
     content: str
     from_cache: bool = False
     effects: tuple[DomainEffect, ...] = ()
+    context_evidence: tuple[ContextEvidenceReceipt, ...] = ()
     error_code: str | None = None
     step_disposition: ToolStepDisposition = ToolStepDisposition.COMPLETE
     planning_disposition: ToolPlanningDisposition = (
@@ -1098,6 +1197,12 @@ class ToolHandlerResult:
         object.__setattr__(self, "content", str(self.content or ""))
         object.__setattr__(self, "from_cache", bool(self.from_cache))
         object.__setattr__(self, "effects", tuple(self.effects))
+        evidence = tuple(self.context_evidence)
+        if not all(isinstance(item, ContextEvidenceReceipt) for item in evidence):
+            raise TypeError(
+                "tool context evidence must contain ContextEvidenceReceipt values"
+            )
+        object.__setattr__(self, "context_evidence", evidence)
         object.__setattr__(self, "error_code", _optional_text(self.error_code))
         object.__setattr__(
             self,
@@ -1209,6 +1314,7 @@ class ToolCallResult:
     approval_status: ApprovalStatus | None = None
     error: str | None = None
     effects: tuple[DomainEffect, ...] = ()
+    context_evidence: tuple[ContextEvidenceReceipt, ...] = ()
     step_disposition: ToolStepDisposition = ToolStepDisposition.COMPLETE
     planning_disposition: ToolPlanningDisposition = (
         ToolPlanningDisposition.KEEP_PLAN
@@ -1230,6 +1336,12 @@ class ToolCallResult:
             )
         object.__setattr__(self, "error", _optional_text(self.error))
         object.__setattr__(self, "effects", tuple(self.effects))
+        evidence = tuple(self.context_evidence)
+        if not all(isinstance(item, ContextEvidenceReceipt) for item in evidence):
+            raise TypeError(
+                "tool context evidence must contain ContextEvidenceReceipt values"
+            )
+        object.__setattr__(self, "context_evidence", evidence)
         object.__setattr__(
             self,
             "step_disposition",
@@ -1755,6 +1867,7 @@ __all__ = [
     "ModelProtocolCapabilities",
     "ModelRequest",
     "ModelStreamActivity",
+    "ModelTransportDiagnostics",
     "ModelStreamActivityKind",
     "ModelStreamActivitySupport",
     "ModelStreamItem",
@@ -1765,6 +1878,7 @@ __all__ = [
     "PlanningCapabilities",
     "PlanningConstraints",
     "PlanningKind",
+    "PlanningMode",
     "PlanningResult",
     "PlanningTurn",
     "ReasoningMode",
@@ -1803,6 +1917,7 @@ __all__ = [
     "ToolHandlerResult",
     "ToolPayloadMode",
     "ToolPlanningDisposition",
+    "ToolPlanningRequirement",
     "ToolPolicy",
     "ToolResultProjection",
     "ToolRiskLevel",

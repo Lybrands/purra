@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import replace
 from datetime import datetime, timezone
 from uuid import uuid4
@@ -106,6 +106,7 @@ from purra.ports import (
 )
 from purra.run_controller import AgentRunController
 from purra.run_recovery import RunRecoverySnapshot
+from purra.retrieval import RetrievalHit, RetrievalRequest, Retriever
 from purra.runtime.model_round import ModelRoundAccumulator
 from purra.task_admission import (
     ExecutionMode,
@@ -120,6 +121,22 @@ from purra.task_admission import (
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+async def assert_retriever_conforms(
+    retriever: Retriever,
+    request: RetrievalRequest,
+) -> None:
+    """Exercise the minimal public Retriever input and output contract."""
+
+    assert isinstance(retriever, Retriever)
+    assert isinstance(request, RetrievalRequest)
+    hits = await retriever.retrieve(request)
+    assert isinstance(hits, Sequence) and not isinstance(
+        hits, (str, bytes, bytearray)
+    )
+    assert len(hits) <= request.limit
+    assert all(isinstance(hit, RetrievalHit) for hit in hits)
 
 
 async def _require_violation(awaitable, message: str) -> None:
@@ -1326,6 +1343,7 @@ __all__ = [
     "assert_long_task_dispatcher_conforms",
     "assert_long_task_repository_conforms",
     "assert_model_gateway_conforms",
+    "assert_retriever_conforms",
     "assert_task_orchestration_conforms",
     "assert_tool_execution_gateway_conforms",
     "assert_tool_idempotency_gateway_conforms",

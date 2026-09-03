@@ -5,5 +5,5 @@
     "rootDir": ".",
     "outDir": ".example-dist"
   },
-  "include": ["examples/quickstart.ts"]
+  "include": ["examples/quickstart.ts", "examples/planner-streaming.ts"]
 }

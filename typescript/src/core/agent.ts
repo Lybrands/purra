@@ -1,3 +1,4 @@
+import { UserInputRequired } from "../interaction.js";
 import type {
   InvocationOutputLimit,
   JsonValue,
@@ -26,10 +27,12 @@ import {
   prepareContext,
   prepareStagedContext,
   resolveContextFactories,
+  restoreContext,
 } from "../context/coordinator.js";
 import type {
   ContextEvidenceReceipt,
   ContextOptions,
+  ModelInputEvidenceValidator,
   PreparedContext,
   StagedContextPreparation,
 } from "../context/types.js";
@@ -39,6 +42,13 @@ import {
   responseRepairMessage,
 } from "../planning/response-validation.js";
 import { taskContextFromPlan } from "../planning/types.js";
+import {
+  AUTO_PLANNING_TOOL_NAME,
+  AUTO_PLANNING_TOOL_SPEC,
+  AUTO_REMAINING_PLANNING_TOOL_NAME,
+  AUTO_REMAINING_PLANNING_TOOL_SPEC,
+  resolvePlanningActivation,
+} from "../planning/activation.js";
 import type {
   PlanningOptions,
   ResolvedPlanningOptions,
@@ -59,9 +69,11 @@ import type {
   AgentPresetSnapshot,
   ModelInvocationReceipt,
   PromptSection,
+  PlanningMode,
   RunBudgets,
   RunHandle,
   RunOptions,
+  RunLeaseClaim,
   RunRequest,
   RunResult,
 } from "../run/types.js";
@@ -123,6 +135,7 @@ import {
 } from "../recovery/index.js";
 
 export interface AgentOptions {
+  readonly checkpointHandler?: (checkpoint: AgentExecutionCheckpoint, request: RunRequest, claim: RunLeaseClaim) => Promise<AgentExecutionCheckpoint>;
   readonly model: ModelGateway;
   readonly tools?: readonly ToolDefinition[];
   readonly approval?: ToolApprovalGateway;
@@ -143,6 +156,7 @@ export interface AgentOptions {
   readonly operations?: AgentOperationController;
   readonly runtimeLimits?: Partial<AgentRuntimeLimits>;
   readonly outputBatchLimits?: Partial<OutputBatchLimits>;
+  readonly evidenceValidator?: ModelInputEvidenceValidator;
 }
 
 export interface AgentRuntimeLimits extends ModelStreamLimits {
@@ -150,7 +164,9 @@ export interface AgentRuntimeLimits extends ModelStreamLimits {
 }
 
 export interface AgentRunInput {
+  readonly persistedRequest?: RunRequest;
   readonly messages: readonly Message[];
+  readonly planningMode?: PlanningMode;
   readonly signal?: AbortSignal;
   readonly maxCallOutputTokens?: number;
   readonly enabledTools?: readonly string[];
@@ -160,6 +176,7 @@ export type AgentRunResult = RunResult;
 
 export type AgentStreamEvent =
   | { readonly type: "model_delta"; readonly delta: string }
+  | { readonly type: "agent_progress"; readonly text: string }
   | ToolExecutionEvent
   | { readonly type: "final"; readonly result: AgentRunResult };
 
@@ -174,6 +191,16 @@ interface AgentTreeRootBinding {
 interface AgentTreeRunScope {
   readonly run: AgentTreeRun;
   readonly agent: AgentNode;
+}
+
+interface AutoPlanningPreparation {
+  activate(
+    roundsUsed: number,
+    messages: readonly Message[],
+  ): Promise<{
+    readonly context?: PreparedContext;
+    readonly planning: PlannedExecutionCoordinator;
+  }>;
 }
 
 export class Agent {
@@ -203,10 +230,13 @@ export class Agent {
   readonly #agentTreeRoots = new Map<string, AgentTreeRootBinding>();
   readonly #recoveryPolicy: RecoveryPolicy;
   readonly #operations: AgentOperationController | undefined;
+  readonly #evidenceValidator: ModelInputEvidenceValidator | undefined;
   readonly #idempotencyNamespace = globalThis.crypto.randomUUID();
+  readonly #checkpointHandler: AgentOptions["checkpointHandler"];
   #invocationSequence = 0;
 
   public constructor(options: AgentOptions) {
+    this.#checkpointHandler = options.checkpointHandler;
     if (typeof options.model?.invoke !== "function") {
       throw new TypeError("Agent requires a model gateway");
     }
@@ -222,6 +252,13 @@ export class Agent {
     }
     this.#context = copyContextOptions(options.context);
     const definitions = Object.freeze([...(options.tools ?? [])]);
+    const reservedPlanningControl = definitions.find((definition) =>
+      definition.name === AUTO_PLANNING_TOOL_NAME
+      || definition.name === AUTO_REMAINING_PLANNING_TOOL_NAME
+    );
+    if (reservedPlanningControl !== undefined) {
+      throw new TypeError(`${reservedPlanningControl.name} is reserved for Planner activation`);
+    }
     if (options.agentTree !== undefined && options.delegation !== undefined) {
       throw new TypeError("Agent tree and legacy delegation are mutually exclusive");
     }
@@ -307,6 +344,9 @@ export class Agent {
               ...(this.#context === undefined ? {} : { context: this.#context }),
               ...(options.recovery === undefined ? {} : { recovery: options.recovery }),
               ...(options.operations === undefined ? {} : { operations: options.operations }),
+              ...(options.evidenceValidator === undefined
+                ? {}
+                : { evidenceValidator: options.evidenceValidator }),
               maxRounds,
             })
           : undefined;
@@ -346,6 +386,13 @@ export class Agent {
       throw new TypeError("operations must be an AgentOperationController");
     }
     this.#operations = options.operations;
+    if (
+      options.evidenceValidator !== undefined
+      && typeof options.evidenceValidator.validateEvidence !== "function"
+    ) {
+      throw new TypeError("evidenceValidator must implement validateEvidence");
+    }
+    this.#evidenceValidator = options.evidenceValidator;
     this.#capabilities = options.model.capabilities === undefined
       ? undefined
       : copyCapabilitySnapshot(options.model.capabilities);
@@ -378,6 +425,16 @@ export class Agent {
 
   public submit(request: RunRequest, options: RunOptions): Promise<RunHandle> {
     return this.#submit(request, requireRunOptions(options));
+  }
+
+  public async resume(runId: string, request: RunRequest): Promise<RunHandle> {
+    if (this.#agentTreeRepository !== undefined && (await this.#agentTreeRepository.getRun(runId)).rootRunId !== runId) {
+      throw new AgentError("child_run_resume_requires_scheduler", "Resume Child Runs through their Root scheduler");
+    }
+    if (this.#runRepository.executeOwned === undefined) throw new AgentError("run_lease_required", "Root recovery requires durable execution ownership");
+    const saved = await this.#runRepository.get(runId);
+    if (saved.status !== "running" || saved.executionCheckpoint === undefined) throw new AgentError("checkpoint_missing", "Run has no resumable checkpoint");
+    return this.#submit(request, { budgets: saved.budgets, deadlineAt: saved.deadlineAt }, undefined, saved.executionCheckpoint);
   }
 
   public spawnAgents(command: SpawnAgentsCommand): Promise<SpawnAgentsReceipt> {
@@ -590,7 +647,7 @@ export class Agent {
         this.#outputBatchLimits,
       );
     } else {
-      if (treeScope === undefined) {
+      if (treeScope === undefined && this.#runRepository.executeOwned === undefined) {
         throw new AgentError(
           "agent_run_resume_checkpoint_missing",
           "Only a claimed Child Run can resume an execution checkpoint",
@@ -623,8 +680,9 @@ export class Agent {
         this.#outputPolicy,
         snapshot,
         {
-          rootRunId: treeScope.run.rootRunId,
-          agentId: treeScope.run.agentId,
+          rootRunId: treeScope?.run.rootRunId ?? snapshot.runId,
+          agentId: treeScope?.run.agentId ?? (this.#agentTreeRepository === undefined ? snapshot.runId : (await this.#agentTreeRepository.getRun(snapshot.runId)).agentId),
+          ...(treeScope === undefined ? {} : {
           ...(treeScope.run.parentRunId === null
             ? {}
             : { parentRunId: treeScope.run.parentRunId }),
@@ -633,6 +691,7 @@ export class Agent {
             "Agent Run lease owner",
           ),
           leaseEpoch: treeScope.run.leaseEpoch,
+          }),
         },
         this.#outputBatchLimits,
       );
@@ -640,7 +699,7 @@ export class Agent {
     let ownsAgentTreeRoot = false;
     if (this.#agentTreeRepository !== undefined && treeScope === undefined) {
       try {
-        await this.#agentTreeRepository.beginRoot({
+        if (resumeCheckpoint === undefined) await this.#agentTreeRepository.beginRoot({
           runId: session.runId,
           agentId: this.#agentTreeRootId!,
           name: "root",
@@ -668,6 +727,7 @@ export class Agent {
       ownsAgentTreeRoot = true;
     }
     const runInput: AgentRunInput = Object.freeze({
+      persistedRequest: request,
       messages: Object.freeze([
         ...this.#preset.promptSections.map((section) => Object.freeze({
           role: section.role,
@@ -677,23 +737,23 @@ export class Agent {
         ...callerMessages,
       ]),
       signal: session.signal,
+      planningMode: resolvePlanningMode(request.planningMode),
       ...(request.maxCallOutputTokens === undefined
         ? {}
         : { maxCallOutputTokens: request.maxCallOutputTokens }),
       ...(enabledTools === undefined ? {} : { enabledTools }),
     });
 
-    const persistentExecution = this.#executePersistent(
-      runInput,
-      session,
-      evidence,
-      metadata,
-      continuation,
-      resumeCheckpoint,
-    );
-    const execution = ownsAgentTreeRoot
-      ? this.#settleRootAgentTree(session.runId, persistentExecution)
-      : persistentExecution;
+    const executePersistent = () => {
+      const running = this.#executePersistent(
+        runInput, session, evidence, metadata, continuation, resumeCheckpoint,
+      );
+      return ownsAgentTreeRoot ? this.#settleRootAgentTree(session.runId, running) : running;
+    };
+    const persistentExecution = this.#runRepository.executeOwned === undefined
+      ? executePersistent()
+      : this.#runRepository.executeOwned(session.runId, executePersistent, resumeCheckpoint);
+    const execution = persistentExecution.finally(() => session.releaseWaitingExecution());
     let result: Promise<RunResult> = execution;
     if (options.signal !== undefined) {
       let rejectCancellation: (error: unknown) => void = () => undefined;
@@ -783,6 +843,7 @@ export class Agent {
         }),
         Object.freeze({ role: "user", content: objective }),
       ]),
+      planningMode: "auto",
       enabledTools,
       metadata: Object.freeze({
         ...(binding.request.metadata ?? {}),
@@ -899,6 +960,7 @@ export class Agent {
     execution: Promise<RunResult>,
   ): Promise<RunResult> {
     const repository = this.#agentTreeRepository!;
+    let suspended = false;
     try {
       const result = await execution;
       const rootRun = await repository.getRun(rootRunId);
@@ -911,6 +973,7 @@ export class Agent {
       });
       return result;
     } catch (error) {
+      if (error instanceof UserInputRequired) { suspended = true; throw error; }
       if (error instanceof AgentCanceledError) {
         await repository.cancelSubtree(rootRunId);
       } else {
@@ -918,7 +981,7 @@ export class Agent {
       }
       throw error;
     } finally {
-      this.#agentTreeRoots.delete(rootRunId);
+      if (!suspended) this.#agentTreeRoots.delete(rootRunId);
     }
   }
 
@@ -991,9 +1054,13 @@ export class Agent {
     continuation?: DurableRecoverySnapshot,
     resumeCheckpoint?: AgentExecutionCheckpoint,
   ): Promise<RunResult> {
+    if (this.#operations !== undefined) session.operations = this.#operations.withOutput(session);
     let delegationBound = false;
     let dynamicExecutorBound = false;
     try {
+      if (resumeCheckpoint !== undefined && this.#agentTreeRepository !== undefined) {
+        resumeCheckpoint = await this.#resumeTreeDelegations(resumeCheckpoint, session);
+      }
       if (this.#delegationCoordinator !== undefined) {
         this.#delegationCoordinator.bindRun(
           session.runId,
@@ -1010,36 +1077,15 @@ export class Agent {
         await this.#completePersistentSession(session, result);
         return result;
       }
-      if (resumeCheckpoint !== undefined) {
-        const responseValidation = new ResponseValidationCoordinator(
-          this.#responseValidationOptions,
-          this.#modelTasksForExecution(session.runId, session),
-        );
-        const resumed = await this.#run(
-          input,
-          undefined,
-          session,
-          evidence,
-          undefined,
-          undefined,
-          responseValidation,
-          undefined,
-          resumeCheckpoint,
-        );
-        const result: RunResult = Object.freeze({
-          ...resumed,
-          messages: Object.freeze(
-            resumed.messages.slice(this.#preset.promptSections.length),
-          ),
-        });
-        await this.#completePersistentSession(session, result);
-        return result;
-      }
-      const prepared = await this.#prepareExecution(input, metadata, session.runId, session);
-      if (session !== undefined && prepared.workPlan !== undefined) {
-        await session.publishPlan(prepared.workPlan, 0);
-      }
-      const durable = await this.#completeAdmission(input, session, prepared.planning);
+      const prepared = await this.#prepareExecution(
+        input,
+        metadata,
+        session.runId,
+        session,
+        evidence,
+        resumeCheckpoint,
+      );
+      const durable = resumeCheckpoint === undefined ? await this.#completeAdmission(input, session, prepared.planning) : undefined;
       if (durable !== undefined) {
         await this.#completePersistentSession(session, durable);
         return durable;
@@ -1052,6 +1098,10 @@ export class Agent {
         prepared.context,
         prepared.planning,
         prepared.responseValidation,
+        undefined,
+        resumeCheckpoint,
+        prepared.modelTasks,
+        prepared.autoPlanning,
       );
       const result: RunResult = Object.freeze({
         ...internal,
@@ -1060,6 +1110,7 @@ export class Agent {
       await this.#completePersistentSession(session, result);
       return result;
     } catch (error) {
+      if (error instanceof UserInputRequired) { session.releaseWaitingExecution(); throw error; }
       if (session.deadlineExceeded) {
         const deadlineError = new AgentError("run_deadline_exceeded", "Run deadline has elapsed", {
           cause: error,
@@ -1093,12 +1144,14 @@ export class Agent {
     responseValidation = new ResponseValidationCoordinator(),
     transientExecutionKey?: string,
     resumeCheckpoint?: AgentExecutionCheckpoint,
+    modelTasks?: ModelTaskRunner,
+    autoPlanning?: AutoPlanningPreparation,
   ): Promise<AgentRunResult> {
     const messages = copyMessages(
       resumeCheckpoint?.messages ?? input.messages,
     );
     if (messages.length === 0) throw new TypeError("Agent run requires at least one message");
-    if (planning?.workPlan !== undefined) messages.push(planningMessage(planning.workPlan, false));
+    if (resumeCheckpoint === undefined && planning?.workPlan !== undefined) messages.push(planningMessage(planning.workPlan, false));
     // ponytail: transient invoke remains process-local; submitted Runs use
     // their durable identity as the idempotency namespace.
     const executionKey = session?.runId
@@ -1108,16 +1161,23 @@ export class Agent {
       this.#capabilities,
       input.maxCallOutputTokens,
     );
+    let pendingReplan = resumeCheckpoint?.pendingReplan;
     let responseAttempts = resumeCheckpoint?.responseAttempts ?? 0;
     let publicPresentationPending = false;
-    let roundLimit = this.#maxRounds;
+    let roundLimit = resumeCheckpoint?.roundLimit ?? this.#maxRounds;
+    const planningMode = resolvePlanningMode(input.planningMode);
+    const planningRequiredToolNames = new Set(
+      this.#tools.planningRequiredNamesFor(input.enabledTools),
+    );
+    let autoPlanningPhase: "initial" | "remaining" | undefined = (
+      autoPlanning !== undefined && planning === undefined
+    ) ? (resumeCheckpoint?.initialPlanningOpen === false ? "remaining" : "initial") : undefined;
     const validatedResultMode = session !== undefined
       && this.#agentTreeRoots.has(session.rootRunId);
     const recovery = new RecoveryLedger(this.#recoveryPolicy);
     if (resumeCheckpoint !== undefined) {
       if (
         resumeCheckpoint.runId !== session?.runId
-        || resumeCheckpoint.executionProfile !== "reactive"
         || resumeCheckpoint.phase !== "model_ready"
       ) {
         throw new AgentError(
@@ -1126,7 +1186,20 @@ export class Agent {
         );
       }
       recovery.restore(resumeCheckpoint.recoveryAttempts);
+      if (this.#checkpointHandler !== undefined) {
+        const updated = await this.#checkpointHandler(resumeCheckpoint, this.#agentTreeRoots.get(session!.rootRunId)?.request ?? input.persistedRequest ?? { messages: input.messages, planningMode }, session!.leaseClaim);
+        if (updated.runId !== resumeCheckpoint.runId) throw new TypeError("checkpoint handler changed Run identity");
+        messages.splice(0, messages.length, ...copyMessages(updated.messages));
+      }
     }
+    let activeEvidence = mergeEvidence(
+      evidence,
+      resumeCheckpoint?.contextEvidence ?? [],
+    );
+    modelTasks?.bindEvidence(mergeEvidence(
+      activeEvidence,
+      context?.evidence ?? [],
+    ));
 
     for (
       let round = resumeCheckpoint?.nextRound ?? 1;
@@ -1134,6 +1207,13 @@ export class Agent {
       round += 1
     ) {
       throwIfCanceled(input.signal);
+      if (pendingReplan !== undefined) {
+        if (planning === undefined) throw new AgentError("replanning_unavailable", "Checkpoint requires its Planner");
+        const revised = await planning.replan({ ...pendingReplan, messages: publicMessages(messages),
+          ...(input.signal === undefined ? {} : { signal: input.signal }) });
+        messages.push(planningMessage(revised, true));
+        pendingReplan = undefined;
+      }
       const transition = planning?.state?.transition();
       let enabledTools: readonly string[] | undefined = planning?.state === undefined
         ? input.enabledTools
@@ -1143,7 +1223,23 @@ export class Agent {
         enabledTools = Object.freeze((enabledTools ?? this.#tools.specsFor().map((tool) => tool.name))
           .filter((name) => name !== "delegateToAgents"));
       }
-      const tools = this.#tools.specsFor(enabledTools);
+      const businessTools = this.#tools.specsFor(enabledTools);
+      const tools = Object.freeze([
+        ...businessTools,
+        ...(
+          autoPlanningPhase !== undefined && !publicPresentationPending
+            ? [
+                autoPlanningPhase === "initial"
+                  ? AUTO_PLANNING_TOOL_SPEC
+                  : AUTO_REMAINING_PLANNING_TOOL_SPEC,
+              ]
+            : []
+        ),
+      ]);
+      modelTasks?.bindEvidence(mergeEvidence(
+        activeEvidence,
+        context?.evidence ?? [],
+      ));
       const projectedMessages = context === undefined
         ? Object.freeze([...messages])
         : await context.project(messages, input.signal);
@@ -1159,23 +1255,42 @@ export class Agent {
       let receipt: ModelInvocationReceipt | undefined;
       let visibleOutputEmitted = false;
       while (true) {
+        const invocationEvidence = mergeEvidence(
+          activeEvidence,
+          context?.evidence ?? [],
+        );
         receipt = session === undefined
           ? undefined
           : await session.openInvocation({
               messages: modelRequest.messages,
               tools: modelRequest.tools,
-              evidence: mergeEvidence(evidence, context?.evidence ?? []),
+              evidence: invocationEvidence,
               capabilityProfileId: this.#capabilities?.profileId ?? null,
               outputLimit: outputLimit?.maxTokens ?? null,
             });
         let chunkIndex = 0;
         try {
+          await validateEvidence(
+            this.#evidenceValidator,
+            invocationEvidence,
+            input.signal,
+          );
           turn = await invokeModel(
             this.#model,
             modelRequest,
             input.signal,
             this.#useStream,
             async (chunk) => {
+              if (
+                chunk.progressDelta !== undefined
+                && chunk.progressDelta !== ""
+                && this.#capabilities?.protocol.publicProgress !== "supported"
+              ) {
+                throw new AgentError(
+                  "model_gateway_contract_violation",
+                  "Model gateway emitted undeclared public progress",
+                );
+              }
               if (session !== undefined && receipt !== undefined) {
                 await session.persistChunk(receipt, chunkIndex, chunk);
                 chunkIndex += 1;
@@ -1185,6 +1300,7 @@ export class Agent {
                   visibleOutputEmitted = true;
                 }
                 emitModelDelta(chunk, emit);
+                emitAgentProgress(chunk, emit);
               }
             },
             this.#runtimeLimits,
@@ -1267,7 +1383,6 @@ export class Agent {
               ...(input.signal === undefined ? {} : { signal: input.signal }),
             });
             messages.push(planningMessage(revised, true));
-            if (session !== undefined) await session.publishPlan(revised, round);
             continue;
           }
           throw new AgentError("plan_incomplete", "Model returned a final response before the execution plan completed");
@@ -1318,7 +1433,7 @@ export class Agent {
           messages.push(responseRepairMessage(rejection));
           continue;
         }
-        if (tools.length > 0 && !publicPresentationPending && !validatedResultMode) {
+        if (businessTools.length > 0 && !publicPresentationPending && !validatedResultMode) {
           messages.pop();
           messages.push(...publicPresentationMessages(assistant));
           publicPresentationPending = true;
@@ -1340,6 +1455,43 @@ export class Agent {
         );
       }
       validateAssistantToolContent(assistant.content, this.#capabilities);
+      const activation = resolvePlanningActivation({
+        calls,
+        mode: planning === undefined
+          ? (autoPlanningPhase !== undefined ? planningMode : "reactive")
+          : "planned",
+        planningAvailable: autoPlanningPhase !== undefined,
+        planningRequiredToolNames,
+        round,
+        initialPlanningOpen: autoPlanningPhase === "initial",
+      });
+      if (activation !== undefined) {
+        if (typeof assistant.content === "string" && assistant.content.trim() !== "") {
+          if (session !== undefined && receipt !== undefined) {
+            await session.publishModelCommentary(receipt, assistant.content);
+          }
+          if (emit !== undefined) {
+            visibleOutputEmitted = true;
+            emit(Object.freeze({ type: "model_delta", delta: assistant.content }));
+          }
+        }
+        messages.pop();
+        const promoted = await autoPlanning!.activate(
+          activation.rounds,
+          publicMessages(messages),
+        );
+        planning = promoted.planning;
+        context = promoted.context;
+        autoPlanningPhase = undefined;
+        const durable = session === undefined
+          ? undefined
+          : await this.#completeAdmission(input, session, planning);
+        if (durable !== undefined) return durable;
+        if (planning.workPlan !== undefined) {
+          messages.push(planningMessage(planning.workPlan, false));
+        }
+        continue;
+      }
       try {
         planning?.state?.beginToolRound(calls.map((call) => call.name));
       } catch (error) {
@@ -1379,7 +1531,6 @@ export class Agent {
           ...(input.signal === undefined ? {} : { signal: input.signal }),
         });
         messages.push(planningMessage(revised, true));
-        if (session !== undefined) await session.publishPlan(revised, round);
         continue;
       }
       let batch: Awaited<ReturnType<ToolCatalog["executeBatch"]>>;
@@ -1434,6 +1585,12 @@ export class Agent {
         throw error;
       }
       messages.push(...batch.messages);
+      if (autoPlanningPhase === "initial") autoPlanningPhase = "remaining";
+      activeEvidence = mergeEvidence(activeEvidence, batch.contextEvidence);
+      modelTasks?.bindEvidence(mergeEvidence(
+        activeEvidence,
+        context?.evidence ?? [],
+      ));
       if (batch.failures.length > 0 && planning !== undefined) {
         const failure = batch.failures[0]!;
         const effectState = batch.failures.some((item) => item.effectState === "unknown")
@@ -1452,55 +1609,60 @@ export class Agent {
         if (!replan.allowed) {
           throw new AgentError(failure.errorCode, "Planned tool execution failed");
         }
-        const revised = await planning.replan({
-          round,
-          messages: publicMessages(messages),
-          reason: "The planned tool execution failed before completing the step",
-          errorCode: failure.errorCode,
-          ...(input.signal === undefined ? {} : { signal: input.signal }),
-        });
-        messages.push(planningMessage(revised, true));
-        if (session !== undefined) await session.publishPlan(revised, round);
-        continue;
-      }
-      if (batch.replan === undefined) {
+        pendingReplan = { round, reason: "The planned tool execution failed before completing the step", errorCode: failure.errorCode };
+      } else if (batch.replan !== undefined) {
+        if (planning === undefined) throw new AgentError("replanning_unavailable", "A tool requested replanning during Reactive execution");
+        if (batch.replan.errorCode === undefined) planning.state?.completeToolRound();
+        pendingReplan = { round, reason: batch.replan.reason,
+          ...(batch.replan.errorCode === undefined ? {} : { errorCode: batch.replan.errorCode }) };
+      } else {
         planning?.state?.completeToolRound();
-        if (
-          session !== undefined
-          && session.parentRunId !== undefined
-          && planning?.state === undefined
-        ) {
-          await session.saveExecutionCheckpoint(Object.freeze({
-            schemaVersion: 1,
-            runId: session.runId,
-            phase: "model_ready",
-            executionProfile: "reactive",
-            nextRound: round + 1,
-            messages: Object.freeze(copyMessages(messages)),
-            responseAttempts,
-            recoveryAttempts: recovery.snapshot(),
-          }));
+      }
+      if (session !== undefined && (session.parentRunId !== undefined || this.#checkpointHandler !== undefined)) {
+        const checkpoint: AgentExecutionCheckpoint = Object.freeze({
+          schemaVersion: 2, runId: session.runId, phase: "model_ready",
+          executionProfile: planning?.state === undefined ? planningMode : "planned",
+          ...(planning?.state === undefined ? {} : { planning: planning.checkpoint() }),
+          ...(pendingReplan === undefined ? {} : { pendingReplan }),
+          roundLimit, initialPlanningOpen: false, nextRound: round + 1,
+          messages: Object.freeze(copyMessages(messages)), context: context?.snapshot() ?? null,
+          contextEvidence: activeEvidence, responseAttempts, recoveryAttempts: recovery.snapshot(),
+        });
+        await session.saveExecutionCheckpoint(checkpoint);
+        if (this.#checkpointHandler !== undefined) {
+          const updated = await this.#checkpointHandler(checkpoint, this.#agentTreeRoots.get(session.rootRunId)?.request ?? input.persistedRequest ?? { messages: input.messages, planningMode }, session.leaseClaim);
+          if (updated.runId !== checkpoint.runId) throw new TypeError("checkpoint handler changed Run identity");
+          messages.splice(0, messages.length, ...copyMessages(updated.messages));
         }
-        continue;
       }
-      if (planning === undefined) {
-        throw new AgentError(
-          "replanning_unavailable",
-          "A tool requested replanning during Reactive execution",
-        );
-      }
-      if (batch.replan.errorCode === undefined) planning.state?.completeToolRound();
-      const revised = await planning.replan({
-        round,
-        messages: publicMessages(messages),
-        reason: batch.replan.reason,
-        ...(batch.replan.errorCode === undefined ? {} : { errorCode: batch.replan.errorCode }),
-        ...(input.signal === undefined ? {} : { signal: input.signal }),
-      });
-      messages.push(planningMessage(revised, true));
-      if (session !== undefined) await session.publishPlan(revised, round);
     }
     throw new AgentError("max_rounds_exceeded", "Agent exceeded its model round limit");
+  }
+
+  async #resumeTreeDelegations(checkpoint: AgentExecutionCheckpoint, session: RunSession): Promise<AgentExecutionCheckpoint> {
+    const calls = new Set(checkpoint.messages.flatMap(m => m.toolCalls ?? []).filter(c => c.name === "delegateToAgents").map(c => c.id));
+    const messages = [...checkpoint.messages];
+    let changed = false;
+    let requiredFailure = false;
+    for (let index = 0; index < messages.length; index++) {
+      const message = messages[index]!;
+      if (message.role !== "tool" || !calls.has(message.toolCallId ?? "")) continue;
+      let value: any = message.content;
+      if (typeof value === "string") { try { value = JSON.parse(value); } catch { continue; } }
+      if (value?.state !== "pending" || !value.pendingRunIds?.length) continue;
+      const aggregate = await this.joinAgentRuns(session.runId, value.pendingRunIds, session.signal, session.leaseClaim);
+      if (aggregate.pendingRunIds.length) continue;
+      const requiredFailures = [...new Set([...value.requiredFailures, ...aggregate.requiredFailures])];
+      requiredFailure ||= requiredFailures.length > 0;
+      const content = { state: requiredFailures.length ? "blocked" : "ready", pendingRunIds: [], requiredFailures, results: [...value.results, ...aggregate.results] };
+      messages[index] = { ...message, content: typeof message.content === "string" ? JSON.stringify(content) : content };
+      changed = true;
+    }
+    if (!changed) return checkpoint;
+    const updated = { ...checkpoint, inputRevision: (checkpoint.inputRevision ?? 0) + 1, messages };
+    await session.saveExecutionCheckpoint(updated);
+    if (requiredFailure) throw new AgentError("required_delegation_failed", "A required Child Run failed");
+    return updated;
   }
 
   async #executeTransient(input: AgentRunInput, emit?: Emit): Promise<AgentRunResult> {
@@ -1518,6 +1680,9 @@ export class Agent {
       prepared.planning,
       prepared.responseValidation,
       executionKey,
+      undefined,
+      prepared.modelTasks,
+      prepared.autoPlanning,
     );
   }
 
@@ -1539,16 +1704,9 @@ export class Agent {
   ): Promise<RunResult | undefined> {
     const durable = this.#durable;
     const plan = planning?.state?.plan;
-    if (durable === undefined || plan?.taskSpec === undefined) return undefined;
-    const decision = copyAdmissionDecision(await awaitWithSignal(
-      Promise.resolve(durable.admission.evaluate({
-        messages: publicMessages(input.messages),
-        plan,
-        signal: session.signal,
-      })),
-      session.signal,
-    ), plan);
-    await session.publishAdmission(decision);
+    const decision = planning?.admission;
+    if (durable === undefined || (plan?.taskSpec === undefined && decision === undefined)) return undefined;
+    if (decision === undefined) throw new AgentError("planning_admission_missing", "Planning did not complete task admission");
     if (decision.mode === "inline") return undefined;
     if (decision.mode === "clarify" || decision.mode === "reject" || decision.requiresConfirmation === true) {
       return terminalWithoutModel(
@@ -1562,6 +1720,7 @@ export class Agent {
         ),
       );
     }
+    if (plan === undefined) throw new AgentError("planning_admission_missing", "Admitted task has no compiled plan");
     const receipt = await durable.dispatcher.dispatch({
       plan,
       admission: decision,
@@ -1634,43 +1793,122 @@ export class Agent {
     metadata: Readonly<Record<string, JsonValue>>,
     runId: string,
     authority?: RunSession,
+    evidence: readonly ContextEvidenceReceipt[] = [],
+    resumeCheckpoint?: AgentExecutionCheckpoint,
   ): Promise<{
     readonly context?: PreparedContext;
     readonly planning?: PlannedExecutionCoordinator;
     readonly workPlan?: WorkPlan;
     readonly responseValidation: ResponseValidationCoordinator;
+    readonly modelTasks?: ModelTaskRunner;
+    readonly autoPlanning?: AutoPlanningPreparation;
   }> {
-    const modelTasks = this.#modelTasksForExecution(runId, authority);
-    const contextOptions = this.#contextForExecution(modelTasks);
-    const planningOptions = this.#planningForExecution(modelTasks);
+    const modelTasks = this.#modelTasksForExecution(runId, authority, input.maxCallOutputTokens);
+    modelTasks?.bindEvidence(evidence);
+    const contextOptions = resumeCheckpoint === undefined ? this.#contextForExecution(modelTasks) : undefined;
+    const planningMode = resolvePlanningMode(input.planningMode);
+    const autoCanSignal = (
+      this.#capabilities?.protocol.toolCalling !== "unavailable"
+    );
+    const planningOptions = (
+      planningMode === "reactive"
+      || (planningMode === "auto" && !autoCanSignal)
+    )
+      ? undefined
+      : this.#planningForExecution(modelTasks);
+    if ((planningMode === "planned" || resumeCheckpoint?.planning !== undefined) && planningOptions === undefined) {
+      throw new AgentError(
+        "planning_unavailable",
+        "Planned execution requires a configured Planner",
+      );
+    }
     const responseValidation = new ResponseValidationCoordinator(
       this.#responseValidationOptions,
       modelTasks,
     );
     let staged: StagedContextPreparation | undefined;
     let context: PreparedContext | undefined;
-    if (contextOptions?.strategy === "staged") {
+    if (resumeCheckpoint !== undefined) {
+      context = this.#restoreContext(input, metadata, resumeCheckpoint, modelTasks);
+    } else if (planningMode === "planned" && contextOptions?.strategy === "staged") {
       staged = await this.#prepareStagedContext(contextOptions, input, metadata);
     } else {
       context = await this.#prepareContext(contextOptions, input, metadata);
+    }
+    if (
+      planningMode === "auto"
+      && planningOptions !== undefined
+      && autoCanSignal
+      && resumeCheckpoint?.planning === undefined
+    ) {
+      const initialContext = context;
+      return Object.freeze({
+        ...(context === undefined ? {} : { context }),
+        responseValidation,
+        ...(modelTasks === undefined ? {} : { modelTasks }),
+        autoPlanning: Object.freeze({
+          activate: (
+            roundsUsed: number,
+            messages: readonly Message[],
+          ) => this.#activateAutoPlanning({
+            input,
+            metadata,
+            runId,
+            evidence,
+            planningOptions,
+            roundsUsed,
+            messages,
+            ...(authority === undefined ? {} : { authority }),
+            ...(modelTasks === undefined ? {} : { modelTasks }),
+            ...(this.#context === undefined ? {} : { contextOptions: resumeCheckpoint === undefined ? contextOptions! : this.#contextForExecution(modelTasks)! }),
+            ...(initialContext === undefined ? {} : { initialContext }),
+          }),
+        }),
+      });
     }
     if (planningOptions === undefined) {
       return Object.freeze({
         ...(context === undefined ? {} : { context }),
         responseValidation,
+        ...(modelTasks === undefined ? {} : { modelTasks }),
       });
     }
     const planning = new PlannedExecutionCoordinator({
+      runId,
+      ...((authority?.operations ?? this.#operations) === undefined ? {} : { operations: authority?.operations ?? this.#operations! }),
+      ...(authority === undefined ? {} : {
+        publishPlan: (plan, revision) => authority.publishPlan(plan, revision),
+        countAttempts: (operationId) => authority.countPlanningAttempts(operationId),
+      }),
+      ...(authority === undefined || this.#durable === undefined ? {} : {
+        admit: async (plan) => {
+          const decision = copyAdmissionDecision(await awaitWithSignal(Promise.resolve(this.#durable!.admission.evaluate({
+            messages: publicMessages(input.messages), plan, signal: authority.signal,
+          })), authority.signal), plan);
+          await authority.publishAdmission(decision);
+          return decision;
+        },
+      }),
       options: planningOptions,
-      request: Object.freeze({
+      request: resumeCheckpoint?.planning?.request ?? Object.freeze({
         messages: copyMessages(input.messages),
         ...(input.enabledTools === undefined ? {} : { enabledTools: Object.freeze([...input.enabledTools]) }),
         ...(Object.keys(metadata).length === 0 ? {} : { metadata }),
       }),
       registrations: this.#tools.planningRegistrationsFor(input.enabledTools),
-      ...(staged === undefined ? {} : { planningContext: staged.planning.blocks }),
-      maxRounds: this.#maxRounds,
+      planningContext: resumeCheckpoint?.planning?.capabilities.planningContext ?? staged?.planning.blocks ?? context?.snapshot().blocks ?? [],
+      maxRounds: resumeCheckpoint?.planning?.maxRounds ?? this.#maxRounds,
+      roundOffset: resumeCheckpoint?.planning?.roundOffset ?? 0,
     });
+    if (resumeCheckpoint?.planning !== undefined) {
+      planning.restore(resumeCheckpoint.planning);
+      return { ...(context === undefined ? {} : { context }), planning, responseValidation,
+        ...(modelTasks === undefined ? {} : { modelTasks }) };
+    }
+    modelTasks?.bindEvidence(mergeEvidence(
+      evidence,
+      context?.evidence ?? evidenceFromBlocks(staged?.planning.blocks ?? []),
+    ));
     const started = await planning.start(input.signal);
     if (started === undefined) {
       context ??= await this.#prepareContext(contextOptions, input, metadata);
@@ -1678,17 +1916,135 @@ export class Agent {
         ...(context === undefined ? {} : { context }),
         planning,
         responseValidation,
+        ...(modelTasks === undefined ? {} : { modelTasks }),
       });
     }
     if (staged !== undefined) {
       context = await staged.prepareExecution(taskContextFromPlan(started.state.plan), input.signal);
     }
+    modelTasks?.bindEvidence(mergeEvidence(
+      evidence,
+      context?.evidence ?? [],
+    ));
     return Object.freeze({
       ...(context === undefined ? {} : { context }),
       planning,
       workPlan: started.workPlan,
       responseValidation,
+      ...(modelTasks === undefined ? {} : { modelTasks }),
     });
+  }
+
+  async #activateAutoPlanning(input: {
+    readonly input: AgentRunInput;
+    readonly metadata: Readonly<Record<string, JsonValue>>;
+    readonly runId: string;
+    readonly authority?: RunSession;
+    readonly evidence: readonly ContextEvidenceReceipt[];
+    readonly modelTasks?: ModelTaskRunner;
+    readonly contextOptions?: ContextOptions;
+    readonly planningOptions: ResolvedPlanningOptions;
+    readonly initialContext?: PreparedContext;
+    readonly roundsUsed: number;
+    readonly messages: readonly Message[];
+  }): Promise<{
+    readonly context?: PreparedContext;
+    readonly planning: PlannedExecutionCoordinator;
+  }> {
+    const remainingRounds = this.#maxRounds - input.roundsUsed;
+    if (remainingRounds < 1) {
+      throw new AgentError(
+        "planning_activation_budget_exhausted",
+        "No model rounds remain after Auto requested planning",
+      );
+    }
+    let context = input.initialContext;
+    const staged = input.contextOptions?.strategy === "staged"
+      ? await this.#prepareStagedContext(
+          input.contextOptions,
+          input.input,
+          input.metadata,
+        )
+      : undefined;
+    const planning = new PlannedExecutionCoordinator({
+      runId: input.runId,
+      ...((input.authority?.operations ?? this.#operations) === undefined
+        ? {}
+        : { operations: input.authority?.operations ?? this.#operations! }),
+      ...(input.authority === undefined ? {} : {
+        publishPlan: (plan, revision) => input.authority!.publishPlan(plan, revision),
+        countAttempts: (operationId) => input.authority!.countPlanningAttempts(operationId),
+      }),
+      ...(input.authority === undefined || this.#durable === undefined ? {} : {
+        admit: async (plan) => {
+          const decision = copyAdmissionDecision(await awaitWithSignal(Promise.resolve(
+            this.#durable!.admission.evaluate({
+              messages: publicMessages(input.messages),
+              plan,
+              signal: input.authority!.signal,
+            }),
+          ), input.authority!.signal), plan);
+          await input.authority!.publishAdmission(decision);
+          return decision;
+        },
+      }),
+      options: input.planningOptions,
+      request: Object.freeze({
+        messages: copyMessages(input.messages),
+        ...(input.input.enabledTools === undefined
+          ? {}
+          : { enabledTools: Object.freeze([...input.input.enabledTools]) }),
+        ...(Object.keys(input.metadata).length === 0
+          ? {}
+          : { metadata: input.metadata }),
+      }),
+      registrations: this.#tools.planningRegistrationsFor(
+        input.input.enabledTools,
+      ),
+      planningContext: staged?.planning.blocks
+        ?? context?.snapshot().blocks
+        ?? [],
+      maxRounds: remainingRounds,
+      roundOffset: input.roundsUsed,
+    });
+    input.modelTasks?.bindEvidence(mergeEvidence(
+      input.evidence,
+      context?.evidence ?? evidenceFromBlocks(staged?.planning.blocks ?? []),
+    ));
+    const started = await planning.start(input.input.signal);
+    if (started !== undefined && staged !== undefined) {
+      context = await staged.prepareExecution(
+        taskContextFromPlan(started.state.plan),
+        input.input.signal,
+      );
+    }
+    input.modelTasks?.bindEvidence(mergeEvidence(
+      input.evidence,
+      context?.evidence ?? [],
+    ));
+    return Object.freeze({
+      ...(context === undefined ? {} : { context }),
+      planning,
+    });
+  }
+
+  #restoreContext(
+    input: AgentRunInput,
+    metadata: Readonly<Record<string, JsonValue>>,
+    checkpoint: AgentExecutionCheckpoint,
+    modelTasks: ModelTaskRunner | undefined,
+  ): PreparedContext | undefined {
+    if ((checkpoint.context !== null) !== (this.#context !== undefined)) {
+      throw new AgentError("agent_execution_checkpoint_conflict", "Checkpoint context does not match the bound Agent");
+    }
+    if (this.#context === undefined || checkpoint.context === null) return undefined;
+    // Only rebind the compression capability; neither source factories nor
+    // ContextProvider methods may replace already resolved checkpoint evidence.
+    const { provider: _provider, providerFactory: _factory, ...projectionOptions } = this.#context;
+    const options = projectionOptions.compressionFactory === undefined
+      ? projectionOptions
+      : resolveContextFactories(projectionOptions, modelTasks!);
+    return restoreContext(options, this.#contextPreparationInput(input, metadata), checkpoint.context);
   }
 
   async #prepareContext(
@@ -1751,7 +2107,7 @@ export class Agent {
     }
     return Object.freeze({
       planner,
-      policy: options.policy,
+      ...(options.policy === undefined ? {} : { policy: options.policy }),
       ...(options.binding === undefined ? {} : { binding: options.binding }),
     });
   }
@@ -1759,6 +2115,7 @@ export class Agent {
   #modelTasksForExecution(
     runId: string,
     authority?: RunSession,
+    maxCallOutputTokens?: number,
   ): ModelTaskRunner | undefined {
     const required = this.#context?.providerFactory !== undefined
       || this.#context?.compressionFactory !== undefined
@@ -1770,8 +2127,12 @@ export class Agent {
       runId,
       runtimeLimits: this.#runtimeLimits,
       recovery: this.#recoveryPolicy,
-      ...(this.#operations === undefined ? {} : { operations: this.#operations }),
+      ...(maxCallOutputTokens === undefined ? {} : { maxCallOutputTokens }),
+      ...((authority?.operations ?? this.#operations) === undefined ? {} : { operations: authority?.operations ?? this.#operations! }),
       ...(authority === undefined ? {} : { authority }),
+      ...(this.#evidenceValidator === undefined
+        ? {}
+        : { evidenceValidator: this.#evidenceValidator }),
     });
   }
 
@@ -1810,6 +2171,11 @@ export class Agent {
 function emitModelDelta(chunk: ModelStreamChunk, emit: Emit | undefined): void {
   if (emit === undefined || chunk.contentDelta === undefined || chunk.contentDelta === "") return;
   emit(Object.freeze({ type: "model_delta", delta: chunk.contentDelta }));
+}
+
+function emitAgentProgress(chunk: ModelStreamChunk, emit: Emit | undefined): void {
+  if (emit === undefined || chunk.progressDelta === undefined || chunk.progressDelta === "") return;
+  emit(Object.freeze({ type: "agent_progress", text: chunk.progressDelta }));
 }
 
 function terminalWithoutModel(messages: readonly Message[], output: string): RunResult {
@@ -1874,7 +2240,7 @@ function publicMessages(messages: readonly Message[]): readonly Message[] {
       && message.attributes?.responseCandidateRejected !== true
       && !isPrivatePresentationMessage(message)
     ))
-    .map(({ reasoning: _reasoning, ...message }) => Object.freeze(message)));
+    .map(({ reasoning: _reasoning, providerData: _providerData, ...message }) => Object.freeze(message)));
 }
 
 function markRejectedAssistant(messages: Message[]): void {
@@ -1998,7 +2364,38 @@ function mergeEvidence(
   direct: readonly ContextEvidenceReceipt[],
   contextual: readonly ContextEvidenceReceipt[],
 ): readonly ContextEvidenceReceipt[] {
-  return copyEvidence(Object.freeze([...direct, ...contextual]));
+  const merged = new Map<string, ContextEvidenceReceipt>();
+  for (const receipt of [...copyEvidence(direct), ...copyEvidence(contextual)]) {
+    const existing = merged.get(receipt.evidenceId);
+    if (existing !== undefined && JSON.stringify(existing) !== JSON.stringify(receipt)) {
+      throw new TypeError(`Conflicting evidence id: ${receipt.evidenceId}`);
+    }
+    merged.set(receipt.evidenceId, receipt);
+  }
+  return Object.freeze([...merged.values()]);
+}
+
+function evidenceFromBlocks(
+  blocks: readonly { readonly evidence?: readonly ContextEvidenceReceipt[] }[],
+): readonly ContextEvidenceReceipt[] {
+  return blocks.reduce<readonly ContextEvidenceReceipt[]>(
+    (receipts, block) => mergeEvidence(receipts, block.evidence ?? []),
+    Object.freeze([]),
+  );
+}
+
+async function validateEvidence(
+  validator: ModelInputEvidenceValidator | undefined,
+  receipts: readonly ContextEvidenceReceipt[],
+  signal: AbortSignal | undefined,
+): Promise<void> {
+  if (validator === undefined || receipts.length === 0) return;
+  throwIfCanceled(signal);
+  await validator.validateEvidence(
+    receipts,
+    signal === undefined ? {} : { signal },
+  );
+  throwIfCanceled(signal);
 }
 
 function copyContextOptions(value: ContextOptions | undefined): ContextOptions | undefined {
@@ -2058,10 +2455,10 @@ function copyPlanningOptions(value: PlanningOptions | undefined): PlanningOption
     throw new TypeError("planning planner factory must be a function");
   }
   if (
-    typeof value.policy?.shouldPlan !== "function"
-    || typeof value.policy.planningConstraints !== "function"
+    value.policy !== undefined
+    && typeof value.policy.planningConstraints !== "function"
   ) {
-    throw new TypeError("planning requires a PlanningPolicy");
+    throw new TypeError("PlanningPolicy must implement planningConstraints");
   }
   const binding = value.binding === undefined
     ? undefined
@@ -2069,9 +2466,16 @@ function copyPlanningOptions(value: PlanningOptions | undefined): PlanningOption
   return Object.freeze({
     ...(value.planner === undefined ? {} : { planner: value.planner }),
     ...(value.plannerFactory === undefined ? {} : { plannerFactory: value.plannerFactory }),
-    policy: value.policy,
+    ...(value.policy === undefined ? {} : { policy: value.policy }),
     ...(binding === undefined ? {} : { binding }),
   }) as PlanningOptions;
+}
+
+function resolvePlanningMode(value: PlanningMode | undefined): PlanningMode {
+  if (value === undefined || value === "auto") return "auto";
+  if (value === "reactive") return "reactive";
+  if (value === "planned") return "planned";
+  throw new TypeError("planningMode must be auto, reactive, or planned");
 }
 
 function copyResponseValidationOptions(

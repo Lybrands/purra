@@ -15,6 +15,7 @@ import type {
   ToolIdempotencyGateway,
   ToolPolicy,
 } from "./types.js";
+import type { ContextEvidenceReceipt } from "../context/types.js";
 
 interface CatalogOptions {
   readonly approval?: ToolApprovalGateway;
@@ -123,6 +124,13 @@ export class ToolCatalog {
     )));
   }
 
+  public planningRequiredNamesFor(enabledTools?: readonly string[]): readonly string[] {
+    const enabled = this.#enabledNames(enabledTools);
+    return Object.freeze([...enabled].filter((name) => (
+      this.#tools.get(name)!.definition.planningRequirement === "required"
+    )));
+  }
+
   public async executeBatch(
     calls: readonly ToolCall[],
     options: ExecuteOptions,
@@ -132,6 +140,7 @@ export class ToolCatalog {
 
     const messages: Message[] = [];
     const failures: { readonly errorCode: string; readonly effectState: ToolEffectState }[] = [];
+    const contextEvidence: ContextEvidenceReceipt[] = [];
     let replan: ToolBatchResult["replan"];
     for (const [call, tool] of admitted) {
       throwIfCanceled(options.signal);
@@ -173,6 +182,9 @@ export class ToolCatalog {
           effectState: result.effectState,
         }));
       }
+      if (result.errorCode === undefined) {
+        contextEvidence.push(...(result.contextEvidence ?? []));
+      }
       if (result.planningDisposition === "replan") {
         replan = Object.freeze({
           reason: result.planningReason!,
@@ -184,6 +196,7 @@ export class ToolCatalog {
       messages: Object.freeze(messages),
       toolNames: Object.freeze(admitted.map(([call]) => call.name)),
       failures: Object.freeze(failures),
+      contextEvidence: copyContextEvidence(contextEvidence),
       ...(replan === undefined ? {} : { replan }),
     });
   }
@@ -406,6 +419,16 @@ function registerTool(value: ToolDefinition): RegisteredTool {
   const policy = copyPolicy(value.policy, name);
   const schema = inspectToolSchema(value.inputSchema, name);
   const displayNames = copyDisplayNames(value.displayNames, name);
+  if (
+    value.planningRequirement !== undefined
+    && value.planningRequirement !== "optional"
+    && value.planningRequirement !== "required"
+  ) {
+    throw new AgentError(
+      "invalid_tool_planning_requirement",
+      `Tool ${name} planning requirement is invalid`,
+    );
+  }
   const planning = value.planning === undefined
     ? undefined
     : copyPlanning(value.planning, name);
@@ -423,6 +446,9 @@ function registerTool(value: ToolDefinition): RegisteredTool {
       policy,
       inputSchema: schema,
       ...(displayNames === undefined ? {} : { displayNames }),
+      ...(value.planningRequirement === undefined
+        ? {}
+        : { planningRequirement: value.planningRequirement }),
       ...(planning === undefined ? {} : { planning }),
     }),
     schema,
@@ -537,9 +563,36 @@ function normalizeResult(value: ToolHandlerResult, mode: ToolPolicy["mode"]): To
     content: copyJsonValue(value.content),
     effectState: value.effectState,
     ...(errorCode === undefined ? {} : { errorCode }),
+    ...(errorCode !== undefined || value.contextEvidence === undefined
+      ? {}
+      : { contextEvidence: copyContextEvidence(value.contextEvidence) }),
     ...(planningDisposition === "continue" ? {} : { planningDisposition }),
     ...(planningReason === undefined ? {} : { planningReason }),
   });
+}
+
+function copyContextEvidence(
+  values: readonly ContextEvidenceReceipt[],
+): readonly ContextEvidenceReceipt[] {
+  if (!Array.isArray(values)) throw new TypeError("Tool contextEvidence must be an array");
+  const byId = new Map<string, ContextEvidenceReceipt>();
+  for (const raw of values) {
+    if (raw === null || typeof raw !== "object") throw new TypeError("Invalid tool context evidence");
+    const evidenceId = requiredText(raw.evidenceId, "evidence id");
+    const receipt = Object.freeze({
+      evidenceId,
+      ...(raw.contextBlock === undefined ? {} : { contextBlock: requiredText(raw.contextBlock, "evidence contextBlock") }),
+      source: requiredText(raw.source, "evidence source"),
+      ...(raw.itemId === undefined ? {} : { itemId: requiredText(raw.itemId, "evidence itemId") }),
+      ...(raw.version === undefined ? {} : { version: requiredText(raw.version, "evidence version") }),
+    });
+    const existing = byId.get(evidenceId);
+    if (existing !== undefined && JSON.stringify(existing) !== JSON.stringify(receipt)) {
+      throw new TypeError(`Conflicting evidence id: ${evidenceId}`);
+    }
+    byId.set(evidenceId, receipt);
+  }
+  return Object.freeze([...byId.values()]);
 }
 
 async function awaitWithSignal<T>(

@@ -7,6 +7,7 @@ not durable across process restarts and must not be used as production storage.
 from __future__ import annotations
 
 import asyncio
+from purra.interaction import is_input_checkpoint_update
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
@@ -86,6 +87,7 @@ class _RunRecord:
     provider_output_events: int = 0
     provider_output_bytes: int = 0
     execution_checkpoint: AgentExecutionCheckpoint | None = None
+    checkpoint_attempt_count: int = 0
 
 
 @dataclass(slots=True)
@@ -153,6 +155,7 @@ def _run_snapshot(run_id: RunId, record: _RunRecord) -> RunSnapshot:
         error=record.error,
         execution_checkpoint=record.execution_checkpoint,
         agent_preset_snapshot=record.params.agent_preset_snapshot,
+        deadline_at_ms=record.params.deadline_at_ms,
     )
 
 
@@ -279,12 +282,14 @@ def _apply_commit(record: _RunRecord, commit: RunCommit) -> None:
             if (
                 checkpoint.next_round == current.next_round
                 and checkpoint != current
+                and not is_input_checkpoint_update(current, checkpoint)
             ):
                 raise ContractViolationError(
                     "Agent execution checkpoint content conflicts",
                     code="agent_execution_checkpoint_conflict",
                 )
         record.execution_checkpoint = checkpoint
+        record.checkpoint_attempt_count = len(record.model_attempt_ids)
     record.events.extend(commit.events)
 
 
@@ -325,6 +330,7 @@ _PROVIDER_OUTPUT_BUDGET_KINDS = frozenset({
     OutputEventKind.PROVIDER_REASONING_DELTA,
     OutputEventKind.PROVIDER_TOOL_CALL_DELTA,
     OutputEventKind.PROVIDER_DELTA_BATCH,
+    OutputEventKind.PLANNING_PROGRESS,
 })
 
 
@@ -407,12 +413,56 @@ def _validate_new_event(
             raise ContractViolationError(
                 "canonical event does not match its output stream"
             )
+        if (stream.spec.output_protocol is not None and draft.visibility is OutputVisibility.PUBLIC
+                and draft.kind is not OutputEventKind.PLANNING_PROGRESS):
+            raise ContractViolationError("planning bytes cannot be published as ordinary text")
+    if draft.kind is OutputEventKind.PLANNING_PROGRESS:
+        if run.status is not RunStatus.RUNNING:
+            raise ContractViolationError("terminal Run cannot accept planning progress")
+        _validate_planning_projection(state, draft)
     is_domain_effect = draft.kind is OutputEventKind.DOMAIN_EFFECT
     if is_domain_effect != (draft.source is OutputSource.DOMAIN):
         raise ContractViolationError(
             "domain effect events require domain source and kind"
         )
     return run
+
+
+def _validate_planning_projection(state: _MemoryState, draft: AgentOutputEventDraft) -> None:
+    from purra.planning_stream import PLANNING_STREAM_SCHEMA, PlanningStreamParser
+    from purra.errors import InvalidPlannerOutputError
+    stream = state.streams.get(draft.output_stream_id)
+    if stream is None or stream.spec.output_protocol != PLANNING_STREAM_SCHEMA:
+        raise ContractViolationError("planning projection requires a planning stream")
+    scope = stream.spec.planning_scope
+    payload = draft.payload
+    if (scope is None or payload.get("operationId") != scope.operation_id
+            or payload.get("revision") != scope.revision
+            or payload.get("attempt") != stream.spec.planning_attempt
+            or draft.source_event_key != f"planning:{draft.invocation_id}:{payload.get('recordIndex')}"):
+        raise ContractViolationError("planning projection scope mismatch")
+    events = state.output_events.get(draft.run_id, [])
+    stage = [e for e in events if e.payload.get("operationId") == scope.operation_id
+             and e.kind in {OutputEventKind.OPERATION_STARTED, OutputEventKind.OPERATION_FINISHED}]
+    if (not stage or stage[-1].kind is not OutputEventKind.OPERATION_STARTED
+            or stage[-1].payload.get("kind") != "planning"):
+        raise ContractViolationError("planning operation is not active")
+    # ponytail: bounded replay (1 MiB, 16 projections); index record spans only if
+    # profiling shows this small per-invocation verification dominates persistence.
+    raw = "".join(str(entry["payload"].get("delta", ""))
+        for event in events if event.invocation_id == draft.invocation_id
+        for entry in _batched_provider_entries(event)
+        if entry.get("kind") == OutputEventKind.PROVIDER_CONTENT_DELTA.value).encode("utf-8")
+    start, end = payload.get("sourceStart"), payload.get("sourceEnd")
+    if type(start) is not int or type(end) is not int or not 0 <= start < end <= len(raw):
+        raise ContractViolationError("planning projection has invalid source span")
+    try:
+        records = PlanningStreamParser().feed(raw[:end].decode("utf-8"))
+        expected = next(record for record in records if record.record_index == payload.get("recordIndex"))
+        if any(payload.get(key) != value for key, value in expected.to_mapping().items()):
+            raise ValueError("projection differs")
+    except (ValueError, StopIteration, InvalidPlannerOutputError) as error:
+        raise ContractViolationError("planning projection does not match Provider source") from error
 
 
 def _append_event(
@@ -963,6 +1013,15 @@ class _InMemoryAgentOutputRepository:
                 raise ContractViolationError(
                     "terminal run cannot open a new output stream"
                 )
+            if spec.planning_scope is not None:
+                scope = spec.planning_scope
+                stage = [e for e in self._state.output_events.get(spec.run_id, [])
+                         if e.payload.get("operationId") == scope.operation_id
+                         and e.kind in {OutputEventKind.OPERATION_STARTED, OutputEventKind.OPERATION_FINISHED}]
+                if (scope.run_id != spec.run_id or not stage
+                        or stage[-1].kind is not OutputEventKind.OPERATION_STARTED
+                        or stage[-1].payload.get("kind") != "planning"):
+                    raise ContractViolationError("planning operation is not active")
             self._state.streams[spec.output_stream_id] = _StreamRecord(spec=spec)
             self._state.stream_by_invocation[spec.invocation_id] = (
                 spec.output_stream_id
@@ -1090,7 +1149,28 @@ class _InMemoryAgentOutputRepository:
                 and stream.spec.run_id == run_id
                 and stream.status == "open"
             )
+            operation_aborts = []
+            for started in self._state.output_events.get(run_id, ()):
+                if started.kind is not OutputEventKind.OPERATION_STARTED:
+                    continue
+                operation_id = started.payload["operationId"]
+                if any(e.kind is OutputEventKind.OPERATION_FINISHED and e.payload.get("operationId") == operation_id
+                       for e in self._state.output_events.get(run_id, ())):
+                    continue
+                operation_aborts.append(AgentOutputEventDraft(
+                    run_id=run_id, turn_id=started.turn_id, output_stream_id=None,
+                    invocation_id=started.invocation_id,
+                    source_event_key=f"operation:{operation_id}:finished", source=OutputSource.RUNTIME,
+                    kind=OutputEventKind.OPERATION_FINISHED, channel=OutputChannel.OPERATION,
+                    visibility=started.visibility, occurred_at=draft.occurred_at,
+                    payload={"operationId": operation_id, "parentOperationId": started.payload.get("parentOperationId"),
+                             "status": "canceled" if expected_status is RunStatus.CANCELED else "failed",
+                             "errorCode": "run_terminalized", "finishedAt": draft.occurred_at.isoformat(),
+                             "durationMs": max(0, round((draft.occurred_at - started.occurred_at).total_seconds() * 1000)),
+                             "timingSource": "recovery_wall_clock", "display": started.payload.get("display", {})},
+                ))
             atomic_drafts = (
+                *operation_aborts,
                 *related_drafts,
                 *((validated_draft,) if validated_draft is not None else ()),
                 *terminal_abort_drafts,
@@ -1191,6 +1271,8 @@ class _InMemoryAgentOutputRepository:
     ) -> tuple[AgentOutputEvent, ...]:
         async with self._state.lock:
             stream = self._require_stream(output_stream_id)
+            if stream.spec.output_protocol is not None:
+                raise ContractViolationError("planning streams cannot be promoted to commentary")
             if stream.status != "committed":
                 raise ContractViolationError(
                     "only a committed model stream can publish commentary"
@@ -1277,6 +1359,108 @@ class _InMemoryAgentOutputRepository:
                     commentary,
                     allow_committed_stream=True,
                 ),
+                _append_event(
+                    self._state,
+                    committed,
+                    allow_committed_stream=True,
+                ),
+            )
+
+    async def publish_stream_content_as_final(
+        self,
+        output_stream_id: str,
+    ) -> tuple[AgentOutputEvent, ...]:
+        async with self._state.lock:
+            stream = self._require_stream(output_stream_id)
+            if stream.spec.output_protocol is not None:
+                raise ContractViolationError(
+                    "planning streams cannot be promoted to final"
+                )
+            if stream.status != "committed":
+                raise ContractViolationError(
+                    "only a committed model stream can publish final output"
+                )
+            if stream.spec.intent is not AgentOutputIntent.STRUCTURED_PRIVATE:
+                raise ContractViolationError(
+                    "only private model content can be promoted to final"
+                )
+            scoped = [
+                event
+                for event in self._state.output_events.get(
+                    stream.spec.run_id, ()
+                )
+                if event.output_stream_id == output_stream_id
+            ]
+            if any(
+                event.kind is OutputEventKind.PROVIDER_TOOL_CALL_DELTA
+                or any(
+                    entry.get("kind")
+                    == OutputEventKind.PROVIDER_TOOL_CALL_DELTA.value
+                    for entry in _batched_provider_entries(event)
+                )
+                for event in scoped
+            ):
+                raise ContractViolationError(
+                    "final publication rejects Provider tool calls"
+                )
+            content_events = [
+                event
+                for event in scoped
+                if event.source is OutputSource.PROVIDER
+                and event.channel is OutputChannel.DIAGNOSTIC
+                and event.visibility is OutputVisibility.PRIVATE
+                and event.kind
+                in {
+                    OutputEventKind.PROVIDER_CONTENT_DELTA,
+                    OutputEventKind.PROVIDER_DELTA_BATCH,
+                }
+            ]
+            content_parts = []
+            for event in content_events:
+                if event.kind is OutputEventKind.PROVIDER_CONTENT_DELTA:
+                    content_parts.append(str(event.payload.get("delta") or ""))
+                else:
+                    content_parts.extend(
+                        str(entry.get("payload", {}).get("delta") or "")
+                        for entry in _batched_provider_entries(event)
+                        if entry.get("kind")
+                        == OutputEventKind.PROVIDER_CONTENT_DELTA.value
+                    )
+            content = "".join(content_parts)
+            if not content.strip():
+                return ()
+            final = AgentOutputEventDraft.public_text(
+                run_id=stream.spec.run_id,
+                turn_id=stream.spec.turn_id,
+                output_stream_id=output_stream_id,
+                invocation_id=stream.spec.invocation_id,
+                source_event_key=f"provider:{stream.spec.invocation_id}:final",
+                source=OutputSource.PROVIDER,
+                channel=OutputChannel.FINAL,
+                delta=content,
+                occurred_at=content_events[0].occurred_at,
+            )
+            committed = AgentOutputEventDraft(
+                run_id=stream.spec.run_id,
+                turn_id=stream.spec.turn_id,
+                output_stream_id=output_stream_id,
+                invocation_id=stream.spec.invocation_id,
+                source_event_key=f"stream:{output_stream_id}:final:committed",
+                source=OutputSource.RUNTIME,
+                kind=OutputEventKind.STREAM_COMMITTED,
+                channel=OutputChannel.FINAL,
+                visibility=OutputVisibility.PUBLIC,
+                payload={
+                    "finishReason": (
+                        stream.finish_reason.value
+                        if stream.finish_reason is not None
+                        else ""
+                    )
+                },
+                occurred_at=_now(),
+            )
+            return (
+                _append_event(self._state, final, allow_committed_stream=True),
                 _append_event(
                     self._state,
                     committed,

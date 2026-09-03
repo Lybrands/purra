@@ -136,7 +136,7 @@ test("shared Agent tree protocol matches TypeScript contracts", () => {
     fences: ["spawn", "continue", "checkpoint", "budget", "output", "terminal"],
   });
   assert.deepEqual(fixture.recovery, {
-    executionCheckpointSchemaVersion: 1,
+    executionCheckpointSchemaVersions: { python: 1, typescript: 2 },
     resumablePhase: "model_ready",
     resumableExecutionProfile: "reactive",
     inFlightProviderOrToolPolicy: "fail_stop",
@@ -588,10 +588,11 @@ test("new Agent instance rebinds and executes one committed Child Run", async ()
     metadata: {},
   });
   await adapters.runs.saveExecutionCheckpoint(checkpointed.runId, {
-    schemaVersion: 1,
+    schemaVersion: 2,
     runId: checkpointed.runId,
     phase: "model_ready",
     executionProfile: "reactive",
+    initialPlanningOpen: false,
     nextRound: 2,
     messages: [
       { role: "system", content: "Recover safely." },
@@ -603,6 +604,8 @@ test("new Agent instance rebinds and executes one committed Child Run", async ()
       },
       { role: "tool", content: "committed result", toolCallId: "committed-call" },
     ],
+    context: null,
+    contextEvidence: [],
     responseAttempts: 0,
     recoveryAttempts: [],
   }, {
@@ -996,12 +999,15 @@ test("expired Agent tree lease fences canonical Run budget and output writes", a
     leaseEpoch: claim.leaseEpoch,
   }), "agent_run_lease_lost");
   await rejectsCode(runs.saveExecutionCheckpoint(claim.runId, {
-    schemaVersion: 1,
+    schemaVersion: 2,
     runId: claim.runId,
     phase: "model_ready",
     executionProfile: "reactive",
+    initialPlanningOpen: false,
     nextRound: 2,
     messages: [{ role: "user", content: "resume" }],
+    context: null,
+    contextEvidence: [],
     responseAttempts: 0,
     recoveryAttempts: [],
   }, {

@@ -1,3 +1,4 @@
+import { encodeStorageState, decodeStorageState } from "../shared/storage-state.js";
 import { copyJsonValue } from "../model/validation.js";
 import { AgentError } from "../shared/errors.js";
 import { stableFingerprint } from "../shared/fingerprint.js";
@@ -21,6 +22,15 @@ export class InMemoryDelegationRepository implements DelegationRepository {
   readonly #rows = new Map<string, AgentDelegation>();
   readonly #batches = new Map<string, StoredBatch>();
   readonly #idFactory: () => string;
+
+  /** Opaque version-pinned storage data, never a public output projection. */
+  public exportState(): string { return encodeStorageState({ rows: this.#rows, batches: this.#batches }); }
+  public importState(text: string): void {
+    const shape = { rows: this.#rows, batches: this.#batches };
+    const saved = decodeStorageState(text) as typeof shape;
+    this.#rows.clear(); for (const [key, value] of saved.rows) this.#rows.set(key, value);
+    this.#batches.clear(); for (const [key, value] of saved.batches) this.#batches.set(key, value);
+  }
 
   public constructor(idFactory: () => string = () => globalThis.crypto.randomUUID()) {
     this.#idFactory = idFactory;

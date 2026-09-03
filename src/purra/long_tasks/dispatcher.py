@@ -349,20 +349,25 @@ class RecipeLongTaskDispatcher:
                 raise RuntimeError("durable_task_scope_conflict")
             _require_same_recipe(active, recipe)
             return active
-        recent = await self._long_tasks.list_for_owner(
-            namespace=descriptor.namespace,
-            owner_id=descriptor.owner_id,
-            kind=recipe.kind,
-            limit=20,
+        reusable = await self._long_tasks.find_by_idempotency_key(
+            descriptor.namespace,
+            descriptor.idempotency_key,
         )
-        reusable = next((
-            task
-            for task in recent
-            if task.metadata.get("idempotencyKey") == descriptor.idempotency_key
-            and _same_optional_text(task.metadata.get("sessionId"), session_id)
-            and task.status in {LongTaskStatus.COMPLETED, LongTaskStatus.FAILED}
-        ), None)
         if reusable is not None:
+            if (
+                reusable.owner_id != descriptor.owner_id
+                or reusable.kind != recipe.kind
+                or not _same_optional_text(
+                    reusable.metadata.get("sessionId"),
+                    session_id,
+                )
+            ):
+                raise RuntimeError("durable_task_scope_conflict")
+            if reusable.status not in {
+                LongTaskStatus.COMPLETED,
+                LongTaskStatus.FAILED,
+            }:
+                raise RuntimeError("durable_task_scope_conflict")
             if reusable.budget_limits != descriptor.budget_limits:
                 raise RuntimeError("durable_task_scope_conflict")
             _require_same_recipe(reusable, recipe)

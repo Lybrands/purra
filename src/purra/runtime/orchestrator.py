@@ -42,6 +42,7 @@ from purra.contracts import (
     ModelFinishReason,
     ModelInvocation,
     ModelTokenUsage,
+    PlanningMode,
     ReasoningMode,
     ResponseConstraints,
     RuntimeLimits,
@@ -71,9 +72,16 @@ from purra.model_invocation import (
     AgentModelInvocationManager,
     ModelInvocationContext,
 )
+from purra.model_invocation.evidence import bind_model_input_evidence
 from purra.model_invocation.manager import ModelInvocationOutputObserver
 from purra.model_protocol import InvocationOutputLimit, classify_model_termination
-from purra.output.contracts import ResponseTransactionMode
+from purra.planning_activation import (
+    AUTO_PLANNING_TOOL_NAME,
+    AUTO_REMAINING_PLANNING_TOOL_NAME,
+    AutoPlanningRequest,
+    resolve_planning_activation,
+)
+from purra.output.contracts import AgentOutputIntent, ResponseTransactionMode
 from purra.operations import (
     AgentOperationController,
     OperationScope,
@@ -132,6 +140,7 @@ from purra.ports import (
     ConversationCompactor,
     EventSink,
     ModelGateway,
+    ModelInputEvidenceValidator,
     ResponseJudge,
     ResponseValidator,
     RuntimeObserver,
@@ -140,7 +149,7 @@ from purra.ports import (
 )
 
 
-RuntimeUpdate = AgentEvent | AgentRuntimeResult
+RuntimeUpdate = AgentEvent | AgentRuntimeResult | AutoPlanningRequest
 
 
 def _match_tool_retry_links(
@@ -213,6 +222,7 @@ class _RuntimeLoopState:
     tool_finish: bool = False
     request_fingerprint: str = ""
     emitted_delta_count: int = 0
+    initial_planning_open: bool = True
 
 
 class AgentRuntime:
@@ -230,6 +240,7 @@ class AgentRuntime:
         operation_controller: AgentOperationController | None = None,
         output_observer: ModelInvocationOutputObserver | None = None,
         model_manager: AgentModelInvocationManager | None = None,
+        evidence_validator: ModelInputEvidenceValidator | None = None,
     ):
         self._model_manager = model_manager or AgentModelInvocationManager(
             model_gateway,
@@ -237,6 +248,7 @@ class AgentRuntime:
             operation_controller=operation_controller,
             invocation_timeout_ms=limits.provider_invocation_timeout_ms,
             runtime_limits=limits,
+            evidence_validator=evidence_validator,
         )
         self._tool_execution_gateway = tool_execution_gateway
         self._observer = observer
@@ -268,15 +280,21 @@ class AgentRuntime:
         require_tool_call: bool | None = None,
         tools_executable: bool = True,
         planning_hook: RuntimePlanningHook | None = None,
+        planning_mode: PlanningMode = PlanningMode.REACTIVE,
+        planning_available: bool = False,
+        planning_required_tool_names: frozenset[str] = frozenset(),
+        model_round_limit: int | None = None,
         tool_context_contracts: Mapping[str, ToolContextContract] | None = None,
         tool_argument_limits: Mapping[str, int] | None = None,
         stage_context_projection_enabled: bool = False,
         resume_checkpoint: AgentExecutionCheckpoint | None = None,
         checkpoint_writer: (
-            Callable[[AgentExecutionCheckpoint], Awaitable[None]] | None
+            Callable[[AgentExecutionCheckpoint], Awaitable[AgentExecutionCheckpoint | None]] | None
         ) = None,
+        checkpoint_handler: Callable[[AgentExecutionCheckpoint], Awaitable[AgentExecutionCheckpoint]] | None = None,
         signal: CancellationSignal | None = None,
     ) -> AsyncIterator[RuntimeUpdate]:
+        planning_mode = PlanningMode(planning_mode)
         if not request.model.protocol_capabilities.reasoning_mode_is_supported(
             reasoning_mode
         ):
@@ -303,6 +321,7 @@ class AgentRuntime:
             require_tool_call=require_tool_call,
             tool_context_contracts=tool_context_contracts,
             tool_argument_limits=tool_argument_limits,
+            model_round_limit=model_round_limit,
         )
         start_round_index = 0
         if resume_checkpoint is not None:
@@ -312,6 +331,11 @@ class AgentRuntime:
                     code="agent_execution_checkpoint_conflict",
                 )
             self._restore_checkpoint(loop, resume_checkpoint)
+            if checkpoint_handler is not None:
+                resumed = await checkpoint_handler(resume_checkpoint)
+                if resumed.run_id != resume_checkpoint.run_id:
+                    raise ValueError("checkpoint handler changed Run identity")
+                self._restore_checkpoint(loop, resumed)
             start_round_index = resume_checkpoint.next_round - 1
             if start_round_index >= loop.absolute_round_limit:
                 yield _runtime_result(
@@ -416,6 +440,7 @@ class AgentRuntime:
                 response_constraints=response_constraints,
                 output_limit=output_limit,
                 planning_hook=planning_hook,
+                planning_mode=planning_mode,
                 signal=signal,
                 run_id=run_id,
             ):
@@ -425,6 +450,20 @@ class AgentRuntime:
                 return
             if loop.retry_round:
                 continue
+
+            activation = await self._resolve_planning_activation(
+                loop,
+                planning_mode=planning_mode,
+                planning_available=planning_available,
+                planning_required_tool_names=planning_required_tool_names,
+                run_id=run_id,
+            )
+            if isinstance(activation, AgentRuntimeResult):
+                yield activation
+                return
+            if activation is not None:
+                yield activation
+                return
 
             async for event in self._authorize_tool_batch(
                 loop,
@@ -452,10 +491,17 @@ class AgentRuntime:
             if loop.terminal_result is not None:
                 yield loop.terminal_result
                 return
-            if checkpoint_writer is not None and planning_hook is None:
+            if planning_mode is PlanningMode.AUTO and loop.calls:
+                loop.initial_planning_open = False
+            if checkpoint_writer is not None:
                 checkpoint = self._build_execution_checkpoint(loop, run_id)
                 if checkpoint is not None:
-                    await checkpoint_writer(checkpoint)
+                    checkpoint = await checkpoint_writer(checkpoint) or checkpoint
+                    if checkpoint_handler is not None:
+                        updated = await checkpoint_handler(checkpoint)
+                        if updated.run_id != checkpoint.run_id:
+                            raise ValueError("checkpoint handler changed Run identity")
+                        self._restore_checkpoint(loop, updated)
 
         yield _runtime_result(
             run_id,
@@ -463,6 +509,86 @@ class AgentRuntime:
             loop.used_model,
             loop.round_limit,
             error_code="max_model_rounds",
+        )
+
+    async def _resolve_planning_activation(
+        self,
+        loop: _RuntimeLoopState,
+        *,
+        planning_mode: PlanningMode,
+        planning_available: bool,
+        planning_required_tool_names: frozenset[str],
+        run_id: RunId | None,
+    ) -> AutoPlanningRequest | AgentRuntimeResult | None:
+        if not loop.tool_finish or not loop.calls:
+            return None
+        resolution = resolve_planning_activation(
+            loop.calls,
+            mode=planning_mode,
+            planning_available=planning_available,
+            planning_required_tool_names=planning_required_tool_names,
+            initial_planning_open=loop.initial_planning_open,
+        )
+        if resolution.error_code is not None:
+            return _runtime_result(
+                run_id,
+                RuntimeOutcome.FAILED,
+                loop.used_model,
+                loop.round_number,
+                error_code=resolution.error_code,
+            )
+        if resolution.trigger is None:
+            return None
+        phase = (
+            "remaining"
+            if resolution.trigger.startswith("remaining_")
+            else "initial"
+        )
+        accumulator = loop.accumulator
+        if accumulator is not None and accumulator.content.strip():
+            await self._model_manager.publish_model_stream_commentary(
+                loop.stream.receipt.output_stream_id
+            )
+        checkpoint = None
+        if phase == "remaining":
+            if accumulator is not None and accumulator.content.strip():
+                loop.messages.append(AgentMessage(
+                    role=MessageRole.ASSISTANT,
+                    content=accumulator.content,
+                ))
+            checkpoint = self._build_execution_checkpoint(loop, run_id)
+            if checkpoint is None:
+                return _runtime_result(
+                    run_id,
+                    RuntimeOutcome.FAILED,
+                    loop.used_model,
+                    loop.round_number,
+                    error_code="remaining_planning_checkpoint_unavailable",
+                )
+        requested_names = frozenset(call.name for call in loop.calls)
+        await self._trace(
+            "planning_activation",
+            resolution.trigger,
+            details={
+                "round": loop.round_number,
+                "requestedToolNames": sorted(
+                    name
+                    for name in requested_names
+                    if name not in {
+                        AUTO_PLANNING_TOOL_NAME,
+                        AUTO_REMAINING_PLANNING_TOOL_NAME,
+                    }
+                ),
+            },
+        )
+        return AutoPlanningRequest(
+            run_id=run_id,
+            model=loop.used_model,
+            round_count=loop.round_number,
+            trigger=resolution.trigger,
+            requested_tool_names=resolution.requested_tool_names,
+            phase=phase,
+            resume_checkpoint=checkpoint,
         )
 
     def _restore_checkpoint(
@@ -496,6 +622,10 @@ class AgentRuntime:
         )
         loop.last_tool_outcome = checkpoint.last_tool_outcome
         loop.pending_tool_input_retries = checkpoint.pending_tool_input_retries
+        loop.initial_planning_open = checkpoint.initial_planning_open
+        loop.dynamic_replan_pending = checkpoint.dynamic_replan_pending
+        loop.pending_recovery_error_code = checkpoint.pending_recovery_error_code
+        loop.failed_tool_recovery_error_code = checkpoint.failed_tool_recovery_error_code
 
     def _build_execution_checkpoint(
         self,
@@ -527,6 +657,10 @@ class AgentRuntime:
                 public_presentation_pending=loop.public_presentation_pending,
                 last_tool_outcome=loop.last_tool_outcome,
                 pending_tool_input_retries=loop.pending_tool_input_retries,
+                initial_planning_open=loop.initial_planning_open,
+                dynamic_replan_pending=loop.dynamic_replan_pending,
+                pending_recovery_error_code=loop.pending_recovery_error_code,
+                failed_tool_recovery_error_code=loop.failed_tool_recovery_error_code,
             )
         except (TypeError, ValueError):
             # Domain state is explicitly host-owned and may not be JSON. Such
@@ -572,7 +706,7 @@ class AgentRuntime:
             )
         loop.requested_names = authorization.requested_names
         if authorization.disposition is ToolAuthorizationDisposition.RETRY_MODEL:
-            loop.messages.extend(authorization.messages)
+            loop.messages.extend(accumulator.continuation(authorization.messages))
             loop.retry_round = True
             return
         if authorization.disposition is ToolAuthorizationDisposition.REPLAN:
@@ -580,7 +714,7 @@ class AgentRuntime:
             loop.pending_recovery_error_code = authorization.error_code
             loop.failed_tool_recovery_error_code = authorization.error_code
             loop.dynamic_replan_pending = True
-            loop.messages.extend(authorization.messages)
+            loop.messages.extend(accumulator.continuation(authorization.messages))
             loop.retry_round = True
             return
         if authorization.disposition is ToolAuthorizationDisposition.REJECT:
@@ -658,7 +792,13 @@ class AgentRuntime:
                     run_id=run_id,
                     invocation_id=loop.stream.receipt.invocation_id,
                     calls=loop.calls,
-                    allowed_tool_names=loop.allowed_names,
+                    allowed_tool_names=(
+                        loop.allowed_names
+                        - {
+                            AUTO_PLANNING_TOOL_NAME,
+                            AUTO_REMAINING_PLANNING_TOOL_NAME,
+                        }
+                    ),
                     state=loop.execution_state,
                     retry_of_tool_call_ids=retry_links,
                 ),
@@ -803,6 +943,7 @@ class AgentRuntime:
             batch_result.results,
             content="" if loop.require_tool else accumulator.content,
             reasoning=accumulator.reasoning,
+            provider_data=accumulator.provider_data,
         ))
         recovery = resolve_tool_recovery(
             batch_result,
@@ -865,6 +1006,7 @@ class AgentRuntime:
         response_constraints: ResponseConstraints,
         output_limit: InvocationOutputLimit | None,
         planning_hook: RuntimePlanningHook | None,
+        planning_mode: PlanningMode,
         signal: CancellationSignal | None,
         run_id: RunId | None,
     ) -> AsyncIterator[AgentEvent]:
@@ -938,7 +1080,7 @@ class AgentRuntime:
                     details=dict(trace.details),
                 )
             if protocol.disposition is ToolAuthorizationDisposition.RETRY_MODEL:
-                loop.messages.extend(protocol.messages)
+                loop.messages.extend(accumulator.continuation(protocol.messages))
                 loop.retry_round = True
                 return
             if protocol.disposition is ToolAuthorizationDisposition.REPLAN:
@@ -946,7 +1088,7 @@ class AgentRuntime:
                 loop.pending_recovery_error_code = protocol.error_code
                 loop.failed_tool_recovery_error_code = protocol.error_code
                 loop.dynamic_replan_pending = True
-                loop.messages.extend(protocol.messages)
+                loop.messages.extend(accumulator.continuation(protocol.messages))
                 loop.retry_round = True
                 return
             if protocol.disposition is ToolAuthorizationDisposition.REJECT:
@@ -962,6 +1104,7 @@ class AgentRuntime:
             async for event in self._finalize_model_response(
                 loop,
                 response_constraints=response_constraints,
+                planning_mode=planning_mode,
                 signal=signal,
                 run_id=run_id,
             ):
@@ -972,6 +1115,7 @@ class AgentRuntime:
         loop: _RuntimeLoopState,
         *,
         response_constraints: ResponseConstraints,
+        planning_mode: PlanningMode,
         signal: CancellationSignal | None,
         run_id: RunId | None,
     ) -> AsyncIterator[AgentEvent]:
@@ -1001,7 +1145,7 @@ class AgentRuntime:
                     details=dict(trace.details),
                 )
             if recovery.disposition is ResponseFinalizationDisposition.RETRY_MODEL:
-                loop.messages.extend(recovery.messages)
+                loop.messages.extend(accumulator.continuation(recovery.messages))
                 loop.retry_round = True
             else:
                 loop.terminal_result = _runtime_result(
@@ -1134,7 +1278,7 @@ class AgentRuntime:
                     loop.response_repair_pending = (
                         constraint_recovery.response_repair_pending
                     )
-                    loop.messages.extend(constraint_recovery.messages)
+                    loop.messages.extend(accumulator.continuation(constraint_recovery.messages))
                     loop.retry_round = True
                 else:
                     loop.terminal_result = _runtime_result(
@@ -1147,10 +1291,33 @@ class AgentRuntime:
                 return
 
         final_response = accumulator.content
+        if (
+            planning_mode is PlanningMode.AUTO
+            and loop.transaction_mode is ResponseTransactionMode.DIRECT_LIVE
+            and loop.stream is not None
+            and loop.stream.receipt.output_intent
+            is AgentOutputIntent.STRUCTURED_PRIVATE
+        ):
+            await self._model_manager.publish_model_stream_final(
+                loop.stream.receipt.output_stream_id
+            )
+            if self._observer is not None and final_response:
+                await self._observer.on_model_delta()
+            loop.terminal_result = _runtime_result(
+                run_id,
+                RuntimeOutcome.COMPLETED,
+                loop.used_model,
+                loop.round_number,
+                final_response=final_response,
+            )
+            return
         presentation_messages = public_presentation_messages(
             content=final_response,
             reasoning=accumulator.reasoning,
-            invocation_had_tools=bool(attempt.invocation.tools),
+            invocation_had_tools=any(
+                tool.name != AUTO_PLANNING_TOOL_NAME
+                for tool in attempt.invocation.tools
+            ),
             buffered_model_content=loop.buffer_model_content,
             transaction_mode=loop.transaction_mode,
             already_pending=loop.public_presentation_pending,
@@ -1158,7 +1325,7 @@ class AgentRuntime:
         if presentation_messages:
             loop.public_presentation_pending = True
             loop.round_limit += 1
-            loop.messages.extend(presentation_messages)
+            loop.messages.extend(accumulator.continuation(presentation_messages))
             loop.retry_round = True
             return
         if loop.buffer_model_content:
@@ -1197,26 +1364,29 @@ class AgentRuntime:
             invocation,
         )
         try:
-            stream = await self._model_manager.stream(
-                attempt.messages,
-                _agent_model_call(
-                    invocation,
-                    require_tool=attempt.require_tool,
-                    requires_full_text_validation=bool(
-                        attempt.buffer_model_content
-                        or loop.validators
-                        or loop.judges
+            with bind_model_input_evidence(
+                loop.evidence_store.context_receipts()
+            ):
+                stream = await self._model_manager.stream(
+                    attempt.messages,
+                    _agent_model_call(
+                        invocation,
+                        require_tool=attempt.require_tool,
+                        requires_full_text_validation=bool(
+                            attempt.buffer_model_content
+                            or loop.validators
+                            or loop.judges
+                        ),
                     ),
-                ),
-                replace(
-                    loop.invocation_context,
-                    attempt_source_key=(
-                        f"runtime:{loop.invocation_context.run_id}:"
-                        f"round:{loop.round_number}:request:{request_fingerprint}"
+                    replace(
+                        loop.invocation_context,
+                        attempt_source_key=(
+                            f"runtime:{loop.invocation_context.run_id}:"
+                            f"round:{loop.round_number}:request:{request_fingerprint}"
+                        ),
                     ),
-                ),
-                signal,
-            )
+                    signal,
+                )
             parameters = stream.receipt.call_parameters[0]
             host_planned_dispatch = (
                 parameters.get("executionRoute")
@@ -1608,6 +1778,21 @@ class AgentRuntime:
                 schema
                 for schema in loop.configured_tools
                 if schema.name in allowed_names
+                and (
+                    schema.name not in {
+                        AUTO_PLANNING_TOOL_NAME,
+                        AUTO_REMAINING_PLANNING_TOOL_NAME,
+                    }
+                    or (
+                        loop.initial_planning_open
+                        and schema.name == AUTO_PLANNING_TOOL_NAME
+                    )
+                    or (
+                        not loop.initial_planning_open
+                        and schema.name
+                        == AUTO_REMAINING_PLANNING_TOOL_NAME
+                    )
+                )
             )
         )
         require_tool = bool(
@@ -1644,35 +1829,38 @@ class AgentRuntime:
         compression_outcome: str | None = None
         compression_strategy: str | None = None
         if token_budget is not None and self._context_compressor is not None:
-            compressed = await await_with_cancellation(
-                self._context_compressor.prepare(
-                    replace(
-                        request,
-                        messages=projection.messages,
-                        metadata={
-                            **request.metadata,
-                            "contextCompressionScope": "runtime",
-                            "runtimeLogicalRound": loop.logical_round_number + 1,
-                        },
-                    ),
-                    signal,
-                    budget=ContextCompactionBudget(
-                        phase=ContextCompactionPhase.MODEL_CALL,
-                        provider_input_tokens=token_budget,
-                        context_tokens=0,
-                        context_tokens_are_resolved=True,
-                        output_reserve_tokens=(
-                            context_budget.output_reserve_tokens
-                            if context_budget is not None
-                            else 1
+            with bind_model_input_evidence(
+                loop.evidence_store.context_receipts()
+            ):
+                compressed = await await_with_cancellation(
+                    self._context_compressor.prepare(
+                        replace(
+                            request,
+                            messages=projection.messages,
+                            metadata={
+                                **request.metadata,
+                                "contextCompressionScope": "runtime",
+                                "runtimeLogicalRound": loop.logical_round_number + 1,
+                            },
+                        ),
+                        signal,
+                        budget=ContextCompactionBudget(
+                            phase=ContextCompactionPhase.MODEL_CALL,
+                            provider_input_tokens=token_budget,
+                            context_tokens=0,
+                            context_tokens_are_resolved=True,
+                            output_reserve_tokens=(
+                                context_budget.output_reserve_tokens
+                                if context_budget is not None
+                                else 1
+                            ),
+                        ),
+                        operation_scope=OperationScope(
+                            run_id=loop.invocation_context.run_id,
                         ),
                     ),
-                    operation_scope=OperationScope(
-                        run_id=loop.invocation_context.run_id,
-                    ),
-                ),
-                signal,
-            )
+                    signal,
+                )
             round_messages = compressed.request.messages
             sent_tokens = estimate_agent_messages_tokens(round_messages)
             dropped_messages = max(
@@ -1814,6 +2002,7 @@ class AgentRuntime:
         require_tool_call: bool | None,
         tool_context_contracts: Mapping[str, ToolContextContract] | None,
         tool_argument_limits: Mapping[str, int] | None,
+        model_round_limit: int | None,
     ) -> _RuntimeLoopState:
         messages = list(request.messages)
         validators = tuple(response_validators)
@@ -1851,6 +2040,13 @@ class AgentRuntime:
                 details={"receiptCount": len(context_receipts)},
             )
         configured_tools = tuple(tools) if request.tools_enabled else ()
+        resolved_round_limit = (
+            self._limits.max_model_rounds
+            if model_round_limit is None
+            else int(model_round_limit)
+        )
+        if resolved_round_limit < 1:
+            raise ValueError("model round limit must be positive")
         return _RuntimeLoopState(
             messages=messages,
             invocation_context=ModelInvocationContext(
@@ -1877,9 +2073,9 @@ class AgentRuntime:
             ),
             provider_required_tool_choice_enabled=bool(force_tool_choice),
             recovery_ledger=RecoveryLedger(self._recovery_policy),
-            round_limit=self._limits.max_model_rounds,
+            round_limit=resolved_round_limit,
             absolute_round_limit=(
-                self._limits.max_model_rounds
+                resolved_round_limit
                 + self._limits.max_progress_rounds
                 + provider_retry_round_capacity(self._recovery_policy)
                 + 1

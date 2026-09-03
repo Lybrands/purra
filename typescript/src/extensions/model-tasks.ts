@@ -1,4 +1,11 @@
 import { AgentOperationController } from "../operations/index.js";
+import { estimateMessagesTokens } from "../context/budget.js";
+import type {
+  ContextEvidenceReceipt,
+  ModelInputEvidenceValidator,
+} from "../context/types.js";
+import { PLANNING_STREAM_SCHEMA, PlanningStreamParser, type PlanningProgress, type PlanningScope } from "../planning/stream.js";
+import type { JsonValue } from "../model/types.js";
 import type { OperationReceipt } from "../operations/index.js";
 import {
   EMPTY_RESPONSE_RETRY_GUIDANCE,
@@ -11,7 +18,11 @@ import type {
   ModelInvocationReceipt,
 } from "../run/types.js";
 import { AgentCanceledError, AgentError } from "../shared/errors.js";
-import { invokeModel, type ModelStreamLimits } from "../model/stream.js";
+import {
+  constrainModelInvocationTimeout,
+  invokeModel,
+  type ModelStreamLimits,
+} from "../model/stream.js";
 import type {
   InvocationOutputLimit,
   Message,
@@ -30,6 +41,9 @@ import {
 
 type ManagedModelRequest = ModelRequest & { readonly outputLimit: InvocationOutputLimit };
 
+export const REJECTED_PLANNER_OUTPUT = Symbol("rejectedPlannerOutput");
+export type PlannerOutputError = AgentError & { readonly [REJECTED_PLANNER_OUTPUT]?: string };
+
 export interface ModelTaskInvocationAuthority {
   readonly runId: string;
   openInvocation(input: InvocationReceiptInput): Promise<ModelInvocationReceipt>;
@@ -44,7 +58,10 @@ export interface ModelTaskInvocationAuthority {
     status: "completed" | "failed",
     turn?: ModelTurn,
     errorCode?: string,
+    usage?: ModelTokenUsage,
   ): Promise<void>;
+  persistPlanningProgress?(receipt: ModelInvocationReceipt, progress: PlanningProgress): Promise<boolean>;
+  recordModelDiagnostics?(receipt: ModelInvocationReceipt, metrics: Readonly<Record<string, JsonValue>>): Promise<void>;
   publishRecoveryDecision(decision: RecoveryDecision, round: number): Promise<void>;
 }
 
@@ -55,6 +72,8 @@ export interface ModelTaskRunnerOptions {
   readonly operations?: AgentOperationController;
   readonly authority?: ModelTaskInvocationAuthority;
   readonly runtimeLimits?: ModelStreamLimits;
+  readonly maxCallOutputTokens?: number;
+  readonly evidenceValidator?: ModelInputEvidenceValidator;
 }
 
 export interface ModelTaskOptions {
@@ -64,6 +83,13 @@ export interface ModelTaskOptions {
 
 export interface ModelTaskStreamTextOptions extends ModelTaskOptions {
   readonly onChunk?: (chunk: ModelStreamChunk) => Promise<void> | void;
+}
+
+export interface ModelTaskPlanOptions extends ModelTaskOptions {
+  readonly scope?: PlanningScope;
+  readonly attempt?: number;
+  readonly validatePlan?: (plan: Readonly<Record<string, JsonValue>>) => void;
+  readonly attemptTimeoutMs?: number;
 }
 
 export interface ModelTaskCompletion {
@@ -88,6 +114,9 @@ export class ModelTaskRunner {
   readonly #operations: AgentOperationController | undefined;
   readonly #authority: ModelTaskInvocationAuthority | undefined;
   readonly #runtimeLimits: ModelStreamLimits | undefined;
+  readonly #maxCallOutputTokens: number | undefined;
+  readonly #evidenceValidator: ModelInputEvidenceValidator | undefined;
+  #contextEvidence: readonly ContextEvidenceReceipt[] = Object.freeze([]);
 
   public constructor(options: ModelTaskRunnerOptions) {
     if (typeof options?.model?.invoke !== "function") {
@@ -117,10 +146,22 @@ export class ModelTaskRunner {
     this.#operations = options.operations;
     this.#authority = options.authority;
     this.#runtimeLimits = options.runtimeLimits;
+    this.#maxCallOutputTokens = options.maxCallOutputTokens;
+    if (
+      options.evidenceValidator !== undefined
+      && typeof options.evidenceValidator.validateEvidence !== "function"
+    ) {
+      throw new TypeError("evidenceValidator must implement validateEvidence");
+    }
+    this.#evidenceValidator = options.evidenceValidator;
   }
 
   public get runId(): string {
     return this.#runId;
+  }
+
+  public bindEvidence(receipts: readonly ContextEvidenceReceipt[]): void {
+    this.#contextEvidence = copyEvidence(receipts);
   }
 
   public async complete(
@@ -129,6 +170,66 @@ export class ModelTaskRunner {
   ): Promise<ModelTaskCompletion> {
     const request = this.#request(messages, options.maxCallOutputTokens);
     const turn = await this.#invoke(request, options.signal, false);
+    return Object.freeze({ turn, outputLimit: request.outputLimit });
+  }
+
+  public async plan(messages: readonly Message[], options: ModelTaskPlanOptions = {}): Promise<ModelTaskCompletion> {
+    if (typeof this.#model.stream !== "function" || this.#capabilities?.protocol.streaming !== "supported") {
+      throw new AgentError("model_stream_unavailable", "Planner requires a streaming Gateway");
+    }
+    if (options.scope !== undefined && options.scope.runId !== this.#runId) {
+      throw new AgentError("planning_scope_conflict", "Planning scope belongs to another Run");
+    }
+    if (options.scope !== undefined && this.#authority !== undefined && this.#authority.persistPlanningProgress === undefined) {
+      throw new AgentError("planning_output_unavailable", "Planning authority cannot persist public projections");
+    }
+    const attempt = options.attempt ?? 0;
+    if (!Number.isSafeInteger(attempt) || attempt < 0) throw new TypeError("Invalid planning attempt");
+    const parser = new PlanningStreamParser();
+    let rejectedOutput = "";
+    let retainedCharacters = 0;
+    let trailingHighSurrogate = false;
+    const started = performance.now();
+    const metrics: Record<string, JsonValue> = { attemptStartedAtMs: Date.now(), firstPublicProgressMs: null, planReceivedMs: null, rejectedPublicProgressRecords: 0, validationMs: null };
+    const request = this.#request(messages, options.maxCallOutputTokens);
+    const turn = await this.#invoke(request, options.signal, true, async (chunk, receipt) => {
+      for (const character of chunk.contentDelta ?? "") {
+        const joinsSurrogate = trailingHighSurrogate && /^[\udc00-\udfff]$/u.test(character);
+        if (retainedCharacters === 65_536 && !joinsSurrogate) break;
+        rejectedOutput += character;
+        retainedCharacters += joinsSurrogate ? 0 : 1;
+        trailingHighSurrogate = /^[\ud800-\udbff]$/u.test(character);
+      }
+      if ((chunk.toolCallDeltas?.length ?? 0) > 0) {
+        throw new AgentError("model_task_tool_call_unsupported", "Planner cannot call tools");
+      }
+      const records = parser.feed(chunk.contentDelta ?? "");
+      metrics.rejectedPublicProgressRecords = parser.rejectedProgressRecords;
+      if (parser.planReceived && metrics.planReceivedMs === null) metrics.planReceivedMs = performance.now() - started;
+      for (const record of records) {
+        if (options.signal?.aborted === true) throw new AgentCanceledError();
+        if (receipt !== undefined && options.scope !== undefined) {
+          const published = await this.#authority!.persistPlanningProgress!(receipt, record);
+          if (published && metrics.firstPublicProgressMs === null) metrics.firstPublicProgressMs = performance.now() - started;
+        }
+      }
+    }, {
+      outputProtocol: PLANNING_STREAM_SCHEMA,
+      ...(options.scope === undefined ? {} : { planningScope: options.scope }),
+      planningAttempt: attempt,
+    }, () => {
+      const plan = parser.finish();
+      metrics.rejectedPublicProgressRecords = parser.rejectedProgressRecords;
+      if (metrics.planReceivedMs === null) metrics.planReceivedMs = performance.now() - started;
+      const validationStarted = performance.now();
+      try { options.validatePlan?.(plan); }
+      finally { metrics.validationMs = performance.now() - validationStarted; }
+    }, metrics, options.attemptTimeoutMs).catch((error: unknown) => {
+      if (error instanceof AgentError && ["invalid_planner_output", "invalid_planning_stream"].includes(error.code)) {
+        Object.defineProperty(error, REJECTED_PLANNER_OUTPUT, { value: rejectedOutput, configurable: true });
+      }
+      throw error;
+    });
     return Object.freeze({ turn, outputLimit: request.outputLimit });
   }
 
@@ -201,7 +302,7 @@ export class ModelTaskRunner {
   ): ManagedModelRequest {
     const outputLimit = resolveInvocationOutputLimit(
       this.#capabilities,
-      maxCallOutputTokens,
+      maxCallOutputTokens ?? this.#maxCallOutputTokens,
     );
     if (outputLimit === undefined) {
       throw new AgentError(
@@ -209,8 +310,12 @@ export class ModelTaskRunner {
         "Model task requires capabilities with an exact output limit",
       );
     }
+    const copied = Object.freeze(copyMessages(messages));
+    if (estimateMessagesTokens(copied) + outputLimit.maxTokens > this.#capabilities!.contextWindowTokens) {
+      throw new AgentError("model_task_input_exceeds_budget", "Model task input and output reserve exceed the model window");
+    }
     return Object.freeze({
-      messages: Object.freeze(copyMessages(messages)),
+      messages: copied,
       tools: Object.freeze([]),
       ...(this.#capabilities === undefined ? {} : { capabilitySnapshot: this.#capabilities }),
       outputLimit,
@@ -221,22 +326,33 @@ export class ModelTaskRunner {
     request: ManagedModelRequest,
     signal: AbortSignal | undefined,
     useStream: boolean,
-    onChunk?: (chunk: ModelStreamChunk) => Promise<void> | void,
+    onChunk?: (chunk: ModelStreamChunk, receipt?: ModelInvocationReceipt) => Promise<void> | void,
+    planning?: Pick<InvocationReceiptInput, "outputProtocol" | "planningScope" | "planningAttempt">,
+    validateTurn?: () => void,
+    diagnostics?: Record<string, JsonValue>,
+    invocationTimeoutMs?: number,
   ): Promise<ModelTurn> {
+    const evidence = this.#contextEvidence;
     const receipt = await this.#authority?.openInvocation({
       messages: request.messages,
       tools: request.tools,
-      evidence: Object.freeze([]),
+      evidence,
       capabilityProfileId: this.#capabilities?.profileId ?? null,
       outputLimit: request.outputLimit.maxTokens,
+      ...planning,
     });
     let operation: OperationReceipt | undefined;
     let chunkIndex = 0;
     let turn: ModelTurn;
+    let latestUsage: ModelTokenUsage | undefined;
+    let settled = false;
+    let diagnosticsRecorded = false;
     try {
+      await validateEvidence(this.#evidenceValidator, evidence, signal);
       operation = await this.#operations?.start("model", {
         runId: this.#runId,
         ...(receipt === undefined ? {} : { invocationId: receipt.invocationId }),
+        ...(planning?.planningScope === undefined ? {} : { parentOperationId: planning.planningScope.operationId }),
       });
       turn = await invokeModel(
         this.#model,
@@ -244,27 +360,43 @@ export class ModelTaskRunner {
         signal,
         useStream,
         async (chunk) => {
+          latestUsage = chunk.usage ?? latestUsage;
           if (receipt !== undefined) {
             await this.#authority!.persistChunk(receipt, chunkIndex, chunk);
             chunkIndex += 1;
           }
-          await onChunk?.(chunk);
+          await onChunk?.(chunk, receipt);
         },
-        this.#runtimeLimits,
+        invocationTimeoutMs === undefined
+          ? this.#runtimeLimits
+          : constrainModelInvocationTimeout(
+            this.#runtimeLimits,
+            invocationTimeoutMs,
+          ),
+        diagnostics === undefined ? undefined : (metrics) => { Object.assign(diagnostics, metrics); },
       );
       assertNoToolCalls(turn);
+      validateTurn?.();
+      if (signal?.aborted === true) throw new AgentCanceledError();
       if (receipt !== undefined && !useStream) {
         await this.#authority!.persistCompletion(receipt, turn);
       }
+      if (receipt !== undefined && diagnostics !== undefined) {
+        diagnosticsRecorded = true;
+        await this.#authority!.recordModelDiagnostics?.(receipt, diagnostics);
+      }
       if (receipt !== undefined) {
+        settled = true;
         await this.#authority!.settleInvocation(receipt, "completed", turn);
       }
     } catch (error) {
-      if (receipt !== undefined) {
+      let failure = error;
+      if (receipt !== undefined && !settled) {
         try {
-          await this.#authority!.settleInvocation(receipt, "failed", undefined, errorCode(error));
-        } catch {
-          // The terminal Run commit fences a receipt left open by persistence failure.
+          settled = true;
+          await this.#authority!.settleInvocation(receipt, "failed", undefined, errorCode(error), latestUsage);
+        } catch (terminationError) {
+          if (planning !== undefined) failure = planningTerminationFailure(failure, terminationError);
         }
       }
       if (operation !== undefined) {
@@ -274,15 +406,61 @@ export class ModelTaskRunner {
           } else {
             await this.#operations!.fail(operation.operationId, errorCode(error));
           }
-        } catch {
-          // Operation persistence failure must not replace the selected model outcome.
+        } catch (terminationError) {
+          if (planning !== undefined) failure = planningTerminationFailure(failure, terminationError);
         }
       }
-      throw error;
+      if (receipt !== undefined && diagnostics !== undefined && !diagnosticsRecorded) {
+        try { await this.#authority!.recordModelDiagnostics?.(receipt, diagnostics); }
+        catch { /* Keep the original invocation failure. */ }
+      }
+      throw failure;
     }
     if (operation !== undefined) await this.#operations!.succeed(operation.operationId);
     return turn;
   }
+}
+
+function copyEvidence(
+  values: readonly ContextEvidenceReceipt[],
+): readonly ContextEvidenceReceipt[] {
+  if (!Array.isArray(values)) throw new TypeError("context evidence must be an array");
+  const byId = new Map<string, ContextEvidenceReceipt>();
+  for (const raw of values) {
+    if (raw === null || typeof raw !== "object") throw new TypeError("Invalid context evidence");
+    const evidenceId = requiredText(raw.evidenceId, "evidence id");
+    const receipt = Object.freeze({
+      evidenceId,
+      ...(raw.contextBlock === undefined ? {} : { contextBlock: requiredText(raw.contextBlock, "evidence contextBlock") }),
+      source: requiredText(raw.source, "evidence source"),
+      ...(raw.itemId === undefined ? {} : { itemId: requiredText(raw.itemId, "evidence itemId") }),
+      ...(raw.version === undefined ? {} : { version: requiredText(raw.version, "evidence version") }),
+    });
+    const existing = byId.get(evidenceId);
+    if (existing !== undefined && JSON.stringify(existing) !== JSON.stringify(receipt)) {
+      throw new TypeError(`Conflicting evidence id: ${evidenceId}`);
+    }
+    byId.set(evidenceId, receipt);
+  }
+  return Object.freeze([...byId.values()]);
+}
+
+async function validateEvidence(
+  validator: ModelInputEvidenceValidator | undefined,
+  receipts: readonly ContextEvidenceReceipt[],
+  signal: AbortSignal | undefined,
+): Promise<void> {
+  if (validator === undefined || receipts.length === 0) return;
+  throwIfAborted(signal);
+  await validator.validateEvidence(
+    receipts,
+    signal === undefined ? {} : { signal },
+  );
+  throwIfAborted(signal);
+}
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted === true) throw new AgentCanceledError();
 }
 
 function assertNoToolCalls(turn: ModelTurn): void {
@@ -305,6 +483,17 @@ function assertAuthority(value: ModelTaskInvocationAuthority): void {
 
 function errorCode(error: unknown): string {
   return error instanceof AgentError ? error.code : "model_task_failed";
+}
+
+function planningTerminationFailure(error: unknown, terminationError: unknown): unknown {
+  const repairableCodes = ["invalid_planner_output", "invalid_planning_stream"];
+  if (!(error instanceof AgentError) || !repairableCodes.includes(error.code)) return error;
+  return new AgentError(
+    terminationError instanceof AgentError && !repairableCodes.includes(terminationError.code)
+      ? terminationError.code : "output_persistence_failed",
+    "Planning termination could not be persisted",
+    { cause: new AggregateError([error, terminationError]) },
+  );
 }
 
 function requiredText(value: unknown, label: string): string {

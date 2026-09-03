@@ -1,0 +1,172 @@
+{
+  "response": {
+    "id": "chatcmpl_fixture",
+    "object": "chat.completion",
+    "created": 1,
+    "model": "fixture-model",
+    "choices": [
+      {
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "先查资料。",
+          "tool_calls": [
+            {
+              "id": "call_lookup",
+              "type": "function",
+              "function": {
+                "name": "lookup",
+                "arguments": "{\"query\":\"中文\"}"
+              }
+            }
+          ]
+        },
+        "finish_reason": "tool_calls"
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 30,
+      "completion_tokens": 20,
+      "total_tokens": 50,
+      "prompt_tokens_details": {
+        "cached_tokens": 7
+      },
+      "completion_tokens_details": {
+        "reasoning_tokens": 4
+      }
+    }
+  },
+  "events": [
+    {
+      "id": "chatcmpl_fixture",
+      "object": "chat.completion.chunk",
+      "created": 1,
+      "model": "fixture-model",
+      "choices": [
+        {
+          "index": 0,
+          "delta": {
+            "role": "assistant",
+            "content": ""
+          },
+          "finish_reason": null
+        }
+      ]
+    },
+    {
+      "id": "chatcmpl_fixture",
+      "object": "chat.completion.chunk",
+      "created": 1,
+      "model": "fixture-model",
+      "choices": [
+        {
+          "index": 0,
+          "delta": {
+            "content": "先查资料。"
+          },
+          "finish_reason": null
+        }
+      ]
+    },
+    {
+      "id": "chatcmpl_fixture",
+      "object": "chat.completion.chunk",
+      "created": 1,
+      "model": "fixture-model",
+      "choices": [
+        {
+          "index": 0,
+          "delta": {
+            "tool_calls": [
+              {
+                "index": 0,
+                "id": "call_lookup",
+                "type": "function",
+                "function": {
+                  "name": "lookup",
+                  "arguments": ""
+                }
+              }
+            ]
+          },
+          "finish_reason": null
+        }
+      ]
+    },
+    {
+      "id": "chatcmpl_fixture",
+      "object": "chat.completion.chunk",
+      "created": 1,
+      "model": "fixture-model",
+      "choices": [
+        {
+          "index": 0,
+          "delta": {
+            "tool_calls": [
+              {
+                "index": 0,
+                "function": {
+                  "arguments": "{\"query\":"
+                }
+              }
+            ]
+          },
+          "finish_reason": null
+        }
+      ]
+    },
+    {
+      "id": "chatcmpl_fixture",
+      "object": "chat.completion.chunk",
+      "created": 1,
+      "model": "fixture-model",
+      "choices": [
+        {
+          "index": 0,
+          "delta": {
+            "tool_calls": [
+              {
+                "index": 0,
+                "function": {
+                  "arguments": "\"中文\"}"
+                }
+              }
+            ]
+          },
+          "finish_reason": null
+        }
+      ]
+    },
+    {
+      "id": "chatcmpl_fixture",
+      "object": "chat.completion.chunk",
+      "created": 1,
+      "model": "fixture-model",
+      "choices": [
+        {
+          "index": 0,
+          "delta": {},
+          "finish_reason": "tool_calls"
+        }
+      ]
+    },
+    {
+      "id": "chatcmpl_fixture",
+      "object": "chat.completion.chunk",
+      "created": 1,
+      "model": "fixture-model",
+      "choices": [],
+      "usage": {
+        "prompt_tokens": 30,
+        "completion_tokens": 20,
+        "total_tokens": 50,
+        "prompt_tokens_details": {
+          "cached_tokens": 7
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 4
+        }
+      }
+    }
+  ]
+}

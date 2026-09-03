@@ -136,6 +136,8 @@ def _budget_message_mapping(message: AgentMessage) -> dict[str, Any]:
         ]
     if message.tool_call_id is not None:
         value["tool_call_identifier"] = message.tool_call_id
+    if message.provider_data:
+        value["provider_continuation_data"] = thaw_json_mapping(message.provider_data)
     return value
 
 

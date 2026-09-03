@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import fields
 from time import perf_counter
 from typing import Sequence
 
@@ -10,6 +11,8 @@ from purra.contracts import (
     AgentMessage,
     AgentRunRequest,
     PlanningCapabilities,
+    PlanningConstraints,
+    ContextBlock,
     PlanningTurn,
     ReasoningMode,
     StepExecutor,
@@ -37,6 +40,7 @@ from purra.run_controller import AgentRunController
 from purra.run_state import RunStateMachine
 from purra.timing import duration_ms
 
+from purra.planning_context import planning_operation, current_planning_context
 from .planning_validation import validate_plan_authority
 
 
@@ -54,7 +58,11 @@ class DynamicPlanningOrchestrator:
         registrations: Sequence[ToolRegistration],
         turn_id: str | None = None,
         reasoning_mode: ReasoningMode = ReasoningMode.DEFAULT,
+        operations=None,
+        model_manager=None,
     ) -> None:
+        self._operations = operations
+        self._model_manager = model_manager
         self._planner = planner
         self._request = request
         self._capabilities = capabilities
@@ -65,6 +73,36 @@ class DynamicPlanningOrchestrator:
         self._reasoning_mode = ReasoningMode(reasoning_mode)
         self._revision = 0
 
+    def checkpoint_state(self):
+        capabilities = self._capabilities
+        return {
+            "revision": self._revision,
+            "available_tool_names": sorted(capabilities.available_tool_names),
+            "model_supports_tools": capabilities.model_supports_tools,
+            "tool_guidance": dict(capabilities.tool_guidance),
+            "planning_context_blocks": [
+                {f.name: getattr(block, f.name) for f in fields(block)}
+                for block in capabilities.planning_context_blocks
+            ],
+            "constraints": {
+                f.name: (sorted(value) if isinstance(value, frozenset) else value)
+                for f in fields(capabilities.constraints)
+                for value in (getattr(capabilities.constraints, f.name),)
+            },
+        }
+
+    def restore_checkpoint_state(self, state):
+        if type(state["revision"]) is not int or state["revision"] < 0:
+            raise ValueError("Invalid planning checkpoint revision")
+        self._revision = state["revision"]
+        self._capabilities = PlanningCapabilities(
+            available_tool_names=state["available_tool_names"],
+            model_supports_tools=state["model_supports_tools"],
+            tool_guidance=state["tool_guidance"],
+            planning_context_blocks=tuple(ContextBlock(**block) for block in state["planning_context_blocks"]),
+            constraints=PlanningConstraints(**state["constraints"]),
+        )
+
     async def replan_after_tool(
         self,
         messages: Sequence[AgentMessage],
@@ -74,8 +112,14 @@ class DynamicPlanningOrchestrator:
         outcome: ToolBatchOutcome,
         signal: CancellationSignal | None = None,
     ) -> AgentMessage:
-        started = perf_counter()
         self._revision += 1
+        async with planning_operation(controller=self._controller, operations=self._operations,
+                model_manager=self._model_manager, revision=self._revision, signal=signal):
+            return await self._replan(messages, round_number=round_number,
+                remaining_model_rounds=remaining_model_rounds, outcome=outcome, signal=signal)
+
+    async def _replan(self, messages, *, round_number, remaining_model_rounds, outcome, signal):
+        started = perf_counter()
         snapshot = self._controller.snapshot
         if snapshot is None:
             raise ContractViolationError("dynamic planning requires a live run")
@@ -120,11 +164,7 @@ class DynamicPlanningOrchestrator:
             )
         except (InvalidPlannerOutputError, ModelGatewayError) as error:
             reason_code = getattr(error, "code", "replanning_failed")
-            validation_reason = (
-                str(error)[:240]
-                if isinstance(error, InvalidPlannerOutputError)
-                else None
-            )
+            current_planning_context().fail(reason_code)
             if outcome is ToolBatchOutcome.FAILED:
                 recovery_plan = safe_model_only_plan(
                     title=snapshot.title,
@@ -159,7 +199,6 @@ class DynamicPlanningOrchestrator:
                         "round": round_number,
                         "errorType": type(error).__name__,
                         "reasonCode": reason_code,
-                        "validationReason": validation_reason,
                         "fallbackToolCount": 0,
                     },
                     duration_ms=duration_ms(started),
@@ -202,13 +241,13 @@ class DynamicPlanningOrchestrator:
                     "round": round_number,
                     "errorType": type(error).__name__,
                     "reasonCode": reason_code,
-                    "validationReason": validation_reason,
                     "remainingStepCount": len(remaining_steps),
                     "trustedPlanToolCount": fallback_tool_count,
                 },
                 duration_ms=duration_ms(started),
             ))
             return build_execution_message(fallback_plan)
+        current_planning_context().validation_started = perf_counter()
         if planning.model_call_parameters:
             for parameters in planning.model_call_parameters:
                 await self._controller.record_event(

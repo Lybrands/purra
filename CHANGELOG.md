@@ -1,6 +1,149 @@
 # Changelog
 
-## 0.5.0 - 2026-08-27
+## 0.5.0 — Unreleased
+
+- Added optional Python/TypeScript components: `purra-openai` (Responses and Chat
+  Completions, official SDKs Python 3.7.0 / TypeScript 7.9.0), `purra-anthropic`
+  (Messages, signed thinking continuation, official SDKs Python 1.3.0 / TypeScript
+  0.123.0), `purra-compaction` (one managed semantic
+  summary call), `purra-sqlite` (transactional Run/output/operations, budgets,
+  checkpoints, leases, tool receipts, Agent trees, Artifacts and Long Tasks), and
+  `purra-interaction` (structured questions, persisted user answers and checkpoint
+  resume). Native interaction supports Auto/Reactive/Planned and nested Agent trees,
+  preserving Run identity, budget, deadline, plan progress and revision state. Waiting
+  children release leases; recovery resolves their canonical delegation results
+  before parent execution. Cancellation closes the complete Root scope. A separate callback API supports host-owned
+  pre-execution handoff. SQLite uses bounded project snapshots; large/high-throughput
+  journals need indexed row storage.
+- Added `MemoryWorkflow` to `purra-mem0`, composing pending extraction, semantic
+  review and explicit host-authorized resolution through the existing journal.
+- Added private Provider continuation data to messages, terminal stream chunks
+  and execution checkpoints. It is included in context budgeting and excluded
+  from TypeScript public message projections.
+
+### Planner streaming and public progress
+
+- Replace policy and business-text activation with the breaking three-mode
+  contract `auto | reactive | planned`. Auto is the default and uses the first
+  ordinary Agent invocation. Before business execution, private sole-call
+  `request_plan` can promote the Run. After a committed business tool, private
+  `request_remaining_plan` can plan only unfinished work from the checkpoint.
+  A planning-required tool promotes before its effect. No separate classifier
+  call or legacy alias is retained. Explicit Planned without a Planner fails closed.
+- Remove `ReactivePlanningPolicy`, `ToolPlanningPolicy` and policy-owned
+  `should_plan` / `shouldPlan` activation. Optional PlanningPolicy objects now
+  constrain an activated planning phase, including Auto promotion; no legacy
+  alias is retained.
+- Use bounded `purra.planning-stream/v1` records in the same managed Provider
+  invocation for initial planning, dynamic revision and finite repair in both SDKs.
+  Non-streaming Gateways fail explicitly; no extra explanatory model call.
+- Persist provider-origin `planning.progress` with exact raw-byte provenance,
+  Run/phase/revision/attempt identity, deduplication, replay and existing budgets.
+  Keep private plans and reasoning private; publish admitted plan summaries only.
+- Core owns `planning` operation lifecycle through validation, compilation and
+  admission. Link model operations with `parentOperationId`, preserve Host
+  observers, fence late output and close unfinished operations on Run termination.
+- Record private first-activity/public-progress/final-plan/validation timings and
+  optional typed Adapter HTTP evidence. Do not infer HTTP timing or speedups.
+- Add shared protocol/lifecycle fixtures, cancellation/failure tests, public
+  examples and independent installed-package checks. No downstream activation or
+  real-Provider performance verification is implied.
+- Accept one complete final `plan` at a normally terminated Provider EOF without
+  requiring trailing LF. Unterminated progress, partial JSON and abnormal stream
+  termination still fail closed; Python and TypeScript share the same fixture.
+
+### Native Agent public progress
+
+- Add opt-in Provider-authored progress on ordinary Agent streams, independent
+  of answer text and reasoning. Persist its private source delta before the
+  public `purra.agent-progress/v1` projection, using existing Run output budgets.
+- Reject undeclared capability use, planning-stream mixing, rewritten content,
+  source mismatches, cross-Run output and late terminal writes. Providers without
+  this capability emit no native Agent progress.
+
+### Optional Mem0 integration (local, unpublished)
+
+- Add bounded administration filters and pagination, host metadata and reasons,
+  explicit record selection/context assembly, and versioned relations between
+  records. These operations reuse the component's scope and lifecycle checks.
+- Added opt-in Python/TypeScript Chinese evaluation scripts and nine shared
+  synthetic tasks, with a no-memory baseline, strict evidence scoring, bounded
+  real-provider transports and metadata-only interrupted-trial reports. SDK smoke
+  checks exercise the evaluator with substitutes; real quality is still unverified.
+- Added opt-in bounded semantic review of pending candidates through the managed
+  model/Run bridge. Strict classifications produce durable advice without changing
+  memory; host-authorized proposals automatically carry a review link and require
+  full-snapshot revalidation at execution. Budgets, cancellation, crash abandonment
+  and replay reuse the existing operation journal. Add single-candidate independent
+  resolution; uncertain or ambiguous classifications do not produce a proposal.
+- Added explicit duplicate/supersession/conflict resolution with expected versions,
+  atomic journal visibility and durable decision receipts in both languages.
+  Originals remain separate in Mem0; reads honor effective journal states and
+  old evidence invalidates. No implicit approval or generated text union.
+- Added durable source revision/whole-ID withdrawal, including future-revision
+  denial, blocked reingestion and late-write filtering. Explicit full-text
+  correction can use an accepted new source; audit history is retained.
+- Revalidate existing Core memory evidence for version, store/scope, lifecycle,
+  expiry and source availability. Fresh memory context uses this guard; host
+  checkpoint recovery still requires explicit wiring. Search uses bounded
+  overfetch to filter revoked vectors without unbounded retries.
+- Added opt-in managed OSS providers in both languages: durable pre-call quotas,
+  exact output-limit acknowledgments, reported/unknown usage receipts, sticky
+  SDK fallback failures, and cancellation that blocks subsequent provider calls.
+  Run-bound LLM calls reuse the existing model-task runner; Embedding remains a
+  separate accounted capability. Raw SDK mode still reports unknown usage.
+
+- Add separately packaged Python and TypeScript `purra-mem0` components, pinned
+  to the tested OSS SDK versions without changing Core's dependencies.
+- Add scoped CRUD/history, pending extraction and explicit activation, source
+  revisions, expiry filtering, version checks, durable write fencing,
+  idempotency and read-back/reconciliation of uncertain SDK writes.
+- Reuse RetrieverTool, context allocation and evidence receipts. Keep inferred
+  candidates out of recall and unknown SDK usage out of zero-cost accounting.
+- Add shared fixtures, failure tests and real-SDK/local-store smoke tests with
+  deterministic Providers. Full erasure, deployment billing validation and real
+  semantic quality evaluation remain unfinished production gates.
+
+### Retrieval contracts
+
+- Add public Python and TypeScript `Retriever`, `RetrievalRequest`,
+  `RetrievalHit`, `RetrievalError`, and `RetrieverTool` contracts.
+- Adapt each Retriever through the existing `ToolRegistration` or
+  `ToolDefinition` path without adding another Catalog or execution system.
+- Keep model-owned input limited to `query`; bind result count, Run identity,
+  and authorized scope from the host, and mark all model-visible hits as
+  untrusted data.
+- Fail closed on invalid or oversized results, preserve source/id/version
+  evidence, propagate cancellation, and expose stable sanitized retrieval
+  error codes.
+- Leave databases, chunking, Embedding, indexing, hybrid search, reranking,
+  credentials, and index synchronization to applications or optional
+  integration packages.
+
+### TypeScript context recovery
+
+- Restore resolved ContextProvider blocks and their source receipts at Reactive
+  Child Run `model_ready` checkpoints without requerying providers or replaying
+  completed retrieval tools.
+- Reuse normal context projection after recovery, recompute input reserves from
+  the rebound model/tools/output limit, and retain spent compaction counts.
+  Oversized protected input or invalid compression fails before model invocation.
+- Upgrade TypeScript `AgentExecutionCheckpoint` to schema v2 with required
+  `context` (`PreparedContextSnapshot` or explicit `null`). Reject v1 and incomplete
+  snapshots without migration; Python's unchanged checkpoint format remains v1.
+
+### Planner evidence and summary lifecycle
+
+- Feed resolved single-pass context and recent tool observations into the built-in
+  TypeScript Planner. Bound observations to the latest eight, with 4,000-character
+  Unicode excerpts, explicit truncation, and Run-scoped full-message references.
+- Keep retrieved planning context and observations outside the privileged planning
+  contract; preserve complete tool results in canonical messages.
+- Retain validated TypeScript compression summaries and provenance across rounds
+  and v2 checkpoints. Hooks receive `previousSummary`; omitted `summary` retains,
+  an object replaces, and `null` clears. Failed projections keep the old summary.
+- Reject private model tasks whose estimated input plus output reserve exceeds
+  the model window before invoking the Provider.
 
 ### Unambiguous output-token contracts
 
@@ -184,7 +327,7 @@
 - Added a public managed model-task runner and per-execution context/compaction
   factories; submitted extension calls reuse the same Run receipts and budgets.
 - Added optional TypeScript-native model Planner and response-judge helpers;
-  host Planner/Judge ports remain supported and Reactive stays the default.
+  host Planner/Judge ports remain supported.
 - Re-audited the documented alpha capability matrix and refreshed one exact
   packed candidate through npm, pnpm, Yarn, Bun, and a strict installed-package
   consumer covering the managed extension composition path.

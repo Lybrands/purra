@@ -214,6 +214,7 @@ function messageForBudget(message: Message): Readonly<Record<string, JsonValue>>
     role: message.role,
     content: message.content,
     ...(message.reasoning === undefined ? {} : { structured_reasoning_content: message.reasoning }),
+    ...(message.providerData === undefined ? {} : { provider_continuation_data: message.providerData }),
     ...(message.toolCalls === undefined
       ? {}
       : {

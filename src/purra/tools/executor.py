@@ -462,6 +462,9 @@ class CoreToolExecutor:
                 max_chars=self._limits.max_result_chars,
             )
             effects = () if handler_error else handler_result.effects
+            context_evidence = (
+                () if handler_error else handler_result.context_evidence
+            )
             result = ToolCallResult(
                 tool_call_id=parsed.call.id,
                 tool_name=parsed.call.name,
@@ -470,6 +473,7 @@ class CoreToolExecutor:
                 approval_status=approval_status,
                 error=handler_error,
                 effects=effects,
+                context_evidence=context_evidence,
                 step_disposition=handler_result.step_disposition,
                 planning_disposition=(
                     handler_result.planning_disposition

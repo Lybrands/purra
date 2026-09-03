@@ -1,5 +1,9 @@
 import { prepareContext, resolveContextFactories } from "../context/coordinator.js";
-import type { PreparedContext } from "../context/types.js";
+import type {
+  ContextEvidenceReceipt,
+  ModelInputEvidenceValidator,
+  PreparedContext,
+} from "../context/types.js";
 import { ModelTaskRunner } from "../extensions/model-tasks.js";
 import { invokeModel, type ModelStreamLimits } from "../model/stream.js";
 import type { Message, ModelTurn, ToolSpec } from "../model/types.js";
@@ -34,6 +38,7 @@ export class DynamicDelegatedAgentExecutor {
   readonly #sessions = new Map<string, RunSession>();
   readonly #useStream: boolean;
   readonly #runtimeLimits: ModelStreamLimits | undefined;
+  readonly #evidenceValidator: ModelInputEvidenceValidator | undefined;
 
   public constructor(options: DynamicDelegatedAgentExecutorOptions) {
     if (typeof options.model?.invoke !== "function") {
@@ -61,6 +66,13 @@ export class DynamicDelegatedAgentExecutor {
     this.#recovery = options.recovery ?? new RecoveryPolicy();
     this.#operations = options.operations;
     this.#runtimeLimits = options.runtimeLimits;
+    if (
+      options.evidenceValidator !== undefined
+      && typeof options.evidenceValidator.validateEvidence !== "function"
+    ) {
+      throw new TypeError("evidenceValidator must implement validateEvidence");
+    }
+    this.#evidenceValidator = options.evidenceValidator;
     this.#useStream = typeof options.model.stream === "function"
       && this.#capabilities?.protocol.streaming !== "unavailable";
   }
@@ -104,10 +116,10 @@ export class DynamicDelegatedAgentExecutor {
       }),
     ];
     const outputLimit = resolveInvocationOutputLimit(this.#capabilities, undefined);
-    const contextOptions = this.#contextForExecution(request.runId, session);
-    const context = contextOptions === undefined
+    const contextBinding = this.#contextForExecution(request.runId, session);
+    const context = contextBinding === undefined
       ? undefined
-      : await prepareContext(contextOptions, {
+      : await prepareContext(contextBinding.options, {
           request: {
             messages,
             enabledTools,
@@ -122,7 +134,16 @@ export class DynamicDelegatedAgentExecutor {
           ...(signal === undefined ? {} : { signal }),
         });
     try {
-      return await this.#run(request, session, messages, tools, enabledTools, context, signal);
+      return await this.#run(
+        request,
+        session,
+        messages,
+        tools,
+        enabledTools,
+        context,
+        contextBinding?.modelTasks,
+        signal,
+      );
     } catch (error) {
       if (signal?.aborted || error instanceof AgentCanceledError) {
         return Object.freeze({ outcome: "canceled", errorCode: "delegation_canceled" });
@@ -137,15 +158,22 @@ export class DynamicDelegatedAgentExecutor {
   #contextForExecution(runId: string, session: RunSession) {
     const options = this.#context;
     if (options === undefined) return undefined;
-    if (options.providerFactory === undefined && options.compressionFactory === undefined) return options;
-    return resolveContextFactories(options, new ModelTaskRunner({
+    if (options.providerFactory === undefined && options.compressionFactory === undefined) {
+      return Object.freeze({ options, modelTasks: undefined });
+    }
+    const modelTasks = new ModelTaskRunner({
       model: this.#model,
       runId,
       recovery: this.#recovery,
       authority: session,
       ...(this.#runtimeLimits === undefined ? {} : { runtimeLimits: this.#runtimeLimits }),
       ...(this.#operations === undefined ? {} : { operations: this.#operations }),
-    }));
+      ...(this.#evidenceValidator === undefined ? {} : { evidenceValidator: this.#evidenceValidator }),
+    });
+    return Object.freeze({
+      options: resolveContextFactories(options, modelTasks),
+      modelTasks,
+    });
   }
 
   async #run(
@@ -155,13 +183,16 @@ export class DynamicDelegatedAgentExecutor {
     tools: readonly ToolSpec[],
     enabledTools: readonly string[],
     context: PreparedContext | undefined,
+    modelTasks: ModelTaskRunner | undefined,
     signal: AbortSignal | undefined,
   ): Promise<DelegatedAgentResult> {
     const outputLimit = resolveInvocationOutputLimit(this.#capabilities, undefined);
     let publicPresentationPending = false;
     let roundLimit = this.#maxRounds;
+    let activeEvidence = context?.evidence ?? Object.freeze([]);
     for (let round = 1; round <= roundLimit; round += 1) {
       if (signal?.aborted) throw new AgentCanceledError();
+      modelTasks?.bindEvidence(activeEvidence);
       const projected = context === undefined
         ? Object.freeze([...messages])
         : await context.project(messages, signal);
@@ -174,13 +205,14 @@ export class DynamicDelegatedAgentExecutor {
       const receipt = await session.openInvocation({
         messages: modelRequest.messages,
         tools: modelRequest.tools,
-        evidence: context?.evidence ?? [],
+        evidence: activeEvidence,
         capabilityProfileId: this.#capabilities?.profileId ?? null,
         outputLimit: outputLimit?.maxTokens ?? null,
       });
       let turn: ModelTurn;
       let chunkIndex = 0;
       try {
+        await validateEvidence(this.#evidenceValidator, activeEvidence, signal);
         turn = await invokeModel(
           this.#model,
           modelRequest,
@@ -249,9 +281,36 @@ export class DynamicDelegatedAgentExecutor {
         ),
       });
       messages.push(...batch.messages);
+      activeEvidence = mergeEvidence(activeEvidence, batch.contextEvidence);
     }
     throw new AgentError("max_rounds_exceeded", "Delegated Agent exceeded its model round limit");
   }
+}
+
+function mergeEvidence(
+  first: readonly ContextEvidenceReceipt[],
+  second: readonly ContextEvidenceReceipt[],
+): readonly ContextEvidenceReceipt[] {
+  const result = new Map<string, ContextEvidenceReceipt>();
+  for (const receipt of [...first, ...second]) {
+    const existing = result.get(receipt.evidenceId);
+    if (existing !== undefined && JSON.stringify(existing) !== JSON.stringify(receipt)) {
+      throw new TypeError(`Conflicting evidence id: ${receipt.evidenceId}`);
+    }
+    result.set(receipt.evidenceId, Object.freeze({ ...receipt }));
+  }
+  return Object.freeze([...result.values()]);
+}
+
+async function validateEvidence(
+  validator: ModelInputEvidenceValidator | undefined,
+  receipts: readonly ContextEvidenceReceipt[],
+  signal: AbortSignal | undefined,
+): Promise<void> {
+  if (validator === undefined || receipts.length === 0) return;
+  if (signal?.aborted) throw new AgentCanceledError();
+  await validator.validateEvidence(receipts, signal === undefined ? {} : { signal });
+  if (signal?.aborted) throw new AgentCanceledError();
 }
 
 function inputSuffix(input: Readonly<Record<string, import("../model/types.js").JsonValue>>): string {

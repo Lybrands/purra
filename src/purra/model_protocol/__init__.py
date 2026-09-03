@@ -48,3 +48,7 @@ __all__ = [
     "preflight_capabilities",
     "resolve_invocation_output_limit",
 ]
+
+from purra.model_protocol.diagnostics import ModelTransportDiagnostics
+
+__all__ = [*__all__, "ModelTransportDiagnostics"]

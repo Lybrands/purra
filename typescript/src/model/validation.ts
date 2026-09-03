@@ -65,7 +65,13 @@ export function validateModelStreamChunk(chunk: ModelStreamChunk): ModelStreamCh
   try {
     const contentDelta = optionalString(chunk.contentDelta, "content delta");
     const reasoningDelta = optionalString(chunk.reasoningDelta, "reasoning delta");
+    const progressDelta = optionalString(chunk.progressDelta, "progress delta");
     const finishReason = chunk.finishReason;
+    const providerData = chunk.providerData === undefined
+      ? undefined : copyJsonMapping(chunk.providerData as Readonly<Record<string, JsonValue>>, "provider data");
+    if (providerData !== undefined && (finishReason === undefined || JSON.stringify(providerData).length > 1_000_000)) {
+      throw new TypeError("Provider data requires a terminal chunk and must fit the size limit");
+    }
     if (finishReason !== undefined && !includes(FINISH_REASONS, finishReason)) {
       throw new TypeError("Invalid finish reason");
     }
@@ -79,11 +85,13 @@ export function validateModelStreamChunk(chunk: ModelStreamChunk): ModelStreamCh
     return Object.freeze({
       ...(contentDelta === undefined ? {} : { contentDelta }),
       ...(reasoningDelta === undefined ? {} : { reasoningDelta }),
+      ...(progressDelta === undefined ? {} : { progressDelta }),
       ...(toolCallDeltas === undefined
         ? {}
         : { toolCallDeltas: Object.freeze(toolCallDeltas) }),
       ...(finishReason === undefined ? {} : { finishReason }),
       ...(usage === undefined ? {} : { usage }),
+      ...(providerData === undefined ? {} : { providerData }),
     });
   } catch (error) {
     if (error instanceof AgentError) throw error;
@@ -143,6 +151,11 @@ export function copyCapabilitySnapshot(value: ModelCapabilitySnapshot): ModelCap
       ),
       streaming: enumValue(FEATURE_SUPPORT, protocol.streaming, "streaming support"),
       cancellation: enumValue(FEATURE_SUPPORT, protocol.cancellation, "cancellation support"),
+      publicProgress: enumValue(
+        FEATURE_SUPPORT,
+        protocol.publicProgress ?? "unknown",
+        "public progress support",
+      ),
       assistantContentWithToolCalls: enumValue(
         ASSISTANT_CONTENT_WITH_TOOL_CALLS,
         protocol.assistantContentWithToolCalls,
@@ -278,6 +291,8 @@ function copyMessage(message: Message): Message {
   const attributes = message.attributes === undefined
     ? undefined
     : copyJsonMapping(message.attributes, "message attributes");
+  const providerData = message.providerData === undefined
+    ? undefined : copyJsonMapping(message.providerData, "provider data");
   return Object.freeze({
     role: message.role,
     content: copyJsonValue(message.content),
@@ -285,6 +300,7 @@ function copyMessage(message: Message): Message {
     ...(toolCallId === undefined ? {} : { toolCallId }),
     ...(toolCalls === undefined ? {} : { toolCalls: Object.freeze(toolCalls) }),
     ...(attributes === undefined ? {} : { attributes }),
+    ...(providerData === undefined ? {} : { providerData }),
   });
 }
 

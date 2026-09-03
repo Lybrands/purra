@@ -18,14 +18,17 @@ import {
   ModelWorkPlanner,
   RecipeLongTaskDispatcher,
   RecoveryPolicy,
+  RetrievalError,
+  RetrieverTool,
   RunCommandService,
-  ToolPlanningPolicy,
   type JsonValue,
   type AgentRuntimeLimits,
   type AgentRuntimeLimitSnapshot,
   type AgentExecutionCheckpoint,
+  type ContextCompressionHook,
   type LongTaskDispatchReceipt,
   type ModelGateway,
+  type PreparedContextSnapshot,
   type ModelStreamActivity,
   type ModelStreamActivityKind,
   type ModelStreamActivitySupport,
@@ -33,9 +36,18 @@ import {
   type ModelStreamLimits,
   type DelegationRepository,
   type OutputEvent,
+  type PlanningMode,
+  type ToolPlanningRequirement,
+  type RetrievalHit,
+  type RetrievalRequest,
+  type Retriever,
   type RunHandle,
   type ToolDefinition,
 } from "purra";
+
+"auto" satisfies PlanningMode;
+"planned" satisfies PlanningMode;
+"required" satisfies ToolPlanningRequirement;
 
 const typedActivityKind = "working" satisfies ModelStreamActivityKind;
 "working" satisfies ModelStreamActivitySupport;
@@ -58,13 +70,32 @@ const typedRuntimeLimits = {
   runTimeoutMs: 900_000,
 } satisfies AgentRuntimeLimits;
 typedRuntimeLimits satisfies AgentRuntimeLimitSnapshot;
+const typedContextSnapshot = {
+  blocks: [{ name: "facts", content: "installed evidence", untrusted: true,
+    evidence: [{ evidenceId: "fact", source: "installed", version: "1" }],
+  }],
+  contextAllocations: { facts: 128 },
+  compactions: 1,
+  summary: { name: "summary", content: "installed summary", untrusted: true,
+    evidence: [{ evidenceId: "summary", source: "installed", version: "1" }],
+  },
+} satisfies PreparedContextSnapshot;
+const typedCompression: ContextCompressionHook = {
+  compress({ messages, previousSummary }) {
+    return { messages, summary: previousSummary === null ? null : { ...previousSummary, untrusted: true } };
+  },
+};
+typedCompression satisfies ContextCompressionHook;
 const typedExecutionCheckpoint = {
-  schemaVersion: 1,
+  schemaVersion: 2,
   runId: "typed-checkpoint",
   phase: "model_ready",
   executionProfile: "reactive",
+  initialPlanningOpen: false,
   nextRound: 2,
   messages: [{ role: "user", content: "resume" }],
+  context: typedContextSnapshot,
+  contextEvidence: [],
   responseAttempts: 0,
   recoveryAttempts: [],
 } satisfies AgentExecutionCheckpoint;
@@ -132,6 +163,28 @@ const tools: readonly ToolDefinition[] = [{
   policy: { mode: "read", title: "Look up" },
   run() { return { content: { found: true }, effectState: "not_started" }; },
 }];
+const installedRetriever: Retriever = {
+  async retrieve(request: RetrievalRequest) {
+    const hits: readonly RetrievalHit[] = [{
+      id: "installed-hit",
+      content: request.query,
+      source: "installed-consumer",
+      untrusted: true,
+      metadata: {},
+    }];
+    return hits;
+  },
+};
+new RetrieverTool({
+  retriever: installedRetriever,
+  name: "searchInstalledKnowledge",
+  description: "Search installed knowledge.",
+}).definition satisfies ToolDefinition;
+new RetrievalError(
+  "retrieval_timeout",
+  "retrieval timed out",
+  { retryable: true },
+).retryable satisfies boolean;
 
 const handle: RunHandle = await new Agent({
   model,
@@ -145,7 +198,6 @@ const handle: RunHandle = await new Agent({
     },
   },
   planning: {
-    policy: new ToolPlanningPolicy(),
     planner: {
       createPlan() {
         return {
@@ -166,6 +218,7 @@ const handle: RunHandle = await new Agent({
   },
 }).submit({
   messages: [{ role: "user", content: "hello" }],
+  planningMode: "planned",
 }, {
   budgets: { maxRunOutputTokens: null },
 });
@@ -415,3 +468,14 @@ function capabilities() {
     },
   };
 }
+
+import { PlanningStreamParser, PLANNING_STREAM_SCHEMA,
+  type PlanningScope, type PlanningProgress, type ModelTaskPlanOptions, type ModelTransportDiagnostics,
+} from "purra";
+const planningScope: PlanningScope = { runId: "typed", operationId: "phase", revision: 0 };
+const planningProgress: PlanningProgress = { text: "Intent", recordIndex: 1, sourceStart: 0, sourceEnd: 44 };
+const planOptions: ModelTaskPlanOptions = { scope: planningScope, attempt: 0, validatePlan: () => undefined };
+const transport: ModelTransportDiagnostics = { requestSentAtMs: 1000, firstByteAtMs: 1001, httpAttempts: 1 };
+PLANNING_STREAM_SCHEMA satisfies "purra.planning-stream/v1";
+new PlanningStreamParser().feed("") satisfies readonly PlanningProgress[];
+void [planningProgress, planOptions, transport];

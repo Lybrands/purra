@@ -1,5 +1,6 @@
 import type { JsonValue } from "./model/types.js";
 import { AgentError } from "./shared/errors.js";
+import { UserInputRequired } from "./interaction.js";
 import {
   AgentCapabilityGrant,
   type AgentNode,
@@ -76,12 +77,13 @@ export class AgentTreeRunSupervisor {
     }
     let requester = await this.#repository.getRun(requesterId);
     if (requester.status === "waiting") {
-      this.#repository.requireRunClaim(requesterId, claim);
+      await this.#repository.requireRunClaim(requesterId, claim);
     } else {
       requester = await this.#repository.markWaiting(requesterId, claim);
     }
     const pending = new Set(targets);
     const active = new Map<Promise<void>, string>();
+    const attempted = new Set<string>();
     let joined = false;
     try {
       while (pending.size > 0) {
@@ -94,7 +96,7 @@ export class AgentTreeRunSupervisor {
           return aggregate;
         }
         for (const candidate of await this.#repository.listRunnable(requester.rootRunId)) {
-          if (!pending.has(candidate.runId)) continue;
+          if (!pending.has(candidate.runId) || attempted.has(candidate.runId)) continue;
           const claimed = await this.#repository.claimRun(candidate.runId, {
             ownerId: this.#ownerId,
             leaseDurationMs: this.#leaseDurationMs,
@@ -102,8 +104,10 @@ export class AgentTreeRunSupervisor {
           if (claimed === undefined) continue;
           const task = this.#executeClaimed(claimed, signal);
           active.set(task, claimed.runId);
+          attempted.add(claimed.runId);
         }
         if (active.size === 0) {
+          if ([...pending].every(id => attempted.has(id))) { joined = true; return aggregate; }
           throw new AgentError(
             "agent_run_scheduler_stalled",
             "Child Run scheduler made no progress",
@@ -147,6 +151,10 @@ export class AgentTreeRunSupervisor {
     try {
       result = validateResult(await this.#executeWithHeartbeat(run, agent, checkpoint, signal));
     } catch (error) {
+      if (error instanceof UserInputRequired) {
+        await this.#repository.suspendRun(run.runId, { leaseOwnerId: run.leaseOwnerId!, leaseEpoch: run.leaseEpoch });
+        return;
+      }
       if (isAbort(error)) {
         await this.#repository.cancelSubtree(run.runId);
         throw error;

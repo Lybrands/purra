@@ -414,6 +414,7 @@ class ModelRoundAccumulator:
         self._reasoning_cache: str | None = None
         self.finish_reason: ModelFinishReason | None = None
         self.usage: ModelTokenUsage | None = None
+        self.provider_data: dict[str, Any] = {}
         self._calls: dict[int, _ToolCallParts] = {}
         self._malformed_reason: str | None = None
 
@@ -446,6 +447,8 @@ class ModelRoundAccumulator:
         )
 
     def add(self, chunk) -> None:
+        if chunk.provider_data is not None:
+            self.provider_data = thaw_json_mapping(chunk.provider_data)
         if chunk.content_delta:
             self._content_fragments.append(chunk.content_delta)
             self._content_cache = None
@@ -495,4 +498,12 @@ class ModelRoundAccumulator:
                 for parts in ordered
             ),
             None,
+        )
+
+    def continuation(self, messages: Sequence[AgentMessage]) -> tuple[AgentMessage, ...]:
+        """Preserve opaque provider state when a settled turn needs repair."""
+        return tuple(
+            replace(message, provider_data=self.provider_data)
+            if message.role.value == "assistant" and self.provider_data else message
+            for message in messages
         )

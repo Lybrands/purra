@@ -20,6 +20,8 @@ from purra.contracts import (
     ToolSchema,
 )
 from purra.errors import ContractViolationError
+from purra.evidence import ContextEvidenceReceipt
+from purra.model_invocation.evidence import bind_model_input_evidence
 from purra.cancellation import ExecutionDeadlineExceeded
 from purra.model_protocol import generic_capability_snapshot
 from purra.operations import (
@@ -171,6 +173,18 @@ class _FailingOpenObserver(_Observer):
         raise ContractViolationError("cannot abort an unopened stream")
 
 
+class _RejectingEvidenceValidator:
+    def __init__(self):
+        self.calls = []
+
+    async def validate_evidence(self, receipts, *, signal=None):
+        self.calls.append((tuple(receipts), signal))
+        raise ContractViolationError(
+            "external evidence is stale",
+            code="external_evidence_stale",
+        )
+
+
 @pytest.mark.asyncio
 async def test_live_full_text_validation_is_rejected_before_gateway_call():
     AgentModelCall, AgentModelInvocationManager, ModelInvocationContext = _types()
@@ -229,6 +243,34 @@ async def test_public_chunk_is_observed_before_runtime_consumes_it():
 
 
 @pytest.mark.asyncio
+async def test_undeclared_provider_progress_is_rejected_before_persistence():
+    AgentModelCall, AgentModelInvocationManager, ModelInvocationContext = _types()
+    observer = _Observer()
+    manager = AgentModelInvocationManager(
+        _ChunkGateway((ModelStreamChunk(progress_delta="正在核对范围"),)),
+        output_observer=observer,
+    )
+    managed = await manager.stream(
+        (AgentMessage(role="user", content="answer"),),
+        AgentModelCall(
+            request=_request(),
+            output_intent=AgentOutputIntent.FINAL_PUBLIC,
+            commit_mode=OutputCommitMode.LIVE,
+        ),
+        ModelInvocationContext(run_id="run-1", turn_id="turn-1"),
+    )
+
+    with pytest.raises(
+        ContractViolationError,
+        match="undeclared public progress",
+    ):
+        await anext(managed.chunks)
+
+    assert observer.accepted == []
+    assert observer.aborted[0][1] == "model_gateway_contract_violation"
+
+
+@pytest.mark.asyncio
 async def test_receipt_fingerprints_model_input_tools_and_context_provenance():
     AgentModelCall, AgentModelInvocationManager, ModelInvocationContext = _types()
     manager = AgentModelInvocationManager(_Gateway(), output_observer=_Observer())
@@ -277,6 +319,54 @@ async def test_receipt_fingerprints_model_input_tools_and_context_provenance():
         "version": 2,
     }]
     assert receipt.to_mapping()["callParameters"][0]["toolNames"] == ["lookup"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ("stream", "complete"))
+async def test_external_evidence_is_revalidated_before_every_gateway_call(method):
+    AgentModelCall, AgentModelInvocationManager, ModelInvocationContext = _types()
+    gateway = _CompletionGateway()
+    validator = _RejectingEvidenceValidator()
+    observer = _Observer()
+    manager = AgentModelInvocationManager(
+        gateway,
+        output_observer=observer,
+        evidence_validator=validator,
+    )
+    evidence = ContextEvidenceReceipt(
+        evidence_id="mem0:store:item-1:3",
+        context_block="memory",
+        source="mem0/scope",
+        item_id="item-1",
+        version=3,
+    )
+    call = AgentModelCall(
+        request=_request(),
+        output_intent=(
+            AgentOutputIntent.FINAL_PUBLIC
+            if method == "stream"
+            else AgentOutputIntent.STRUCTURED_PRIVATE
+        ),
+        commit_mode=(
+            OutputCommitMode.LIVE
+            if method == "stream"
+            else OutputCommitMode.PRIVATE
+        ),
+    )
+
+    with bind_model_input_evidence((evidence,)):
+        with pytest.raises(ContractViolationError) as captured:
+            await getattr(manager, method)(
+                (AgentMessage(role="user", content="answer"),),
+                call,
+                ModelInvocationContext(run_id="run-evidence"),
+            )
+
+    assert captured.value.code == "external_evidence_stale"
+    assert len(validator.calls) == 1
+    assert validator.calls[0][0] == (evidence,)
+    assert gateway.calls == []
+    assert observer.opened == []
 
 
 @pytest.mark.asyncio
@@ -653,3 +743,20 @@ async def test_late_tool_name_rechecks_the_registration_specific_limit():
 
     assert getattr(exceeded.value, "code", None) == "model_stream_limit_exceeded"
     assert len(observer.accepted) == 1
+
+
+@pytest.mark.asyncio
+async def test_unconsumed_managed_stream_closes_scope_and_invocation_once():
+    AgentModelCall, AgentModelInvocationManager, ModelInvocationContext = _types()
+    output = _Observer()
+    operations = _OperationOutput()
+    manager = AgentModelInvocationManager(_Gateway(), output_observer=output,
+        operation_controller=AgentOperationController(operations))
+    stream = await manager.stream((), AgentModelCall(request=_request(),
+        output_intent=AgentOutputIntent.STRUCTURED_PRIVATE, commit_mode=OutputCommitMode.PRIVATE),
+        ModelInvocationContext(run_id='unconsumed'))
+    await stream.chunks.aclose()
+    await stream.chunks.aclose()
+    assert len(output.aborted) == 1
+    assert len(operations.events) == 2
+    assert operations.events[-1].status is OperationStatus.CANCELED

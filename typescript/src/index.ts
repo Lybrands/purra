@@ -76,6 +76,13 @@ export type {
   ModelTaskTextResult,
 } from "./extensions/model-tasks.js";
 export { AgentCanceledError, AgentError } from "./shared/errors.js";
+export { RetrievalError } from "./retrieval/errors.js";
+export { RetrieverTool } from "./retrieval/tool.js";
+export type {
+  RetrievalHit,
+  RetrievalRequest,
+  Retriever,
+} from "./retrieval/types.js";
 export {
   EMPTY_RESPONSE_RETRY_GUIDANCE,
   RecoveryLedger,
@@ -243,6 +250,7 @@ export type {
   ContextCompressionRequest,
   ContextCompressionResult,
   ContextEvidenceReceipt,
+  ModelInputEvidenceValidator,
   ContextOptions,
   ContextPreparationInput,
   ContextProvider,
@@ -250,6 +258,7 @@ export type {
   ContextReserves,
   ContextStrategy,
   PreparedContext,
+  PreparedContextSnapshot,
   StagedContextProvider,
   StagedContextPreparation,
   TaskContextRequest,
@@ -260,7 +269,6 @@ export {
   copyWorkPlan,
   planningToolSpecs,
 } from "./planning/compiler.js";
-export { ToolPlanningPolicy } from "./planning/policies.js";
 export { CoreExecutionState, CoreExecutionStateFactory } from "./planning/state.js";
 export { ModelResponseJudge, ModelWorkPlanner } from "./extensions/planning.js";
 export type {
@@ -392,6 +400,7 @@ export type {
   InvocationReceiptInput,
   InvocationSettlement,
   ModelInvocationReceipt,
+  PlanningMode,
   PromptSection,
   RunBeginParams,
   RunBudgetOptions,
@@ -424,6 +433,7 @@ export type {
   ToolIdempotencyGateway,
   ToolPolicy,
   ToolPlanningMetadata,
+  ToolPlanningRequirement,
   ToolRiskLevel,
 } from "./tools/types.js";
 export { InMemoryAgentAdapters } from "./testing/adapters.js";
@@ -435,3 +445,11 @@ export {
   assertOutputPublisherConforms,
   assertToolDefinitionConforms,
 } from "./testing/conformance.js";
+
+export { PLANNING_STREAM_SCHEMA, PlanningStreamParser } from "./planning/stream.js";
+export type { PlanningScope, PlanningProgress } from "./planning/stream.js";
+
+export type { ModelTaskPlanOptions } from "./extensions/model-tasks.js";
+export type { ModelTransportDiagnostics } from "./model/types.js";
+
+export { UserInputRequired } from "./interaction.js";

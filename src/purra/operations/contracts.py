@@ -19,6 +19,7 @@ from purra.normalization import (
 
 class OperationKind(StrEnum):
     MODEL = "model"
+    PLANNING = "planning"
     TOOL = "tool"
     VALIDATION = "validation"
     CONTEXT_COMPACTION = "context_compaction"
@@ -83,6 +84,7 @@ class OperationDisplay:
 class OperationScope:
     run_id: RunId
     invocation_id: str | None = None
+    parent_operation_id: str | None = None
     display: OperationDisplay = field(default_factory=OperationDisplay)
 
     def __post_init__(self) -> None:
@@ -103,6 +105,7 @@ class OperationStarted:
     invocation_id: str | None
     kind: OperationKind
     started_at: datetime
+    parent_operation_id: str | None = None
     display: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -133,6 +136,7 @@ class OperationFinished:
     finished_at: datetime
     duration_ms: int
     error_code: str | None = None
+    parent_operation_id: str | None = None
     display: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:

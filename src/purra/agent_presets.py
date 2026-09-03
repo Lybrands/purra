@@ -31,7 +31,6 @@ from purra.ports import (
     ToolRegistration,
 )
 from purra.recovery import RecoveryPolicy
-from purra.planning_policies import ReactivePlanningPolicy, ToolPlanningPolicy
 
 
 ContextProviderFactory = Callable[[AgentModelTaskRunner], ContextProvider]
@@ -459,21 +458,14 @@ class AgentPreset:
         role: str,
         value: object | None,
     ) -> Mapping[str, Any]:
-        builtin_id = None
-        if isinstance(value, ReactivePlanningPolicy):
-            builtin_id = "purra.planning.reactive"
-        elif isinstance(value, ToolPlanningPolicy):
-            builtin_id = "purra.planning.tool"
         return _component_binding(
             role,
             value,
             None,
             self.component_bindings,
-            known_builtin=builtin_id is not None,
+            known_builtin=False,
             default_id=(
-                builtin_id
-                if builtin_id is not None
-                else f"purra.execution-profile.{role}.none"
+                f"purra.execution-profile.{role}.none"
                 if value is None
                 else None
             ),

@@ -22,11 +22,7 @@ from purra.ports.model import CancellationSignal
 
 @runtime_checkable
 class PlanningPolicy(Protocol):
-    def should_plan(
-        self,
-        request: AgentRunRequest,
-        capabilities: PlanningCapabilities,
-    ) -> bool: ...
+    """Constrain planning activated by Auto or an explicit Planned request."""
 
     def planning_constraints(
         self,

@@ -9,9 +9,11 @@ import pytest
 from purra.api import (
     AgentComponentBinding,
     AgentCore,
+    AgentCoreRunOptions,
     AgentModelTaskRunner,
     AgentPreset,
     ContextStrategy,
+    DelegationPolicy,
     ExecutionProfile,
     InMemoryAgentAdapters,
     PromptSection,
@@ -32,16 +34,31 @@ from purra.contracts import (
     ModelStreamChunk,
     PlanningConstraints,
     PlanningKind,
+    PlanningMode,
     PlanningResult,
     RunStatus,
     RuntimeLimits,
     StepExecutor,
     StepType,
     TaskSpec,
+    ToolCallDelta,
+    ToolHandlerResult,
+    ToolPlanningRequirement,
+    ToolPolicy,
+    ToolSchema,
     WorkPlan,
     WorkStep,
 )
 from purra.model_protocol import generic_capability_snapshot
+from purra.errors import ContractViolationError
+from purra.output import (
+    PublicFact,
+    PublicFactBundle,
+    PublicPresentationMode,
+    ResponseTransactionMode,
+    ResponseTransactionPolicy,
+)
+from purra.ports import ToolRegistration
 from purra.tools import InMemoryToolCatalog
 from purra.task_admission import (
     ExecutionMode,
@@ -63,10 +80,12 @@ class _Gateway:
     def __init__(self, response: str) -> None:
         self.response = response
         self.messages = []
+        self.invocations = []
 
     async def stream(self, messages, invocation, signal=None):
         del signal
         self.messages.append(tuple(messages))
+        self.invocations.append(invocation)
         return ModelStream(
             chunks=_chunks(self.response),
             model="portable-model",
@@ -83,6 +102,46 @@ class _Gateway:
             model="portable-model",
             applied_output_limit=invocation.output_limit.max_tokens,
             finish_reason=ModelFinishReason.STOP,
+        )
+
+
+class _ScriptedToolGateway(_Gateway):
+    def __init__(self, steps) -> None:
+        super().__init__("planned answer")
+        self.steps = list(steps)
+
+    async def stream(self, messages, invocation, signal=None):
+        del signal
+        self.messages.append(tuple(messages))
+        self.invocations.append(invocation)
+        step = self.steps.pop(0)
+
+        async def chunks():
+            if step is None:
+                yield ModelStreamChunk(
+                    content_delta=self.response,
+                    finish_reason=ModelFinishReason.STOP,
+                )
+                return
+            tool_name, public_text = (
+                step if isinstance(step, tuple) else (step, None)
+            )
+            if public_text:
+                yield ModelStreamChunk(content_delta=public_text)
+            yield ModelStreamChunk(
+                tool_call_deltas=(ToolCallDelta(
+                    index=0,
+                    id=f"call-{tool_name}-{len(self.invocations)}",
+                    name=tool_name,
+                    arguments_fragment="{}",
+                ),),
+                finish_reason=ModelFinishReason.TOOL_CALLS,
+            )
+
+        return ModelStream(
+            chunks=chunks(),
+            model="portable-model",
+            applied_output_limit=invocation.output_limit.max_tokens,
         )
 
 
@@ -133,11 +192,6 @@ class _AlwaysPlan:
     def planning_constraints(self, request, capabilities):
         del request, capabilities
         return PlanningConstraints()
-
-    def should_plan(self, request, capabilities):
-        del request, capabilities
-        return True
-
 
 class _Planner:
     def __init__(self) -> None:
@@ -226,6 +280,15 @@ class _Dispatcher:
         )
 
 
+class _DurableFacts:
+    async def facts_for(self, run_id, result):
+        assert result.run_id == run_id
+        assert result.final_response == "portable durable answer"
+        return PublicFactBundle(facts=(
+            PublicFact("result", "committed durable evidence"),
+        ))
+
+
 def _request() -> AgentRunRequest:
     return AgentRunRequest(
         messages=(AgentMessage(role=MessageRole.USER, content="Answer portably."),),
@@ -244,7 +307,16 @@ def _request() -> AgentRunRequest:
     )
 
 
-def _core(*, gateway, context, profile=None, adapters=None, runtime_limits=None):
+def _core(
+    *,
+    gateway,
+    context,
+    profile=None,
+    adapters=None,
+    runtime_limits=None,
+    tool_catalog=None,
+    delegation=False,
+):
     adapters = adapters or InMemoryAgentAdapters()
     resolved_profile = profile or ExecutionProfile()
     bindings = {
@@ -265,13 +337,16 @@ def _core(*, gateway, context, profile=None, adapters=None, runtime_limits=None)
         run_repository=adapters.runs,
         output_repository=adapters.outputs,
         output_publisher=adapters.publisher,
+        delegation_repository=(adapters.delegations if delegation else None),
+        tool_idempotency_gateway=(adapters.idempotency if delegation else None),
         preset=AgentPreset(
             id="portable",
             revision="1",
-            tool_catalog=InMemoryToolCatalog(()),
+            tool_catalog=tool_catalog or InMemoryToolCatalog(()),
             context_provider=context,
             runtime_limits=runtime_limits or RuntimeLimits(max_run_output_tokens=None),
             execution_profile=resolved_profile,
+            delegation_policy=(DelegationPolicy() if delegation else None),
             component_bindings=bindings,
             prompt_sections=(PromptSection(
                 name="identity",
@@ -349,12 +424,14 @@ class _RetryableStreamFailureGateway(_Gateway):
 
 
 @pytest.mark.asyncio
-async def test_portable_reactive_agent_runs_through_public_submit():
+async def test_portable_auto_agent_without_planner_runs_through_public_submit():
     gateway = _Gateway("portable reactive answer")
     context = _Context()
     core = _core(gateway=gateway, context=context)
     try:
-        result = await (await core.submit(_request())).wait()
+        result = await (await core.submit(replace(
+            _request(), context_window=32_768
+        ))).wait()
     finally:
         await core.close()
 
@@ -362,6 +439,479 @@ async def test_portable_reactive_agent_runs_through_public_submit():
     assert result.final_response == "portable reactive answer"
     assert context.single_pass_calls == 1
     assert gateway.messages[0][0].content == "Be concise, explicit, and calm."
+
+
+@pytest.mark.asyncio
+async def test_reactive_run_bypasses_configured_planner_and_staged_context():
+    gateway = _Gateway("portable reactive answer")
+    context = _Context()
+    planner = _Planner()
+    core = _core(
+        gateway=gateway,
+        context=context,
+        profile=ExecutionProfile(
+            planner=planner,
+            planning_policy=_AlwaysPlan(),
+            context_strategy=ContextStrategy.STAGED,
+        ),
+    )
+    try:
+        result = await (await core.submit(replace(
+            _request(), planning_mode=PlanningMode.REACTIVE
+        ))).wait()
+    finally:
+        await core.close()
+
+    assert result.status is RunStatus.DONE
+    assert planner.calls == 0
+    assert context.single_pass_calls == 1
+    assert (context.planning_calls, context.task_calls) == (0, 0)
+
+
+@pytest.mark.asyncio
+async def test_auto_direct_answer_uses_one_model_call_and_no_planner_call():
+    async def lookup(state, arguments, signal=None):
+        del state, arguments, signal
+        return ToolHandlerResult(content="found", effect_state="not_started")
+
+    catalog = InMemoryToolCatalog((ToolRegistration(
+        schema=ToolSchema(
+            name="lookup",
+            description="Look up a fact.",
+            parameters={"type": "object", "properties": {}},
+        ),
+        handler=lookup,
+        policy=ToolPolicy(mode="read", title="Lookup"),
+    ),))
+    gateway = _Gateway("portable direct answer")
+    context = _Context()
+    planner = _Planner()
+    adapters = InMemoryAgentAdapters()
+    core = _core(
+        gateway=gateway,
+        context=context,
+        adapters=adapters,
+        tool_catalog=catalog,
+        profile=ExecutionProfile(
+            planner=planner,
+            planning_policy=_AlwaysPlan(),
+            context_strategy=ContextStrategy.STAGED,
+        ),
+    )
+    try:
+        handle = await core.submit(replace(
+            _request(),
+            context_window=32_768,
+            tools_enabled=True,
+        ))
+        result = await handle.wait()
+        events = await adapters.outputs.list_events(
+            result.run_id,
+            after_sequence=0,
+        )
+    finally:
+        await core.close()
+
+    assert result.status is RunStatus.DONE
+    assert result.final_response == "portable direct answer"
+    assert planner.calls == 0
+    assert len(gateway.invocations) == 1
+    assert {tool.name for tool in gateway.invocations[0].tools} == {
+        "lookup",
+        "request_plan",
+    }
+    assert (context.single_pass_calls, context.planning_calls) == (1, 0)
+    assert [
+        event.payload["delta"]
+        for event in events
+        if event.kind.value == "provider.content_delta"
+        and event.channel.value == "final"
+        and event.visibility.value == "public"
+    ] == ["portable direct answer"]
+
+
+@pytest.mark.asyncio
+async def test_auto_does_not_advertise_control_without_tool_calling_support():
+    gateway = _Gateway("portable direct answer")
+    planner = _Planner()
+    core = _core(
+        gateway=gateway,
+        context=_Context(),
+        profile=ExecutionProfile(
+            planner=planner,
+            planning_policy=_AlwaysPlan(),
+        ),
+    )
+    try:
+        result = await (await core.submit(
+            _request(),
+            options=AgentCoreRunOptions(model_supports_tools=False),
+        )).wait()
+    finally:
+        await core.close()
+
+    assert result.status is RunStatus.DONE
+    assert gateway.invocations[0].tools == ()
+    assert planner.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_auto_request_plan_promotes_before_execution_and_stays_private():
+    public_intent = "I will inspect the scope before planning the remaining work."
+    gateway = _ScriptedToolGateway((("request_plan", public_intent), None))
+    context = _Context()
+    planner = _Planner()
+    adapters = InMemoryAgentAdapters()
+    core = _core(
+        gateway=gateway,
+        context=context,
+        adapters=adapters,
+        delegation=True,
+        profile=ExecutionProfile(
+            planner=planner,
+            planning_policy=_AlwaysPlan(),
+            context_strategy=ContextStrategy.STAGED,
+        ),
+    )
+    try:
+        handle = await core.submit(replace(
+            _request(),
+            context_window=32_768,
+            tools_enabled=True,
+        ))
+        result = await handle.wait()
+        events = await adapters.outputs.list_events(result.run_id, after_sequence=0)
+    finally:
+        await core.close()
+
+    assert result.status is RunStatus.DONE
+    assert result.final_response == "planned answer"
+    assert planner.calls == 1
+    assert len(gateway.invocations) == 2
+    assert {tool.name for tool in gateway.invocations[0].tools} == {
+        "delegateToAgents",
+        "request_plan",
+    }
+    assert gateway.invocations[1].tools == ()
+    assert (context.single_pass_calls, context.planning_calls, context.task_calls) == (
+        1,
+        1,
+        1,
+    )
+    public_payloads = "\n".join(
+        str(event.payload)
+        for event in events
+        if event.visibility.value == "public"
+    )
+    assert "request_plan" not in public_payloads
+    assert public_intent in public_payloads
+
+
+@pytest.mark.asyncio
+async def test_auto_required_tool_plans_before_effect_and_reactive_fails_closed():
+    tool_calls = 0
+
+    async def publish(state, arguments, signal=None):
+        nonlocal tool_calls
+        del state, arguments, signal
+        tool_calls += 1
+        return ToolHandlerResult(content="published", effect_state="not_started")
+
+    registration = ToolRegistration(
+        schema=ToolSchema(
+            name="publish",
+            description="Publish the prepared result.",
+            parameters={"type": "object", "properties": {}},
+        ),
+        handler=publish,
+        policy=ToolPolicy(mode="read", title="Publish"),
+        planning_requirement=ToolPlanningRequirement.REQUIRED,
+    )
+    catalog = InMemoryToolCatalog((registration,))
+    planner = _Planner()
+    planner.plan = WorkPlan(
+        title="Publish safely",
+        steps=(WorkStep(
+            id="publish",
+            title="Publish",
+            type=StepType.WRITE,
+            executor=StepExecutor.TOOL,
+            capability_names=("publish",),
+        ),),
+    )
+    auto_gateway = _ScriptedToolGateway(("publish", "publish", None))
+    auto = _core(
+        gateway=auto_gateway,
+        context=_Context(),
+        profile=ExecutionProfile(
+            planner=planner,
+            planning_policy=_AlwaysPlan(),
+        ),
+        tool_catalog=catalog,
+    )
+    try:
+        result = await (await auto.submit(replace(
+            _request(), tools_enabled=True, context_window=32_768
+        ))).wait()
+    finally:
+        await auto.close()
+
+    assert result.status is RunStatus.DONE
+    assert planner.calls == 1
+    assert tool_calls == 1
+
+    reactive_planner = _Planner()
+    reactive = _core(
+        gateway=_ScriptedToolGateway(("publish",)),
+        context=_Context(),
+        profile=ExecutionProfile(
+            planner=reactive_planner,
+            planning_policy=_AlwaysPlan(),
+        ),
+        tool_catalog=catalog,
+    )
+    try:
+        result = await (await reactive.submit(replace(
+            _request(),
+            tools_enabled=True,
+            context_window=32_768,
+            planning_mode=PlanningMode.REACTIVE,
+        ))).wait()
+    finally:
+        await reactive.close()
+
+    assert result.status is RunStatus.FAILED
+    assert result.error == "planning_required"
+    assert reactive_planner.calls == 0
+    assert tool_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_require_tool_call_does_not_assume_provider_required_choice_support():
+    tool_calls = 0
+
+    async def lookup(state, arguments, signal=None):
+        nonlocal tool_calls
+        del state, arguments, signal
+        tool_calls += 1
+        return ToolHandlerResult(content="found", effect_state="not_started")
+
+    gateway = _ScriptedToolGateway(("lookup", None))
+    core = _core(
+        gateway=gateway,
+        context=_Context(),
+        tool_catalog=InMemoryToolCatalog((ToolRegistration(
+            schema=ToolSchema(
+                name="lookup",
+                description="Look up data.",
+                parameters={"type": "object", "properties": {}},
+            ),
+            handler=lookup,
+            policy=ToolPolicy(mode="read", title="Lookup"),
+        ),)),
+    )
+    try:
+        result = await (await core.submit(
+            replace(_request(), tools_enabled=True, context_window=32_768),
+            options=AgentCoreRunOptions(
+                require_tool_call=True,
+                force_planned_tool_choice=False,
+            ),
+        )).wait()
+    finally:
+        await core.close()
+
+    assert result.status is RunStatus.DONE
+    assert tool_calls == 1
+    assert gateway.invocations[0].tool_choice.value == "auto"
+
+
+@pytest.mark.asyncio
+async def test_auto_plans_remaining_work_before_required_tool_effect():
+    calls = []
+
+    async def run_tool(state, arguments, signal=None):
+        del state, arguments, signal
+        calls.append("executed")
+        return ToolHandlerResult(content="ok", effect_state="not_started")
+
+    catalog = InMemoryToolCatalog((
+        ToolRegistration(
+            schema=ToolSchema(
+                name="lookup",
+                description="Look up data.",
+                parameters={"type": "object", "properties": {}},
+            ),
+            handler=run_tool,
+            policy=ToolPolicy(mode="read", title="Lookup"),
+        ),
+        ToolRegistration(
+            schema=ToolSchema(
+                name="publish",
+                description="Publish data.",
+                parameters={"type": "object", "properties": {}},
+            ),
+            handler=run_tool,
+            policy=ToolPolicy(mode="read", title="Publish"),
+            planning_requirement=ToolPlanningRequirement.REQUIRED,
+        ),
+    ))
+    planner = _Planner()
+    planner.plan = WorkPlan(
+        title="Publish remaining work",
+        steps=(WorkStep(
+            id="publish",
+            title="Publish",
+            type=StepType.WRITE,
+            executor=StepExecutor.TOOL,
+            capability_names=("publish",),
+        ),),
+    )
+    gateway = _ScriptedToolGateway(("lookup", "publish", "publish", None))
+    core = _core(
+        gateway=gateway,
+        context=_Context(),
+        profile=ExecutionProfile(
+            planner=planner,
+            planning_policy=_AlwaysPlan(),
+        ),
+        tool_catalog=catalog,
+    )
+    try:
+        result = await (await core.submit(replace(
+            _request(), tools_enabled=True, context_window=32_768
+        ))).wait()
+    finally:
+        await core.close()
+
+    assert result.status is RunStatus.DONE
+    assert planner.calls == 1
+    assert calls == ["executed", "executed"]
+    assert "request_plan" in {
+        tool.name for tool in gateway.invocations[0].tools
+    }
+    assert "request_remaining_plan" not in {
+        tool.name for tool in gateway.invocations[0].tools
+    }
+    assert "request_plan" not in {
+        tool.name for tool in gateway.invocations[1].tools
+    }
+    assert "request_remaining_plan" in {
+        tool.name for tool in gateway.invocations[1].tools
+    }
+
+
+@pytest.mark.asyncio
+async def test_auto_model_can_request_a_plan_for_remaining_work_privately():
+    calls = []
+
+    async def lookup(state, arguments, signal=None):
+        del state, arguments, signal
+        calls.append("lookup")
+        return ToolHandlerResult(content="evidence", effect_state="not_started")
+
+    public_intent = "I found evidence and need a plan for the remaining work."
+    gateway = _ScriptedToolGateway((
+        "lookup",
+        ("request_remaining_plan", public_intent),
+        None,
+    ))
+    adapters = InMemoryAgentAdapters()
+    planner = _Planner()
+    core = _core(
+        gateway=gateway,
+        context=_Context(),
+        adapters=adapters,
+        profile=ExecutionProfile(
+            planner=planner,
+            planning_policy=_AlwaysPlan(),
+        ),
+        tool_catalog=InMemoryToolCatalog((ToolRegistration(
+            schema=ToolSchema(
+                name="lookup",
+                description="Look up data.",
+                parameters={"type": "object", "properties": {}},
+            ),
+            handler=lookup,
+            policy=ToolPolicy(mode="read", title="Lookup"),
+        ),)),
+    )
+    try:
+        result = await (await core.submit(replace(
+            _request(), tools_enabled=True, context_window=32_768
+        ))).wait()
+        events = await adapters.outputs.list_events(
+            result.run_id,
+            after_sequence=0,
+        )
+    finally:
+        await core.close()
+
+    assert result.status is RunStatus.DONE
+    assert planner.calls == 1
+    assert calls == ["lookup"]
+    public_payloads = "\n".join(
+        str(event.payload)
+        for event in events
+        if event.visibility.value == "public"
+    )
+    assert "request_remaining_plan" not in public_payloads
+    commentary = next(
+        event for event in events
+        if event.visibility.value == "public"
+        and public_intent in str(event.payload)
+    )
+    planning_started = next(
+        event for event in events
+        if event.kind.value == "operation.started"
+        and event.payload.get("kind") == "planning"
+    )
+    assert commentary.sequence < planning_started.sequence
+
+
+@pytest.mark.asyncio
+async def test_auto_planning_activation_uses_the_run_model_round_budget():
+    planner = _Planner()
+    core = _core(
+        gateway=_ScriptedToolGateway(("request_plan",)),
+        context=_Context(),
+        profile=ExecutionProfile(
+            planner=planner,
+            planning_policy=_AlwaysPlan(),
+        ),
+        runtime_limits=RuntimeLimits(
+            max_model_rounds=1,
+            max_run_output_tokens=None,
+        ),
+    )
+    try:
+        result = await (await core.submit(replace(
+            _request(), context_window=32_768
+        ))).wait()
+    finally:
+        await core.close()
+
+    assert result.status is RunStatus.FAILED
+    assert result.error == "planning_activation_budget_exhausted"
+    assert planner.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_planned_run_fails_closed_without_a_configured_planner():
+    gateway = _Gateway("must not run")
+    context = _Context()
+    core = _core(gateway=gateway, context=context)
+    try:
+        result = await (await core.submit(replace(
+            _request(), planning_mode=PlanningMode.PLANNED
+        ))).wait()
+    finally:
+        await core.close()
+
+    assert result.status is RunStatus.FAILED
+    assert result.error == "planning_unavailable"
+    assert gateway.messages == []
+    assert context.single_pass_calls == 0
 
 
 @pytest.mark.asyncio
@@ -481,7 +1031,9 @@ async def test_portable_planned_agent_uses_staged_task_context():
         ),
     )
     try:
-        result = await (await core.submit(_request())).wait()
+        result = await (await core.submit(replace(
+            _request(), planning_mode=PlanningMode.PLANNED
+        ))).wait()
     finally:
         await core.close()
 
@@ -524,7 +1076,9 @@ async def test_portable_durable_agent_hands_off_without_product_runtime():
         ),
     )
     try:
-        result = await (await core.submit(_request())).wait()
+        result = await (await core.submit(replace(
+            _request(), planning_mode=PlanningMode.PLANNED
+        ))).wait()
     finally:
         await core.close()
 
@@ -532,3 +1086,101 @@ async def test_portable_durable_agent_hands_off_without_product_runtime():
     assert result.final_response == "portable durable answer"
     assert dispatcher.dispatches == 1
     assert gateway.messages == []
+
+
+@pytest.mark.asyncio
+async def test_portable_durable_agent_presents_committed_result_before_terminal():
+    gateway = _Gateway("model-authored final synthesis")
+    context = _Context()
+    dispatcher = _Dispatcher()
+    adapters = InMemoryAgentAdapters()
+    core = _core(
+        gateway=gateway,
+        context=context,
+        adapters=adapters,
+        profile=ExecutionProfile(
+            planner=_Planner(),
+            planning_policy=_AlwaysPlan(),
+            context_strategy=ContextStrategy.STAGED,
+            task_admission_evaluator=_Admission(),
+            long_task_dispatcher=dispatcher,
+        ),
+    )
+    try:
+        result = await (await core.submit(
+            replace(_request(), planning_mode=PlanningMode.PLANNED),
+            options=AgentCoreRunOptions(
+                response_transaction_policy=ResponseTransactionPolicy(
+                    mode=ResponseTransactionMode.VALIDATED_RESULT,
+                    public_presentation=PublicPresentationMode.MODEL_LIVE,
+                ),
+                committed_result_facts_provider=_DurableFacts(),
+            ),
+        )).wait()
+    finally:
+        await core.close()
+
+    assert result.status is RunStatus.DONE
+    assert result.final_response == "model-authored final synthesis"
+    assert dispatcher.dispatches == 1
+    assert len(gateway.messages) == 1
+    assert any(
+        "committed durable evidence" in message.content
+        for message in gateway.messages[0]
+    )
+    terminal = [
+        event
+        for event in await adapters.outputs.list_events(
+            result.run_id,
+            after_sequence=0,
+        )
+        if event.kind.value == "run.lifecycle"
+        and event.payload.get("status") in {"done", "failed", "canceled"}
+    ]
+    assert len(terminal) == 1
+
+
+@pytest.mark.asyncio
+async def test_durable_dispatch_contract_error_commits_failed_run():
+    class _FailingDispatcher(_Dispatcher):
+        async def dispatch(self, *args, **kwargs):
+            del args, kwargs
+            raise ContractViolationError(
+                "Invalid persisted durable task contract",
+                code="runtime_limits_invalid",
+            )
+
+    adapters = InMemoryAgentAdapters()
+    core = _core(
+        gateway=_Gateway("must not be used"),
+        context=_Context(),
+        adapters=adapters,
+        profile=ExecutionProfile(
+            planner=_Planner(),
+            planning_policy=_AlwaysPlan(),
+            context_strategy=ContextStrategy.STAGED,
+            task_admission_evaluator=_Admission(),
+            long_task_dispatcher=_FailingDispatcher(),
+        ),
+    )
+    try:
+        handle = await core.submit(replace(
+            _request(), planning_mode=PlanningMode.PLANNED
+        ))
+        result = await handle.wait()
+        events = [event async for event in handle.subscribe()]
+    finally:
+        await core.close()
+
+    assert result.status is RunStatus.FAILED
+    assert result.error == "runtime_limits_invalid"
+    terminal = [
+        event for event in events
+        if event.kind.value == "run.lifecycle"
+        and event.payload.get("status") in {"done", "failed", "canceled"}
+    ]
+    assert len(terminal) == 1
+    assert terminal[0].payload == {
+        "status": "failed",
+        "error": "runtime_limits_invalid",
+    }

@@ -6,6 +6,7 @@ from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass, field
 
 from purra.contracts import (
+    ContextEvidenceReceipt,
     ModelCompletion,
     ModelRequest,
     ModelStreamChunk,
@@ -16,12 +17,12 @@ from purra.contracts import (
 )
 from purra.json_values import freeze_json_mapping
 from purra.json_values import thaw_json_mapping
-from purra.evidence import ContextEvidenceReceipt
 from purra.model_protocol import (
     InvocationOutputLimit,
     resolve_invocation_output_limit,
 )
 from purra.normalization import optional_positive_int, optional_text, required_text
+from purra.planning_stream import PlanningScope, PLANNING_STREAM_SCHEMA
 from purra.output.contracts import AgentOutputIntent, OutputCommitMode
 
 
@@ -33,6 +34,8 @@ class ModelInvocationContext:
     deadline_at_ms: int | None = None
     deadline_code: str = "run_deadline_exceeded"
     attempt_source_key: str | None = None
+    planning_scope: PlanningScope | None = None
+    planning_attempt: int = 0
     tool_argument_limits: Mapping[str, int] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -61,6 +64,10 @@ class ModelInvocationContext:
             "deadline_code",
             required_text(self.deadline_code, "model invocation parent deadline code"),
         )
+        if self.planning_scope is not None and self.planning_scope.run_id != self.run_id:
+            raise ValueError("planning scope belongs to another Run")
+        if type(self.planning_attempt) is not int or self.planning_attempt < 0:
+            raise ValueError("planning attempt must be a non-negative integer")
         limits = {
             required_text(name, "tool argument limit name"): int(limit)
             for name, limit in self.tool_argument_limits.items()
@@ -75,6 +82,7 @@ class AgentModelCall:
     request: ModelRequest
     output_intent: AgentOutputIntent
     commit_mode: OutputCommitMode
+    output_protocol: str | None = None
     requires_full_text_validation: bool = False
     reasoning_mode: ReasoningMode = ReasoningMode.DEFAULT
     output_limit: InvocationOutputLimit | None = None
@@ -84,6 +92,12 @@ class AgentModelCall:
     def __post_init__(self) -> None:
         if not isinstance(self.request, ModelRequest):
             raise TypeError("agent model call requires a ModelRequest")
+        if self.output_protocol is not None and (
+            self.output_protocol != PLANNING_STREAM_SCHEMA
+            or self.output_intent != AgentOutputIntent.STRUCTURED_PRIVATE
+            or self.commit_mode != OutputCommitMode.PRIVATE
+        ):
+            raise ValueError("planning protocol requires structured private output")
         intent = AgentOutputIntent(self.output_intent)
         commit_mode = OutputCommitMode(self.commit_mode)
         if intent in {
@@ -128,6 +142,9 @@ class ModelInvocationReceipt:
     output_limit: InvocationOutputLimit
     input_fingerprint: str
     tool_schema_fingerprint: str
+    output_protocol: str | None = None
+    planning_scope: PlanningScope | None = None
+    planning_attempt: int = 0
     budget_key: str | None = None
     context_evidence: tuple[ContextEvidenceReceipt, ...] = field(
         default_factory=tuple
@@ -195,6 +212,9 @@ class ModelInvocationReceipt:
             "inputFingerprint": self.input_fingerprint,
             "toolSchemaFingerprint": self.tool_schema_fingerprint,
             "budgetKey": self.budget_key or self.invocation_id,
+            "outputProtocol": self.output_protocol,
+            "planningScope": self.planning_scope.to_mapping() if self.planning_scope else None,
+            "planningAttempt": self.planning_attempt,
             "contextEvidence": [
                 item.to_mapping() for item in self.context_evidence
             ],

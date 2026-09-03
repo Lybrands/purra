@@ -11,6 +11,13 @@ export interface ContextEvidenceReceipt {
   readonly version?: string;
 }
 
+export interface ModelInputEvidenceValidator {
+  validateEvidence(
+    receipts: readonly ContextEvidenceReceipt[],
+    options?: { readonly signal?: AbortSignal },
+  ): Promise<void> | void;
+}
+
 export interface ContextBudgetClaim {
   readonly name: string;
   readonly desiredTokens: number;
@@ -90,6 +97,7 @@ export interface StagedContextProvider extends ContextProvider {
 
 export interface ContextCompressionRequest {
   readonly messages: readonly Message[];
+  readonly previousSummary: ContextBlock | null;
   readonly budget: ContextBudget;
   readonly contextTokens: number;
   readonly availableMessageTokens: number;
@@ -102,7 +110,8 @@ export interface ContextCompressionRequest {
 
 export interface ContextCompressionResult {
   readonly messages: readonly Message[];
-  readonly summary?: ContextBlock;
+  /** Omit to retain the previous summary, null to clear it, or supply its replacement. */
+  readonly summary?: ContextBlock | null;
 }
 
 export interface ContextCompressionHook {
@@ -130,9 +139,17 @@ export interface ContextOptions {
   readonly reserves?: ContextReserves;
 }
 
+export interface PreparedContextSnapshot {
+  readonly blocks: readonly ContextBlock[];
+  readonly contextAllocations: Readonly<Record<string, number>>;
+  readonly compactions: number;
+  readonly summary: ContextBlock | null;
+}
+
 export interface PreparedContext {
   readonly budget: ContextBudget;
   readonly evidence: readonly ContextEvidenceReceipt[];
+  snapshot(): PreparedContextSnapshot;
   project(messages: readonly Message[], signal?: AbortSignal): Promise<readonly Message[]>;
 }
 

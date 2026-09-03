@@ -1,3 +1,4 @@
+import { encodeStorageState, decodeStorageState } from "./shared/storage-state.js";
 import type { JsonValue } from "./model/types.js";
 import { copyJsonValue } from "./model/validation.js";
 import { AgentError } from "./shared/errors.js";
@@ -219,6 +220,7 @@ export interface RunTreeRepository {
   beginRoot(command: BeginRootAgentCommand): Promise<AgentTreeRun>;
   spawnAgents(command: SpawnAgentsCommand): Promise<SpawnAgentsReceipt>;
   continueAgent(command: ContinueAgentCommand): Promise<ContinueAgentReceipt>;
+  suspendRun(runId: string, claim: { readonly leaseOwnerId: string; readonly leaseEpoch: number }): Promise<AgentTreeRun>;
   claimRun(
     runId: string,
     options?: { readonly ownerId?: string; readonly leaseDurationMs?: number },
@@ -291,6 +293,29 @@ export class InMemoryRunTreeRepository implements RunTreeRepository {
   #batchSequence = 0;
   #checkpointSequence = 0;
   readonly #clockMs: () => number;
+
+  /** Opaque version-pinned storage data, never a public output projection. */
+  public exportState(): string { return encodeStorageState({ agents: this.#agents, runs: this.#runs, checkpoints: this.#checkpoints, spawnReceipts: this.#spawnReceipts, continueReceipts: this.#continueReceipts, rootDigests: this.#rootDigests, sequence: this.#sequence, agentSequence: this.#agentSequence, runSequence: this.#runSequence, batchSequence: this.#batchSequence, checkpointSequence: this.#checkpointSequence }); }
+  public importState(text: string): void {
+    const shape = { agents: this.#agents, runs: this.#runs, checkpoints: this.#checkpoints, spawnReceipts: this.#spawnReceipts, continueReceipts: this.#continueReceipts, rootDigests: this.#rootDigests, sequence: this.#sequence, agentSequence: this.#agentSequence, runSequence: this.#runSequence, batchSequence: this.#batchSequence, checkpointSequence: this.#checkpointSequence };
+    const saved = decodeStorageState(text) as typeof shape;
+    const restoreAgent = (node: AgentNode): AgentNode => freezeAgent({ ...node, capabilityGrant: new AgentCapabilityGrant(node.capabilityGrant) });
+    this.#agents.clear(); for (const [key, value] of saved.agents) this.#agents.set(key, restoreAgent(value));
+    this.#runs.clear(); for (const [key, value] of saved.runs) this.#runs.set(key, value);
+    this.#checkpoints.clear(); for (const [key, value] of saved.checkpoints) this.#checkpoints.set(key, value);
+    this.#spawnReceipts.clear(); for (const [key, value] of saved.spawnReceipts) this.#spawnReceipts.set(key, {
+      ...value, receipt: { ...value.receipt, items: value.receipt.items.map(item => ({ ...item, agent: restoreAgent(item.agent) })) },
+    });
+    this.#continueReceipts.clear(); for (const [key, value] of saved.continueReceipts) this.#continueReceipts.set(key, {
+      ...value, receipt: { ...value.receipt, agent: restoreAgent(value.receipt.agent) },
+    });
+    this.#rootDigests.clear(); for (const [key, value] of saved.rootDigests) this.#rootDigests.set(key, value);
+    this.#sequence = saved.sequence;
+    this.#agentSequence = saved.agentSequence;
+    this.#runSequence = saved.runSequence;
+    this.#batchSequence = saved.batchSequence;
+    this.#checkpointSequence = saved.checkpointSequence;
+  }
 
   public constructor(options: { readonly clockMs?: () => number } = {}) {
     this.#clockMs = options.clockMs ?? Date.now;
@@ -574,7 +599,8 @@ export class InMemoryRunTreeRepository implements RunTreeRepository {
   ): Promise<AgentTreeRun | undefined> {
     const run = this.#requireRun(runId);
     const now = this.#nowMs();
-    const reclaimable = run.status === "running" && this.#leaseExpired(run, now);
+    const reclaimable = (run.status === "running" && this.#leaseExpired(run, now))
+      || (run.status === "waiting" && run.leaseOwnerId === null && run.leaseEpoch > 0);
     if (run.status !== "queued" && !reclaimable) return undefined;
     const ownerId = requiredText(options.ownerId ?? "run-tree-supervisor", "lease owner id");
     const leaseDurationMs = positive(options.leaseDurationMs ?? 30_000, "lease duration");
@@ -594,6 +620,14 @@ export class InMemoryRunTreeRepository implements RunTreeRepository {
     });
     this.#runs.set(run.runId, claimed);
     return claimed;
+  }
+
+  public async suspendRun(runId: string, claim: { readonly leaseOwnerId: string; readonly leaseEpoch: number }): Promise<AgentTreeRun> {
+    const run = this.#requireActiveRun(runId);
+    this.#requireClaim(run, claim);
+    const suspended = freezeRun({ ...run, status: "waiting", leaseOwnerId: null, leaseExpiresAtMs: null });
+    this.#runs.set(runId, suspended);
+    return suspended;
   }
 
   public async renewRunLease(
@@ -834,6 +868,7 @@ export class InMemoryRunTreeRepository implements RunTreeRepository {
         run.rootRunId === root
         && (
           run.status === "queued"
+          || (run.status === "waiting" && run.leaseOwnerId === null && run.leaseEpoch > 0)
           || (run.status === "running" && this.#leaseExpired(run, now))
         )
       ))

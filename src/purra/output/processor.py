@@ -34,6 +34,8 @@ from purra.output.contracts import (
     OutputSource,
     OutputStreamSpec,
     OutputVisibility,
+    AGENT_PROGRESS_SCHEMA,
+    MAX_AGENT_PROGRESS_CHARS,
     PROVIDER_DELTA_BATCH_SCHEMA,
     RunLifecycleOutputDraft,
     RuntimeOutputEvent,
@@ -46,6 +48,8 @@ from purra.output.ports import (
     AgentOutputRepository,
 )
 from purra.ports.run_lifecycle import RunBeginResult, RunCommit
+from purra.cancellation import raise_if_stopped
+from purra.planning_stream import PlanningProgress, PLANNING_STREAM_SCHEMA
 
 
 class OutputRecoveryObserver(Protocol):
@@ -116,6 +120,19 @@ def _canonical_json(value: object) -> bytes:
     ).encode("utf-8")
 
 
+def _validate_agent_progress_text(text: str) -> None:
+    if (
+        text != text.strip()
+        or not text
+        or "\n" in text
+        or "\r" in text
+        or len(text) > MAX_AGENT_PROGRESS_CHARS
+    ):
+        raise ContractViolationError(
+            "Provider progress must be one trimmed line within the public limit"
+        )
+
+
 class AgentOutputProcessor:
     """Normalize typed producers into persist-before-publish output events."""
 
@@ -158,6 +175,9 @@ class AgentOutputProcessor:
             or receipt.turn_id != spec.turn_id
             or receipt.output_intent is not spec.intent
             or receipt.commit_mode is not spec.commit_mode
+            or receipt.output_protocol != spec.output_protocol
+            or receipt.planning_scope != spec.planning_scope
+            or receipt.planning_attempt != spec.planning_attempt
         ):
             raise ContractViolationError(
                 "model invocation receipt does not match output stream"
@@ -193,6 +213,48 @@ class AgentOutputProcessor:
             raise
         return opened
 
+    async def accept_planning_progress(self, output_stream_id, progress: PlanningProgress, signal=None):
+        """Project a complete Provider record; the repository verifies its bytes."""
+        spec = self._require_stream(output_stream_id)
+        if spec.output_protocol != PLANNING_STREAM_SCHEMA or spec.planning_scope is None:
+            raise ContractViolationError("planning projection requires a bound planning stream")
+        batch = self._require_batch(output_stream_id)
+        async with batch.lock:
+            self._raise_background_error(batch)
+            raise_if_stopped(signal)
+            authorize = getattr(self._policy, "authorize_planning_progress", None)
+            if authorize is not None:
+                authorized = await authorize(spec, progress)
+                if authorized is None:
+                    return None
+                if authorized != progress:
+                    raise ContractViolationError("output policy cannot rewrite Provider planning progress")
+            await self._flush_batch_locked(spec, batch)
+            raise_if_stopped(signal)
+            return await self._append(AgentOutputEventDraft(
+                run_id=spec.run_id, turn_id=spec.turn_id,
+                output_stream_id=spec.output_stream_id, invocation_id=spec.invocation_id,
+                source_event_key=f"planning:{spec.invocation_id}:{progress.record_index}",
+                source=OutputSource.PROVIDER, kind=OutputEventKind.PLANNING_PROGRESS,
+                channel=OutputChannel.COMMENTARY, visibility=OutputVisibility.PUBLIC,
+                payload={"schemaVersion": PLANNING_STREAM_SCHEMA,
+                         "operationId": spec.planning_scope.operation_id,
+                         "revision": spec.planning_scope.revision, "attempt": spec.planning_attempt,
+                         **progress.to_mapping()}, occurred_at=datetime.now(timezone.utc),
+            ))
+
+    async def record_model_diagnostics(self, receipt, metrics):
+        return await self._append(AgentOutputEventDraft(
+            run_id=receipt.run_id, turn_id=receipt.turn_id, output_stream_id=None,
+            invocation_id=receipt.invocation_id,
+            source_event_key=f"diagnostics:{receipt.invocation_id}",
+            source=OutputSource.RUNTIME, kind=OutputEventKind.MODEL_DIAGNOSTICS,
+            channel=OutputChannel.DIAGNOSTIC, visibility=OutputVisibility.PRIVATE,
+            payload={"planningScope": receipt.planning_scope.to_mapping() if receipt.planning_scope else None,
+                     "attempt": receipt.planning_attempt, **metrics},
+            occurred_at=datetime.now(timezone.utc),
+        ))
+
     async def begin_run_lifecycle(
         self,
         params: RunCreateParams,
@@ -226,6 +288,18 @@ class AgentOutputProcessor:
             raise ContractViolationError(
                 "output policy must return a ModelStreamChunk or None"
             )
+        if authorized.progress_delta != chunk.progress_delta:
+            raise ContractViolationError(
+                "output policy cannot add or rewrite Provider progress"
+            )
+        if authorized.progress_delta:
+            if spec.output_protocol == PLANNING_STREAM_SCHEMA:
+                raise ContractViolationError(
+                    "planning streams cannot emit agent progress"
+                )
+            _validate_agent_progress_text(authorized.progress_delta)
+        if spec.output_protocol == PLANNING_STREAM_SCHEMA and authorized != chunk:
+            raise ContractViolationError("output policy cannot rewrite planning Provider bytes")
         batch = self._require_batch(output_stream_id)
         async with batch.lock:
             self._raise_background_error(batch)
@@ -245,6 +319,8 @@ class AgentOutputProcessor:
 
             events: list[AgentOutputEvent] = []
             must_flush = (
+                bool(authorized.progress_delta)
+                or
                 authorized.usage is not None
                 or authorized.finish_reason is not None
                 or batch.payload_bytes >= self._batch_limits.max_payload_bytes
@@ -270,6 +346,26 @@ class AgentOutputProcessor:
                         "reasoningOutputTokens": (
                             authorized.usage.reasoning_output_tokens
                         ),
+                    },
+                    occurred_at=occurred_at,
+                )))
+            if authorized.progress_delta:
+                events.append(await self._append(AgentOutputEventDraft(
+                    run_id=spec.run_id,
+                    turn_id=spec.turn_id,
+                    output_stream_id=spec.output_stream_id,
+                    invocation_id=spec.invocation_id,
+                    source_event_key=(
+                        f"agent-progress:{spec.invocation_id}:{chunk_index}"
+                    ),
+                    source=OutputSource.PROVIDER,
+                    kind=OutputEventKind.AGENT_PROGRESS,
+                    channel=OutputChannel.COMMENTARY,
+                    visibility=OutputVisibility.PUBLIC,
+                    payload={
+                        "schemaVersion": AGENT_PROGRESS_SCHEMA,
+                        "text": authorized.progress_delta,
+                        "sourceChunkIndex": chunk_index,
                     },
                     occurred_at=occurred_at,
                 )))
@@ -345,6 +441,23 @@ class AgentOutputProcessor:
             await self._publish_if_visible(event)
         return events
 
+    async def publish_model_stream_final(
+        self,
+        output_stream_id: str,
+    ) -> tuple[AgentOutputEvent, ...]:
+        spec = self._require_stream(output_stream_id)
+        try:
+            events = await self._repository.publish_stream_content_as_final(
+                output_stream_id
+            )
+        except ContractViolationError:
+            raise
+        except Exception as error:
+            raise await self._persistence_error(spec.run_id, error) from error
+        for event in events:
+            await self._publish_if_visible(event)
+        return events
+
     async def accept_operation_event(
         self,
         event: OperationStarted | OperationFinished,
@@ -362,6 +475,7 @@ class AgentOutputProcessor:
                 visibility=OutputVisibility.PUBLIC,
                 payload={
                     "operationId": event.operation_id,
+                    "parentOperationId": event.parent_operation_id,
                     "kind": event.kind.value,
                     "startedAt": event.started_at.isoformat(),
                     "display": thaw_json_mapping(event.display),
@@ -381,6 +495,7 @@ class AgentOutputProcessor:
                 visibility=OutputVisibility.PUBLIC,
                 payload={
                     "operationId": event.operation_id,
+                    "parentOperationId": event.parent_operation_id,
                     "status": event.status.value,
                     "finishedAt": event.finished_at.isoformat(),
                     "durationMs": event.duration_ms,
@@ -643,6 +758,16 @@ class AgentOutputProcessor:
                 },
                 occurred_at,
             ))
+        if chunk.progress_delta:
+            pending.append(_PendingProviderDelta(
+                chunk_index,
+                3,
+                OutputEventKind.PROVIDER_PROGRESS_DELTA,
+                OutputChannel.DIAGNOSTIC,
+                OutputVisibility.PRIVATE,
+                {"delta": chunk.progress_delta},
+                occurred_at,
+            ))
         return tuple(pending)
 
     def _batch_drafts(
@@ -804,7 +929,13 @@ class AgentOutputProcessor:
 
     async def _publish_if_visible(self, event: AgentOutputEvent) -> None:
         if event.visibility is OutputVisibility.PUBLIC:
-            await self._publisher.publish_committed(event)
+            try:
+                await self._publisher.publish_committed(event)
+            except ContractViolationError:
+                raise
+            except Exception as error:
+                raise OutputPersistenceError("committed output could not be published",
+                    code="output_publish_failed", details={"causeType": type(error).__name__}) from error
 
     async def _persistence_error(
         self,
@@ -852,14 +983,12 @@ def _public_runtime_payload(
     public = thaw_json_mapping(payload)
     if event_type == "run.todos_updated":
         steps = public.get("steps")
-        if isinstance(steps, list):
-            public["steps"] = [
-                step for step in steps
-                if not (
-                    isinstance(step, Mapping)
-                    and bool(step.get("protocol_private"))
-                )
-            ]
+        public = {key: public[key] for key in ("title", "status") if key in public}
+        public["steps"] = [
+            {key: step[key] for key in ("id", "title", "status", "type") if key in step}
+            for step in (steps if isinstance(steps, list) else [])
+            if isinstance(step, Mapping) and not step.get("protocol_private")
+        ]
     elif event_type == "run.todo_updated":
         step = public.get("step")
         if isinstance(step, Mapping) and bool(step.get("protocol_private")):

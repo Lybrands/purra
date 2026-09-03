@@ -22,9 +22,24 @@ stable contracts rather than identical class names.
 - `submit()` creates a canonical Run with replay, cancellation, budgets, and
   terminal authority.
 
-Reactive execution is the default. Planning, durable tasks, context budgeting,
-response validation, recovery, Artifacts, Agent trees, Operations, and
-observability are explicit options around the same Root Run authority.
+Auto is the default planning mode. Configuring `planning.planner` or
+`planning.plannerFactory` installs the capability; an optional `PlanningPolicy`
+constrains planning after activation. With a Planner and tool calling available,
+the ordinary model invocation can answer, use a business tool, or request
+planning through private `request_plan`. After a business tool commits, only
+`request_remaining_plan` can request a plan for unfinished work. A
+`planningRequirement: "required"` tool activates planning before its effect.
+
+Explicit `planningMode: "reactive"` forbids Planner activation;
+`planningMode: "planned"` forces it before ordinary execution and requires a
+Planner. Auto without a Planner or tool calling uses the ordinary model/tool
+loop without advertising planning controls. A planning-required tool still
+cannot execute without Planner admission.
+
+Durable tasks extend an admitted plan. Context budgeting, response validation,
+recovery, Artifacts, Agent trees, Operations, and observability compose around
+the same Root Run authority. See the [Planner example](examples/planner-streaming.ts)
+for host wiring and public progress subscription.
 
 For Reactive Child Runs, `run/` atomically stores a private model-ready
 checkpoint and journal event after each committed tool round. Agent-tree
@@ -37,7 +52,7 @@ execution fail closed instead of being replayed.
 | Path | Owns | Must not own |
 | --- | --- | --- |
 | `index.ts` | Public exports | Runtime logic |
-| `core/` | Agent composition and Reactive sequencing | Provider SDKs, databases, product policy |
+| `core/` | Agent composition, model/tool sequencing, and Planner activation | Provider SDKs, databases, product policy |
 | `model/` | Provider-facing types, stream assembly, response validation | Tool handlers and Run policy |
 | `tools/` | Tool contracts, Schema checks, admission, approval, idempotency | Product permissions and model-round policy |
 | `run/`, `output/` | Run state, budgets, cancellation, canonical events, replay | Provider calls and product lifecycle semantics |

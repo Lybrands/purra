@@ -1,0 +1,140 @@
+{
+  "schemaVersion": 2,
+  "cases": [
+    {
+      "name": "auto direct answer",
+      "mode": "auto",
+      "planningAvailable": true,
+      "requiredTools": [],
+      "calls": [],
+      "expected": { "outcome": "continue" }
+    },
+    {
+      "name": "auto ordinary tool",
+      "mode": "auto",
+      "planningAvailable": true,
+      "requiredTools": [],
+      "calls": [{ "name": "lookup", "arguments": {} }],
+      "expected": { "outcome": "continue" }
+    },
+    {
+      "name": "auto model requests plan",
+      "mode": "auto",
+      "planningAvailable": true,
+      "requiredTools": [],
+      "calls": [{ "name": "request_plan", "arguments": {} }],
+      "expected": {
+        "outcome": "activate",
+        "trigger": "model_requested",
+        "requestedTools": []
+      }
+    },
+    {
+      "name": "auto required tool requests plan",
+      "mode": "auto",
+      "planningAvailable": true,
+      "requiredTools": ["publish"],
+      "calls": [{ "name": "publish", "arguments": {} }],
+      "expected": {
+        "outcome": "activate",
+        "trigger": "tool_required",
+        "requestedTools": ["publish"]
+      }
+    },
+    {
+      "name": "auto model requests remaining plan",
+      "mode": "auto",
+      "planningAvailable": true,
+      "initialPlanningOpen": false,
+      "requiredTools": [],
+      "calls": [{ "name": "request_remaining_plan", "arguments": {} }],
+      "expected": {
+        "outcome": "activate",
+        "trigger": "remaining_model_requested",
+        "requestedTools": []
+      }
+    },
+    {
+      "name": "auto remaining required tool requests plan",
+      "mode": "auto",
+      "planningAvailable": true,
+      "initialPlanningOpen": false,
+      "requiredTools": ["publish"],
+      "calls": [{ "name": "publish", "arguments": {} }],
+      "expected": {
+        "outcome": "activate",
+        "trigger": "remaining_tool_required",
+        "requestedTools": ["publish"]
+      }
+    },
+    {
+      "name": "initial control is closed after an effect",
+      "mode": "auto",
+      "planningAvailable": true,
+      "initialPlanningOpen": false,
+      "requiredTools": [],
+      "calls": [{ "name": "request_plan", "arguments": {} }],
+      "expected": { "outcome": "error", "errorCode": "invalid_planning_control_call" }
+    },
+    {
+      "name": "remaining control is closed before an effect",
+      "mode": "auto",
+      "planningAvailable": true,
+      "initialPlanningOpen": true,
+      "requiredTools": [],
+      "calls": [{ "name": "request_remaining_plan", "arguments": {} }],
+      "expected": { "outcome": "error", "errorCode": "invalid_planning_control_call" }
+    },
+    {
+      "name": "auto planner unavailable",
+      "mode": "auto",
+      "planningAvailable": false,
+      "requiredTools": ["publish"],
+      "calls": [{ "name": "publish", "arguments": {} }],
+      "expected": { "outcome": "error", "errorCode": "planning_unavailable" }
+    },
+    {
+      "name": "reactive refuses control",
+      "mode": "reactive",
+      "planningAvailable": true,
+      "requiredTools": [],
+      "calls": [{ "name": "request_plan", "arguments": {} }],
+      "expected": { "outcome": "error", "errorCode": "planning_required" }
+    },
+    {
+      "name": "reactive refuses required tool",
+      "mode": "reactive",
+      "planningAvailable": true,
+      "requiredTools": ["publish"],
+      "calls": [{ "name": "publish", "arguments": {} }],
+      "expected": { "outcome": "error", "errorCode": "planning_required" }
+    },
+    {
+      "name": "planned refuses private control",
+      "mode": "planned",
+      "planningAvailable": true,
+      "requiredTools": [],
+      "calls": [{ "name": "request_plan", "arguments": {} }],
+      "expected": { "outcome": "error", "errorCode": "invalid_planning_control_call" }
+    },
+    {
+      "name": "control must be sole call",
+      "mode": "auto",
+      "planningAvailable": true,
+      "requiredTools": [],
+      "calls": [
+        { "name": "request_plan", "arguments": {} },
+        { "name": "lookup", "arguments": {} }
+      ],
+      "expected": { "outcome": "error", "errorCode": "invalid_planning_control_call" }
+    },
+    {
+      "name": "control arguments must be empty",
+      "mode": "auto",
+      "planningAvailable": true,
+      "requiredTools": [],
+      "calls": [{ "name": "request_plan", "arguments": { "reason": "hidden" } }],
+      "expected": { "outcome": "error", "errorCode": "invalid_planning_control_call" }
+    }
+  ]
+}

@@ -153,10 +153,25 @@ class ToolPlanningDisposition(StrEnum):
     REPLAN = "replan"
 
 
+class ToolPlanningRequirement(StrEnum):
+    """Whether a runtime tool may execute before a governed plan exists."""
+
+    OPTIONAL = "optional"
+    REQUIRED = "required"
+
+
 class RuntimeOutcome(StrEnum):
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELED = "canceled"
+
+
+class PlanningMode(StrEnum):
+    """Per-Run strategy for adaptive, direct, or governed execution."""
+
+    AUTO = "auto"
+    REACTIVE = "reactive"
+    PLANNED = "planned"
 
 
 class PlanningKind(StrEnum):

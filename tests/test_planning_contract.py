@@ -21,10 +21,13 @@ from purra.contracts import (
     ExecutionPlan,
     MessageRole,
     ModelCompletion,
+    ModelStream,
+    ModelStreamChunk,
     ModelFinishReason,
     ModelRequest,
     PlanningCapabilities,
     PlanningConstraints,
+    PlanningMode,
     PlannerLimits,
     PlanningTurn,
     ReasoningMode,
@@ -36,6 +39,7 @@ from purra.contracts import (
     TaskSpec,
     ToolPolicy,
     ToolContextContract,
+    ToolCall,
     ToolSchema,
     WorkPlan,
     WorkStep,
@@ -46,16 +50,29 @@ from purra.plan_compiler import compile_work_plan
 from purra.ports import ToolRegistration
 from purra.planner import (
     AgentPlanner,
+    MODEL_ONLY_PLANNER_SYSTEM_PROMPT,
     PLANNER_SYSTEM_PROMPT,
     build_planner_messages,
     normalize_work_plan,
 )
+from purra.planning_activation import resolve_planning_activation
+from purra.planning_stream import PlanningStreamParser
 from purra.run_state import RunStateMachine
 from purra.tools import InMemoryToolCatalog
 
 
 class _Planner:
     pass
+
+
+@pytest.mark.parametrize("prompt", [PLANNER_SYSTEM_PROMPT, MODEL_ONLY_PLANNER_SYSTEM_PROMPT])
+def test_planner_schema_examples_are_complete_jsonl_records(prompt):
+    examples = [line for line in prompt.splitlines() if line.startswith("{")]
+    assert len(examples) == 2
+    for example in examples:
+        parser = PlanningStreamParser()
+        assert parser.feed(example + "\n") == ()
+        assert isinstance(parser.finish()["needsTodos"], bool)
 
 
 class _Gateway:
@@ -73,7 +90,13 @@ class _ScriptedPlannerGateway:
         self.invocations = []
 
     async def stream(self, messages, invocation, signal=None):
-        raise AssertionError("planner must use complete")
+        self.message_rounds.append(tuple(messages))
+        self.invocations.append(invocation)
+        output = self.outputs.pop(0)
+        async def chunks():
+            yield ModelStreamChunk(content_delta=json.dumps({"v": 1, "type": "plan", "plan": json.loads(output)}) + "\n")
+            yield ModelStreamChunk(finish_reason=ModelFinishReason.STOP)
+        return ModelStream(chunks=chunks(), model="test-model", applied_output_limit=invocation.output_limit.max_tokens)
 
     async def complete(self, messages, invocation, signal=None):
         del signal
@@ -92,12 +115,11 @@ class _AlwaysPlan:
         del request, capabilities
         return PlanningConstraints()
 
-    def should_plan(self, request, capabilities):
-        del request, capabilities
-        return True
 
-
-def _request() -> AgentRunRequest:
+def _request(
+    *,
+    planning_mode: PlanningMode = PlanningMode.PLANNED,
+) -> AgentRunRequest:
     return AgentRunRequest(
         messages=(AgentMessage(role=MessageRole.USER, content="Plan this."),),
         model=ModelRequest(
@@ -110,7 +132,36 @@ def _request() -> AgentRunRequest:
             ),
         ),
         domain_context=DomainContext(namespace="test.domain"),
+        planning_mode=planning_mode,
     )
+
+
+def test_dynamic_planner_observations_are_bounded_without_changing_full_evidence():
+    messages = tuple(
+        AgentMessage(
+            role=MessageRole.TOOL,
+            tool_call_id=f"call-{index}",
+            content=json.dumps({
+                "id": f"fact-{index}", "source": "retrieval-fixture",
+                "version": 3, "content": "evidence " + "x" * 6_000,
+            }),
+        )
+        for index in range(12)
+    )
+    originals = tuple(message.content for message in messages)
+    system, user = build_planner_messages(
+        _request(), PlanningCapabilities(),
+        turn=PlanningTurn(
+            revision=1, round_number=2, remaining_model_rounds=2,
+            messages=messages,
+        ),
+    )
+    observations = json.loads(user.content)["executionState"]["recentToolObservations"]
+    assert [row["toolCallId"] for row in observations] == [f"call-{i}" for i in range(4, 12)]
+    assert all(len(row["content"]) <= 4_001 for row in observations)
+    assert "retrieval-fixture" not in system.content
+    assert tuple(message.content for message in messages) == originals
+    assert json.loads(messages[-1].content)["version"] == 3
 
 
 def _always_reasoning_request() -> AgentRunRequest:
@@ -275,6 +326,31 @@ async def test_planner_uses_the_run_reasoning_mode():
     assert gateway.invocations[0].reasoning_mode is ReasoningMode.ENABLED
 
 
+@pytest.mark.asyncio
+async def test_planner_applies_its_own_output_budget():
+    gateway = _ScriptedPlannerGateway([json.dumps({
+        "needsTodos": False,
+        "title": "Answer",
+        "goal": "Answer the question",
+    })])
+
+    await AgentPlanner(
+        gateway,
+        limits=PlannerLimits(max_call_output_tokens=512),
+    ).create_plan(_request(), PlanningCapabilities())
+
+    output_limit = gateway.invocations[0].output_limit
+    assert output_limit.max_tokens == 512
+    assert output_limit.source.value == "workflow_policy"
+
+
+def test_planner_budget_limits_require_positive_values():
+    with pytest.raises(ValueError, match="max_call_output_tokens"):
+        PlannerLimits(max_call_output_tokens=0)
+    with pytest.raises(ValueError, match="attempt_timeout_ms"):
+        PlannerLimits(attempt_timeout_ms=0)
+
+
 def test_planner_has_no_default_total_step_limit_but_honors_an_explicit_one():
     raw = {
         "needsTodos": True,
@@ -419,11 +495,51 @@ def test_generic_planner_prompt_has_no_product_artifact_protocol():
         assert product_symbol not in PLANNER_SYSTEM_PROMPT
 
 
-def test_execution_profile_requires_an_explicit_planner_policy_pair():
-    with pytest.raises(ValueError, match="explicit planner"):
-        ExecutionProfile(planning_policy=_AlwaysPlan())
-    with pytest.raises(ValueError, match="unused planner"):
-        ExecutionProfile(planner=_Planner())
+def test_planner_configuration_is_capability_not_per_run_activation():
+    profile = ExecutionProfile(planner=_Planner())
+
+    assert profile.planning_enabled is True
+    assert profile.planning_policy is None
+    assert AgentRunRequest(
+        messages=(),
+        model=_request().model,
+        domain_context=DomainContext(namespace="test.domain"),
+    ).planning_mode is PlanningMode.AUTO
+    with pytest.raises(ValueError):
+        replace(_request(), planning_mode="automatic")
+
+
+def test_shared_planning_activation_cases_match_typescript():
+    fixture_path = (
+        Path(__file__).parents[1]
+        / "conformance"
+        / "fixtures"
+        / "planning_activation.json"
+    )
+    fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+    for row in fixture["cases"]:
+        resolution = resolve_planning_activation(
+            tuple(
+                ToolCall(
+                    id=f"call-{index}",
+                    name=call["name"],
+                    arguments_json=json.dumps(call["arguments"]),
+                )
+                for index, call in enumerate(row["calls"])
+            ),
+            mode=PlanningMode(row["mode"]),
+            planning_available=row["planningAvailable"],
+            planning_required_tool_names=frozenset(row["requiredTools"]),
+            initial_planning_open=row.get("initialPlanningOpen", True),
+        )
+        expected = row["expected"]
+        if expected["outcome"] == "error":
+            assert resolution.error_code == expected["errorCode"], row["name"]
+        elif expected["outcome"] == "activate":
+            assert resolution.trigger == expected["trigger"], row["name"]
+            assert list(resolution.requested_tool_names) == expected["requestedTools"]
+        else:
+            assert resolution == type(resolution)(), row["name"]
 
 
 def test_planning_does_not_implicitly_enable_staged_context():
@@ -435,17 +551,18 @@ def test_planning_does_not_implicitly_enable_staged_context():
     assert profile.context_strategy is ContextStrategy.SINGLE_PASS
 
 
-def test_low_level_core_does_not_infer_a_policy_from_a_planner():
+def test_low_level_core_accepts_a_planner_without_an_activation_policy():
     adapters = InMemoryAgentAdapters()
-    with pytest.raises(ValueError, match="explicit planning policy"):
-        AgentCore(
-            model_gateway=_Gateway(),
-            run_repository=adapters.runs,
-            planner=_Planner(),
-            runtime_limits=RuntimeLimits(
-                max_run_output_tokens=None,
-            ),
-        )
+    core = AgentCore(
+        model_gateway=_Gateway(),
+        run_repository=adapters.runs,
+        planner=_Planner(),
+        runtime_limits=RuntimeLimits(
+            max_run_output_tokens=None,
+        ),
+    )
+
+    assert core._planning_enabled is True
 
 
 def test_agent_core_requires_an_explicit_cumulative_output_budget():

@@ -1,67 +1,104 @@
 # PurrA
 
-English | [简体中文](https://github.com/Lybrands/purra/blob/main/README.zh-CN.md)
+English | [简体中文](README.zh-CN.md)
 
-PurrA is a product-neutral Agent runtime for applications that need explicit
-control over model calls, tools, state, and recovery.
-
-Python and JavaScript/TypeScript are independent implementations of the same
-safety contracts.
+PurrA is an Agent runtime for Python and TypeScript. It coordinates model calls,
+tool execution, planning, context, and recoverable Runs inside your application.
+The application supplies its models, tools, data sources, and access rules.
 
 ## Install
 
 Python 3.11+:
 
-```bash
+```sh
 pip install purra
 ```
 
-Node.js 22+:
+Node.js 22+ (ESM):
 
-```bash
+```sh
 npm install purra
 ```
 
-The npm package is native ESM.
+Core has no runtime dependencies. Model SDKs, storage, and memory integrations
+are available as [optional packages](integrations/README.md).
 
-## Start
+## Python quickstart
 
-Python Runs enter through `purra.api.AgentCore.submit()`. See the runnable
-[Python quickstart](https://github.com/Lybrands/purra/blob/main/examples/python/quickstart.py).
+Provide a model gateway, a `ModelRequest` with the selected model's capability
+snapshot, and its context-window size. The gateway can come from an optional
+adapter or implement PurrA's `ModelGateway` port.
 
-For JavaScript and TypeScript, see the
-[package guide](https://github.com/Lybrands/purra/blob/main/typescript/README.md)
-and [quickstart](https://github.com/Lybrands/purra/blob/main/typescript/examples/quickstart.ts).
+```python
+from purra.api import AgentCore, AgentPreset, InMemoryAgentAdapters
+from purra.contracts import (
+    AgentMessage, AgentRunRequest, DomainContext, ModelRequest, RuntimeLimits,
+)
+from purra.tools import InMemoryToolCatalog
 
-Reactive execution is the default; Planned and Durable execution are opt-in.
-The host supplies Provider adapters, tools, business authorization, and
-production persistence. See [Architecture](https://github.com/Lybrands/purra/blob/main/ARCHITECTURE.md)
-for runtime guarantees and ownership boundaries.
+async def ask(gateway, model: ModelRequest, context_window: int):
+    storage = InMemoryAgentAdapters()
+    core = AgentCore(
+        model_gateway=gateway,
+        preset=AgentPreset(
+            id="assistant",
+            revision="1",
+            tool_catalog=InMemoryToolCatalog(()),
+            runtime_limits=RuntimeLimits(max_run_output_tokens=8192),
+        ),
+        run_repository=storage.runs,
+        output_repository=storage.outputs,
+        output_publisher=storage.publisher,
+    )
+    try:
+        run = await core.submit(AgentRunRequest(
+            messages=(AgentMessage(role="user", content="Hello"),),
+            model=model,
+            domain_context=DomainContext(namespace="example"),
+            context_window=context_window,
+        ))
+        result = await run.wait()
+        return result.final_response
+    finally:
+        await core.close()
+```
 
-## Output-token contracts
+This example stores Runs in memory. Use a persistent repository to retain them
+after restart. For a complete example that runs without API credentials, see
+[local examples](examples/README.md). For JavaScript and TypeScript, see the
+[TypeScript guide](typescript/README.md).
 
-PurrA 0.5.0 separates the per-invocation model limit from the cumulative Run
-budget. Python uses `max_call_output_tokens` and
-`max_run_output_tokens`; TypeScript uses
-`maxCallOutputTokens` and `maxRunOutputTokens`.
+## Runtime capabilities
 
-Run creation must state the cumulative budget explicitly. Use `None` in Python
-or `null` in TypeScript only when the host deliberately chooses no finite
-cumulative token limit. Provider gateways must also acknowledge the exact
-per-invocation limit they applied; omission or mismatch is a contract error.
-PurrA 0.5.0 does not alias or migrate older output-token field names.
+- **Runs:** submit work, subscribe to committed events, cancel execution, and replay output.
+- **Tools:** validate arguments, enforce access and effect policies, and record results.
+- **Planning:** select Auto, Reactive, or Planned execution when a planner is configured.
+- **Context:** allocate input budgets, retrieve external data, and compress conversation history.
+- **Agent trees and long tasks:** delegate work and persist execution progress through repository ports.
 
-## Compatibility
+The application chooses models and their limits, authorizes data access and tool
+side effects, and manages persistent storage. Retrieval sources and tool results
+are treated as data rather than instructions.
 
-PurrA is pre-1.0. Breaking public-contract changes require a new minor release.
-Python and npm packages use the version encoded by the same Git tag; matching
-versions do not imply automatic capability parity.
+## Budgets and recovery
 
-## Links
+`max_call_output_tokens` limits one model call; `max_run_output_tokens` limits
+cumulative model output for a Run. Set the cumulative budget explicitly;
+`None` means no finite token ceiling. A finite budget requires reported model usage.
 
-- [Runnable examples](https://github.com/Lybrands/purra/blob/main/examples/README.md)
-- [Issue tracker](https://github.com/Lybrands/purra/issues)
+Recovery continues from committed checkpoints. The application must restore the
+same model and tool configuration and reconcile interrupted external writes
+before retrying them. Persistent storage alone does not make those writes replayable.
+
+## Documentation
+
+- [TypeScript guide](typescript/README.md)
+- [Examples](examples/README.md)
+- [Optional packages](integrations/README.md)
+- [Architecture](ARCHITECTURE.md)
+- [Cross-language conformance](conformance/README.md)
+- [Changelog](CHANGELOG.md)
 
 ## License
 
-[MIT](https://github.com/Lybrands/purra/blob/main/LICENSE)
+[MIT](LICENSE)

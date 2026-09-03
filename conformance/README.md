@@ -1,31 +1,37 @@
 # Cross-language conformance
 
-The JSON fixtures in `fixtures/` define shared behavioral cases consumed by
-the Python and TypeScript test suites. They align safety semantics, wire values,
-and stable error outcomes without requiring identical public APIs or shared
-runtime code.
+English | [简体中文](README.zh-CN.md)
 
-`tool_security.json` covers Core-authoritative tool-schema admission and runtime
-validation in both languages. The recursively enforced subset supports `type`,
-`properties`, `required`, `additionalProperties`, `items`, `anyOf`, `oneOf`,
-`enum`, `const`, `minLength`, `maxLength`, `minItems`, `maxItems`,
-`uniqueItems`, `minimum`, and `maximum`; `title` and `description` are admitted
-annotations. Unknown or malformed keywords fail Tool Catalog assembly.
-`uniqueItems`, `enum`, and `const` share recursive JSON-value equality: numeric
-representations compare by mathematical value, booleans remain distinct from
-numbers, and object property order is irrelevant.
-Cross-runtime numeric fixtures cover values represented identically by both
-runtimes. TypeScript `JsonValue` remains a finite IEEE-754 number, so integer
-literals beyond its safe range are not exact cross-language conformance
-evidence.
+The JSON files in [fixtures](fixtures/) define behavior shared by the Python and
+TypeScript implementations. Both test suites consume these cases to check
+protocol values, validation, state transitions, and error outcomes.
 
-`durable_protocol.json` freezes protocol version 4, Agent Preset snapshot
-version 4, stable Runtime Safety error codes, budget edge cases, Provider delta
-batch hashing, lease expiry, and orphan settlement outcomes for both runtimes.
+| Fixtures | Coverage |
+| --- | --- |
+| `model_protocol.json`, `context_protocol.json` | Model messages, output limits, and context budgets |
+| `tool_security.json`, `retrieval.json` | Tool schemas, retrieval results, and access boundaries |
+| `planning_protocol.json`, `planning_activation.json`, `planning_stream.json` | Plans, activation modes, and public progress streams |
+| `durable_protocol.json`, `recovery_protocol.json` | Durable execution and recovery |
+| `agent_tree_protocol.json`, `delegation_protocol.json` | Agent identity, delegation, and shared budgets |
+| `artifact_protocol.json`, `observability_protocol.json` | Artifacts, events, and diagnostics |
 
-`agent_tree_protocol.json` freezes recursive Agent identity, immutable Run
-chains, bounded scheduling, continuation CAS, capability narrowing, stable
-errors, Root-scoped budget dimensions, canonical journal attribution, and the
-target Agent Preset snapshot v5 for both runtimes. It also freezes the
-Reactive `model_ready` checkpoint v1 boundary: completed tool rounds may
-resume, while in-flight Provider/tool work remains fail-stop.
+## Run
+
+From the repository root:
+
+```sh
+python -m pip install -e '.[test]'
+python -m pytest
+npm --prefix typescript ci
+npm --prefix typescript run check
+```
+
+## Maintaining fixtures
+
+When changing a shared contract, update its fixture and both SDK test consumers.
+Use values that both runtimes can represent exactly, and keep private execution
+state out of public-output expectations. SDK-specific checkpoint formats and
+public API names do not need to match.
+
+For package installation and consumer checks, see
+[SDK parity smoke](../sdk-parity-smoke/README.md).

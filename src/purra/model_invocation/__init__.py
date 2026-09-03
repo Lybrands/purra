@@ -11,6 +11,7 @@ from purra.model_invocation.manager import (
     AgentModelInvocationManager,
     ModelInvocationOutputObserver,
 )
+from purra.ports.evidence import ModelInputEvidenceValidator
 
 __all__ = [
     "AgentModelCall",
@@ -19,5 +20,6 @@ __all__ = [
     "ManagedInvocationStream",
     "ModelInvocationContext",
     "ModelInvocationOutputObserver",
+    "ModelInputEvidenceValidator",
     "ModelInvocationReceipt",
 ]

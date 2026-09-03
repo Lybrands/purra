@@ -381,6 +381,7 @@ def _validate_result_contract(
         "mode",
         "context_window",
         "tools_enabled",
+        "planning_mode",
     )
     if any(
         getattr(candidate, name) != getattr(source, name)

@@ -78,6 +78,11 @@ test("conformance probes reject adapters with removed safety guarantees", async 
   await assert.rejects(assertRunRepositoryConforms(proxy(adapters.runs, {
     async listEvents(target, ...args) { return (await target.listEvents(...args)).slice(0, -1); },
   })));
+  await assert.rejects(assertRunRepositoryConforms(proxy(new InMemoryAgentAdapters().runs, {
+    async saveExecutionCheckpoint(target, runId, checkpoint, claim) {
+      return target.saveExecutionCheckpoint(runId, { ...checkpoint, context: null }, claim);
+    },
+  })), nonconforming("run_repository_nonconforming"));
   await assert.rejects(assertContextProviderConforms({
     provider: { buildContext() { return { blocks: [{ name: "same", content: "a" }, { name: "same", content: "b" }] }; } },
     request: { messages: [{ role: "user", content: "probe" }] },

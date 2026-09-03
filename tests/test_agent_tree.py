@@ -115,7 +115,7 @@ def test_shared_agent_tree_protocol_matches_python_contracts():
     assert "agent_execution_checkpoint_conflict" in FIXTURE["stableErrorCodes"]
     assert "agent_preset_mismatch" in FIXTURE["stableErrorCodes"]
     assert FIXTURE["recovery"] == {
-        "executionCheckpointSchemaVersion": 1,
+        "executionCheckpointSchemaVersions": {"python": 1, "typescript": 2},
         "resumablePhase": "model_ready",
         "resumableExecutionProfile": "reactive",
         "inFlightProviderOrToolPolicy": "fail_stop",

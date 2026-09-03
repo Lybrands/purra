@@ -24,6 +24,7 @@ from purra.contracts import (
     ToolDataContract,
     ToolHandlerResult,
     ToolPolicy,
+    ToolPlanningRequirement,
     ToolSchema,
     TraceRecord,
 )
@@ -102,6 +103,9 @@ class ToolRegistration:
     data_contract: ToolDataContract = ToolDataContract()
     max_argument_chars: int | None = None
     planning_capability: ToolSchema | None = None
+    planning_requirement: ToolPlanningRequirement = (
+        ToolPlanningRequirement.OPTIONAL
+    )
     host_planned_arguments: Mapping[str, Any] | None = None
     call_handler: ToolCallHandler | None = None
     operation_display_params: OperationDisplayParamsResolver | None = None
@@ -137,6 +141,11 @@ class ToolRegistration:
             and not isinstance(self.planning_capability, ToolSchema)
         ):
             raise TypeError("tool planning_capability must be a ToolSchema")
+        object.__setattr__(
+            self,
+            "planning_requirement",
+            ToolPlanningRequirement(self.planning_requirement),
+        )
         if self.host_planned_arguments is not None:
             if not isinstance(self.host_planned_arguments, Mapping):
                 raise TypeError("tool host_planned_arguments must be a mapping")

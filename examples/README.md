@@ -1,31 +1,37 @@
 # Examples
 
-These examples use deterministic local model gateways and in-memory adapters.
-They need no credentials and are not production persistence examples.
+English | [简体中文](README.zh-CN.md)
+
+Runnable examples using local model gateways and in-memory storage. No API key or
+network model call is required.
+
+| Example | Python | TypeScript |
+| --- | --- | --- |
+| Run a tool and return an answer | [quickstart.py](python/quickstart.py) | [quickstart.ts](../typescript/examples/quickstart.ts) |
+| Subscribe to planning progress, cancel, and replay events | [planner_streaming.py](python/planner_streaming.py) | [planner-streaming.ts](../typescript/examples/planner-streaming.ts) |
 
 ## Python
 
-From the repository root:
+From the repository root, with Python 3.11+:
 
-```bash
+```sh
 python -m pip install -e .
 python examples/python/quickstart.py
+python examples/python/planner_streaming.py
 ```
-
-See [`python/quickstart.py`](python/quickstart.py).
 
 ## TypeScript
 
-From the repository root:
+From the repository root, with Node.js 22+:
 
-```bash
-cd typescript
-npm ci
-npm run example
+```sh
+npm --prefix typescript ci
+npm --prefix typescript run example
 ```
 
-See [`../typescript/examples/quickstart.ts`](../typescript/examples/quickstart.ts).
+The TypeScript command compiles and runs both examples.
 
-Both examples run the same flow: the model requests a read-only lookup tool,
-the host executes it, and the model returns a final answer through a canonical
-Run.
+To use a model service or persistent storage, replace the local adapters with
+[optional packages](../integrations/README.md) or application implementations.
+The quickstart Retriever reads fixed public data; an application Retriever must
+check access to its own data source.

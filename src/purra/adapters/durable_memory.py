@@ -704,6 +704,27 @@ class InMemoryLongTaskRepository:
             ]
             return tuple(records[:max(1, int(limit))])
 
+    async def find_by_idempotency_key(
+        self,
+        namespace: str,
+        idempotency_key: str,
+    ) -> LongTaskRecord | None:
+        normalized_namespace = _required(namespace, "long task namespace")
+        normalized_key = _required(
+            idempotency_key,
+            "long task idempotency key",
+        )
+        async with self._lock:
+            matches = tuple(
+                state.record
+                for state in self._tasks.values()
+                if state.record.namespace == normalized_namespace
+                and state.record.metadata.get("idempotencyKey") == normalized_key
+            )
+            if len(matches) > 1:
+                raise ValueError("long task idempotency key conflicts")
+            return matches[0] if matches else None
+
     async def find_active(
         self,
         *,

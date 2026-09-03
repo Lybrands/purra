@@ -53,6 +53,7 @@ test("Agent consumes model chunks, tool deltas, usage, and output limits", async
             yield {
               toolCallDeltas: [{ index: 0, argumentsFragment: "\"Hangzhou\"}" }],
               finishReason: "stop",
+              providerData: { opaque_fixture: "encrypted-state" },
             };
           } finally {
             closed += 1;
@@ -87,6 +88,8 @@ test("Agent consumes model chunks, tool deltas, usage, and output limits", async
   assert.deepEqual(requests[2].tools, []);
   assert.deepEqual(result.messages[1].toolCalls[0].arguments, { city: "Hangzhou" });
   assert.equal(requests[1].messages[1].reasoning, "private reasoning");
+  assert.deepEqual(requests[1].messages[1].providerData, { opaque_fixture: "encrypted-state" });
+  assert.equal(JSON.stringify(result.messages).includes("encrypted-state"), false);
   assert.equal(JSON.stringify(result.messages).includes("private weather candidate"), false);
   assert.equal(result.messages[1].reasoning, undefined);
 });
@@ -139,6 +142,34 @@ test("Agent.stream does not retry after a public delta was emitted", async () =>
   );
   assert.equal(closed, 1);
 });
+
+test("Agent.stream emits native public progress separately from answer text", async () => {
+  const agent = new Agent({
+    model: {
+      capabilities: capabilities(1000),
+      async invoke() { throw new Error("stream should be used"); },
+      stream(request) {
+        return Object.assign((async function* () {
+          yield { progressDelta: "正在核对人物动机" };
+          yield { contentDelta: "分析完成", finishReason: "stop" };
+        })(), { appliedOutputLimit: request.outputLimit?.maxTokens });
+      },
+    },
+  });
+
+  const events = [];
+  for await (const event of agent.stream({
+    messages: [{ role: "user", content: "分析" }],
+  })) events.push(event);
+
+  assert.deepEqual(events.map((event) => event.type), [
+    "agent_progress",
+    "model_delta",
+    "final",
+  ]);
+  assert.equal(events[0].text, "正在核对人物动机");
+  assert.equal(events.at(-1).result.output, "分析完成");
+})
 
 test("Agent closes a pending model stream when canceled", async () => {
   const controller = new AbortController();
@@ -327,10 +358,12 @@ test("Transport-only activity expires progress with the stable code", async () =
 
 test("declared stream silence expires activity with the stable code", async () => {
   let closed = 0;
+  let stoppedBeforeClose = false;
   const agent = new Agent({
     model: {
       async invoke() { throw new Error("stream should be used"); },
-      stream() {
+      stream(_request, signal) {
+        signal.addEventListener("abort", () => { stoppedBeforeClose = closed === 0; }, { once: true });
         return streamWithSupport("transport", async function* () {
           try {
             await delay(100);
@@ -347,15 +380,12 @@ test("declared stream silence expires activity with the stable code", async () =
     },
   });
 
-  const startedAt = performance.now();
   await assert.rejects(
     agent.invoke({ messages: [{ role: "user", content: "Wait" }] }),
     (error) => error instanceof AgentError
       && error.code === "model_activity_deadline_exceeded",
   );
-  assert.ok(performance.now() - startedAt < 60);
-  assert.equal(closed, 0);
-  await delay(100);
+  assert.equal(stoppedBeforeClose, true);
   assert.equal(closed, 1);
 });
 
@@ -616,6 +646,7 @@ function capabilities(maxCallOutputTokens, streaming = "supported") {
       parallelToolCalls: "supported",
       streaming,
       cancellation: "supported",
+      publicProgress: "supported",
       assistantContentWithToolCalls: "optional",
       jsonSchemaLevel: "unknown",
       streamFinishSemantics: "normalized",

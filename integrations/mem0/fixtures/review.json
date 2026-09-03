@@ -1,0 +1,23 @@
+{
+  "description": "Contract fixtures with predetermined model output, not a Chinese semantic quality evaluation.",
+  "cases": [
+    {"name": "no comparison is not independence", "kinds": [], "proposal": null},
+    {"name": "compatible facts", "kinds": ["independent"], "proposal": "independent"},
+    {"name": "one duplicate", "kinds": ["duplicate", "independent"], "proposal": "duplicate"},
+    {"name": "explicit lasting replacement", "kinds": ["supersede", "independent"], "proposal": "supersede"},
+    {"name": "unresolved contradiction", "kinds": ["conflict"], "proposal": "conflict"},
+    {"name": "authority unclear", "kinds": ["uncertain"], "proposal": null},
+    {"name": "mixed claims need review", "kinds": ["duplicate", "supersede"], "proposal": null},
+    {"name": "multiple keepers need policy", "kinds": ["duplicate", "duplicate"], "proposal": null}
+  ],
+  "invalid": [
+    "not json",
+    "{\"relations\":[]}",
+    "{\"relations\":[{\"item\":\"foreign\",\"kind\":\"duplicate\"}]}",
+    "{\"relations\":[{\"item\":0,\"kind\":\"duplicate\"}]}",
+    "{\"relations\":[{\"item\":\"0\",\"kind\":\"delete\"}]}",
+    "{\"relations\":[{\"item\":\"0\",\"kind\":\"duplicate\",\"text\":\"injected\"}]}",
+    "{\"relations\":[{\"item\":\"0\",\"kind\":\"duplicate\"}],\"keep\":\"foreign\"}",
+    "{\"relations\":[{\"item\":\"0\",\"kind\":\"duplicate\"},{\"item\":\"0\",\"kind\":\"duplicate\"}]}"
+  ]
+}

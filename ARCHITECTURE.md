@@ -39,12 +39,39 @@ downstream of persistence; subscribers are never the source of Run truth.
 
 ## Execution styles
 
-Reactive execution is the default. The model answers directly or requests
-currently authorized tools.
+Auto execution is the default. Core adds the private, empty-argument
+`request_plan` control to the first ordinary Agent invocation when a Planner and
+tool calling are available. A direct answer completes without planning. An
+ordinary business tool call executes Reactively and closes later upfront-plan
+activation. Core then exposes only private `request_remaining_plan`, which can
+plan unfinished work from the committed checkpoint without replaying prior
+effects. Either phase control, or selecting a tool declared planning-required,
+promotes the same Run into governed planning before the selected required effect.
+There is no separate classifier invocation.
 
-Planned execution is explicit. A Planner produces a semantic `WorkPlan`; Core
+Without a Planner or tool calling, Auto does not advertise planning controls
+and uses the ordinary model/tool loop. A planning-required tool still needs
+Planner admission and cannot fall back to unplanned execution. Avoid assuming
+that a direct answer always costs one invocation: the configured response
+transaction may also require validation or a tool-free public presentation.
+
+Reactive execution is an explicit override that forbids Planner activation. A
+planning-required tool then fails closed with `planning_required`.
+
+Planned execution is an explicit override. A Planner produces a semantic `WorkPlan`; Core
 validates and compiles it before it can grant step-scoped tool authority. The
-plan describes intended work but is not itself runtime authority.
+plan describes intended work but is not itself runtime authority. Configuring a
+Planner installs that capability. Python `PlanningMode.PLANNED` and TypeScript
+`planningMode: "planned"` force it before the ordinary Agent invocation;
+omitting the field selects Auto. Planning policies constrain an activated plan;
+they do not classify requests or grant tools.
+
+Configure the Python Planner through `ExecutionProfile.planner` in an
+`AgentPreset`, or the direct `AgentCore(planner=...)` composition. TypeScript
+uses `planning.planner` or `planning.plannerFactory`. A planning policy is
+optional in both SDKs. Full-Run callers must explicitly select the cumulative
+output budget: Python `RuntimeLimits(max_run_output_tokens=...)` and TypeScript
+`submit(request, { budgets: { maxRunOutputTokens: ... } })`.
 
 Durable execution extends a valid Planned composition with task admission,
 leased task units, checkpoints, and authenticated continuation. A continuation
@@ -106,6 +133,39 @@ host adapters -> public contracts and ports <- PurrA runtime
 
 Provider SDKs, database drivers, product schemas, and UI code must not become
 runtime dependencies.
+
+`purra-openai` adapts OpenAI Responses and Chat Completions; `purra-anthropic`
+adapts Anthropic Messages. Both are optional packages using the public model port.
+They translate text, function tools, streaming, usage and private continuation
+state. Applications select models, supply verified capabilities and credentials,
+and handle other vendors' compatibility rules. Core owns execution and budgets;
+the adapters disable SDK retries so each invocation is one HTTP attempt.
+
+Optional components under `integrations/` are separate distributions, outside
+the Core source trees and dependency guards. The first is
+[`purra-mem0`](integrations/mem0/README.md), which depends only on public PurrA
+contracts plus its SDK/storage stack. Its SQLite journal tracks uncertain
+memory operations, visibility and optional provider budget reservations. Managed
+LLM callbacks reuse the Run-injected model task runner; Embedding usage stays in
+the component ledger. Canonical Run events and context evidence remain in the
+existing Core/host persistence path. Core never imports it.
+Source withdrawal is an independent journal transaction, so uncertain SDK writes
+cannot prevent revocation or make late records readable. Existing Core evidence
+can be revalidated against live versions, expiry and source policy; the host owns
+source-event routing and checkpoint/pre-dispatch wiring. Neither withdrawal nor
+logical deletion promises erasure of historical context or SDK audit text.
+Explicit duplicate/supersession/conflict decisions verify a bounded set of SDK
+records, then atomically change their journal views/versions and decision receipt.
+SDK payloads remain unchanged; all reads use effective journal visibility rather
+than treating SDK lifecycle metadata as current. Host policy chooses the semantic
+decision; the component does not synthesize facts or fabricate merged provenance.
+Optional semantic review reuses bounded Mem0 search and the managed model callback
+to classify a pending candidate against active peers. It persists advice without
+changing visibility. Derived proposals carry their review key; execution verifies
+the whole saved snapshot, including peers excluded from the change, then checks
+epoch/source/expiry again in the journal transaction. Host policy authorizes the
+decision. Review shares the namespace writer fence and provider ledger, with no
+second queue or Run journal; abandoned reviews are not replayed after recovery.
 
 ## Cross-language releases
 

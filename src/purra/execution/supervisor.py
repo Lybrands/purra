@@ -32,6 +32,10 @@ class AgentExecutionFactory(Protocol):
     ) -> AsyncIterator[AgentEvent | AgentRunResult]: ...
 
 
+from purra.execution.ownership import execution_owner, execution_claim
+from purra.interaction import UserInputRequired
+
+
 class AgentRunSupervisor:
     """Own execution Tasks; subscriptions only observe the canonical journal."""
 
@@ -122,7 +126,11 @@ class AgentRunSupervisor:
         )
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
-        run_id = await asyncio.shield(ready)
+        try:
+            run_id = await asyncio.shield(ready)
+        except BaseException:
+            if result.done() and not result.cancelled(): result.exception()
+            raise
         return _SupervisedRunHandle(
             supervisor=self,
             run_id=run_id,
@@ -151,12 +159,21 @@ class AgentRunSupervisor:
         session: _LeaseSession | None = None
         result: AgentRunResult | None = None
         stream: AsyncIterator[AgentEvent | AgentRunResult] | None = None
+        owner_token = execution_owner.set(self._owner_id)
+        claim_token = execution_claim.set(None)
         try:
+            checkpoint = getattr(options, "agent_execution_checkpoint", None)
+            if checkpoint is not None:
+                if self._lease_store is None and getattr(options, "agent_tree_run_id", None) is None:
+                    raise ContractViolationError("Root recovery requires an execution lease store")
+                session = await self._bind_lease(checkpoint.run_id, signal, force_claim=True)
+                ready.set_result(checkpoint.run_id)
             stream = self._execution_factory(request, options, signal)
             async for update in stream:
                 update_run_id = str(getattr(update, "run_id", "") or "").strip()
                 if update_run_id and not ready.done():
-                    session = await self._bind_lease(update_run_id, signal)
+                    if session is None:
+                        session = await self._bind_lease(update_run_id, signal)
                     ready.set_result(update_run_id)
                 if isinstance(update, AgentRunResult):
                     result = update
@@ -177,6 +194,12 @@ class AgentRunSupervisor:
             _settle_future_exception(ready, error)
             _settle_future_exception(result_future, error)
             raise
+        except UserInputRequired as error:
+            if session is not None:
+                await session.close()
+                session = None
+            _settle_future_exception(ready, error)
+            _settle_future_exception(result_future, error)
         except BaseException as error:
             _settle_future_exception(ready, error)
             _settle_future_exception(result_future, error)
@@ -186,11 +209,14 @@ class AgentRunSupervisor:
                     await stream.aclose()
             if session is not None:
                 await session.close()
+            execution_owner.reset(owner_token)
+            execution_claim.reset(claim_token)
 
     async def _bind_lease(
         self,
         run_id: RunId,
         signal: asyncio.Event,
+        *, force_claim: bool = False,
     ) -> _LeaseSession | None:
         if self._lease_store is None:
             return None
@@ -201,7 +227,9 @@ class AgentRunSupervisor:
             poll_interval_seconds=self._poll_interval_seconds,
             signal=signal,
         )
-        await session.bind(run_id)
+        await session.bind(run_id, force_claim=force_claim)
+        lease = await self._lease_store.get(run_id)
+        execution_claim.set((run_id, self._owner_id, lease.attempt))
         return session
 
     async def _subscribe(
@@ -326,9 +354,9 @@ class _LeaseSession:
         self._run_id: RunId | None = None
         self._monitor: asyncio.Task[None] | None = None
 
-    async def bind(self, run_id: RunId) -> None:
+    async def bind(self, run_id: RunId, *, force_claim: bool = False) -> None:
         state = await self._store.get(run_id)
-        if state is None or state.owner_id != self._owner_id:
+        if force_claim or state is None or state.owner_id != self._owner_id:
             claimed = await self._store.claim(
                 run_id,
                 self._owner_id,

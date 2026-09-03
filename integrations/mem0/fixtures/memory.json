@@ -1,0 +1,148 @@
+{
+  "schema": "purra-mem0/v1",
+  "scopes": [
+    {
+      "scope": {
+        "user": "u",
+        "project": "p"
+      },
+      "namespace": "purra-2c75ee8f48e88f30c6b25e0320025cd273899ae93d454fe0c3c1f17dfd5a0418"
+    },
+    {
+      "scope": {
+        "user": "作者😺",
+        "project": "项目/一",
+        "agent": "写作助手"
+      },
+      "namespace": "purra-3b71e1ae6ddfa033a239c22ada600ab12ca5793fc9966bf5f846e2c72cd80de2"
+    },
+    {
+      "scope": {
+        "user": "a/b",
+        "project": "c"
+      },
+      "namespace": "purra-abfda028130532e4aaa01da8717a0d2e00b5e5d885ce020d4756d875a6f2a57b"
+    },
+    {
+      "scope": {
+        "user": "a",
+        "project": "b/c"
+      },
+      "namespace": "purra-2b47a191c9ff32b227f1523ce8dee8e1c9768f4bbb9cbab194d6cf5afb013e7d"
+    }
+  ],
+  "invalid_expiry": [
+    "2026-08-31",
+    "2026-02-31T00:00:00Z",
+    "0000-01-01T00:00:00Z",
+    "2026-08-31T24:00:00Z",
+    "2026-08-31T00:00:00+08:00"
+  ],
+  "resolutions": [
+    {
+      "kind": "duplicate",
+      "texts": [
+        "回答尽量简短。",
+        "请简洁回复。"
+      ],
+      "keep": 0
+    },
+    {
+      "kind": "supersede",
+      "texts": [
+        "默认使用中文。",
+        "今后默认使用英文。"
+      ],
+      "keep": 1
+    },
+    {
+      "kind": "conflict",
+      "texts": [
+        "预算上限为 100。",
+        "预算上限为 200。"
+      ],
+      "keep": null
+    }
+  ],
+  "lifecycle": [
+    "pending",
+    "active",
+    "disabled",
+    "deleted"
+  ],
+  "management": {
+    "metadata": [
+      {
+        "kind": "plot",
+        "pinned": true,
+        "scopeId": null,
+        "importance": 3
+      },
+      {
+        "kind": "setting",
+        "pinned": false,
+        "scopeId": "人物一",
+        "importance": 1
+      },
+      {
+        "kind": "plot",
+        "pinned": false,
+        "scopeId": null,
+        "importance": 3
+      }
+    ],
+    "filters": [
+      {
+        "value": {
+          "kind": [
+            "plot",
+            "setting"
+          ],
+          "pinned": false
+        },
+        "indices": [
+          1,
+          2
+        ]
+      },
+      {
+        "value": {
+          "pinned": 1
+        },
+        "indices": []
+      },
+      {
+        "value": {
+          "importance": 3.0
+        },
+        "indices": [
+          0,
+          2
+        ]
+      },
+      {
+        "value": {
+          "scopeId": null
+        },
+        "indices": [
+          0,
+          2
+        ]
+      },
+      {
+        "value": {
+          "scopeId": "人物一"
+        },
+        "indices": [
+          1
+        ]
+      },
+      {
+        "value": {
+          "absent": null
+        },
+        "indices": []
+      }
+    ]
+  }
+}

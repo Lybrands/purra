@@ -283,13 +283,7 @@ def _sanitize_trace(value: Mapping[str, Any]) -> dict[str, Any]:
 def generation_attempt_traces(
     by_stage: Mapping[str, tuple[dict[str, Any], ...]],
 ) -> tuple[dict[str, Any], ...]:
-    """Return one terminal trace for every generation provider attempt.
-
-    Successful and ordinary failed attempts use ``model_round``. Historical
-    interrupted streams used ``stream/interrupted``; newer retry traces carry
-    an explicit content-free terminal marker. Counting both prevents an
-    upstream timeout from disappearing from round and latency budgets.
-    """
+    """Return one terminal trace for every generation provider attempt."""
 
     interrupted_streams = tuple(
         trace

@@ -39,7 +39,20 @@ class AgentOutputRepository(Protocol):
     async def append_event(
         self,
         draft: AgentOutputEventDraft,
-    ) -> AgentOutputEvent: ...
+    ) -> AgentOutputEvent:
+        """Deduplicate source keys and fence terminal streams/Runs.
+
+        planning.progress must match the invocation's versioned planning scope,
+        its still-active planning operation, and the exact text/record index/UTF-8
+        span in already persisted private Provider content. Meter the derived
+        event's bytes/events, never its tokens. Reject forged or cross-Run spans.
+
+        agent.progress must likewise match an exact, already persisted private
+        Provider progress delta for the same Run, invocation, stream, and source
+        chunk. It is a public projection, never synthesized from content or
+        reasoning bytes.
+        """
+        ...
 
     async def append_batch(
         self,
@@ -58,7 +71,8 @@ class AgentOutputRepository(Protocol):
         """Commit Run state and output events as one terminal fence.
 
         A terminal commit must abort every still-open stream for the Run in the
-        same transaction and must replay the same canonical events exactly.
+        same transaction, settle unfinished operations with run_terminalized,
+        and replay the same canonical events exactly.
         """
         ...
 
@@ -75,6 +89,11 @@ class AgentOutputRepository(Protocol):
     ) -> AgentOutputEvent: ...
 
     async def publish_stream_content_as_commentary(
+        self,
+        output_stream_id: str,
+    ) -> tuple[AgentOutputEvent, ...]: ...
+
+    async def publish_stream_content_as_final(
         self,
         output_stream_id: str,
     ) -> tuple[AgentOutputEvent, ...]: ...

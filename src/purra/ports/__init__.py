@@ -9,6 +9,7 @@ from purra.ports.context import (
     TaskContextDemandProvider,
 )
 from purra.ports.model import CancellationSignal, ModelGateway
+from purra.ports.evidence import ModelInputEvidenceValidator
 from purra.ports.persistence import (
     DelegationRepository,
     ExecutionLeaseStore,
@@ -74,6 +75,7 @@ __all__ = [
     "ExecutionLeaseStore",
     "ExecutionStateFactory",
     "ModelGateway",
+    "ModelInputEvidenceValidator",
     "PlanningPolicy",
     "ResponseJudge",
     "ResponseJudgePolicy",

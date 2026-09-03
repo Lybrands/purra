@@ -56,6 +56,17 @@ class ContextCapability:
             bundle = await self.provider.build_context(request, budget, signal)
         return _require_context_bundle(bundle)
 
+    async def build_reactive(
+        self,
+        request: AgentRunRequest,
+        budget: ContextBudget,
+        signal: CancellationSignal | None,
+    ) -> ContextBundle:
+        """Use the ordinary context path without touching staged planning data."""
+
+        bundle = await self.provider.build_context(request, budget, signal)
+        return _require_context_bundle(bundle)
+
     async def build_execution(
         self,
         request: AgentRunRequest,

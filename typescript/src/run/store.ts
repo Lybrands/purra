@@ -1,5 +1,8 @@
+import { encodeStorageState, decodeStorageState } from "../shared/storage-state.js";
+import { PLANNING_STREAM_SCHEMA, PlanningStreamParser } from "../planning/stream.js";
 import type { JsonValue, ModelTokenUsage } from "../model/types.js";
 import { copyJsonValue } from "../model/validation.js";
+import { copyPreparedContextSnapshot } from "../context/coordinator.js";
 import type { OutputEvent, OutputEventDraft } from "../output/types.js";
 import { AgentError } from "../shared/errors.js";
 import type {
@@ -15,6 +18,7 @@ import type {
 } from "./types.js";
 
 export interface RunRepository {
+  executeOwned?<T>(runId: string, operation: () => Promise<T>, checkpoint?: AgentExecutionCheckpoint): Promise<T>;
   begin(params: RunBeginParams): Promise<{ readonly snapshot: RunSnapshot; readonly event: OutputEvent }>;
   openInvocation(
     runId: string,
@@ -79,6 +83,7 @@ interface StoredRun {
 }
 
 const METERED_KINDS = new Set([
+  "planning.progress",
   "model.delta",
   "provider.delta_batch",
   "reasoning.delta",
@@ -94,6 +99,17 @@ export class InMemoryRunRepository implements RunRepository {
     runId: string,
     claim: { readonly leaseOwnerId?: string; readonly leaseEpoch?: number },
   ) => void;
+
+  /** Opaque version-pinned storage data, never a public output projection. */
+  public exportState(): string { return encodeStorageState({ runs: this.#runs, rootEvents: this.#rootEvents, rootEventsBySourceKey: this.#rootEventsBySourceKey }); }
+  public importState(text: string): void {
+    const shape = { runs: this.#runs, rootEvents: this.#rootEvents, rootEventsBySourceKey: this.#rootEventsBySourceKey };
+    const saved = decodeStorageState(text) as typeof shape;
+    this.#runs.clear(); for (const [key, value] of saved.runs) this.#runs.set(key, value);
+    this.#rootEvents.clear(); for (const [key, value] of saved.rootEvents) this.#rootEvents.set(key, value);
+    this.#rootEventsBySourceKey.clear(); for (const [key, value] of saved.rootEventsBySourceKey) this.#rootEventsBySourceKey.set(key, value);
+    for (const [id, run] of this.#runs) this.#runs.set(id, { ...run, rootEvents: this.#rootEvents.get(run.rootRunId)!, rootBySourceKey: this.#rootEventsBySourceKey.get(run.rootRunId)! });
+  }
 
   public constructor(options: {
     readonly leaseValidator?: (
@@ -204,6 +220,12 @@ export class InMemoryRunRepository implements RunRepository {
   ) {
     const run = this.#active(runId, claim);
     const root = this.#root(run);
+    if (input.runId !== runId || (input.outputProtocol !== undefined && input.outputProtocol !== PLANNING_STREAM_SCHEMA)
+      || (input.planningScope !== undefined && (input.outputProtocol !== PLANNING_STREAM_SCHEMA
+        || input.planningScope.runId !== runId || !Number.isSafeInteger(input.planningScope.revision) || input.planningScope.revision < 0))) {
+      throw new AgentError("planning_scope_conflict", "Invalid invocation planning scope or protocol");
+    }
+    if (input.planningScope !== undefined) requirePlanningOperation(run, input.planningScope.operationId);
     const existing = run.invocationReceipts.get(input.invocationId);
     if (existing !== undefined) {
       if (!sameInvocationInput(existing, input)) {
@@ -272,6 +294,7 @@ export class InMemoryRunRepository implements RunRepository {
       return existing === undefined;
     });
     const root = this.#root(run);
+    for (const draft of pending) validatePlanningProjection(run, draft);
     checkRelatedBudget(root, pending);
     return Object.freeze(copied.map((draft) => (
       run.rootBySourceKey.get(draft.sourceKey) ?? append(run, runId, draft, true, root)
@@ -302,6 +325,7 @@ export class InMemoryRunRepository implements RunRepository {
       if (
         copied.nextRound === current.nextRound
         && canonicalJson(copied) !== canonicalJson(current)
+        && !isInputCheckpointUpdate(current, copied)
       ) {
         throw new AgentError(
           "agent_execution_checkpoint_conflict",
@@ -310,7 +334,7 @@ export class InMemoryRunRepository implements RunRepository {
       }
     }
     const event = append(run, runId, {
-      sourceKey: `agent-checkpoint:${runId}:${copied.nextRound}`,
+      sourceKey: `agent-checkpoint:${runId}:${copied.nextRound}:${copied.inputRevision ?? 0}`,
       kind: "agent.execution_checkpoint",
       channel: "lifecycle",
       visibility: "private",
@@ -416,13 +440,34 @@ export class InMemoryRunRepository implements RunRepository {
     const events: OutputEvent[] = [];
     for (const invocationId of [...run.openInvocations]) {
       run.openInvocations.delete(invocationId);
+      // Cancellation can commit before the consuming task's catch runs. Charge
+      // its last persisted Provider usage once, rather than losing known tokens.
+      const observed = [...run.events].reverse().find((event) => event.kind === "model.usage"
+        && event.payload.invocationId === invocationId);
+      const usage = observed?.payload.usage as ModelTokenUsage | undefined;
+      applyInvocationUsage(run, usage);
+      if (root !== run) applyInvocationUsage(root, usage);
       events.push(append(run, runId, {
         sourceKey: `invocation:${invocationId}:aborted:${status}`,
         kind: "invocation.aborted",
         channel: "lifecycle",
         visibility: "private",
-        payload: { invocationId, cause: "run_terminal_commit" },
+        payload: { invocationId, cause: "run_terminal_commit", usageReported: usage !== undefined,
+          ...(usage === undefined ? {} : { usage: copyJsonValue(usage), usageSource: "last_observed" }) },
       }, false));
+    }
+    for (const started of run.events.filter((event) => event.kind === "operation.started")) {
+      const operationId = String(started.payload.operationId);
+      if (run.events.some((event) => event.kind === "operation.finished" && event.payload.operationId === operationId)) continue;
+      events.push(append(run, runId, { sourceKey: `operation:${operationId}:operation.finished`,
+        kind: "operation.finished", channel: "lifecycle", visibility: started.visibility,
+        payload: { type: "operation.finished", operationId, runId,
+          ...(started.payload.invocationId === undefined ? {} : { invocationId: started.payload.invocationId }),
+          ...(started.payload.parentOperationId === undefined ? {} : { parentOperationId: started.payload.parentOperationId }),
+          status: status === "canceled" ? "canceled" : "failed", errorCode: "run_terminalized",
+          finishedAt: new Date().toISOString(), durationMs: Math.max(0, Date.now() - Date.parse(started.occurredAt)),
+          timingSource: "recovery_wall_clock", display: started.payload.display ?? {},
+        } }, false));
     }
     for (const draft of related) events.push(append(run, runId, draft, true, root));
     const now = new Date().toISOString();
@@ -583,15 +628,28 @@ export async function assertRunRepositoryConforms(repository: RunRepository): Pr
   if (batch.length !== 2 || replay[0]?.eventId !== batch[0]?.eventId) {
     throw new AgentError("run_repository_nonconforming", "Run repository batch replay is not atomic");
   }
+  const contextSnapshot = copyPreparedContextSnapshot({
+    blocks: [{ name: "facts", content: "checkpoint evidence", untrusted: true,
+      evidence: [{ evidenceId: "fact", source: "conformance", itemId: "item", version: "1" }],
+    }],
+    contextAllocations: { facts: 64 },
+    compactions: 1,
+    summary: { name: "summary", content: "checkpoint summary", untrusted: true,
+      evidence: [{ evidenceId: "summary-fact", source: "conformance", version: "1" }],
+    },
+  });
   const checkpoint = await repository.saveExecutionCheckpoint(
     begun.snapshot.runId,
     {
-      schemaVersion: 1,
+      schemaVersion: 2,
       runId: begun.snapshot.runId,
       phase: "model_ready",
       executionProfile: "reactive",
+      initialPlanningOpen: false,
       nextRound: 2,
       messages: [{ role: "user", content: "resume" }],
+      context: contextSnapshot,
+      contextEvidence: Object.freeze([]),
       responseAttempts: 0,
       recoveryAttempts: [],
     },
@@ -603,6 +661,8 @@ export async function assertRunRepositoryConforms(repository: RunRepository): Pr
   if (
     checkpoint.snapshot.executionCheckpoint?.nextRound !== 2
     || checkpointReplay.event.eventId !== checkpoint.event.eventId
+    || canonicalJson((await repository.get(begun.snapshot.runId))?.executionCheckpoint?.context ?? null)
+      !== canonicalJson(contextSnapshot)
   ) {
     throw new AgentError(
       "run_repository_nonconforming",
@@ -658,6 +718,7 @@ function append(
     return existing;
   }
   const draft = copyDraft(rawDraft);
+  validatePlanningProjection(run, draft);
   if (meter) applyBudget(run, root, draft);
   const event: OutputEvent = Object.freeze({
     ...draft,
@@ -680,6 +741,152 @@ function append(
     updatedAt: event.occurredAt,
   });
   return event;
+}
+
+function requirePlanningOperation(run: StoredRun, operationId: string): void {
+  const events = run.events.filter((event) => event.payload.operationId === operationId
+    && (event.kind === "operation.started" || event.kind === "operation.finished"));
+  if (events.at(-1)?.kind !== "operation.started" || events.at(-1)?.payload.kind !== "planning") {
+    throw new AgentError("planning_scope_conflict", "Planning operation is not active");
+  }
+}
+
+function validatePlanningProjection(run: StoredRun, draft: OutputEventDraft): void {
+  if (draft.kind === "provider.delta_batch" && draft.visibility !== "private") {
+    const id = draft.payload?.invocationId;
+    const receipt = typeof id === "string" ? run.invocationReceipts.get(id) : undefined;
+    if (receipt === undefined || receipt.outputProtocol === PLANNING_STREAM_SCHEMA
+      || draft.payload?.source !== "provider" || !Array.isArray(draft.payload.entries)
+      || draft.payload.entries.some((entry) => entry === null || typeof entry !== "object"
+        || Array.isArray(entry) || entry.kind !== "provider.content_delta")) {
+      throw new AgentError("planning_projection_invalid", "Private or unattributed Provider bytes cannot be public");
+    }
+  }
+  if (draft.kind === "commentary" && draft.payload?.source === "provider") {
+    const invocationId = draft.payload.invocationId;
+    const receipt = typeof invocationId === "string"
+      ? run.invocationReceipts.get(invocationId)
+      : undefined;
+    const text = draft.payload.text;
+    const completion = typeof invocationId === "string"
+      ? run.events.find((event) => (
+          event.sourceKey === `invocation:${invocationId}:completion`
+          && event.kind === "model.completed"
+        ))
+      : undefined;
+    const streamedText = typeof invocationId === "string"
+      ? run.events.filter((event) => (
+          event.kind === "provider.delta_batch"
+          && event.visibility === "private"
+          && event.payload.invocationId === invocationId
+        )).flatMap((event) => (
+          event.payload.entries as unknown as readonly {
+            kind: string;
+            payload: { delta?: string };
+          }[]
+        )).filter((entry) => entry.kind === "provider.content_delta")
+          .map((entry) => entry.payload.delta ?? "").join("")
+      : "";
+    const providerText = streamedText !== ""
+      ? streamedText
+      : completion?.payload.content;
+    if (
+      receipt === undefined
+      || receipt.outputProtocol === PLANNING_STREAM_SCHEMA
+      || typeof text !== "string"
+      || text.trim() === ""
+      || providerText !== text
+      || draft.channel !== "commentary"
+      || draft.sourceKey !== `auto-planning-intent:${invocationId}`
+      || Object.keys(draft.payload).sort().join(",") !== "invocationId,source,text"
+    ) {
+      throw new AgentError(
+        "planning_projection_invalid",
+        "Auto planning commentary lacks Provider authority",
+      );
+    }
+  }
+  if (draft.kind === "agent.progress") {
+    const p = draft.payload ?? {};
+    const invocationId = p.invocationId;
+    const chunkIndex = p.sourceChunkIndex;
+    const receipt = typeof invocationId === "string"
+      ? run.invocationReceipts.get(invocationId)
+      : undefined;
+    const sourceText = typeof invocationId === "string" && Number.isSafeInteger(chunkIndex)
+      ? run.events.filter((event) => (
+          event.kind === "provider.delta_batch"
+          && event.visibility === "private"
+          && event.payload.invocationId === invocationId
+        )).flatMap((event) => (
+          event.payload.entries as unknown as readonly {
+            sourceChunkIndex: number;
+            kind: string;
+            payload: { delta?: string };
+          }[]
+        )).find((entry) => (
+          entry.kind === "provider.progress_delta"
+          && entry.sourceChunkIndex === chunkIndex
+        ))?.payload.delta
+      : undefined;
+    if (
+      receipt === undefined
+      || !run.openInvocations.has(receipt.invocationId)
+      || receipt.outputProtocol === PLANNING_STREAM_SCHEMA
+      || p.schemaVersion !== "purra.agent-progress/v1"
+      || p.source !== "provider"
+      || draft.channel !== "commentary"
+      || typeof p.text !== "string"
+      || p.text.trim() !== p.text
+      || p.text === ""
+      || p.text.includes("\n")
+      || p.text.includes("\r")
+      || p.text.length > 160
+      || !Number.isSafeInteger(chunkIndex)
+      || (chunkIndex as number) < 1
+      || sourceText !== p.text
+      || draft.sourceKey !== `agent-progress:${invocationId}:${chunkIndex}`
+      || Object.keys(p).sort().join(",")
+        !== "invocationId,schemaVersion,source,sourceChunkIndex,text"
+    ) {
+      throw new AgentError(
+        "agent_progress_invalid",
+        "Agent progress lacks exact persisted Provider authority",
+      );
+    }
+  }
+  if (draft.kind !== "planning.progress") return;
+  const p = draft.payload ?? {};
+  const invocationId = p.invocationId;
+  const receipt = typeof invocationId === "string" ? run.invocationReceipts.get(invocationId) : undefined;
+  const scope = receipt?.planningScope;
+  if (receipt === undefined || scope === undefined || !run.openInvocations.has(receipt.invocationId)
+    || receipt.outputProtocol !== PLANNING_STREAM_SCHEMA || p.schemaVersion !== PLANNING_STREAM_SCHEMA
+    || p.source !== "provider" || draft.channel !== "commentary"
+    || p.operationId !== scope.operationId || p.revision !== scope.revision || p.attempt !== (receipt.planningAttempt ?? 0)
+    || Object.keys(p).sort().join(",") !== "attempt,invocationId,operationId,recordIndex,revision,schemaVersion,source,sourceEnd,sourceStart,text"
+    || draft.sourceKey !== `planning:${receipt.invocationId}:${p.recordIndex}`) {
+    throw new AgentError("planning_projection_invalid", "Planning projection lacks Provider authority");
+  }
+  requirePlanningOperation(run, scope.operationId);
+  // ponytail: bounded replay (1 MiB, 16 projections), shared with Python. Index
+  // source spans only if profiling shows persistence needs that complexity.
+  const text = run.events.filter((event) => event.kind === "provider.delta_batch"
+    && event.payload.invocationId === invocationId).flatMap((event) => (
+      event.payload.entries as unknown as readonly { kind: string; payload: { delta?: string } }[]
+    )).filter((entry) => entry.kind === "provider.content_delta").map((entry) => entry.payload.delta ?? "").join("");
+  const raw = new TextEncoder().encode(text);
+  if (!Number.isSafeInteger(p.sourceStart) || !Number.isSafeInteger(p.sourceEnd)
+    || (p.sourceStart as number) < 0 || (p.sourceEnd as number) <= (p.sourceStart as number) || (p.sourceEnd as number) > raw.length) {
+    throw new AgentError("planning_projection_invalid", "Planning projection source span is invalid");
+  }
+  try {
+    const prefix = new TextDecoder("utf-8", { fatal: true }).decode(raw.subarray(0, p.sourceEnd as number));
+    const record = new PlanningStreamParser().feed(prefix).find((row) => row.recordIndex === p.recordIndex);
+    if (record === undefined || record.text !== p.text || record.sourceStart !== p.sourceStart || record.sourceEnd !== p.sourceEnd) throw new Error();
+  } catch {
+    throw new AgentError("planning_projection_invalid", "Planning projection differs from persisted Provider bytes");
+  }
 }
 
 function requireSameEvent(
@@ -844,14 +1051,46 @@ function nullablePositiveBudget(value: unknown, label: string): number | null {
   return normalized;
 }
 
+function isInputCheckpointUpdate(current: AgentExecutionCheckpoint, updated: AgentExecutionCheckpoint): boolean {
+  if ((updated.inputRevision ?? 0) !== (current.inputRevision ?? 0) + 1
+    || canonicalJson(updated) !== canonicalJson({ ...current, inputRevision: updated.inputRevision, messages: updated.messages })) return false;
+  if (updated.messages.length === current.messages.length + 1) {
+    return updated.messages.at(-1)?.role === "user" && typeof updated.messages.at(-1)?.attributes?.inputRequestId === "string"
+      && canonicalJson(updated.messages.slice(0, -1)) === canonicalJson(current.messages);
+  }
+  if (updated.messages.length !== current.messages.length) return false;
+  const calls = new Set(current.messages.flatMap(m => m.toolCalls ?? []).filter(c => c.name === "delegateToAgents").map(c => c.id));
+  let changed = false;
+  for (let i = 0; i < current.messages.length; i++) {
+    const before = current.messages[i]!, after = updated.messages[i]!;
+    if (canonicalJson(before) === canonicalJson(after)) continue;
+    if (before.role !== "tool" || !calls.has(before.toolCallId ?? "")
+      || canonicalJson(after) !== canonicalJson({ ...before, content: after.content })) return false;
+    try {
+      const old = typeof before.content === "string" ? JSON.parse(before.content) : before.content;
+      const value = typeof after.content === "string" ? JSON.parse(after.content) : after.content;
+      const expected = new Set([...old.pendingRunIds, ...old.results.map((row: any) => row.runId)]);
+      if (old.state !== "pending" || !old.pendingRunIds.length || !["ready", "blocked"].includes(value.state)
+        || value.pendingRunIds.length || value.results.length !== expected.size
+        || new Set(value.results.map((row: any) => row.runId)).size !== expected.size
+        || value.results.some((row: any) => !expected.has(row.runId))
+        || old.results.some((row: any) => !value.results.some((item: any) => canonicalJson(row) === canonicalJson(item)))) return false;
+    } catch { return false; }
+    changed = true;
+  }
+  return changed;
+}
+
 function copyExecutionCheckpoint(
   checkpoint: AgentExecutionCheckpoint,
 ): AgentExecutionCheckpoint {
   const copied = copyJsonValue(checkpoint as unknown as JsonValue) as unknown as AgentExecutionCheckpoint;
+  nonNegativeInteger(copied.inputRevision ?? 0, "checkpoint input revision");
   if (
-    copied.schemaVersion !== 1
+    copied.schemaVersion !== 2
     || copied.phase !== "model_ready"
-    || copied.executionProfile !== "reactive"
+    || !["reactive", "auto", "planned"].includes(copied.executionProfile)
+    || typeof copied.initialPlanningOpen !== "boolean"
   ) {
     throw new TypeError("Agent execution checkpoint contract is invalid");
   }
@@ -863,10 +1102,38 @@ function copyExecutionCheckpoint(
     throw new TypeError("Agent execution checkpoint messages are required");
   }
   nonNegativeInteger(copied.responseAttempts, "checkpoint response attempts");
+  if (copied.executionProfile === "planned" && copied.planning === undefined) throw new TypeError("Planned checkpoint requires its coordinator");
+  if (copied.roundLimit !== undefined && (!Number.isSafeInteger(copied.roundLimit) || copied.roundLimit < 1)) throw new TypeError("Invalid checkpoint round limit");
   if (!Array.isArray(copied.recoveryAttempts)) {
     throw new TypeError("Agent execution checkpoint recovery attempts are invalid");
   }
-  return Object.freeze(copied);
+  if (!Array.isArray(copied.contextEvidence)) {
+    throw new TypeError("Agent execution checkpoint context evidence is invalid");
+  }
+  return Object.freeze({
+    ...copied,
+    context: copied.context === null ? null : copyPreparedContextSnapshot(copied.context),
+    contextEvidence: copyCheckpointEvidence(copied.contextEvidence),
+  });
+}
+
+function copyCheckpointEvidence(
+  values: readonly import("../context/types.js").ContextEvidenceReceipt[],
+): readonly import("../context/types.js").ContextEvidenceReceipt[] {
+  const ids = new Set<string>();
+  return Object.freeze(values.map((raw) => {
+    if (raw === null || typeof raw !== "object") throw new TypeError("Invalid checkpoint evidence");
+    const evidenceId = requiredText(raw.evidenceId, "checkpoint evidence id");
+    if (ids.has(evidenceId)) throw new TypeError(`Duplicate checkpoint evidence id: ${evidenceId}`);
+    ids.add(evidenceId);
+    return Object.freeze({
+      evidenceId,
+      ...(raw.contextBlock === undefined ? {} : { contextBlock: requiredText(raw.contextBlock, "checkpoint evidence contextBlock") }),
+      source: requiredText(raw.source, "checkpoint evidence source"),
+      ...(raw.itemId === undefined ? {} : { itemId: requiredText(raw.itemId, "checkpoint evidence itemId") }),
+      ...(raw.version === undefined ? {} : { version: requiredText(raw.version, "checkpoint evidence version") }),
+    });
+  }));
 }
 
 function byteLength(value: unknown): number {

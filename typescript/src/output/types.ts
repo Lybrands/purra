@@ -12,6 +12,11 @@ export type OutputChannel =
 export type OutputVisibility = "private" | "public";
 
 export type OutputEventKind =
+  | "planning.progress"
+  | "agent.progress"
+  | "model.diagnostics"
+  | "operation.started"
+  | "operation.finished"
   | "agentRunTrace"
   | "run.started"
   | "run.completed"
@@ -38,7 +43,9 @@ export type OutputEventKind =
   | "long_task.progress"
   | "long_task.checkpoint"
   | "durable.recovery_snapshot"
-  | "agent.execution_checkpoint";
+  | "agent.execution_checkpoint"
+  | "input.required"
+  | "input.answered";
 
 export interface OutputEventDraft {
   readonly sourceKey: string;

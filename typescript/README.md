@@ -1,115 +1,102 @@
-# purra
+# PurrA for JavaScript and TypeScript
 
-`purra` is a product-neutral Agent runtime for JavaScript and TypeScript. It is
-a native ESM package for Node.js 22+.
+English | [简体中文](README.zh-CN.md)
+
+An ESM Agent runtime for Node.js 22+. Applications provide a `ModelGateway` and
+compose tools, context, planning, and persistence through the public `purra` exports.
 
 ## Install
 
-```bash
+```sh
 npm install purra
 ```
 
-## Quick start
+## Run an Agent
+
+Pass a configured gateway to `ask`. The [OpenAI and Anthropic adapters](../integrations/README.md)
+provide gateways for their native APIs. A custom gateway must declare model
+capabilities and acknowledge the output limit applied to each request.
 
 ```ts
-import { Agent } from "purra";
+import { Agent, type ModelGateway } from "purra";
 
-const agent = new Agent({ model: yourModelGateway });
-const run = await agent.submit({
-  messages: [{ role: "user", content: "Hello" }],
-}, {
-  budgets: { maxRunOutputTokens: null },
-});
+async function ask(model: ModelGateway) {
+  const agent = new Agent({ model });
+  const run = await agent.submit({
+    messages: [{ role: "user", content: "Hello" }],
+  }, {
+    budgets: { maxRunOutputTokens: 8192 },
+  });
 
-for await (const event of run.events()) {
-  console.log(event.kind, event.payload);
+  for await (const event of run.events()) {
+    console.log(event.kind, event.payload);
+  }
+  return (await run.result).output;
 }
-
-const result = await run.result;
-console.log(result.output);
 ```
 
-The complete deterministic model-and-tool example is
-[`examples/quickstart.ts`](https://github.com/Lybrands/purra/blob/main/typescript/examples/quickstart.ts).
+`submit()` returns a Run handle with committed events, cancellation, and a result.
+Call `run.cancel()` to request cancellation. Use `invoke()` for a process-local
+result or `stream()` for provisional events without a persisted Run.
+See the [runnable quickstart](examples/quickstart.ts) for a local gateway and tool.
 
-The host supplies the `ModelGateway`. `invoke()` returns a process-local result,
-`stream()` exposes provisional events, and `submit()` creates a canonical Run
-with replay, cancellation, and budgets. Built-in repositories are in-memory;
-inject production implementations for restart safety or multiple workers.
+## Tools and retrieval
 
-## Output-token limits
+Pass tool definitions in `new Agent({ model, tools })`. Each tool declares its
+input schema and effect policy. Side-effecting tools require idempotency;
+`confirm` tools also require application approval.
 
-PurrA 0.5.0 uses different names for different scopes:
+Use `RetrieverTool` to expose an application `Retriever` through the same tool
+system. The application chooses the data source and scope, and must check access
+before reading data. The model supplies only the search query. See the
+[quickstart](examples/quickstart.ts) for registration.
 
-- `maxCallOutputTokens` limits one Provider call.
-- `maxRunOutputTokens` limits all model output charged to a Run.
+Ordinary Runs with tools use a separate tool-free call to produce the public
+answer. Include that call when setting model-call, token, and deadline budgets.
 
-`submit()` requires the cumulative budget to be explicit; `null` deliberately
-means no finite cumulative token limit. PurrA 0.5.0 does not alias or migrate
-older output-token field names.
+## Planning
 
-When PurrA sends `ModelRequest.outputLimit`, the `ModelGateway` must return the
-same value as `ModelTurn.appliedOutputLimit` or
-`ModelStream.appliedOutputLimit`. Missing or mismatched acknowledgments fail
-before model output is committed.
-
-## Tools
-
-Every tool declares an object Schema and effect policy. The runtime admits a
-complete batch before any handler starts; side-effecting tools require
-idempotency, and `confirm` tools also require host approval.
-
-In a normal Agent run, a model round that receives tool schemas remains private
-even when it returns a final answer without calling a tool. PurrA performs one
-additional tool-free presentation round and publishes only that answer. The
-extra Provider call is subject to the Run deadline and model-attempt/token
-budgets; explicit budgets must reserve capacity for it. Provisional deltas from
-the tool-capable candidate are not emitted by `Agent.stream()`.
-
-## Child Agents
-
-Enable canonical Child Runs by supplying the Agent tree repository together
-with the Run and output adapters:
+Given a configured `model`, enable the built-in planner:
 
 ```ts
-import { Agent, InMemoryAgentAdapters } from "purra";
+import { Agent, ModelWorkPlanner } from "purra";
 
-const adapters = new InMemoryAgentAdapters();
 const agent = new Agent({
-  model: yourModelGateway,
-  runRepository: adapters.runs,
-  outputPublisher: adapters.outputs,
-  agentTree: { repository: adapters.runTree },
+  model,
+  planning: { plannerFactory: tasks => new ModelWorkPlanner(tasks) },
 });
 ```
 
-This enables `delegateToAgents` with stable Agent identity, bounded recursion,
-structured joins, continuation commands, Root-scoped budgets, and attributed
-output. Like Python, canonical Root and Child Runs use validated-result mode and
-do not add the normal public-presentation invocation. `recoverAgentTreeRoot()`
-rebinds an active Root and scans all persisted descendants. In-memory adapters
-are for local execution and tests; restart-safe hosts must implement the same
-repository atomicity and lease contracts.
+Run requests accept `planningMode`:
 
-## Composition
+| Mode | Behavior |
+| --- | --- |
+| `auto` | Default. Start normally; enter planning when requested or required by a tool. |
+| `reactive` | Continue the model/tool loop without activating planning. |
+| `planned` | Plan before executing the task. |
 
-Reactive execution is the default; Planned and Durable execution are opt-in.
-The host owns Provider adapters, tools, business authorization, and production
-persistence. Consumers import only from `purra`; package subpaths are private.
-See [Architecture](https://github.com/Lybrands/purra/blob/main/ARCHITECTURE.md).
+The planner requires a streaming gateway. Subscribe to Run events for public
+`planning.progress`; private plans and reasoning are excluded. See the
+[planning example](examples/planner-streaming.ts) for subscription and replay.
 
-## Compatibility
+## Budgets and persistence
 
-The package is pre-1.0. Breaking public-contract changes require a new minor
-release. npm and Python use the version encoded by the same Git tag; matching
-versions do not imply automatic capability parity.
+`maxCallOutputTokens` limits one model call. `maxRunOutputTokens` limits cumulative
+Run output and must be explicit; `null` means no finite token ceiling. Finite
+budgets require provider-reported usage.
 
-## Links
+Built-in repositories are in-memory. For persistence, configure
+[SQLite adapters](../integrations/sqlite/typescript/README.md) or implement the
+repository ports. Recovery uses committed checkpoints and requires the original
+model/tool configuration. Reconcile uncertain external writes before retrying.
 
-- [Repository guide](https://github.com/Lybrands/purra#readme)
-- [TypeScript implementation notes](https://github.com/Lybrands/purra/blob/main/typescript/ARCHITECTURE.md)
-- [Issue tracker](https://github.com/Lybrands/purra/issues)
+For child Agents, supply the same Run and Run-tree repositories through the
+`runRepository` and `agentTree.repository` options. Child capabilities and budgets
+are constrained by the parent. See [Architecture](ARCHITECTURE.md).
 
-## License
+## More
 
-[MIT](https://github.com/Lybrands/purra/blob/main/typescript/LICENSE)
+- [Repository guide](../README.md)
+- [Examples](../examples/README.md)
+- [Optional packages](../integrations/README.md)
+- [MIT license](LICENSE)

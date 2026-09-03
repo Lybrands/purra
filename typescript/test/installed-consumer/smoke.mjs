@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { realpathSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+assert.match(realpathSync(fileURLToPath(import.meta.resolve("purra"))), /[/\\]node_modules[/\\]purra[/\\]dist[/\\]index\.js$/u);
 
 import {
   Agent,
@@ -7,6 +10,7 @@ import {
   AgentOperationController,
   ArtifactAccessController,
   ArtifactLifecycle,
+  assertRunRepositoryConforms,
   DurableExecutorRegistry,
   evaluateAgentRun,
   InMemoryAgentAdapters,
@@ -17,12 +21,51 @@ import {
   ModelWorkPlanner,
   RecipeLongTaskDispatcher,
   RecoveryPolicy,
+  RetrieverTool,
   RunCommandService,
-  ToolPlanningPolicy,
 } from "purra";
 
 const RUN_OPTIONS = Object.freeze({
   budgets: Object.freeze({ maxRunOutputTokens: null }),
+});
+
+await assertRunRepositoryConforms(new InMemoryAgentAdapters().runs);
+
+const installedRetrieverTool = new RetrieverTool({
+  retriever: {
+    async retrieve(request) {
+      return [{
+        id: "installed-hit",
+        content: `installed retrieval: ${request.query}`,
+        source: "installed-smoke",
+        version: 1,
+        untrusted: true,
+        metadata: {},
+      }];
+    },
+  },
+  name: "searchInstalledKnowledge",
+  description: "Search installed knowledge.",
+  scope: { namespace: "installed-smoke" },
+});
+const installedRetrievalResult = await installedRetrieverTool.definition.run(
+  { query: "ready" },
+  {
+    call: {
+      id: "installed-retrieval-call",
+      name: "searchInstalledKnowledge",
+      arguments: { query: "ready" },
+    },
+    runId: "installed-retrieval-run",
+  },
+);
+assert.deepEqual(installedRetrievalResult.content.hits[0], {
+  id: "installed-hit",
+  content: "installed retrieval: ready",
+  source: "installed-smoke",
+  version: 1,
+  untrusted: true,
+  metadata: {},
 });
 
 let round = 0;
@@ -34,21 +77,26 @@ const handle = await new Agent({
     async invoke() {
       throw new Error("stream should be used");
     },
-    async *stream() {
-      round += 1;
-      if (round === 1) {
-        yield {
-          toolCallDeltas: [{
-            index: 0,
-            id: "call-1",
-            name: "lookup",
-            argumentsFragment: "{\"key\":\"installed\"}",
-          }],
-          finishReason: "tool_calls",
-        };
-        return;
+    stream(request) {
+      async function* chunks() {
+        round += 1;
+        if (round === 1) {
+          yield {
+            toolCallDeltas: [{
+              index: 0,
+              id: "call-1",
+              name: "lookup",
+              argumentsFragment: "{\"key\":\"installed\"}",
+            }],
+            finishReason: "tool_calls",
+          };
+          return;
+        }
+        yield { contentDelta: "installed", finishReason: "stop" };
       }
-      yield { contentDelta: "installed", finishReason: "stop" };
+      return Object.assign(chunks(), {
+        appliedOutputLimit: request.outputLimit?.maxTokens,
+      });
     },
   },
   tools: [{
@@ -80,7 +128,6 @@ const handle = await new Agent({
     },
   },
   planning: {
-    policy: new ToolPlanningPolicy(),
     planner: {
       createPlan() {
         return {
@@ -99,7 +146,7 @@ const handle = await new Agent({
       },
     },
   },
-}).submit({ messages: [{ role: "user", content: "hello" }] }, RUN_OPTIONS);
+}).submit({ messages: [{ role: "user", content: "hello" }], planningMode: "planned" }, RUN_OPTIONS);
 const result = await handle.result;
 for await (const event of handle.events()) events.push(event);
 const allEvents = [];
@@ -107,7 +154,9 @@ for await (const event of handle.events({ visibility: "all" })) allEvents.push(e
 
 assert.deepEqual(events.map((event) => event.kind), [
   "run.started",
+  "operation.started",
   "plan.updated",
+  "operation.finished",
   "tool.started",
   "tool.completed",
   "final",
@@ -426,6 +475,17 @@ const managedCalls = [];
 const managedHandle = await new Agent({
   model: {
     capabilities: managedCapabilities(),
+    async stream(request) {
+      const result = await this.invoke(request);
+      const planning = request.messages.some((message) => message.attributes?.planningContract);
+      return { appliedOutputLimit: request.outputLimit.maxTokens,
+        async *[Symbol.asyncIterator]() {
+          if (planning) yield { contentDelta: JSON.stringify({ v: 1, type: "progress", text: "I will check the scope." }) + "\n" };
+          yield { contentDelta: planning ? JSON.stringify({ v: 1, type: "plan", plan: JSON.parse(result.message.content) }) + "\n" : result.message.content,
+            finishReason: "stop" };
+        },
+      };
+    },
     async invoke(request) {
       managedCalls.push(request);
       if (request.messages.some((message) => message.attributes?.planningContract === true)) {
@@ -434,15 +494,15 @@ const managedHandle = await new Agent({
             title: "Installed managed plan",
             steps: [{ id: "respond", title: "Respond", type: "review", executor: "model" }],
           },
-        }));
+        }), request);
       }
       if (String(request.messages[0]?.content).startsWith("installed-judge:")) {
-        return finalTurn("accept");
+        return finalTurn("accept", request);
       }
       if (request.messages[0]?.content === "installed-context-task") {
-        return finalTurn("managed context");
+        return finalTurn("managed context", request);
       }
-      return finalTurn("installed managed response");
+      return finalTurn("installed managed response", request);
     },
   },
   operations: new AgentOperationController({
@@ -469,7 +529,6 @@ const managedHandle = await new Agent({
   },
   planning: {
     policy: {
-      shouldPlan() { return true; },
       planningConstraints() { return { maxSteps: 2 }; },
     },
     plannerFactory(modelTasks) {
@@ -493,7 +552,7 @@ const managedHandle = await new Agent({
     }],
     maxAttempts: 1,
   },
-}).submit({ messages: [{ role: "user", content: "managed" }] }, RUN_OPTIONS);
+}).submit({ messages: [{ role: "user", content: "managed" }], planningMode: "planned" }, RUN_OPTIONS);
 assert.equal((await managedHandle.result).output, "installed managed response");
 assert.deepEqual(managedFactoryRunIds, [
   managedHandle.runId,
@@ -504,17 +563,18 @@ assert.equal(managedCalls.length, 4);
 assert.deepEqual(
   managedOperationEvents.map((event) => [event.type, event.status ?? event.kind]),
   [
-    ["operation.started", "model"],
+    ["operation.started", "model"], ["operation.finished", "succeeded"],
+    ["operation.started", "planning"],
+    ["operation.started", "model"], ["operation.finished", "succeeded"],
     ["operation.finished", "succeeded"],
-    ["operation.started", "model"],
-    ["operation.finished", "succeeded"],
-    ["operation.started", "model"],
-    ["operation.finished", "succeeded"],
+    ["operation.started", "model"], ["operation.finished", "succeeded"],
   ],
 );
 const managedEvents = [];
 for await (const event of managedHandle.events({ visibility: "all" })) managedEvents.push(event);
 assert.equal(managedEvents.filter((event) => event.kind === "invocation.started").length, 4);
+assert.equal(managedEvents.filter((event) => event.kind === "planning.progress").length, 1);
+assert.equal(managedEvents.filter((event) => event.kind === "model.diagnostics").length, 1);
 
 function capabilities() {
   return {
@@ -544,12 +604,18 @@ function managedCapabilities() {
   return {
     ...capabilities(),
     profileId: "installed-managed",
-    protocol: { ...capabilities().protocol, streaming: "unavailable" },
+    protocol: { ...capabilities().protocol, streaming: "supported" },
   };
 }
 
-function finalTurn(content) {
-  return { message: { role: "assistant", content }, finishReason: "stop" };
+function finalTurn(content, request) {
+  return {
+    message: { role: "assistant", content },
+    finishReason: "stop",
+    ...(request?.outputLimit === undefined
+      ? {}
+      : { appliedOutputLimit: request.outputLimit.maxTokens }),
+  };
 }
 
 function durableInput() {

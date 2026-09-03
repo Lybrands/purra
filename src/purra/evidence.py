@@ -9,6 +9,7 @@ from typing import Any, Mapping, Sequence
 from purra.context_budget import estimate_text_tokens
 from purra.contracts import (
     AgentMessage,
+    ContextEvidenceReceipt,
     MessageRole,
     ToolBatchResult,
     ToolCall,
@@ -64,32 +65,6 @@ class ToolResultReceipt:
         }
 
 
-@dataclass(frozen=True, slots=True)
-class ContextEvidenceReceipt:
-    """Receipt for one host-selected context fact used by this run."""
-
-    evidence_id: str
-    context_block: str
-    source: str
-    item_id: str
-    version: int | None = None
-    metadata: Mapping[str, Any] = field(default_factory=dict)
-
-    def to_mapping(self) -> dict[str, Any]:
-        return {
-            key: value
-            for key, value in {
-                "evidenceId": self.evidence_id,
-                "contextBlock": self.context_block,
-                "source": self.source,
-                "itemId": self.item_id,
-                "version": self.version,
-                "metadata": dict(self.metadata),
-            }.items()
-            if value not in (None, "", {})
-        }
-
-
 def context_evidence_receipts(
     messages: Sequence[AgentMessage],
 ) -> tuple[ContextEvidenceReceipt, ...]:
@@ -131,7 +106,7 @@ class RunEvidenceStore:
             ):
                 self._context_blocks[block_name] = str(message.content or "")
         for _block_name, _content, receipt in _context_receipt_rows(messages):
-            self._context_receipts[receipt.evidence_id] = receipt
+            self._record_context_receipt(receipt)
             recorded.append(receipt)
         return tuple(recorded)
 
@@ -149,17 +124,38 @@ class RunEvidenceStore:
             record, receipt = _record_and_receipt(call, result)
             self._records[record.evidence_id] = record
             self._tool_result_receipts[receipt.tool_call_id] = receipt
+            for context_receipt in result.context_evidence:
+                self._record_context_receipt(context_receipt)
             receipts.append(receipt)
         return tuple(receipts)
 
     def get(self, evidence_id: str) -> EvidenceRecord | None:
         return self._records.get(str(evidence_id or "").strip())
 
+    def resolve_delegation(self, tool_call_id: str, content: str) -> None:
+        record = self._records[f"tool:{tool_call_id}"]
+        if record.tool_name != "delegateToAgents":
+            raise ValueError("Only a delegation receipt can be resolved")
+        tokens = estimate_text_tokens(content)
+        self._records[record.evidence_id] = replace(record, content=content, token_estimate=tokens)
+        receipt = self._tool_result_receipts[tool_call_id]
+        self._tool_result_receipts[tool_call_id] = replace(receipt,
+            token_estimate=tokens, content_characters=len(content),
+            summary=content.strip().replace("\n", " ")[:480])
+
     def tool_result_receipts(self) -> tuple[ToolResultReceipt, ...]:
         return tuple(self._tool_result_receipts.values())
 
     def context_receipts(self) -> tuple[ContextEvidenceReceipt, ...]:
         return tuple(self._context_receipts.values())
+
+    def _record_context_receipt(self, receipt: ContextEvidenceReceipt) -> None:
+        existing = self._context_receipts.get(receipt.evidence_id)
+        if existing is not None and existing != receipt:
+            raise ValueError(
+                f"conflicting context evidence receipt: {receipt.evidence_id}"
+            )
+        self._context_receipts[receipt.evidence_id] = receipt
 
     def checkpoint_mapping(self) -> dict[str, Any]:
         """Return the private JSON state needed for a model-ready resume."""
@@ -268,13 +264,7 @@ class RunEvidenceStore:
         *,
         max_excerpt_characters: int = 4_000,
     ) -> tuple[AgentMessage, ...]:
-        """Replace raw tool payloads with bounded, metadata-bearing receipts.
-
-        The dynamic planner already consumed at most 4k characters per tool
-        observation.  Keeping the same excerpt bound avoids a semantic
-        regression while removing protocol noise and making completeness
-        explicit.
-        """
+        """Replace raw tool payloads with bounded, metadata-bearing receipts."""
 
         projected: list[AgentMessage] = []
         for message in messages:

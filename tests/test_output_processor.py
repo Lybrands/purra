@@ -247,6 +247,60 @@ async def test_execution_public_provider_chunk_uses_commentary_channel():
 
 
 @pytest.mark.asyncio
+async def test_provider_progress_is_persisted_privately_before_public_projection():
+    processor, repository, publisher, _recovery = await _opened_processor(_spec())
+
+    events = await processor.accept_provider_chunk(
+        "output-1",
+        ModelStreamChunk(progress_delta="正在核对人物动机"),
+    )
+
+    private_batch, progress = events
+    private_entry = private_batch.payload["entries"][0]
+    assert private_batch.visibility is OutputVisibility.PRIVATE
+    assert private_entry["kind"] == "provider.progress_delta"
+    assert private_entry["payload"]["delta"] == "正在核对人物动机"
+    assert progress.kind is OutputEventKind.AGENT_PROGRESS
+    assert progress.visibility is OutputVisibility.PUBLIC
+    assert progress.payload == {
+        "schemaVersion": "purra.agent-progress/v1",
+        "text": "正在核对人物动机",
+        "sourceChunkIndex": 1,
+    }
+    assert repository.events[-2:] == [private_batch, progress]
+    assert publisher.published == [progress]
+
+
+@pytest.mark.asyncio
+async def test_output_policy_cannot_fabricate_provider_progress():
+    from purra.errors import ContractViolationError
+    from purra.output.processor import AgentOutputProcessor, OutputBatchLimits
+
+    class FabricatingPolicy:
+        async def authorize_provider_chunk(self, spec, chunk):
+            del spec, chunk
+            return ModelStreamChunk(progress_delta="伪造的阶段")
+
+    repository = _Repository()
+    processor = AgentOutputProcessor(
+        repository,
+        _Publisher(),
+        policy=FabricatingPolicy(),
+        batch_limits=OutputBatchLimits(max_fragments=1),
+    )
+    spec = _spec()
+    await processor.open_model_stream(_receipt(spec), spec)
+
+    with pytest.raises(
+        ContractViolationError,
+        match="cannot add or rewrite Provider progress",
+    ):
+        await processor.accept_provider_chunk(
+            "output-1",
+            ModelStreamChunk(content_delta="正文"),
+        )
+
+@pytest.mark.asyncio
 async def test_promoted_commentary_is_published_after_repository_commit():
     processor, repository, publisher, _recovery = await _opened_processor(
         _spec(
@@ -844,7 +898,6 @@ async def test_private_protocol_plan_steps_never_enter_public_journal():
         {
             "id": "public-capability",
             "title": "生成完整场景表",
-            "protocol_private": False,
         },
     )
 

@@ -2,7 +2,7 @@ import type { JsonValue } from "../model/types.js";
 import { copyJsonValue } from "../model/validation.js";
 import { AgentError } from "../shared/errors.js";
 
-export type OperationKind = "model" | "tool" | "validation" | "context_compaction" | "delegation";
+export type OperationKind = "planning" | "model" | "tool" | "validation" | "context_compaction" | "delegation";
 export type OperationStatus = "running" | "succeeded" | "failed" | "canceled";
 
 export interface OperationDisplay {
@@ -14,6 +14,7 @@ export interface OperationDisplay {
 export interface OperationScope {
   readonly runId: string;
   readonly invocationId?: string;
+  readonly parentOperationId?: string;
   readonly display?: OperationDisplay;
 }
 
@@ -22,6 +23,7 @@ export interface OperationStarted {
   readonly operationId: string;
   readonly runId: string;
   readonly invocationId?: string;
+  readonly parentOperationId?: string;
   readonly kind: OperationKind;
   readonly startedAt: string;
   readonly display: OperationDisplay;
@@ -32,6 +34,7 @@ export interface OperationFinished {
   readonly operationId: string;
   readonly runId: string;
   readonly invocationId?: string;
+  readonly parentOperationId?: string;
   readonly status: Exclude<OperationStatus, "running">;
   readonly finishedAt: string;
   readonly durationMs: number;
@@ -46,6 +49,7 @@ export interface OperationReceipt {
   readonly kind: OperationKind;
   readonly runId: string;
   readonly invocationId?: string;
+  readonly parentOperationId?: string;
   readonly startedAt: string;
   readonly startedEvent: OperationStarted;
 }
@@ -61,7 +65,7 @@ interface RunningOperation {
 }
 
 const KINDS = new Set<OperationKind>([
-  "model", "tool", "validation", "context_compaction", "delegation",
+  "planning", "model", "tool", "validation", "context_compaction", "delegation",
 ]);
 const LIFECYCLE_DISPLAY_FIELDS = new Set([
   "operationid", "status", "startedat", "finishedat", "durationms", "errorcode",
@@ -97,6 +101,13 @@ export class AgentOperationController {
     return Object.freeze([...this.#running.keys()]);
   }
 
+  public withOutput(processor: OperationEventProcessor): AgentOperationController {
+    return new AgentOperationController({ acceptOperationEvent: async (event) => {
+      await processor.acceptOperationEvent(event);
+      await this.#processor.acceptOperationEvent(event);
+    } }, { wallClock: this.#wallClock, monotonicClock: this.#monotonicClock, idFactory: this.#idFactory });
+  }
+
   public async start(kind: OperationKind, scope: OperationScope): Promise<OperationReceipt> {
     if (!KINDS.has(kind)) throw new TypeError("operation kind is invalid");
     if (scope === null || typeof scope !== "object") throw new TypeError("operation scope is invalid");
@@ -113,6 +124,7 @@ export class AgentOperationController {
       operationId,
       runId,
       ...(invocationId === undefined ? {} : { invocationId }),
+      ...(scope.parentOperationId === undefined ? {} : { parentOperationId: requiredText(scope.parentOperationId, "parent operation id") }),
       kind,
       startedAt,
       display,
@@ -170,6 +182,7 @@ export class AgentOperationController {
         ...(running.receipt.invocationId === undefined
           ? {}
           : { invocationId: running.receipt.invocationId }),
+        ...(running.receipt.startedEvent.parentOperationId === undefined ? {} : { parentOperationId: running.receipt.startedEvent.parentOperationId }),
         status,
         finishedAt: this.#wallTime(),
         durationMs: Math.max(0, Math.round(this.#monotonicTime() - running.monotonicStarted)),

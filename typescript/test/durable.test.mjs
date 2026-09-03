@@ -413,7 +413,7 @@ test("Durable admission is fail-closed before Provider and dispatcher authority"
     dispatcher,
   });
 
-  const handle = await agent.submit({ messages: [user("run durable")] }, RUN_OPTIONS);
+  const handle = await agent.submit(plannedUser("run durable"), RUN_OPTIONS);
   const result = await handle.result;
   assert.equal(result.output, "durable done");
   assert.equal(result.durable.status, "completed");
@@ -435,7 +435,7 @@ test("Durable admission is fail-closed before Provider and dispatcher authority"
     dispatcher,
   });
   await rejectsCode(
-    (await invalid.submit({ messages: [user("invalid")] }, RUN_OPTIONS)).result,
+    (await invalid.submit(plannedUser("invalid"), RUN_OPTIONS)).result,
     "durable_plan_coverage_invalid",
   );
   assert.equal(modelCalls, 0);
@@ -466,7 +466,14 @@ test("inline, clarify, and reject admission modes keep their authority boundarie
         async execute() { throw new Error("non-durable admission must not execute"); },
       },
     });
-    const result = await (await agent.submit({ messages: [user(row.mode)] }, RUN_OPTIONS)).result;
+    const handle = await agent.submit(plannedUser(row.mode), RUN_OPTIONS);
+    const result = await handle.result;
+    const events = [];
+    for await (const event of handle.events()) events.push(event);
+    const phase = events.find((e) => e.kind === "operation.started" && e.payload.kind === "planning");
+    const terminal = events.find((e) => e.kind === "operation.finished" && e.payload.operationId === phase.payload.operationId);
+    assert.equal(terminal.payload.status, row.mode === "inline" ? "succeeded" : "failed");
+    assert.equal(events.filter((e) => e.kind === "plan.updated").length, row.mode === "inline" ? 1 : 0);
     assert.equal(result.output, row.expected);
     assert.equal(modelCalls, row.modelCalls);
     assert.equal(dispatchCalls, 0);
@@ -499,7 +506,7 @@ test("authenticated continuation skips planning and rejects incompatible authori
     }),
     dispatcher,
   });
-  const initial = await (await agent.submit({ messages: [user("start")] }, RUN_OPTIONS)).result;
+  const initial = await (await agent.submit(plannedUser("start"), RUN_OPTIONS)).result;
   const snapshot = initial.durable.recoverySnapshot;
   const resumed = await (await agent.submit(
     { messages: [user("continue")] },
@@ -575,7 +582,6 @@ function durableAgent({
     planning: {
       binding: { id: "fixture-planner", revision: "1" },
       policy: {
-        shouldPlan: () => true,
         planningConstraints: () => ({}),
       },
       planner: { createPlan: planner },
@@ -587,6 +593,10 @@ function durableAgent({
       recoveryAuthenticator: new HmacRecoveryAuthenticator(SECRET),
     },
   });
+}
+
+function plannedUser(content) {
+  return { messages: [user(content)], planningMode: "planned" };
 }
 
 function workPlan() {

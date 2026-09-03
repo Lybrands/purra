@@ -1,3 +1,4 @@
+import type { PlanningScope } from "./stream.js";
 import type { ContextBlock, TaskContextRequest } from "../context/types.js";
 import type { JsonValue, Message, ToolSpec } from "../model/types.js";
 import type { ModelTaskRunner } from "../extensions/model-tasks.js";
@@ -62,6 +63,7 @@ export interface PlanningCapabilities {
 }
 
 export interface PlanningRequest {
+  readonly scope?: PlanningScope;
   readonly messages: readonly Message[];
   readonly enabledTools?: readonly string[];
   readonly metadata?: Readonly<Record<string, JsonValue>>;
@@ -99,7 +101,6 @@ export interface DynamicWorkPlanner extends WorkPlanner {
 }
 
 export interface PlanningPolicy {
-  shouldPlan(request: PlanningRequest, capabilities: PlanningCapabilities): boolean;
   planningConstraints(
     request: PlanningRequest,
     capabilities: Omit<PlanningCapabilities, "constraints">,
@@ -128,7 +129,7 @@ export interface ResponseJudge {
 }
 
 interface PlanningOptionsBase {
-  readonly policy: PlanningPolicy;
+  readonly policy?: PlanningPolicy;
   readonly binding?: {
     readonly id: string;
     readonly revision: string;

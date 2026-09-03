@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any, Generic, TypeVar
 
 
@@ -26,11 +26,14 @@ class OwnedAsyncIterator(AsyncIterator[T], Generic[T]):
         iterator: AsyncIterator[T],
         *resources: Any,
         terminal_predicate: Callable[[T], bool] | None = None,
+        on_unstarted_close: Callable[[], Awaitable[None]] | None = None,
     ):
         self._iterator = iterator
         self._resources = tuple(resources)
         self._terminal_predicate = terminal_predicate
         self._closed = False
+        self._started = False
+        self._on_unstarted_close = on_unstarted_close
         self._close_task: asyncio.Task[None] | None = None
 
     def __aiter__(self) -> "OwnedAsyncIterator[T]":
@@ -40,6 +43,7 @@ class OwnedAsyncIterator(AsyncIterator[T], Generic[T]):
         if self._closed:
             raise StopAsyncIteration
         try:
+            self._started = True
             item = await anext(self._iterator)
             if (
                 self._terminal_predicate is not None
@@ -76,6 +80,8 @@ class OwnedAsyncIterator(AsyncIterator[T], Generic[T]):
             if resource is self or resource is self._iterator:
                 continue
             await close_async_resource(resource)
+        if not self._started and self._on_unstarted_close is not None:
+            await self._on_unstarted_close()
 
 
 async def close_async_resource(resource: Any) -> None:

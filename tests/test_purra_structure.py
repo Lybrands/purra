@@ -425,7 +425,7 @@ def test_planning_boundary_cannot_recover_hidden_or_product_context():
     ):
         assert product_symbol not in planner
     assert "AgentPlanner(" not in orchestrator
-    assert "ToolPlanningPolicy(" not in orchestrator
+    assert "request.planning_mode is PlanningMode.PLANNED" in orchestrator
 
 
 def test_work_planning_and_runtime_authority_remain_separate():

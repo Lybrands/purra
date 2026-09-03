@@ -1,9 +1,11 @@
 import type { JsonValue, ToolCall, ToolSpec } from "../model/types.js";
+import type { ContextEvidenceReceipt } from "../context/types.js";
 import type { JsonSchema } from "./schema.js";
 
 export type ToolExecutionMode = "read" | "propose" | "confirm";
 export type ToolRiskLevel = "read" | "write" | "destructive";
 export type ToolEffectState = "not_started" | "committed" | "unknown";
+export type ToolPlanningRequirement = "optional" | "required";
 export type ToolApprovalStatus = "approved" | "rejected" | "timed_out" | "canceled";
 
 export interface ToolPolicy {
@@ -28,6 +30,7 @@ export interface ToolHandlerResult {
   readonly content: JsonValue;
   readonly effectState: ToolEffectState;
   readonly errorCode?: string;
+  readonly contextEvidence?: readonly ContextEvidenceReceipt[];
   readonly planningDisposition?: "continue" | "replan";
   readonly planningReason?: string;
 }
@@ -46,6 +49,8 @@ export interface ToolDefinition {
   readonly enabled?: boolean;
   readonly cancellationLinearizable?: boolean;
   readonly hostManagedDurability?: boolean;
+  /** Required tools cannot execute before a governed plan is admitted. */
+  readonly planningRequirement?: ToolPlanningRequirement;
   readonly planning?: ToolPlanningMetadata;
   scope?(input: JsonValue, context: ToolContext): Promise<string | boolean | void> | string | boolean | void;
   run(input: JsonValue, context: ToolContext): Promise<ToolHandlerResult> | ToolHandlerResult;
@@ -102,6 +107,7 @@ export interface ToolBatchResult {
     readonly errorCode: string;
     readonly effectState: ToolEffectState;
   }[];
+  readonly contextEvidence: readonly ContextEvidenceReceipt[];
   readonly replan?: {
     readonly reason: string;
     readonly errorCode?: string;

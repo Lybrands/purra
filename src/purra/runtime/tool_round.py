@@ -273,6 +273,7 @@ def continuation_messages(
     *,
     content: str,
     reasoning: str,
+    provider_data: Mapping[str, Any] | None = None,
 ) -> list[AgentMessage]:
     messages = [AgentMessage(
         role=MessageRole.ASSISTANT,
@@ -280,6 +281,7 @@ def continuation_messages(
         reasoning=reasoning or None,
         tool_calls=tuple(calls),
         origin=MessageOrigin.MODEL,
+        provider_data=provider_data or {},
     )]
     messages.extend(
         AgentMessage(

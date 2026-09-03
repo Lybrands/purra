@@ -1,0 +1,35 @@
+{
+  "name": "purra-openai",
+  "version": "0.5.0",
+  "type": "module",
+  "license": "MIT",
+  "description": "Official OpenAI Responses and Chat Completions SDK adapter for PurrA",
+  "files": [
+    "dist",
+    "README.md",
+    "README.zh-CN.md",
+    "LICENSE"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "dependencies": {
+    "openai": "7.9.0"
+  },
+  "peerDependencies": {
+    "purra": "0.5.0"
+  },
+  "devDependencies": {
+    "purra": "file:../../../typescript",
+    "typescript": "7.0.2"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "node --test test/*.test.mjs",
+    "check": "npm run build && npm test",
+    "prepack": "npm run build"
+  }
+}
