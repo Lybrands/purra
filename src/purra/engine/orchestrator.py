@@ -854,11 +854,18 @@ class AgentCore:
         """Resume a canonical checkpoint using the host's execution lease store."""
         if self._run_tree_repository is not None and (await self._run_tree_repository.get_run(run_id)).root_run_id != run_id:
             raise ContractViolationError("Resume Child Runs through their Root scheduler", code="child_run_resume_requires_scheduler")
-        if self._run_supervisor is None or self._run_supervisor._lease_store is None:
-            raise ContractViolationError("Root recovery requires an execution lease store")
+        if self._run_supervisor is None or not self._run_supervisor.supports_root_recovery:
+            raise ContractViolationError(
+                "Root recovery requires an execution lease store",
+                code="run_lease_required",
+            )
         snapshot = await self._repository.get(run_id)
-        if snapshot.terminal or snapshot.execution_checkpoint is None:
-            raise ContractViolationError("Run has no resumable checkpoint")
+        if snapshot.terminal:
+            raise ContractViolationError("Run is terminal", code="run_terminal")
+        if snapshot.execution_checkpoint is None:
+            raise ContractViolationError(
+                "Run has no resumable checkpoint", code="checkpoint_missing",
+            )
         return await self.submit(request, options=replace(
             options or AgentCoreRunOptions(), agent_execution_checkpoint=snapshot.execution_checkpoint,
             deadline_at_ms=snapshot.deadline_at_ms,
@@ -2049,7 +2056,10 @@ class AgentCore:
             return
         persisted = await self._repository.get(checkpoint.run_id)
         if persisted.execution_checkpoint != checkpoint:
-            raise ContractViolationError("Selected checkpoint is not canonical")
+            raise ContractViolationError(
+                "Selected checkpoint is not canonical",
+                code="agent_execution_checkpoint_conflict",
+            )
         expected_preset = (
             options.agent_preset_snapshot.to_mapping()
             if options.agent_preset_snapshot is not None

@@ -4,7 +4,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { openSync, closeSync } from "node:fs";
 import { setTimeout as sleep } from "node:timers/promises";
 import {
-  InMemoryRunRepository, InMemoryRunTreeRepository, InMemoryArtifactStore,
+  AgentError, InMemoryRunRepository, InMemoryRunTreeRepository, InMemoryArtifactStore,
   InMemoryLongTaskRepository,
   type OutputPublisher, type ToolHandlerResult, type ToolIdempotencyGateway, type AgentExecutionCheckpoint,
 } from "purra";
@@ -97,14 +97,14 @@ export class SqliteAgentAdapters {
     const owner = globalThis.crypto.randomUUID();
     await this.transaction(async (all, extra) => {
       const saved = await all.runs.get(runId);
-      if (saved.status !== "running") throw new Error("run_terminal");
+      if (saved.status !== "running") throw new AgentError("run_terminal", "Run is terminal");
       const old = extra.leases[runId];
-      if (old && old.owner !== null && old.expires > Date.now()) throw new Error("run_lease_conflict");
-      if (checkpoint !== undefined && JSON.stringify(saved.executionCheckpoint) !== JSON.stringify(checkpoint)) throw new Error("checkpoint_conflict");
+      if (old && old.owner !== null && old.expires > Date.now()) throw new AgentError("run_lease_conflict", "Run execution lease could not be acquired");
+      if (checkpoint !== undefined && JSON.stringify(saved.executionCheckpoint) !== JSON.stringify(checkpoint)) throw new AgentError("agent_execution_checkpoint_conflict", "Selected checkpoint is not canonical");
       if (checkpoint !== undefined) {
         const events = await all.runs.listEvents(runId, 0, Number.MAX_SAFE_INTEGER);
         const lastCheckpoint = events.reduce((last, event, index) => event.kind === "agent.execution_checkpoint" ? index : last, -1);
-        if (events.slice(lastCheckpoint + 1).some(event => event.kind === "invocation.started")) throw new Error("run_recovery_requires_reconciliation");
+        if (events.slice(lastCheckpoint + 1).some(event => event.kind === "invocation.started")) throw new AgentError("run_recovery_requires_reconciliation", "The last model/tool attempt needs reconciliation");
       }
       extra.leases[runId] = { owner, expires: Date.now() + 30000 };
     });

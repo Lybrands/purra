@@ -401,7 +401,8 @@ export class Agent {
     }
     if (this.#runRepository.executeOwned === undefined) throw new AgentError("run_lease_required", "Root recovery requires durable execution ownership");
     const saved = await this.#runRepository.get(runId);
-    if (saved.status !== "running" || saved.executionCheckpoint === undefined) throw new AgentError("checkpoint_missing", "Run has no resumable checkpoint");
+    if (saved.status !== "running") throw new AgentError("run_terminal", "Run is terminal");
+    if (saved.executionCheckpoint === undefined) throw new AgentError("checkpoint_missing", "Run has no resumable checkpoint");
     return this.#submit(request, { budgets: saved.budgets, deadlineAt: saved.deadlineAt }, undefined, saved.executionCheckpoint);
   }
 

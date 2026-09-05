@@ -11,6 +11,7 @@
 | `tool_security.json`、`retrieval.json` | 工具 Schema、检索结果与访问边界 |
 | `planning_protocol.json`、`planning_activation.json`、`planning_stream.json` | 计划、激活模式与公开进度流 |
 | `durable_protocol.json`、`recovery_protocol.json` | 持久执行与恢复 |
+| `run_resume.json` | 使用 SQLite 验证公开 Root 恢复入口的拒绝错误码 |
 | `agent_tree_protocol.json` | Agent 身份、Child Run 与共享预算 |
 | `artifact_protocol.json`、`observability_protocol.json` | 产物、事件与诊断 |
 
@@ -24,6 +25,12 @@ python -m pytest
 npm --prefix typescript ci
 npm --prefix typescript run check
 ```
+
+公开恢复场景在可选 SQLite 包的测试中运行。按
+[Python](../integrations/sqlite/python/README.zh-CN.md) 和
+[TypeScript](../integrations/sqlite/typescript/README.zh-CN.md) 指南安装组件并运行测试。
+这些测试重新打开临时数据库，验证恢复被拒绝后不调用模型或工具、不追加规范输出。
+使用的是确定性网关，不代表真实 Provider 验证。
 
 ## 维护测试数据
 

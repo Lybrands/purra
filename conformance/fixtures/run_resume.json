@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "cases": [
+    { "id": "lease-required", "errorCode": "run_lease_required" },
+    { "id": "checkpoint-missing", "errorCode": "checkpoint_missing" },
+    { "id": "terminal", "errorCode": "run_terminal" },
+    { "id": "preset-mismatch", "errorCode": "agent_preset_mismatch" },
+    { "id": "lease-conflict", "errorCode": "run_lease_conflict" },
+    { "id": "unreconciled-attempt", "errorCode": "run_recovery_requires_reconciliation" }
+  ]
+}

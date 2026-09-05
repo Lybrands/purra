@@ -83,17 +83,23 @@ test("concurrent resume cannot borrow another execution's lease", async () => {
   const entered = new Promise(resolve => { enter = resolve; });
   const barrier = new Promise(resolve => { release = resolve; });
   const host = compose(join(dir, "agent.db"), async () => { enter(); await barrier; });
+  let first;
   try {
     const initial = await host.agent.submit({ messages: [{ role: "user", content: "Write" }], planningMode: "reactive" }, { budgets: { maxRunGenerationTokens: 100 } });
     let id;
     await assert.rejects(initial.result, error => { id = error.requestId; return error instanceof UserInputRequired; });
     await host.interaction.answer(id, { revision: 1, key: "a", answers: { length: "短" } });
-    const first = await host.interaction.resume(host.agent, id);
+    first = await host.interaction.resume(host.agent, id);
     await entered;
     const second = await host.interaction.resume(host.agent, id);
-    await assert.rejects(second.result, /lease_conflict/);
+    await assert.rejects(second.result, { code: "run_lease_conflict" });
     release();
     assert.equal((await first.result).output, "Finished with the answer");
     assert.equal(host.calls.length, 3);
-  } finally { release(); host.storage.close(); rmSync(dir, { recursive: true }); }
+  } finally {
+    release();
+    if (first) await first.result.catch(() => {});
+    host.storage.close();
+    rmSync(dir, { recursive: true });
+  }
 });

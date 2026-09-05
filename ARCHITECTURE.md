@@ -125,6 +125,38 @@ business answer is correct; that remains a host responsibility.
 
 ## Public boundaries
 
+Full-Run execution uses `AgentCore.submit` / `Agent.submit`. Recovery of a
+checkpointed Root uses `resume`; it requires durable execution ownership, the
+persisted deadline and budget authority, and the original Agent composition.
+Child execution is resumed through its Root scheduler. `continue_agent` /
+`continueAgent` creates a subsequent Agent execution through the tree command
+contract; it does not bypass checkpoint reconciliation for an interrupted Run.
+
+Hosts handle recovery failures by `error.code`, catching both the `resume`
+call and the returned handle's result. Python uses `ContractViolationError`;
+TypeScript uses `AgentError`. The following rejection scenarios do not dispatch
+a new model or tool call:
+
+| Code | Condition |
+| --- | --- |
+| `child_run_resume_requires_scheduler` | Direct Root recovery was requested for a Child Run |
+| `run_lease_required` | Durable execution ownership is not configured |
+| `run_terminal` | The selected Run has already settled |
+| `checkpoint_missing` | A running Run has no committed execution checkpoint |
+| `agent_preset_mismatch` | The rebound Agent composition differs from the saved composition |
+| `agent_execution_checkpoint_conflict` | The selected checkpoint differs from canonical state |
+| `run_lease_conflict` | Execution ownership could not be acquired |
+| `run_recovery_requires_reconciliation` | The durable adapter found an attempt after the last checkpoint |
+
+Child routing and ownership availability are checked before canonical Root
+state; terminal state takes precedence over a missing checkpoint. Subsequent
+identity and lease checks may discover changes since the first read. Hosts must
+not infer an exhaustive diagnosis from the first reported error, parse exception
+messages, or retry an unknown external effect automatically. A custom durable
+adapter supplies the same coded acquisition and reconciliation failures through
+the execution ownership port. Other validation, budget and Provider errors keep
+their capability-specific contracts.
+
 Python hosts compose complete Runs through `purra.api.AgentCore` and implement
 contracts from `purra.contracts`, `purra.ports`, and capability-specific public
 modules. `purra.engine`, `purra.runtime`, and their submodules are implementation

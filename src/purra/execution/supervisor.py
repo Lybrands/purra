@@ -70,6 +70,10 @@ class AgentRunSupervisor:
         self._tasks: set[asyncio.Task[None]] = set()
         self._agent_tree: _AgentTreeSchedulingCapability | None = None
 
+    @property
+    def supports_root_recovery(self) -> bool:
+        return self._lease_store is not None
+
     def configure_agent_tree(
         self,
         repository: RunTreeRepository,
@@ -165,7 +169,10 @@ class AgentRunSupervisor:
             checkpoint = getattr(options, "agent_execution_checkpoint", None)
             if checkpoint is not None:
                 if self._lease_store is None and getattr(options, "agent_tree_run_id", None) is None:
-                    raise ContractViolationError("Root recovery requires an execution lease store")
+                    raise ContractViolationError(
+                        "Root recovery requires an execution lease store",
+                        code="run_lease_required",
+                    )
                 session = await self._bind_lease(checkpoint.run_id, signal, force_claim=True)
                 ready.set_result(checkpoint.run_id)
             stream = self._execution_factory(request, options, signal)
@@ -364,7 +371,8 @@ class _LeaseSession:
             )
             if not claimed:
                 raise ContractViolationError(
-                    "run execution lease could not be acquired"
+                    "run execution lease could not be acquired",
+                    code="run_lease_conflict",
                 )
         self._run_id = run_id
         self._monitor = asyncio.create_task(self._monitor_lease())

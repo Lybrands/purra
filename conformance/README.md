@@ -12,6 +12,7 @@ protocol values, validation, state transitions, and error outcomes.
 | `tool_security.json`, `retrieval.json` | Tool schemas, retrieval results, and access boundaries |
 | `planning_protocol.json`, `planning_activation.json`, `planning_stream.json` | Plans, activation modes, and public progress streams |
 | `durable_protocol.json`, `recovery_protocol.json` | Durable execution and recovery |
+| `run_resume.json` | Public Root recovery rejection codes, exercised with SQLite |
 | `agent_tree_protocol.json` | Agent identity, Child Runs, and shared budgets |
 | `artifact_protocol.json`, `observability_protocol.json` | Artifacts, events, and diagnostics |
 
@@ -25,6 +26,13 @@ python -m pytest
 npm --prefix typescript ci
 npm --prefix typescript run check
 ```
+
+The public recovery scenarios run in the optional SQLite suites. Install the
+SQLite packages and run their checks as described in the
+[Python](../integrations/sqlite/python/README.md) and
+[TypeScript](../integrations/sqlite/typescript/README.md) guides. These tests
+reopen temporary databases and verify that rejected recovery does not call a
+Provider or tool or append canonical output. They use deterministic gateways.
 
 ## Maintaining fixtures
 
