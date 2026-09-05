@@ -1,4 +1,4 @@
-import { encodeStorageState, decodeStorageState } from "../shared/storage-state.js";
+import { encodeStorageState, decodeStorageState, requireStorageFields } from "../shared/storage-state.js";
 import { copyJsonValue } from "../model/validation.js";
 import { AgentError } from "../shared/errors.js";
 import { stableFingerprint } from "../shared/fingerprint.js";
@@ -57,10 +57,15 @@ export class InMemoryArtifactStore implements
   readonly #runIsAvailable: (runId: string) => boolean;
 
   /** Opaque version-pinned storage data, never a public output projection. */
-  public exportState(): string { return encodeStorageState({ artifacts: this.#artifacts, owners: this.#owners, claims: this.#claims }); }
+  public exportState(): string { return encodeStorageState("purra.artifact-state/v1", { artifacts: new Map([...this.#artifacts].map(([id, state]) => [id, { record: state.record, createFingerprint: state.createFingerprint, batches: state.batches, receipts: new Map([...state.receipts].map(([key, value]) => [key, { contentDigest: value.contentDigest, receipt: value.receipt }])), updatedAtMs: state.updatedAtMs }])), owners: this.#owners, claims: this.#claims }); }
   public importState(text: string): void {
     const shape = { artifacts: this.#artifacts, owners: this.#owners, claims: this.#claims };
-    const saved = decodeStorageState(text) as typeof shape;
+    const saved = decodeStorageState(text, "purra.artifact-state/v1", shape) as typeof shape;
+    for (const state of saved.artifacts.values()) {
+      requireStorageFields(state, ["record", "createFingerprint", "batches", "receipts", "updatedAtMs"]);
+      if (!(state.receipts instanceof Map) || !Array.isArray(state.batches)) throw new TypeError("Invalid stored Artifact");
+      for (const value of state.receipts.values()) requireStorageFields(value, ["contentDigest", "receipt"]);
+    }
     this.#artifacts.clear(); for (const [key, value] of saved.artifacts) this.#artifacts.set(key, value);
     this.#owners.clear(); for (const [key, value] of saved.owners) this.#owners.set(key, value);
     this.#claims.clear(); for (const [key, value] of saved.claims) this.#claims.set(key, value);

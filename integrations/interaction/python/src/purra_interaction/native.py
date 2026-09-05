@@ -49,7 +49,7 @@ class SqliteClarification:
                 pending.append((message.tool_call_id, _questions(value["purraInputRequest"])))
         async with self.storage.transaction() as adapters:
             self.storage._guard(checkpoint.run_id)
-            tree = adapters.run_tree._runs.get(checkpoint.run_id)
+            tree = adapters.find_tree_run(checkpoint.run_id)
             root_id = tree.root_run_id if tree is not None else checkpoint.run_id
             rows = self.storage.extra.setdefault("clarifications", {})
             for call_id, questions in pending:
@@ -60,7 +60,7 @@ class SqliteClarification:
                     await self._event(adapters, rows[identifier], "input.required")
             descendants = {run.run_id for run in await adapters.run_tree.list_descendants(checkpoint.run_id)} if tree is not None else set()
             waiting = [row for row in rows.values() if row["runId"] in {checkpoint.run_id, *descendants}
-                       and row["state"] == "waiting" and adapters.runs._state.runs[row["runId"]].status.value == "running"]
+                       and row["state"] == "waiting" and adapters.get_run_info(row["runId"]).status.value == "running"]
         if waiting:
             raise UserInputRequired(checkpoint.run_id, waiting[0]["id"])
         return checkpoint
@@ -69,7 +69,7 @@ class SqliteClarification:
         async with self.storage.transaction() as adapters:
             row = self.storage.extra.get("clarifications", {})[identifier]
             result = {key: row[key] for key in ("id", "runId", "rootRunId", "questions", "state", "revision", "answers")}
-            status = adapters.runs._state.runs[row["runId"]].status.value
+            status = adapters.get_run_info(row["runId"]).status.value
             if status != "running": result["state"] = "completed" if status == "done" else status
             lease = self.storage._leases.get(row["runId"])
             if status == "running" and row["state"] == "ready" and lease is not None and lease.owner_id is not None and (lease.expires_at_ms or 0) > int(datetime.now().timestamp() * 1000):
@@ -79,14 +79,14 @@ class SqliteClarification:
     async def list_pending(self):
         async with self.storage.transaction() as adapters:
             identifiers = tuple(row["id"] for row in self.storage.extra.get("clarifications", {}).values()
-                if adapters.runs._state.runs[row["runId"]].status.value == "running")
+                if adapters.get_run_info(row["runId"]).status.value == "running")
         return tuple([await self.get(identifier) for identifier in identifiers])
 
     async def list_waiting(self):
         async with self.storage.transaction() as adapters:
             return tuple({key: row[key] for key in ("id", "runId", "questions", "state", "revision")}
                          for row in self.storage.extra.get("clarifications", {}).values() if row["state"] == "waiting"
-                         and adapters.runs._state.runs[row["runId"]].status.value == "running")
+                         and adapters.get_run_info(row["runId"]).status.value == "running")
 
     async def answer(self, identifier, *, revision, key, answers):
         _text(key); _json(answers)
@@ -100,9 +100,9 @@ class SqliteClarification:
                 for q in row["questions"]:
                     value = _text(answers[q["id"]], 8000)
                     if not q["allowFreeform"] and value not in q["choices"]: raise ValueError("invalid answer choice")
-                run = adapters.runs._state.runs[row["runId"]]
+                run = await adapters.runs.get(row["runId"])
                 if run.status.value != "running": raise ValueError("clarification_run_terminal")
-                if run.params.deadline_at_ms is not None and run.params.deadline_at_ms <= int(datetime.now().timestamp() * 1000): raise ValueError("clarification_expired")
+                if run.deadline_at_ms is not None and run.deadline_at_ms <= int(datetime.now().timestamp() * 1000): raise ValueError("clarification_expired")
                 checkpoint = run.execution_checkpoint
                 if checkpoint is None: raise ValueError("clarification_checkpoint_missing")
                 message = AgentMessage("user", "Answers to requested task information:\n" + _json(answers), attributes={"inputRequestId": identifier})
@@ -116,7 +116,7 @@ class SqliteClarification:
             row = self.storage.extra["clarifications"][identifier]
             if row["state"] != "ready": raise ValueError("clarification_not_ready")
             if any(r["rootRunId"] == row["rootRunId"] and r["state"] == "waiting"
-                   and adapters.runs._state.runs[r["runId"]].status.value == "running"
+                   and adapters.get_run_info(r["runId"]).status.value == "running"
                    for r in self.storage.extra["clarifications"].values()): raise ValueError("clarification_answers_incomplete")
             request, run_id = row["request"], row["rootRunId"]
         async def checkpoint(saved): return await self._checkpoint(saved, request)
@@ -125,15 +125,15 @@ class SqliteClarification:
     async def cancel(self, identifier):
         async with self.storage.transaction() as adapters:
             row = self.storage.extra["clarifications"][identifier]
-            run = adapters.runs._state.runs[row["rootRunId"]]
+            run = await adapters.runs.get(row["rootRunId"])
             if run.status.value != "running": return False
             root_id = row["rootRunId"]
-            tree = adapters.run_tree._runs.get(root_id)
+            tree = adapters.find_tree_run(root_id)
             run_ids = [root_id, *(r.run_id for r in await adapters.run_tree.list_descendants(root_id))] if tree else [root_id]
             if any((lease := self.storage._leases.get(rid)) is not None and lease.owner_id is not None for rid in run_ids):
                 raise ValueError("cancel the active Run through its handle")
             for rid in run_ids:
-                canonical = adapters.runs._state.runs.get(rid)
+                canonical = adapters.get_run_info(rid)
                 if canonical is None or canonical.status.value != "running": continue
                 await adapters.outputs.commit_run_lifecycle(rid, RunCommit(
                     terminal_status="canceled", events=(AgentEvent("run.canceled", {"reason": "user_input_canceled"}, rid),)),

@@ -1,4 +1,4 @@
-import { encodeStorageState, decodeStorageState } from "../shared/storage-state.js";
+import { encodeStorageState, decodeStorageState, requireStorageFields } from "../shared/storage-state.js";
 import type { JsonValue, ModelTokenUsage } from "../model/types.js";
 import { copyJsonValue } from "../model/validation.js";
 import { AgentError } from "../shared/errors.js";
@@ -39,10 +39,14 @@ export class InMemoryLongTaskRepository implements LongTaskRepository {
   readonly #tokenFactory: () => string;
 
   /** Opaque version-pinned storage data, never a public output projection. */
-  public exportState(): string { return encodeStorageState({ tasks: this.#tasks, idempotency: this.#idempotency }); }
+  public exportState(): string { return encodeStorageState("purra.task-state/v1", { tasks: new Map([...this.#tasks].map(([id, state]) => [id, { record: state.record, units: state.units, checkpoints: state.checkpoints, settlements: state.settlements, bindings: state.bindings }])), idempotency: this.#idempotency }); }
   public importState(text: string): void {
     const shape = { tasks: this.#tasks, idempotency: this.#idempotency };
-    const saved = decodeStorageState(text) as typeof shape;
+    const saved = decodeStorageState(text, "purra.task-state/v1", shape) as typeof shape;
+    for (const state of saved.tasks.values()) {
+      requireStorageFields(state, ["record", "units", "checkpoints", "settlements", "bindings"]);
+      if (![state.units, state.checkpoints, state.settlements].every(v => v instanceof Map) || !Array.isArray(state.bindings)) throw new TypeError("Invalid stored Task");
+    }
     this.#tasks.clear(); for (const [key, value] of saved.tasks) this.#tasks.set(key, value);
     this.#idempotency.clear(); for (const [key, value] of saved.idempotency) this.#idempotency.set(key, value);
   }

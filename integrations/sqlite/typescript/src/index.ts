@@ -4,18 +4,13 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { openSync, closeSync } from "node:fs";
 import { setTimeout as sleep } from "node:timers/promises";
 import {
-  AgentError, InMemoryRunRepository, InMemoryRunTreeRepository, InMemoryArtifactStore,
-  InMemoryLongTaskRepository,
+  AgentError, StorageSession, STORAGE_PORT_METHODS,
+  type StorageStores, type StoragePorts, type StorageSelection,
   type OutputPublisher, type ToolHandlerResult, type ToolIdempotencyGateway, type AgentExecutionCheckpoint,
 } from "purra";
 
-function stores() {
-  const runTree = new InMemoryRunTreeRepository();
-  const runs = new InMemoryRunRepository({ leaseValidator: (id, claim) => runTree.requireRunClaim(id, claim) });
-  return { runs, runTree, artifacts: new InMemoryArtifactStore(), longTasks: new InMemoryLongTaskRepository() };
-}
-type Stores = ReturnType<typeof stores>;
-type StateSelection = "all" | "extra" | Exclude<keyof Stores, "runs">;
+type Stores = StorageStores;
+type StateSelection = StorageSelection;
 const RUN_READ_METHODS = new Set(["get", "listEvents", "listRootEvents"]);
 const ROOT_BOUND_METHODS = new Set(["get", "openInvocation", "appendEvent", "appendBatch", "saveExecutionCheckpoint", "settleInvocation", "settleRun", "cancel"]);
 
@@ -66,14 +61,19 @@ export class SqliteAgentAdapters {
       catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
     }
     this.#db = new DatabaseSync(path);
+    if (this.#db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='purra_state'").get()
+      && this.#db.prepare("SELECT 1 FROM purra_state WHERE version != ? LIMIT 1").get(STORAGE_VERSION)) {
+      this.#db.close();
+      throw new Error("unsupported SQLite storage version");
+    }
     this.#db.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=0; PRAGMA foreign_keys=ON;");
     this.#db.exec("CREATE TABLE IF NOT EXISTS purra_state (scope TEXT NOT NULL, sdk TEXT NOT NULL, version INTEGER NOT NULL, body TEXT NOT NULL, PRIMARY KEY(scope,sdk))");
     this.#journal = new OutputJournal(this.#db, this.#scope);
   }
 
-  #port<K extends keyof Stores>(name: K): Stores[K] {
-    const methods = new Set(Object.getOwnPropertyNames(Object.getPrototypeOf(stores()[name])));
-    return new Proxy({} as Stores[K], { get: (_target, method: string) => {
+  #port<K extends keyof Stores>(name: K): StoragePorts[K] {
+    const methods = new Set<string>(STORAGE_PORT_METHODS[name]);
+    return new Proxy({} as StoragePorts[K], { get: (_target, method: string) => {
       if (name === "runs" && method === "executeOwned") return this.#executeOwned.bind(this);
       if (name === "runs" && (method === "listEvents" || method === "listRootEvents")) {
         return (id: string, after: number, limit?: number) => this.#withConnection(
@@ -169,31 +169,20 @@ export class SqliteAgentAdapters {
 
   async #transaction<T>(operation: (all: Stores, extra: { tools: Record<string, any>; [key: string]: any }) => Promise<T>, readOnly = false, selection: StateSelection = "all", journalRunId?: string): Promise<T> {
     return this.#withConnection(async () => {
-      const all = stores();
       const row = this.#db.prepare("SELECT version,body FROM purra_state WHERE scope=? AND sdk='typescript'").get(this.#scope);
       if (row && row.version !== STORAGE_VERSION) throw new Error("unsupported SQLite storage version");
-      const saved = row ? JSON.parse(String(row.body)) : { extra: { tools: Object.create(null) } };
-      saved.extra.tools = Object.assign(Object.create(null), saved.extra.tools);
-      saved.extra.leases = Object.assign(Object.create(null), saved.extra.leases);
       const rootRunId = row && journalRunId !== undefined ? this.#journal.rootForRun(journalRunId) : undefined;
       const deferredJournal = row && selection === "all" && !readOnly && rootRunId !== undefined ? this.#journal.deferred(rootRunId) : undefined;
       const events = row && selection === "all" && deferredJournal === undefined ? this.#journal.restore(rootRunId) : [];
       const prior = new Map<string, number>(deferredJournal?.counts);
       for (const event of events) prior.set(event.runId, event.sequence);
-      if (saved.runs && selection === "all") all.runs.importState(saved.runs,
-        deferredJournal === undefined ? events : undefined,
+      const session = new StorageSession(row ? String(row.body) : undefined, selection, events,
         { ...(rootRunId === undefined ? {} : { rootRunId }), ...(deferredJournal === undefined ? {} : { deferredJournal }) });
-      for (const key of ["runTree", "artifacts", "longTasks"] as const) if (saved[key] && (selection === "all" || selection === key)) all[key].importState(saved[key]);
-      const result = await operation(all, saved.extra);
+      const result = await operation(session.stores, session.extra);
       if (!readOnly) {
-        const checkpoint = selection === "all" ? all.runs.exportJournalState({ incremental: true }) : undefined;
-        if (checkpoint !== undefined) saved.runs = checkpoint.state;
-        for (const key of ["runTree", "artifacts", "longTasks"] as const) {
-          if (selection === "all" || selection === key) saved[key] = all[key].exportState();
-        }
-        const body = JSON.stringify(saved);
-        if (!row || row.body !== body) this.#db.prepare("INSERT INTO purra_state VALUES(?, 'typescript', 3, ?) ON CONFLICT(scope,sdk) DO UPDATE SET version=excluded.version,body=excluded.body").run(this.#scope, body);
-        if (checkpoint !== undefined) this.#journal.append(checkpoint.journals, prior);
+        const checkpoint = session.exportSnapshot();
+        if (!row || row.body !== checkpoint.body) this.#db.prepare("INSERT INTO purra_state VALUES(?, 'typescript', ?, ?) ON CONFLICT(scope,sdk) DO UPDATE SET version=excluded.version,body=excluded.body").run(this.#scope, STORAGE_VERSION, checkpoint.body);
+        if (selection === "all") this.#journal.append(checkpoint.journals, prior);
       }
       return result;
     }, readOnly);

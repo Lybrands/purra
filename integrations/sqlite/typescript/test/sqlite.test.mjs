@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
-import { Agent, UserInputRequired, InMemoryRunRepository, assertRunRepositoryConforms, assertArtifactRepositoryConforms, assertLongTaskRepositoryConforms } from "purra";
+import { Agent, AgentCapabilityGrant, UserInputRequired, InMemoryRunRepository, assertRunRepositoryConforms, assertArtifactRepositoryConforms, assertLongTaskRepositoryConforms } from "purra";
 import { SqliteAgentAdapters } from "../dist/index.js";
 
 test("reads use committed snapshots without writer locks or state export", async () => {
@@ -52,7 +52,7 @@ test("canonical storage conformance survives reopen and rejects terminal writes"
   } finally { storage.close(); rmSync(dir, { recursive: true }); }
 });
 
-for (const version of [1, 2]) test(`storage v3 rejects v${version} snapshots`, async () => {
+for (const version of [1, 2, 3]) test(`storage v4 rejects v${version} before any database write`, () => {
   const dir = mkdtempSync(join(tmpdir(), "purra-sqlite-v1-"));
   const path = join(dir, "agent.db");
   const db = new DatabaseSync(path);
@@ -62,12 +62,50 @@ for (const version of [1, 2]) test(`storage v3 rejects v${version} snapshots`, a
   } finally {
     db.close();
   }
-  const storage = new SqliteAgentAdapters(path, { scope: "legacy" });
+  const before = readFileSync(path);
   try {
-    await assert.rejects(storage.runs.get("missing"), /unsupported SQLite storage version/);
-    await assert.rejects(storage.runs.listEvents("missing", 0), /unsupported SQLite storage version/);
+    assert.throws(() => new SqliteAgentAdapters(path, { scope: "new" }), /unsupported SQLite storage version/);
+    assert.deepEqual(readFileSync(path), before);
+    assert.equal(existsSync(path + "-wal"), false);
   } finally {
-    storage.close();
     rmSync(dir, { recursive: true });
   }
+});
+
+for (const group of ["runs", "runTree", "artifacts", "longTasks"]) test(`invalid ${group} state aborts transaction without changing rows`, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "purra-invalid-state-"));
+  const path = join(dir,"agent.db");
+  const storage = new SqliteAgentAdapters(path,{scope:"invalid"});
+  const db = new DatabaseSync(path);
+  try {
+    await storage.transaction(async (_stores,extra) => { extra.committed=true; });
+    const state=JSON.parse(db.prepare("SELECT body FROM purra_state").get().body);
+    const inner=JSON.parse(state.stores[group]);
+    inner.value[1].push(["unexpectedPrivateField",["map",[]]]);
+    state.stores[group]=JSON.stringify(inner);
+    const body=JSON.stringify(state);
+    db.prepare("UPDATE purra_state SET body=?").run(body);
+    await assert.rejects(storage.transaction(async () => assert.fail("invalid state reached callback")),/storage fields/);
+    assert.equal(db.prepare("SELECT body FROM purra_state").get().body,body);
+    assert.equal(db.prepare("SELECT count(*) AS n FROM purra_output_events").get().n,0);
+  } finally { db.close(); storage.close(); rmSync(dir,{recursive:true}); }
+});
+
+
+test("explicit tree ports preserve persisted lease fencing after reopen", async () => {
+  const dir=mkdtempSync(join(tmpdir(),"purra-tree-ports-"));
+  const path=join(dir,"agent.db");
+  let storage=new SqliteAgentAdapters(path,{scope:"tree"});
+  try {
+    await storage.runTree.beginRoot({runId:"root",agentId:"agent",name:"root",title:"Root",instruction:"Own task",objective:"Finish",capabilityGrant:new AgentCapabilityGrant({canSpawnAgents:true}),idempotencyKey:"begin"});
+    const spawned=await storage.runTree.spawnAgents({parentRunId:"root",idempotencyKey:"spawn",children:[{name:"child",title:"Child",instruction:"Read",objective:"Read"}]});
+    const childId=spawned.items[0].run.runId;
+    const claimed=await storage.runTree.claimRun(childId,{ownerId:"worker",leaseDurationMs:30000});
+    assert.ok(claimed);
+    storage.close(); storage=new SqliteAgentAdapters(path,{scope:"tree"});
+    await storage.runTree.requireRunClaim(childId,{leaseOwnerId:claimed.leaseOwnerId,leaseEpoch:claimed.leaseEpoch});
+    await assert.rejects(storage.runTree.requireRunClaim(childId,{leaseOwnerId:"other",leaseEpoch:claimed.leaseEpoch}),{code:"agent_run_lease_lost"});
+    assert.equal(storage.runTree.importState,undefined);
+    assert.equal(storage.runs.exportJournalState,undefined);
+  } finally { storage.close();rmSync(dir,{recursive:true}); }
 });

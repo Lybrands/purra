@@ -7,7 +7,7 @@ import test from "node:test";
 import { InMemoryRunRepository, assertRunRepositoryConforms } from "purra";
 import { SqliteAgentAdapters } from "../dist/index.js";
 
-test("existing v3 adds covering indexes and bounds the actual child join without rewriting data", async (t) => {
+test("existing v4 adds covering indexes and bounds the actual child join without rewriting data", async (t) => {
   const dir = mkdtempSync(join(tmpdir(), "purra-cover-"));
   const path = join(dir, "agent.db");
   let storage = new SqliteAgentAdapters(path, { scope: "cover" });

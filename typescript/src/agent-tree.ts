@@ -1,4 +1,4 @@
-import { encodeStorageState, decodeStorageState } from "./shared/storage-state.js";
+import { encodeStorageState, decodeStorageState, requireStorageFields } from "./shared/storage-state.js";
 import type { JsonValue } from "./model/types.js";
 import { copyJsonValue } from "./model/validation.js";
 import { AgentError } from "./shared/errors.js";
@@ -295,10 +295,11 @@ export class InMemoryRunTreeRepository implements RunTreeRepository {
   readonly #clockMs: () => number;
 
   /** Opaque version-pinned storage data, never a public output projection. */
-  public exportState(): string { return encodeStorageState({ agents: this.#agents, runs: this.#runs, checkpoints: this.#checkpoints, spawnReceipts: this.#spawnReceipts, continueReceipts: this.#continueReceipts, rootDigests: this.#rootDigests, sequence: this.#sequence, agentSequence: this.#agentSequence, runSequence: this.#runSequence, batchSequence: this.#batchSequence, checkpointSequence: this.#checkpointSequence }); }
+  public exportState(): string { return encodeStorageState("purra.tree-state/v1", { agents: this.#agents, runs: this.#runs, checkpoints: this.#checkpoints, spawnReceipts: new Map([...this.#spawnReceipts].map(([id, value]) => [id, { digest: value.digest, receipt: value.receipt }])), continueReceipts: new Map([...this.#continueReceipts].map(([id, value]) => [id, { digest: value.digest, receipt: value.receipt }])), rootDigests: this.#rootDigests, sequence: this.#sequence, agentSequence: this.#agentSequence, runSequence: this.#runSequence, batchSequence: this.#batchSequence, checkpointSequence: this.#checkpointSequence }); }
   public importState(text: string): void {
     const shape = { agents: this.#agents, runs: this.#runs, checkpoints: this.#checkpoints, spawnReceipts: this.#spawnReceipts, continueReceipts: this.#continueReceipts, rootDigests: this.#rootDigests, sequence: this.#sequence, agentSequence: this.#agentSequence, runSequence: this.#runSequence, batchSequence: this.#batchSequence, checkpointSequence: this.#checkpointSequence };
-    const saved = decodeStorageState(text) as typeof shape;
+    const saved = decodeStorageState(text, "purra.tree-state/v1", shape) as typeof shape;
+    for (const value of [...saved.spawnReceipts.values(), ...saved.continueReceipts.values()]) requireStorageFields(value, ["digest", "receipt"]);
     const restoreAgent = (node: AgentNode): AgentNode => freezeAgent({ ...node, capabilityGrant: new AgentCapabilityGrant(node.capabilityGrant) });
     this.#agents.clear(); for (const [key, value] of saved.agents) this.#agents.set(key, restoreAgent(value));
     this.#runs.clear(); for (const [key, value] of saved.runs) this.#runs.set(key, value);

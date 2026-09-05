@@ -57,7 +57,7 @@ test("indexed pagination preserves child order and scopes without loading state"
     const db = new DatabaseSync(path);
     try {
       const saved = JSON.parse(db.prepare("SELECT body FROM purra_state WHERE scope='a'").get().body);
-      assert.ok(!saved.runs.includes(c.eventId));
+      assert.ok(!saved.stores.runs.includes(c.eventId));
       const plan = db.prepare("EXPLAIN QUERY PLAN SELECT body FROM purra_output_events WHERE scope=? AND sdk='typescript' AND root_run_id=? AND root_sequence>? ORDER BY root_sequence LIMIT ?").all("a", "root", 2, 2);
       assert.ok(plan.some((row) => row.detail.includes("SEARCH")));
       assert.ok(!plan.some((row) => row.detail.includes("TEMP B-TREE")));

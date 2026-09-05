@@ -225,3 +225,16 @@ runtimes consume the same contract.
 - [Runnable examples](examples/README.md)
 - [TypeScript implementation notes](typescript/ARCHITECTURE.md)
 - [Cross-language fixtures](conformance/README.md)
+
+## Durable adapter state boundary
+
+Core owns `StorageSession` and explicit versioned state schemas; SQLite manages
+transactions and journal rows through that boundary. Python exposes it from
+`purra.storage`; TypeScript exports it from `purra`. This is a version-pinned
+adapter contract, separate from application ports and public output projections.
+Python record identifiers do not depend on module paths. Repository state and
+canonical output history commit atomically, while lazy history stays transaction-local.
+SQLite storage v4 rejects other versions before database initialization writes.
+It provides no legacy codec or automatic migration. SDK state schemas, execution
+checkpoint versions, preset versions and package versions evolve independently;
+Python and TypeScript snapshots are not interchangeable.

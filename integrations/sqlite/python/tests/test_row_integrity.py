@@ -9,7 +9,7 @@ from purra.events import AgentEvent
 from purra.output.contracts import AgentOutputEventDraft, RunLifecycleOutputDraft
 from purra.ports.run_lifecycle import RunCommit
 from purra_sqlite import SqliteAgentAdapters
-from purra_sqlite.codec import dumps
+from purra.storage import dump_storage_value as dumps
 
 
 def draft(run, key):

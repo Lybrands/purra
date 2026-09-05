@@ -1,4 +1,4 @@
-import { encodeStorageState, decodeStorageState } from "../shared/storage-state.js";
+import { encodeStorageState, decodeStorageState, requireStorageFields } from "../shared/storage-state.js";
 import { PLANNING_STREAM_SCHEMA, PlanningStreamParser } from "../planning/stream.js";
 import type { JsonValue, ModelTokenUsage } from "../model/types.js";
 import { copyJsonValue } from "../model/validation.js";
@@ -80,6 +80,20 @@ interface StoredRun {
     readonly event: OutputEvent;
     readonly budgetError?: string;
   }>;
+}
+
+function storageRun(run: StoredRun, detached = false): StoredRun {
+  return {
+    runId: run.runId, rootRunId: run.rootRunId, agentId: run.agentId,
+    parentRunId: run.parentRunId, leaseOwnerId: run.leaseOwnerId, leaseEpoch: run.leaseEpoch,
+    snapshot: run.snapshot, openInvocations: run.openInvocations,
+    invocationReceipts: run.invocationReceipts,
+    invocationSettlements: new Map([...run.invocationSettlements].map(([id, value]) => [id, {
+      input: value.input, event: value.event, ...(value.budgetError === undefined ? {} : { budgetError: value.budgetError }),
+    }])),
+    events: detached ? [] : run.events, bySourceKey: detached ? new Map() : run.bySourceKey,
+    rootEvents: detached ? [] : run.rootEvents, rootBySourceKey: detached ? new Map() : run.rootBySourceKey,
+  };
 }
 
 interface DeferredOutputJournal {
@@ -180,18 +194,16 @@ export class InMemoryRunRepository implements RunRepository {
       restored.importState(checkpoint.state, events);
       return restored.exportState();
     }
-    return encodeStorageState({ runs: this.#runs, rootEvents: this.#rootEvents, rootEventsBySourceKey: this.#rootEventsBySourceKey });
+    return encodeStorageState("purra.run-state/v1", { runs: new Map([...this.#runs].map(([id, run]) => [id, storageRun(run)])), rootEvents: this.#rootEvents, rootEventsBySourceKey: this.#rootEventsBySourceKey });
   }
   /** Execution state without the canonical journal, for transactional row storage. */
   public exportJournalState(options: { readonly incremental?: boolean } = {}): {
     readonly state: string;
     readonly journals: readonly { readonly runId: string; readonly rootRunId: string; readonly afterSequence: number; readonly events: readonly OutputEvent[] }[];
   } {
-    const runs = new Map([...this.#runs].map(([id, run]) => [id, {
-      ...run, events: [], bySourceKey: new Map(), rootEvents: [], rootBySourceKey: new Map(),
-    }]));
+    const runs = new Map([...this.#runs].map(([id, run]) => [id, storageRun(run, true)]));
     return {
-      state: encodeStorageState({ runs, rootEvents: new Map(), rootEventsBySourceKey: new Map(), journalCounts: new Map([...this.#runs].map(([id, run]) => [id, this.#unloadedRoots.has(run.rootRunId) ? this.#journalCounts.get(id)! : eventCount(run)])) }),
+      state: encodeStorageState("purra.run-state/v1", { runs, rootEvents: new Map(), rootEventsBySourceKey: new Map(), journalCounts: new Map([...this.#runs].map(([id, run]) => [id, this.#unloadedRoots.has(run.rootRunId) ? this.#journalCounts.get(id)! : eventCount(run)])) }),
       journals: Object.freeze([...this.#runs.values()].filter((run) => !this.#unloadedRoots.has(run.rootRunId)).map((run) => Object.freeze({
         runId: run.runId, rootRunId: run.rootRunId,
         afterSequence: options.incremental ? deferredHistories.get(run)?.count ?? 0 : 0,
@@ -202,7 +214,15 @@ export class InMemoryRunRepository implements RunRepository {
 
   public importState(text: string, outputEvents?: readonly OutputEvent[], options: { readonly rootRunId?: string; readonly deferredJournal?: DeferredOutputJournal } = {}): void {
     const shape = { runs: this.#runs, rootEvents: this.#rootEvents, rootEventsBySourceKey: this.#rootEventsBySourceKey };
-    const saved = decodeStorageState(text) as typeof shape & { journalCounts?: Map<string, number> };
+    const saved = decodeStorageState(text, "purra.run-state/v1", shape, { journalCounts: new Map<string, number>() }) as typeof shape & { journalCounts?: Map<string, number> };
+    for (const [id, run] of saved.runs) {
+      requireStorageFields(run, ["runId", "rootRunId", "agentId", "parentRunId", "leaseOwnerId", "leaseEpoch",
+        "snapshot", "openInvocations", "invocationReceipts", "invocationSettlements", "events", "bySourceKey", "rootEvents", "rootBySourceKey"]);
+      if (typeof id !== "string" || run.runId !== id || !saved.runs.has(run.rootRunId)
+        || !Array.isArray(run.events) || !Array.isArray(run.rootEvents) || !(run.openInvocations instanceof Set)
+        || ![run.bySourceKey, run.rootBySourceKey, run.invocationReceipts, run.invocationSettlements].every(v => v instanceof Map)) throw new TypeError("Invalid stored Run");
+      for (const value of run.invocationSettlements.values()) requireStorageFields(value, ["input", "event"], ["budgetError"]);
+    }
     const deferred = options.deferredJournal;
     if (deferred !== undefined && (options.rootRunId === undefined || outputEvents !== undefined || saved.journalCounts === undefined)) {
       throw new TypeError("deferred journal requires a detached Root checkpoint");

@@ -1,7 +1,7 @@
 import type { DatabaseSync } from "node:sqlite";
 import { AgentError, type OutputEvent } from "purra";
 
-export const STORAGE_VERSION = 3;
+export const STORAGE_VERSION = 4;
 
 function decode(text: string): OutputEvent {
   const freeze = (value: any): any => {

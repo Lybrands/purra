@@ -44,6 +44,19 @@ For uncertain external tool writes, call
 happened. For persisted questions and answers, use
 [SqliteClarification](../../interaction/typescript/README.md).
 
+## Adapter state boundary
+
+Core owns the versioned `StorageSession` contract and the repository state schemas.
+SQLite owns transactions, indexes, leases and tool-effect reconciliation. The state
+bridge is version-pinned between packages, not a portable business interchange
+format. Install matching Core and integration builds together.
+
+`StorageSession` is exported by `purra`. It combines versioned repository state
+with detached journal rows. `storage.transaction(async (stores, extra) => ...)`
+keeps transaction-local ports and extension metadata. Sessions and their lazy
+history callbacks must not escape the transaction; the snapshot body alone is
+not a complete backup. Repository methods are exposed from an explicit port list.
+
 ## Storage and shutdown
 
 Canonical output events are appended as rows with Run and Root sequence indexes.
@@ -62,14 +75,15 @@ their checkpoints and event counts are preserved. Lease acquisition, public
 scope. Execution snapshots retain checkpoints and receipts and
 are still loaded and saved at scope granularity. This adapter therefore
 still suits bounded local workloads.
-Storage v3 rejects v1/v2 data without automatic migration; existing databases
-cannot be resumed directly.
+Storage v4 rejects every other storage version (including v1/v2/v3) during
+construction, before changing database pragmas, tables or indexes. There is no
+automatic migration or old-format resume path; rejected databases remain unchanged.
 Python and TypeScript execution snapshots are not interchangeable.
 The source-key index is local to each Root (Python keys are scope-wide).
-Opening existing v3 data creates the index using SQLite `json_extract`.
+Opening existing v4 data creates the index using SQLite `json_extract`.
 Sequence checks scan a covering index for the selected Root and match each child
 by Run id, without fetching event body rows. Root headers have a covering index
-as well. Existing v3 databases build these indexes on opening, consuming time and
+as well. Existing v4 databases build these indexes on opening, consuming time and
 disk space; inserts maintain the extra indexes. Metadata remains scope-sized;
 writes are not constant-cost. Event bodies are validated when read. Lease
 acquisition and public transactions retain full journal hydration.

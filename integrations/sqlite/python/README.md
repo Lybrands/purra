@@ -47,6 +47,22 @@ An interrupted external tool call may already have taken effect. Use
 before retrying. For persisted questions and answers, use
 [SqliteClarification](../../interaction/python/README.md).
 
+## Adapter state boundary
+
+Core owns the versioned `StorageSession` contract and the repository state schemas.
+SQLite owns transactions, indexes, leases and tool-effect reconciliation. The state
+bridge is version-pinned between packages, not a portable business interchange
+format. Install matching Core and integration builds together.
+
+`from purra.storage import StorageSession` replaces the SQLite-owned reflective
+codec. Records have explicit identifiers and fields independent of Python module
+paths. `storage.transaction()` yields a session with `runs`, `outputs`, `run_tree`,
+`artifacts`, `artifact_claims`, `artifact_maintenance` and `long_tasks` ports.
+For transaction-local recovery metadata use `get_run_info()` and `find_tree_run()`;
+never access an in-memory repository's private fields. Event history is stored
+separately; `export_snapshot()` alone is not a complete backup. Session ports and
+lazy history callbacks must not escape the transaction.
+
 ## Storage and shutdown
 
 Canonical output events are appended as rows with Run and Root sequence indexes.
@@ -62,17 +78,18 @@ operation settlement) load the required Run's original events on demand.
 Shared budgets still use all sibling Run counters; event-key replay uses indexed
 lookups. Run reads retain complete Root journal hydration.
 Cross-Root event keys use an index; Python SQLite requires `json_extract`, and
-opening an existing v3 database creates this index on first use. Lease acquisition,
+opening an existing v4 database creates this index on first use. Lease acquisition,
 public `transaction()` and operations without an identifiable Run still validate
 the full scope. Execution snapshots retain Run history,
 checkpoints and receipts and are still loaded and saved at scope granularity.
 This adapter therefore still suits bounded local workloads.
-Storage v3 rejects v1/v2 data without automatic migration; existing databases
-cannot be resumed directly.
+Storage v4 rejects every other storage version (including v1/v2/v3) during
+construction, before changing database pragmas, tables or indexes. There is no
+automatic migration or old-format resume path; rejected databases remain unchanged.
 Python and TypeScript execution snapshots are not interchangeable.
 Both SDKs defer history loading for Run-scoped writes. SQL sequence checks scan the
 selected Root's covering index without fetching event body rows or sorting by
-Run. Root headers also have a covering index. Existing v3 databases build these
+Run. Root headers also have a covering index. Existing v4 databases build these
 indexes on opening; this takes time and disk space, and inserts maintain them.
 Metadata snapshots remain scope-sized, so these writes are
 not constant-cost. Event bodies are validated when read; lease acquisition and

@@ -46,6 +46,19 @@ core = AgentCore(
 提供其执行结果或未执行的证据。需要保存提问和回答时，使用
 [SqliteClarification](../../interaction/python/README.zh-CN.md)。
 
+## 适配器状态边界
+
+Core 通过版本化 `StorageSession` 负责仓储状态格式；SQLite 负责事务、索引、租约及工具
+效果对账。这是组件间需要版本匹配的适配契约，不是业务数据交换格式。Core 和集成包
+需要成套安装。
+
+通过 `purra.storage` 导入 `StorageSession`，不再使用 SQLite 内部的反射 codec。
+记录使用显式标识和字段，不依赖 Python 模块路径。`storage.transaction()` 返回会话，
+包含 `runs`、`outputs`、`run_tree`、`artifacts`、`artifact_claims`、
+`artifact_maintenance`、`long_tasks` 端口；恢复元数据通过 `get_run_info()`、
+`find_tree_run()` 查询，不读取仓储私有字段。事件日志独立保存，`export_snapshot()`
+不是完整备份。会话端口和延迟日志回调不能离开事务后继续使用。
+
 ## 存储与关闭
 
 规范输出事件按行增量保存，通过 Run 序号和 Root 序号索引分页读取。事件追加与执行状态
@@ -57,14 +70,15 @@ Agent 树、产物和长任务仓储操作跳过输出历史的还原与写回�
 共享预算仍使用全部兄弟 Run 的计数，事件幂等重放通过索引查询；Run 读取仍完整还原
 所属 Root 的输出日志。
 跨 Root 的事件幂等键通过索引查询；Python SQLite 需要支持 `json_extract`，首次打开
-已有 v3 数据库时会建立该索引。租约认领、公开 `transaction()` 和无法定位 Run 的操作
+已有 v4 数据库时会建立该索引。租约认领、公开 `transaction()` 和无法定位 Run 的操作
 仍执行完整作用域校验。执行快照仍按作用域加载和保存，包含 Run 历史、
 检查点和回执，适合数据量受控的本地场景。
-本次存储格式为 v3，明确拒绝 v1/v2 数据；没有自动迁移，已有数据库不能直接恢复。
+本次存储格式为 v4。构造器在修改数据库参数、表或索引之前拒绝其他所有版本（包括
+v1/v2/v3）；拒绝后原库不变。没有自动迁移或旧格式恢复路径。
 Python 与 TypeScript 的执行快照不能互换。
 Python 与 TypeScript 均在指向已有 Run 的写入中按需加载历史。
 SQL 序号校验扫描选定 Root 的覆盖索引，无需读取事件正文所在的数据行或按 Run 排序；
-Root 与 Run 的映射也有覆盖索引。已有 v3 数据库在打开时补建索引，需要耗时和额外磁盘，
+Root 与 Run 的映射也有覆盖索引。已有 v4 数据库在打开时补建索引，需要耗时和额外磁盘，
 新增事件也需要维护索引。元数据快照仍按作用域保存，因此写入成本并非常数。
 事件正文在读取时校验；租约认领和公开事务仍解码完整日志。
 所有事件读取（包括索引重放和分页）都会核对正文中的 Run、Root 和序号是否与 SQL 列

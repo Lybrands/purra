@@ -444,3 +444,6 @@ export type { ModelTaskPlanOptions } from "./extensions/model-tasks.js";
 export type { ModelTransportDiagnostics } from "./model/types.js";
 
 export { UserInputRequired } from "./interaction.js";
+
+export { StorageSession, STORAGE_STATE_SCHEMA, STORAGE_PORT_METHODS } from "./storage/session.js";
+export type { StorageStores, StoragePorts, StorageSelection, StorageJournalOptions } from "./storage/session.js";

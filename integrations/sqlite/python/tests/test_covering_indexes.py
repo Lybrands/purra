@@ -16,7 +16,7 @@ def draft(run, key):
 
 
 @pytest.mark.asyncio
-async def test_existing_v3_adds_covering_indexes_without_rewriting_state_or_events(tmp_path):
+async def test_existing_v4_adds_covering_indexes_without_rewriting_state_or_events(tmp_path):
     path = tmp_path / "cover.db"
     storage = SqliteAgentAdapters(path, scope="cover")
     try:

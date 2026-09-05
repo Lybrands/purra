@@ -35,9 +35,9 @@ def instrument(owner, name, phase):
 
 
 if PROFILE:
-    instrument(OutputJournal, "_restore_deferred", "journal_ms")
-    instrument(purra_sqlite, "loads", "state_codec_ms")
-    instrument(purra_sqlite, "dumps", "state_codec_ms")
+    instrument(OutputJournal, "restore", "journal_ms")
+    instrument(purra_sqlite.StorageSession, "__init__", "state_codec_ms")
+    instrument(purra_sqlite.StorageSession, "export_snapshot", "state_codec_ms")
 
 
 def draft(run, key):

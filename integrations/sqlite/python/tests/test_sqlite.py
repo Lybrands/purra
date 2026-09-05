@@ -22,7 +22,7 @@ async def test_reads_use_committed_snapshot_without_writer_lock_or_serialization
         def reject_serialization(value):
             raise AssertionError("read queries must not serialize storage")
 
-        monkeypatch.setattr(purra_sqlite, "dumps", reject_serialization)
+        monkeypatch.setattr(purra_sqlite.StorageSession, "export_snapshot", reject_serialization)
         writer.execute("BEGIN IMMEDIATE")
         writer.execute("DELETE FROM purra_state WHERE scope='reader'")
         assert await storage.runs.get(run_id) == expected
@@ -41,31 +41,21 @@ async def test_reads_use_committed_snapshot_without_writer_lock_or_serialization
         storage.close()
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("version", [1, 2])
-async def test_breaking_storage_version_rejects_pre_generation_budget_state(
-    tmp_path, version,
-):
+@pytest.mark.parametrize("version", [1, 2, 3])
+def test_old_storage_is_rejected_before_any_database_write(tmp_path, version):
     path = tmp_path / "legacy.db"
     with sqlite3.connect(path) as database:
         database.execute(
             "CREATE TABLE purra_state (scope TEXT NOT NULL, sdk TEXT NOT NULL, "
-            "version INTEGER NOT NULL, body TEXT NOT NULL, "
-            "PRIMARY KEY(scope,sdk))"
+            "version INTEGER NOT NULL, body TEXT NOT NULL, PRIMARY KEY(scope,sdk))"
         )
-        database.execute(
-            "INSERT INTO purra_state VALUES (?, 'python', ?, ?)",
-            ("legacy", version, "[]"),
-        )
-    storage = SqliteAgentAdapters(path, scope="legacy")
-    try:
-        with pytest.raises(ValueError, match="unsupported SQLite storage version"):
-            async with storage.transaction():
-                pass
-        with pytest.raises(ValueError, match="unsupported SQLite storage version"):
-            await storage.outputs.list_events("missing", after_sequence=0)
-    finally:
-        storage.close()
+        database.execute("INSERT INTO purra_state VALUES (?, 'python', ?, ?)", ("legacy", version, "[]"))
+    before = path.read_bytes()
+    # Even a different scope must not initialize tables/indexes in an old database.
+    with pytest.raises(ValueError, match="unsupported SQLite storage version"):
+        SqliteAgentAdapters(path, scope="new")
+    assert path.read_bytes() == before
+    assert not path.with_name(path.name + "-wal").exists()
 
 @pytest.mark.asyncio
 async def test_transactions_rollback_and_scope_isolation(tmp_path):
@@ -129,3 +119,27 @@ async def test_unknown_tool_effect_is_not_replayed_after_restart(tmp_path):
         assert (await storage.idempotency.execute_once(run_id, call, uncertain)).content == "committed"
         assert attempts == 1
     finally: storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("group", ["run", "tree", "artifact", "task"])
+async def test_invalid_core_state_aborts_transaction_without_changing_rows(tmp_path, group):
+    from purra.storage import dump_storage_value, load_storage_value
+    path = tmp_path / "invalid-state.db"
+    storage = SqliteAgentAdapters(path, scope="invalid")
+    try:
+        async with storage.transaction():
+            storage.extra["committed"] = True
+        with sqlite3.connect(path) as db:
+            state = load_storage_value(db.execute("SELECT body FROM purra_state").fetchone()[0])
+            state["groups"][group]["unexpected_private_field"] = {}
+            db.execute("UPDATE purra_state SET body=?", (dump_storage_value(state),))
+        with sqlite3.connect(path) as db:
+            before = tuple(db.iterdump())
+        with pytest.raises(ValueError, match="storage fields"):
+            async with storage.transaction():
+                pytest.fail("invalid state reached the transaction callback")
+        with sqlite3.connect(path) as db:
+            assert tuple(db.iterdump()) == before
+    finally:
+        storage.close()

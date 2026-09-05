@@ -8,7 +8,7 @@ from purra.events import AgentEvent
 from purra.errors import ContractViolationError
 from purra.output.contracts import AgentOutputEventDraft
 from purra_sqlite import SqliteAgentAdapters
-from purra_sqlite.codec import loads
+from purra.storage import load_storage_value as loads
 
 
 def draft(run_id, key):
@@ -38,7 +38,7 @@ async def test_indexed_replay_scope_and_child_order_without_snapshot_loading(tmp
         def reject_snapshot(*args):
             raise AssertionError("event queries must not decode the execution snapshot")
 
-        monkeypatch.setattr(purra_sqlite, "loads", reject_snapshot)
+        monkeypatch.setattr(purra_sqlite, "StorageSession", reject_snapshot)
         assert await storage.outputs.list_events(root, after_sequence=1, limit=1) == (rows[2],)
         assert await storage.outputs.list_root_events(root, after_root_sequence=1, limit=2) == tuple(rows[1:])
         assert await storage.outputs.list_events(child, after_sequence=0) == (rows[1],)
@@ -56,9 +56,9 @@ async def test_indexed_replay_scope_and_child_order_without_snapshot_loading(tmp
             await storage.outputs.list_events(root, after_sequence=0, limit=0)
         with sqlite3.connect(path) as db:
             saved = loads(db.execute("SELECT body FROM purra_state WHERE scope='a'").fetchone()[0])
-            assert "output_events" not in saved["run"]
-            assert "root_output_events" not in saved["run"]
-            assert "events_by_source_key" not in saved["run"]
+            assert "output_events" not in saved["groups"]["run"]
+            assert "root_output_events" not in saved["groups"]["run"]
+            assert "events_by_source_key" not in saved["groups"]["run"]
             plan = db.execute("EXPLAIN QUERY PLAN SELECT body FROM purra_output_events WHERE scope=? AND sdk='python' AND root_run_id=? AND root_sequence>? ORDER BY root_sequence LIMIT ?", ("a", root, 1, 2)).fetchall()
             assert any("SEARCH" in row[3] for row in plan)
             assert not any("TEMP B-TREE" in row[3] for row in plan)
