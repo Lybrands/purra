@@ -2,6 +2,52 @@
 
 ## 0.5.0 — Unreleased
 
+- Preserve transport-activity events in the opt-in Provider timing sampler
+  without treating them as content or progress. Add SQLite multiprocess,
+  interrupted-transaction, tool-receipt reconciliation and live-Provider
+  verification scripts using temporary synthetic data.
+- Validate Python SQLite event bodies against their stored Run/Root identities
+  and sequence columns on replay, deferred history reads, pagination and full
+  restoration. Reject inconsistent rows before returning or caching them; failed
+  replay, settlement and lease acquisition leave persisted state unchanged.
+- Use covering SQLite indexes for Root/Run sequence validation and Root headers
+  in both SDKs. Avoid event-body table reads and repeated Root-wide child joins,
+  retaining count and sequence checks. Existing v3 databases create the indexes
+  on opening without rewriting snapshots or events. Execution-write benchmarks
+  optionally report journal, state and remaining transaction costs separately.
+- Defer Python and TypeScript SQLite output history reads during Run-scoped writes. Validate
+  sequence counts in SQL, replay keys through indexes, and buffer new
+  events; planning and terminal-state rules still read original evidence when
+  needed. Preserve atomic commits, sibling budgets and full lease-recovery
+  validation. TypeScript uses persisted counts plus pending events for sequences
+  and indexes Root-local keys. Full exports retain complete journals; incremental
+  exports include an explicit sequence offset. Storage remains v3.
+- Restore only the active Root tree's SQLite output journal for Run-scoped
+  execution operations. Preserve unrelated checkpoints, event counts and shared
+  child budgets. Python indexes cross-Root event keys and resolves stream lease
+  fencing through the owning Run; TypeScript rejects access to unloaded Roots.
+  Public transactions and lease acquisition retain full-scope validation.
+- Avoid restoring SQLite output history for tool receipts, lease maintenance,
+  and Agent tree/Artifact/Long Task repository operations. TypeScript also skips
+  unrelated repository hydration. Keep complete state validation on the loaded
+  Root tree, lease acquisition and public transactions; storage remains v3.
+- Store SQLite canonical output events as incremental rows with Run and Root
+  sequence indexes. Event pages and subscription polls use read-only queries
+  without loading execution snapshots. Journal additions and execution state
+  commit atomically; general repository operations still hydrate scope state.
+  SQLite storage v3 rejects v1/v2 snapshots without automatic migration.
+- Make durable failure settlement terminal when no concrete recovery action
+  remains. Exhausted retries, invalid model output, and systemic protocol
+  failures now fail the Long Task and Root Run instead of being mislabeled as
+  recoverable pauses. Unknown or already-committed effects without a checkpoint
+  also fail without replay; pauses remain reserved for explicit interruption
+  recovery rather than error settlement.
+- Remove the Python and TypeScript same-Run delegation stack, including its
+  repository, coordinator, dynamic executor, lifecycle events, adapters,
+  conformance fixture, public exports, and `AgentOptions.delegation` entry.
+  Agent Tree is now the sole Child Agent authority through `AgentTreePolicy`;
+  `delegateToAgents` accepts `children`, and newly executable Preset snapshots
+  are v5 only.
 - Added optional Python/TypeScript components: `purra-openai` (Responses and Chat
   Completions, official SDKs Python 3.7.0 / TypeScript 7.9.0), `purra-anthropic`
   (Messages, signed thinking continuation, official SDKs Python 1.3.0 / TypeScript
@@ -11,10 +57,10 @@
   `purra-interaction` (structured questions, persisted user answers and checkpoint
   resume). Native interaction supports Auto/Reactive/Planned and nested Agent trees,
   preserving Run identity, budget, deadline, plan progress and revision state. Waiting
-  children release leases; recovery resolves their canonical delegation results
+  children release leases; recovery resolves their canonical Child Run results
   before parent execution. Cancellation closes the complete Root scope. A separate callback API supports host-owned
-  pre-execution handoff. SQLite uses bounded project snapshots; large/high-throughput
-  journals need indexed row storage.
+  pre-execution handoff. SQLite combines indexed output journals with bounded
+  project execution snapshots.
 - Added `MemoryWorkflow` to `purra-mem0`, composing pending extraction, semantic
   review and explicit host-authorized resolution through the existing journal.
 - Added private Provider continuation data to messages, terminal stream chunks
@@ -57,6 +103,9 @@
 - Add opt-in Provider-authored progress on ordinary Agent streams, independent
   of answer text and reasoning. Persist its private source delta before the
   public `purra.agent-progress/v1` projection, using existing Run output budgets.
+- Keep tool-equipped model output private until its role is known, then use the
+  existing tool-free `final_public/live` presentation round so visible final
+  responses stream from Provider chunks instead of one committed bulk event.
 - Reject undeclared capability use, planning-stream mixing, rewritten content,
   source mismatches, cross-Run output and late terminal writes. Providers without
   this capability emit no native Agent progress.
@@ -145,15 +194,11 @@
 - Reject private model tasks whose estimated input plus output reserve exceeds
   the model window before invoking the Provider.
 
-### Unambiguous output-token contracts
+### Unambiguous generation-token contracts
 
-- Rename the per-model-invocation limit to
-  `max_call_output_tokens` in Python and
-  `maxCallOutputTokens` in TypeScript.
-- Rename the cumulative Run budget to
-  `max_run_output_tokens` in Python and
-  `maxRunOutputTokens` in TypeScript.
-- Require public Run creation to state the cumulative output budget explicitly;
+- Renamed the per-model-invocation and cumulative Run limits to explicitly
+  describe Provider generation, rather than visible output.
+- Require public Run creation to state the cumulative generation budget explicitly;
   use `None`/`null` to deliberately select no finite cumulative token limit.
 - Require Provider gateways to report the output limit they actually applied.
   Missing or mismatched acknowledgments and reported usage above that limit fail
@@ -279,8 +324,8 @@
 
 #### Breaking changes
 
-- `RunBudgetOptions.maxTotalTokens` is replaced by `maxInputTokens`,
-  `maxOutputTokens`, and `maxReasoningTokens`; `RunUsage.knownTokens` is
+- The former combined Run token setting is replaced by independent input,
+  generation, and reasoning token budgets; `RunUsage.knownTokens` is
   replaced by separate counters plus `unreportedUsageAttempts`.
 - `LongTaskCreateCommand.deadlineAt` and `LongTaskRecord.deadlineAt` are
   replaced by epoch-millisecond `deadlineAtMs`; Long Task budgets now use

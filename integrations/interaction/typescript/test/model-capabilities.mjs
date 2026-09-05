@@ -1,0 +1,22 @@
+export const TEST_MODEL_CAPABILITIES = Object.freeze({
+  schemaVersion: 2,
+  profileId: "interaction-test-model",
+  providerProtocol: "custom",
+  contextWindowTokens: 16_000,
+  maxGenerationTokens: 2_048,
+  thinkingTokenAccounting: "unknown",
+  protocol: Object.freeze({
+    reasoningControl: "selectable",
+    reasoningReplay: "ignored",
+    toolCalling: "supported",
+    requiredToolChoice: "supported",
+    parallelToolCalls: "supported",
+    streaming: "unavailable",
+    cancellation: "supported",
+    publicProgress: "supported",
+    assistantContentWithToolCalls: "optional",
+    jsonSchemaLevel: "unknown",
+    streamFinishSemantics: "normalized",
+    usageSemantics: "normalized",
+  }),
+});

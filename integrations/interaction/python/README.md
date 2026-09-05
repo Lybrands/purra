@@ -35,7 +35,7 @@ core = AgentCore(
     model_gateway=gateway,
     preset=AgentPreset(
         id="assistant", revision="1",
-        runtime_limits=RuntimeLimits(max_run_output_tokens=8192),
+        runtime_limits=RuntimeLimits(max_run_generation_tokens=8192),
         tool_catalog=InMemoryToolCatalog((interaction.registration,)),
     ),
     run_repository=storage.runs,

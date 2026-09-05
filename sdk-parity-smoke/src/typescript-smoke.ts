@@ -1,4 +1,4 @@
-import { Agent, type ModelGateway, type ToolDefinition } from "purra";
+import { Agent, type ModelCapabilitySnapshot, type ModelGateway, type ToolDefinition } from "purra";
 import packageMetadata from "purra/package.json" with { type: "json" };
 
 const scenario = "local-tool-roundtrip";
@@ -9,7 +9,17 @@ const toolCalls: Array<{
 }> = [];
 let modelCalls = 0;
 
+const capabilities: ModelCapabilitySnapshot = {
+  schemaVersion: 2, profileId: "sdk-parity", providerProtocol: "custom",
+  contextWindowTokens: 16_000, maxGenerationTokens: 512, thinkingTokenAccounting: "unknown",
+  protocol: { reasoningControl: "selectable", reasoningReplay: "ignored", toolCalling: "supported",
+    requiredToolChoice: "supported", parallelToolCalls: "supported", streaming: "unavailable",
+    cancellation: "supported", assistantContentWithToolCalls: "optional", jsonSchemaLevel: "unknown",
+    streamFinishSemantics: "normalized", usageSemantics: "normalized" },
+};
+
 const model: ModelGateway = {
+  capabilities,
   async invoke(request) {
     modelCalls += 1;
     if (modelCalls === 1) {
@@ -24,6 +34,7 @@ const model: ModelGateway = {
           }],
         },
         finishReason: "tool_calls",
+        appliedGenerationLimit: request.outputBudget.maxGenerationTokens,
       };
     }
     if (request.tools.length === 0) {
@@ -36,6 +47,7 @@ const model: ModelGateway = {
       return {
         message: { role: "assistant", content: "PurrA is ready." },
         finishReason: "stop",
+        appliedGenerationLimit: request.outputBudget.maxGenerationTokens,
       };
     }
     if (request.messages.at(-1)?.role !== "tool") {
@@ -44,6 +56,7 @@ const model: ModelGateway = {
     return {
       message: { role: "assistant", content: "private TypeScript candidate" },
       finishReason: "stop",
+      appliedGenerationLimit: request.outputBudget.maxGenerationTokens,
     };
   },
 };
@@ -69,7 +82,7 @@ const lookup = {
 const handle = await new Agent({ model, tools: [lookup] }).submit({
   messages: [{ role: "user", content: "Check the local status." }],
 }, {
-  budgets: { maxRunOutputTokens: null },
+  budgets: { maxRunGenerationTokens: null },
 });
 const result = await handle.result;
 const eventKinds: string[] = [];

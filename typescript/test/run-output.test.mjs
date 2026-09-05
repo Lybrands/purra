@@ -9,9 +9,10 @@ import {
   InMemoryOutputPublisher,
   InMemoryRunRepository,
 } from "purra";
+import { testGateway } from "./support/model-gateway.mjs";
 
 const RUN_OPTIONS = Object.freeze({
-  budgets: Object.freeze({ maxRunOutputTokens: null }),
+  budgets: Object.freeze({ maxRunGenerationTokens: null }),
 });
 
 test("in-memory Run repository passes the public conformance probe", async () => {
@@ -20,14 +21,14 @@ test("in-memory Run repository passes the public conformance probe", async () =>
 
 test("new Runs require an explicit Run output budget", () => {
   const agent = new Agent({
-    model: { async invoke() { return finalTurn("unused"); } },
+    model: testGateway({ async invoke() { return finalTurn("unused"); } }),
   });
   const request = { messages: [{ role: "user", content: "run" }] };
 
   assert.throws(() => agent.submit(request), /explicit budgets/);
   assert.throws(
     () => agent.submit(request, { budgets: {} }),
-    /maxRunOutputTokens must be a number or explicit null/,
+    /maxRunGenerationTokens must be a number or explicit null/,
   );
 });
 
@@ -35,7 +36,7 @@ test("Run output batches are atomic, replayable, and budgeted before append", as
   const repository = new InMemoryRunRepository();
   const begun = await repository.begin({
     preset: {
-      schemaVersion: 4,
+      schemaVersion: 5,
       presetId: "batch",
       presetRevision: "1",
       promptFingerprint: "prompt",
@@ -52,12 +53,13 @@ test("Run output batches are atomic, replayable, and budgeted before append", as
         maxReasoningChars: 1_000_000,
         maxToolArgumentChars: 1_000_000,
       },
+      agentTree: { protocolVersion: 1, enabled: false },
     },
     deadlineAt: null,
     budgets: {
       maxModelAttempts: 1,
       maxInputTokens: null,
-      maxRunOutputTokens: null,
+      maxRunGenerationTokens: null,
       maxReasoningTokens: null,
       maxOutputBytes: 10_000,
       maxOutputEvents: 1,
@@ -92,7 +94,7 @@ test("Run output batches are atomic, replayable, and budgeted before append", as
 test("Child Runs share Root attempts, tokens, output budgets, and journal order", async () => {
   const repository = new InMemoryRunRepository();
   const preset = {
-    schemaVersion: 4,
+    schemaVersion: 5,
     presetId: "tree-budget",
     presetRevision: "1",
     promptFingerprint: "prompt",
@@ -109,11 +111,12 @@ test("Child Runs share Root attempts, tokens, output budgets, and journal order"
       maxReasoningChars: 1_000_000,
       maxToolArgumentChars: 1_000_000,
     },
+    agentTree: { protocolVersion: 1, enabled: false },
   };
   const budgets = {
     maxModelAttempts: 2,
     maxInputTokens: 3,
-    maxRunOutputTokens: null,
+    maxRunGenerationTokens: null,
     maxReasoningTokens: null,
     maxOutputBytes: 10_000,
     maxOutputEvents: 1,
@@ -149,7 +152,7 @@ test("Child Runs share Root attempts, tokens, output budgets, and journal order"
       ? [repository.settleInvocation(children[index].snapshot.runId, {
           invocationId: `invocation-${index + 1}`,
           status: "completed",
-          usage: { inputTokens: 2, outputTokens: 0, totalTokens: 2 },
+          usage: { inputTokens: 2, generationTokens: 0, totalTokens: 2 },
         })]
       : []
   )));
@@ -193,7 +196,7 @@ test("ten thousand one-character chunks coalesce deterministically", async () =>
       maxLatencyMs: 60_000,
       maxBackgroundLatencyMs: 60_000,
     },
-    model: {
+    model: testGateway({
       async invoke() { throw new Error("stream expected"); },
       async *stream() {
         for (let index = 0; index < 10_000; index += 1) {
@@ -203,11 +206,11 @@ test("ten thousand one-character chunks coalesce deterministically", async () =>
           };
         }
       },
-    },
+    }),
   });
   const handle = await agent.submit(
     { messages: [{ role: "user", content: "many" }] },
-    { budgets: { maxRunOutputTokens: null, maxOutputBytes: candidate } },
+    { budgets: { maxRunGenerationTokens: null, maxOutputBytes: candidate } },
   );
   assert.equal((await handle.result).output.length, 10_000);
   assert.ok((await handle.snapshot()).usage.outputBytes * 2 <= candidate);
@@ -230,18 +233,18 @@ test("private Provider batches use the background latency ceiling", async () => 
       maxLatencyMs: 1_000,
       maxBackgroundLatencyMs: 1,
     },
-    model: {
+    model: testGateway({
       async invoke() { throw new Error("stream expected"); },
       async *stream() {
         yield { contentDelta: "a" };
         await new Promise((resolve) => setTimeout(resolve, 20));
         yield { contentDelta: "b", finishReason: "stop" };
       },
-    },
+    }),
   });
   const handle = await agent.submit(
     { messages: [{ role: "user", content: "background" }] },
-    { budgets: { maxRunOutputTokens: null, maxOutputBytes: null } },
+    { budgets: { maxRunGenerationTokens: null, maxOutputBytes: null } },
   );
 
   assert.equal((await handle.result).output, "ab");
@@ -253,7 +256,7 @@ test("private Provider batches use the background latency ceiling", async () => 
 test("Provider output budget failure stays coded, terminal, and non-retryable", async () => {
   let modelCalls = 0;
   const agent = new Agent({
-    model: {
+    model: testGateway({
       async invoke() { throw new Error("stream expected"); },
       async *stream() {
         modelCalls += 1;
@@ -263,11 +266,11 @@ test("Provider output budget failure stays coded, terminal, and non-retryable", 
           finishReason: "stop",
         };
       },
-    },
+    }),
   });
   const handle = await agent.submit(
     { messages: [{ role: "user", content: "budget" }] },
-    { budgets: { maxRunOutputTokens: null, maxOutputBytes: 1 } },
+    { budgets: { maxRunGenerationTokens: null, maxOutputBytes: 1 } },
   );
 
   await rejectsCode(handle.result, "runtime_budget_exceeded");
@@ -288,7 +291,7 @@ test("submitted Run persists private model evidence and public output in order",
       promptSections: [{ id: "policy", role: "system", content: "private-prompt" }],
     },
     runRepository: repository,
-    model: {
+    model: testGateway({
       async invoke() { throw new Error("stream should be used"); },
       async *stream() {
         round += 1;
@@ -302,7 +305,7 @@ test("submitted Run persists private model evidence and public output in order",
               argumentsFragment: "{\"key\":\"purr\"}",
             }],
             finishReason: "tool_calls",
-            usage: { inputTokens: 10, outputTokens: 2, totalTokens: 12 },
+            usage: { inputTokens: 10, generationTokens: 2, totalTokens: 12 },
           };
           return;
         }
@@ -310,10 +313,10 @@ test("submitted Run persists private model evidence and public output in order",
           contentDelta: "Found it",
           reasoningDelta: "another-secret",
           finishReason: "stop",
-          usage: { inputTokens: 12, outputTokens: 2, totalTokens: 14 },
+          usage: { inputTokens: 12, generationTokens: 2, totalTokens: 14 },
         };
       },
-    },
+    }),
     tools: [readTool("lookup", (input) => readResult({ value: input.key }))],
   });
 
@@ -360,7 +363,7 @@ test("submitted Run persists private model evidence and public output in order",
   assert.match(receipt.evidenceFingerprint, /^[a-f0-9]{64}$/);
   assert.equal(JSON.stringify(receipt).includes("private-prompt"), false);
   assert.equal((await handle.snapshot()).usage.inputTokens, 34);
-  assert.equal((await handle.snapshot()).usage.outputTokens, 6);
+  assert.equal((await handle.snapshot()).usage.generationTokens, 6);
   assert.equal((await handle.cancel()).accepted, false);
 });
 
@@ -376,7 +379,7 @@ test("failed terminal commit does not expose a final answer or completed state",
   });
   const agent = new Agent({
     runRepository: repository,
-    model: { async invoke() { return finalTurn("uncommitted"); } },
+    model: testGateway({ async invoke() { return finalTurn("uncommitted"); } }),
   });
   const handle = await agent.submit(
     { messages: [{ role: "user", content: "run" }] },
@@ -397,7 +400,7 @@ test("Run begin failure prevents Provider and tool execution", async () => {
   const repository = failingRepository("begin");
   const agent = new Agent({
     runRepository: repository,
-    model: { async invoke() { modelCalls += 1; return finalTurn("no"); } },
+    model: testGateway({ async invoke() { modelCalls += 1; return finalTurn("no"); } }),
     tools: [readTool("read", () => { toolCalls += 1; return readResult(null); })],
   });
 
@@ -417,7 +420,7 @@ test("invocation receipt persistence failure prevents the Provider call", async 
   });
   const agent = new Agent({
     runRepository: repository,
-    model: { async invoke() { modelCalls += 1; return finalTurn("no"); } },
+    model: testGateway({ async invoke() { modelCalls += 1; return finalTurn("no"); } }),
   });
 
   const handle = await agent.submit(
@@ -448,14 +451,14 @@ test("committed invocation receipt is published before Provider execution", asyn
   const agent = new Agent({
     runRepository: repository,
     outputPublisher: publisher,
-    model: {
+    model: testGateway({
       async invoke() {
         providerCalls += 1;
         const events = await repository.listEvents(runId, 0);
         assert.equal(events.at(-1).kind, "invocation.started");
         return finalTurn("done");
       },
-    },
+    }),
   });
 
   const handle = await agent.submit(
@@ -477,7 +480,7 @@ test("tool-start persistence failure prevents the handler", async () => {
   });
   const agent = new Agent({
     runRepository: repository,
-    model: calls([{ id: "call-1", name: "read", arguments: {} }]),
+    model: testGateway(calls([{ id: "call-1", name: "read", arguments: {} }])),
     tools: [readTool("read", () => { executions += 1; return readResult(null); })],
   });
 
@@ -499,10 +502,10 @@ test("cancellation atomically aborts an open invocation and wins the terminal ra
     return() { returned += 1; return Promise.resolve({ done: true }); },
   };
   const agent = new Agent({
-    model: {
+    model: testGateway({
       async invoke() { throw new Error("stream should be used"); },
       stream() { return { [Symbol.asyncIterator]: () => iterator }; },
-    },
+    }),
   });
   const handle = await agent.submit(
     { messages: [{ role: "user", content: "wait" }] },
@@ -551,10 +554,10 @@ test("cancellation flushes a pending private batch and clears its timer", async 
       maxLatencyMs: 1_000,
       maxBackgroundLatencyMs: 1_000,
     },
-    model: {
+    model: testGateway({
       async invoke() { throw new Error("stream should be used"); },
       stream() { return { [Symbol.asyncIterator]: () => iterator }; },
-    },
+    }),
   });
   const handle = await agent.submit(
     { messages: [{ role: "user", content: "wait" }] },
@@ -575,17 +578,17 @@ test("attempt budget prevents a second Provider call", async () => {
   let modelCalls = 0;
   let toolCalls = 0;
   const agent = new Agent({
-    model: {
+    model: testGateway({
       async invoke() {
         modelCalls += 1;
         return callsTurn([{ id: "call-1", name: "read", arguments: {} }]);
       },
-    },
+    }),
     tools: [readTool("read", () => { toolCalls += 1; return readResult(null); })],
   });
   const handle = await agent.submit(
     { messages: [{ role: "user", content: "loop" }] },
-    { budgets: { maxRunOutputTokens: null, maxModelAttempts: 1 } },
+    { budgets: { maxRunGenerationTokens: null, maxModelAttempts: 1 } },
   );
 
   await rejectsCode(handle.result, "runtime_budget_exceeded");
@@ -596,34 +599,92 @@ test("attempt budget prevents a second Provider call", async () => {
 
 test("reported token budget and final-output budget fail before completion commit", async () => {
   const tokenAgent = new Agent({
-    model: {
+    model: testGateway({
       async invoke() {
         return {
           message: { role: "assistant", content: "answer" },
           finishReason: "stop",
-          usage: { inputTokens: 8, outputTokens: 2, totalTokens: 10 },
+          usage: { inputTokens: 8, generationTokens: 2, totalTokens: 10 },
         };
       },
-    },
+    }),
   });
   const tokenRun = await tokenAgent.submit(
     { messages: [{ role: "user", content: "run" }] },
-    { budgets: { maxRunOutputTokens: null, maxInputTokens: 5 } },
+    { budgets: { maxRunGenerationTokens: null, maxInputTokens: 5 } },
   );
   await rejectsCode(tokenRun.result, "runtime_budget_exceeded");
   assert.equal((await tokenRun.snapshot()).usage.inputTokens, 8);
   assert.equal((await tokenRun.snapshot()).status, "failed");
 
-  const outputAgent = new Agent({ model: { async invoke() { return finalTurn("answer"); } } });
+  const reasoningRun = await tokenAgent.submit(
+    { messages: [{ role: "user", content: "run" }] },
+    { budgets: { maxRunGenerationTokens: null, maxReasoningTokens: 5 } },
+  );
+  await rejectsCode(reasoningRun.result, "runtime_budget_exceeded");
+  const reasoningSnapshot = await reasoningRun.snapshot();
+  assert.equal(reasoningSnapshot.usage.reasoningTokens, 0);
+  assert.equal(reasoningSnapshot.usage.unreportedReasoningAttempts, 1);
+  assert.equal(reasoningSnapshot.status, "failed");
+
+  const outputAgent = new Agent({ model: testGateway({ async invoke() { return finalTurn("answer"); } }) });
   const outputRun = await outputAgent.submit(
     { messages: [{ role: "user", content: "run" }] },
-    { budgets: { maxRunOutputTokens: null, maxOutputBytes: 1 } },
+    { budgets: { maxRunGenerationTokens: null, maxOutputBytes: 1 } },
   );
   await rejectsCode(outputRun.result, "runtime_budget_exceeded");
   const outputEvents = await collect(outputRun.events({ visibility: "all" }));
   assert.equal(outputEvents.some((event) => event.kind === "final"), false);
   assert.equal(outputEvents.some((event) => event.kind === "run.completed"), false);
   assert.equal(outputEvents.at(-1).kind, "run.failed");
+});
+
+test("non-stream terminal failures retain validated Provider usage", async () => {
+  const agent = new Agent({
+    model: testGateway({
+      async invoke() {
+        return {
+          message: { role: "assistant", content: "partial" },
+          finishReason: "length",
+          usage: { inputTokens: 3, generationTokens: 4 },
+        };
+      },
+    }),
+  });
+  const run = await agent.submit(
+    { messages: [{ role: "user", content: "write" }] },
+    { budgets: { maxRunGenerationTokens: 10 } },
+  );
+  await rejectsCode(run.result, "model_output_truncated");
+  const snapshot = await run.snapshot();
+  assert.equal(snapshot.usage.inputTokens, 3);
+  assert.equal(snapshot.usage.generationTokens, 4);
+  assert.equal(snapshot.usage.unreportedUsageAttempts, 0);
+});
+
+test("Provider budget contract failures retain reported usage", async () => {
+  const agent = new Agent({
+    model: {
+      capabilities: generationCapabilities(10),
+      async invoke(request) {
+        return {
+          message: { role: "assistant", content: "invalid" },
+          finishReason: "stop",
+          appliedGenerationLimit: request.outputBudget.maxGenerationTokens,
+          usage: { inputTokens: 2, generationTokens: 11 },
+        };
+      },
+    },
+  });
+  const run = await agent.submit(
+    { messages: [{ role: "user", content: "write" }] },
+    { budgets: { maxRunGenerationTokens: null } },
+  );
+  await rejectsCode(run.result, "model_gateway_contract_violation");
+  const snapshot = await run.snapshot();
+  assert.equal(snapshot.usage.inputTokens, 2);
+  assert.equal(snapshot.usage.generationTokens, 11);
+  assert.equal(snapshot.usage.unreportedUsageAttempts, 0);
 });
 
 test("absolute deadline aborts Provider work and commits failed exactly once", async () => {
@@ -633,16 +694,16 @@ test("absolute deadline aborts Provider work and commits failed exactly once", a
     return() { returned += 1; return Promise.resolve({ done: true }); },
   };
   const agent = new Agent({
-    model: {
+    model: testGateway({
       async invoke() { throw new Error("stream should be used"); },
       stream() { return { [Symbol.asyncIterator]: () => iterator }; },
-    },
+    }),
   });
   const handle = await agent.submit(
     { messages: [{ role: "user", content: "wait" }] },
     {
       deadlineAt: new Date(Date.now() + 10).toISOString(),
-      budgets: { maxRunOutputTokens: null },
+      budgets: { maxRunGenerationTokens: null },
     },
   );
 
@@ -661,12 +722,12 @@ test("output policy cannot promote private reasoning", async () => {
         return event.channel === "reasoning" ? { ...event, visibility: "public" } : event;
       },
     },
-    model: {
+    model: testGateway({
       async invoke() { throw new Error("stream should be used"); },
       async *stream() {
         yield { reasoningDelta: "secret", contentDelta: "answer", finishReason: "stop" };
       },
-    },
+    }),
   });
   const handle = await agent.submit(
     { messages: [{ role: "user", content: "run" }] },
@@ -688,7 +749,7 @@ test("output policy authorizes final output before the atomic terminal commit", 
         return event;
       },
     },
-    model: { async invoke() { return finalTurn("private answer"); } },
+    model: testGateway({ async invoke() { return finalTurn("private answer"); } }),
   });
   const handle = await agent.submit(
     { messages: [{ role: "user", content: "run" }] },
@@ -732,9 +793,33 @@ function finalTurn(content) {
   return { message: { role: "assistant", content }, finishReason: "stop" };
 }
 
+function generationCapabilities(maxGenerationTokens) {
+  return {
+    schemaVersion: 2,
+    profileId: "run-output-budget",
+    providerProtocol: "custom",
+    contextWindowTokens: 16_000,
+    maxGenerationTokens,
+    thinkingTokenAccounting: "included",
+    protocol: {
+      reasoningControl: "unavailable",
+      reasoningReplay: "ignored",
+      toolCalling: "supported",
+      requiredToolChoice: "supported",
+      parallelToolCalls: "supported",
+      streaming: "unavailable",
+      cancellation: "supported",
+      assistantContentWithToolCalls: "optional",
+      jsonSchemaLevel: "unknown",
+      streamFinishSemantics: "normalized",
+      usageSemantics: "normalized",
+    },
+  };
+}
+
 function invocationInput(runId, index) {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     runId,
     invocationId: `invocation-${index}`,
     messageFingerprint: `message-${index}`,
@@ -743,7 +828,7 @@ function invocationInput(runId, index) {
     evidenceFingerprint: "evidence",
     contextEvidence: [],
     capabilityProfileId: null,
-    outputLimit: null,
+    outputBudget: null,
   };
 }
 

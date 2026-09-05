@@ -5,12 +5,11 @@ import {
   Agent,
   AgentError,
   AgentOperationController,
-  estimateMessagesTokens,
   ModelTaskRunner,
 } from "purra";
 
 const RUN_OPTIONS = Object.freeze({
-  budgets: Object.freeze({ maxRunOutputTokens: null }),
+  budgets: Object.freeze({ maxRunGenerationTokens: null }),
 });
 
 test("standalone model tasks resolve an exact output limit and Operation", async () => {
@@ -18,6 +17,7 @@ test("standalone model tasks resolve an exact output limit and Operation", async
   const operations = [];
   const runner = new ModelTaskRunner({
     runId: "standalone-run",
+    maxGenerationTokens: 256,
     model: {
       capabilities: capabilities(),
       async invoke(request) {
@@ -30,24 +30,48 @@ test("standalone model tasks resolve an exact output limit and Operation", async
     }),
   });
 
-  const result = await runner.complete(
-    [{ role: "user", content: "private task" }],
-    { maxCallOutputTokens: 256 },
-  );
+  const result = await runner.complete([{ role: "user", content: "private task" }]);
 
   assert.equal(result.turn.message.content, "done");
-  assert.deepEqual(result.outputLimit, {
-    maxTokens: 256,
-    source: "user_override",
-    profileMaxTokens: 512,
+  assert.deepEqual(result.outputBudget, {
+    maxGenerationTokens: 256,
+    generationSource: "user",
+    profileMaxGenerationTokens: 512,
+    requestedUserMaxGenerationTokens: 256,
+    resultCapacityTargetTokens: null,
+    resultCapacitySource: null,
+    nonResultHeadroomTokens: null,
   });
   assert.equal(requests[0].tools.length, 0);
-  assert.equal(requests[0].outputLimit.maxTokens, 256);
+  assert.equal(requests[0].outputBudget.maxGenerationTokens, 256);
   assert.deepEqual(operations.map((event) => [event.type, event.runId]), [
     ["operation.started", "standalone-run"],
     ["operation.finished", "standalone-run"],
   ]);
   assert.equal(operations[1].status, "succeeded");
+});
+
+test("per-call model tasks cannot claim user generation authority", async () => {
+  let calls = 0;
+  const runner = new ModelTaskRunner({
+    runId: "call-generation-authority",
+    model: {
+      capabilities: capabilities("unavailable"),
+      async invoke(request) {
+        calls += 1;
+        return finalTurn("unsafe", request);
+      },
+    },
+  });
+
+  await assert.rejects(
+    runner.complete(
+      [{ role: "user", content: "private task" }],
+      { maxGenerationTokens: 64 },
+    ),
+    { code: "model_output_budget_invalid" },
+  );
+  assert.equal(calls, 0);
 });
 
 test("private model tasks reject input plus output reserve beyond the model window", async () => {
@@ -65,17 +89,49 @@ test("private model tasks reject input plus output reserve beyond the model wind
   await assert.rejects(runner.streamText(messages), { code: "model_task_input_exceeds_budget" });
   assert.equal(calls, 0);
   const small = [{ role: "user", content: "x".repeat(1_000) }];
+  const constrainedRequests = [];
   const bounded = new ModelTaskRunner({
     runId: "reserve-boundary",
     model: {
-      capabilities: { ...capabilities(), contextWindowTokens: estimateMessagesTokens(small) + 511 },
-      async invoke(request) { calls++; return finalTurn("safe", request); },
+      capabilities: { ...capabilities(), contextWindowTokens: 8_000, maxGenerationTokens: 1_000 },
+      async invoke(request) {
+        calls++;
+        constrainedRequests.push(request);
+        return finalTurn("safe", request);
+      },
     },
   });
-  await assert.rejects(bounded.complete(small), { code: "model_task_input_exceeds_budget" });
-  assert.equal(calls, 0);
-  assert.equal((await bounded.complete(small, { maxCallOutputTokens: 256 })).turn.message.content, "safe");
+  assert.equal((await bounded.complete(small)).turn.message.content, "safe");
   assert.equal(calls, 1);
+  assert.equal(constrainedRequests[0].outputBudget.maxGenerationTokens, 832);
+  assert.equal(constrainedRequests[0].outputBudget.generationSource, "context_capacity");
+});
+
+test("workflow result capacity never shrinks the Provider generation allowance", async () => {
+  let captured;
+  const runner = new ModelTaskRunner({
+    runId: "result-capacity",
+    model: {
+      capabilities: capabilities("unavailable"),
+      async invoke(request) {
+        captured = request.outputBudget;
+        return finalTurn("done", request);
+      },
+    },
+  });
+  await runner.complete([{ role: "user", content: "size this result" }], {
+    resultCapacityTargetTokens: 128,
+    resultCapacitySource: "workflow_policy",
+  });
+  assert.deepEqual(captured, {
+    maxGenerationTokens: 512,
+    generationSource: "model_profile",
+    profileMaxGenerationTokens: 512,
+    requestedUserMaxGenerationTokens: null,
+    resultCapacityTargetTokens: 128,
+    resultCapacitySource: "workflow_policy",
+    nonResultHeadroomTokens: 384,
+  });
 });
 
 test("managed task receipt failure prevents the Provider call", async () => {
@@ -101,6 +157,26 @@ test("managed task receipt failure prevents the Provider call", async () => {
     /receipt unavailable/,
   );
   assert.equal(calls, 0);
+});
+
+test("non-stream model tasks fail closed on LENGTH without continuation", async () => {
+  const runner = new ModelTaskRunner({
+    runId: "length-fail-closed",
+    model: {
+      capabilities: capabilities("unavailable"),
+      async invoke(request) {
+        return {
+          message: { role: "assistant", content: "partial" },
+          finishReason: "length",
+          appliedGenerationLimit: request.outputBudget.maxGenerationTokens,
+        };
+      },
+    },
+  });
+  await assert.rejects(
+    runner.complete([{ role: "user", content: "write" }]),
+    (error) => error instanceof AgentError && error.code === "model_output_truncated",
+  );
 });
 
 test("model tasks revalidate bound evidence before invoking the Provider", async () => {
@@ -336,11 +412,11 @@ test("direct context ports and factories are mutually exclusive", () => {
 
 function capabilities(streaming = "supported") {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     profileId: "model-task-fixture",
     providerProtocol: "custom",
     contextWindowTokens: 16_000,
-    maxCallOutputTokens: 512,
+    maxGenerationTokens: 512,
     thinkingTokenAccounting: "unknown",
     protocol: {
       reasoningControl: "selectable",
@@ -362,13 +438,13 @@ function finalTurn(content, request) {
   return {
     message: { role: "assistant", content },
     finishReason: "stop",
-    appliedOutputLimit: request.outputLimit?.maxTokens,
+    appliedGenerationLimit: request.outputBudget?.maxGenerationTokens,
   };
 }
 
 function acknowledgedStream(request, stream) {
   return Object.assign(stream, {
-    appliedOutputLimit: request.outputLimit?.maxTokens,
+    appliedGenerationLimit: request.outputBudget?.maxGenerationTokens,
   });
 }
 

@@ -1,9 +1,16 @@
 import type { PlanningScope } from "../planning/stream.js";
 import type { ContextEvidenceReceipt, PreparedContextSnapshot } from "../context/types.js";
-import type { JsonValue, Message, ModelTokenUsage, ToolSpec } from "../model/types.js";
+import type {
+  InvocationOutputBudget,
+  JsonValue,
+  Message,
+  ModelTokenUsage,
+  ToolSpec,
+} from "../model/types.js";
 import type { OutputEvent, OutputEventQuery } from "../output/types.js";
 import type { DurableContinuation, DurableRunResult } from "../durable/types.js";
 import type { RecoveryCause } from "../recovery/index.js";
+import type { AgentTreePolicySnapshot } from "../agent-tree-policy.js";
 
 export type RunStatus = "running" | "completed" | "failed" | "canceled";
 export type PlanningMode = "auto" | "reactive" | "planned";
@@ -32,8 +39,8 @@ export interface RunRequest {
   /** Selects adaptive, direct, or governed execution. Omitted requests use Auto. */
   readonly planningMode?: PlanningMode;
   readonly enabledTools?: readonly string[];
-  /** Maximum output tokens for each individual Provider invocation. */
-  readonly maxCallOutputTokens?: number;
+  /** User-selected total generation allowance for each Provider invocation. */
+  readonly maxGenerationTokens?: number;
   readonly contextEvidence?: readonly ContextEvidenceReceipt[];
   readonly metadata?: Readonly<Record<string, JsonValue>>;
 }
@@ -41,8 +48,8 @@ export interface RunRequest {
 export interface RunBudgetOptions {
   readonly maxModelAttempts?: number | null;
   readonly maxInputTokens?: number | null;
-  /** Cumulative model output charged across the entire Run; null is explicit. */
-  readonly maxRunOutputTokens: number | null;
+  /** Cumulative Provider generation charged across the entire Run; null is explicit. */
+  readonly maxRunGenerationTokens: number | null;
   readonly maxReasoningTokens?: number | null;
   readonly maxOutputBytes?: number | null;
   readonly maxOutputEvents?: number | null;
@@ -51,7 +58,7 @@ export interface RunBudgetOptions {
 export interface RunBudgets {
   readonly maxModelAttempts: number | null;
   readonly maxInputTokens: number | null;
-  readonly maxRunOutputTokens: number | null;
+  readonly maxRunGenerationTokens: number | null;
   readonly maxReasoningTokens: number | null;
   readonly maxOutputBytes: number | null;
   readonly maxOutputEvents: number | null;
@@ -61,8 +68,9 @@ export interface RunUsage {
   readonly modelAttempts: number;
   readonly unreportedUsageAttempts: number;
   readonly inputTokens: number;
-  readonly outputTokens: number;
+  readonly generationTokens: number;
   readonly reasoningTokens: number;
+  readonly unreportedReasoningAttempts: number;
   readonly outputBytes: number;
   readonly outputEvents: number;
 }
@@ -74,12 +82,15 @@ interface RunOptionBase {
 
 export interface NewRunOptions extends RunOptionBase {
   readonly budgets: RunBudgetOptions;
+  /** Workflow sizing target; never changes the Provider generation allowance. */
+  readonly resultCapacityTargetTokens?: number;
   readonly durableContinuation?: never;
 }
 
 export interface ContinuationRunOptions extends RunOptionBase {
   readonly budgets?: never;
   readonly deadlineAt?: never;
+  readonly resultCapacityTargetTokens?: never;
   readonly durableContinuation: DurableContinuation;
 }
 
@@ -95,19 +106,18 @@ interface AgentPresetSnapshotBase {
   readonly runtimeLimits: AgentRuntimeLimitSnapshot;
 }
 
-export interface AgentPresetSnapshotV4 extends AgentPresetSnapshotBase {
-  readonly schemaVersion: 4;
-}
-
-export interface AgentPresetSnapshotV5 extends AgentPresetSnapshotBase {
+export interface AgentPresetSnapshot extends AgentPresetSnapshotBase {
   readonly schemaVersion: 5;
-  readonly agentTree: {
-    readonly protocolVersion: 1;
-    readonly capabilityGrant: Readonly<Record<string, JsonValue>>;
-  };
+  readonly agentTree:
+    | {
+        readonly protocolVersion: 1;
+        readonly enabled: false;
+      }
+    | (AgentTreePolicySnapshot & {
+        readonly protocolVersion: 1;
+        readonly capabilityGrant: Readonly<Record<string, JsonValue>>;
+      });
 }
-
-export type AgentPresetSnapshot = AgentPresetSnapshotV4 | AgentPresetSnapshotV5;
 
 export interface AgentRuntimeLimitSnapshot {
   readonly runTimeoutMs: number | null;
@@ -187,7 +197,7 @@ export interface ModelInvocationReceipt {
   readonly outputProtocol?: "purra.planning-stream/v1";
   readonly planningScope?: PlanningScope;
   readonly planningAttempt?: number;
-  readonly schemaVersion: 1;
+  readonly schemaVersion: 2;
   readonly runId: string;
   readonly invocationId: string;
   readonly attempt: number;
@@ -197,7 +207,7 @@ export interface ModelInvocationReceipt {
   readonly evidenceFingerprint: string;
   readonly contextEvidence: readonly ContextEvidenceReceipt[];
   readonly capabilityProfileId: string | null;
-  readonly outputLimit: number | null;
+  readonly outputBudget: InvocationOutputBudget | null;
   readonly openedAt: string;
 }
 
@@ -229,5 +239,5 @@ export interface InvocationReceiptInput {
   readonly tools: readonly ToolSpec[];
   readonly evidence: readonly ContextEvidenceReceipt[];
   readonly capabilityProfileId: string | null;
-  readonly outputLimit: number | null;
+  readonly outputBudget: InvocationOutputBudget | null;
 }

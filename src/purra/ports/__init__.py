@@ -11,7 +11,6 @@ from purra.ports.context import (
 from purra.ports.model import CancellationSignal, ModelGateway
 from purra.ports.evidence import ModelInputEvidenceValidator
 from purra.ports.persistence import (
-    DelegationRepository,
     ExecutionLeaseStore,
     RunControlStore,
     RunRecoveryStore,
@@ -68,7 +67,6 @@ __all__ = [
     "ContextProvider",
     "CONTROLLER_OWNED_RUN_EVENT_TYPES",
     "ConversationCompactor",
-    "DelegationRepository",
     "DomainEventProjector",
     "DynamicWorkPlanner",
     "EventSink",

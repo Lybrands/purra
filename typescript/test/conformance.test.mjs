@@ -6,7 +6,6 @@ import {
   allocateContextBudget,
   assertArtifactRepositoryConforms,
   assertContextProviderConforms,
-  assertDelegationRepositoryConforms,
   assertLongTaskRepositoryConforms,
   assertModelGatewayConforms,
   assertOutputPublisherConforms,
@@ -32,14 +31,23 @@ test("in-memory host adapters pass every public repository probe", async () => {
   const adapters = new InMemoryAgentAdapters();
   await assertRunRepositoryConforms(adapters.runs);
   await assertOutputPublisherConforms(adapters.outputs);
-  await assertDelegationRepositoryConforms(adapters.delegations);
   await assertLongTaskRepositoryConforms(adapters.longTasks);
   await assertArtifactRepositoryConforms(adapters.artifacts);
 });
 
 test("model, context, and tool adapter probes use the real public boundaries", async () => {
   await assertModelGatewayConforms({
-    gateway: { async invoke() { return { message: { role: "assistant", content: "ok" }, finishReason: "stop" }; } },
+    gateway: {
+      capabilities: modelCapabilities(),
+      async invoke(request) {
+        return {
+          message: { role: "assistant", content: "ok" },
+          finishReason: "stop",
+          appliedGenerationLimit: request.outputBudget.maxGenerationTokens,
+          usage: { inputTokens: 1, generationTokens: 1 },
+        };
+      },
+    },
   });
   await assertToolDefinitionConforms({
     definition: readTool,
@@ -88,9 +96,6 @@ test("conformance probes reject adapters with removed safety guarantees", async 
     request: { messages: [{ role: "user", content: "probe" }] },
     budget: budget(),
   }));
-  await assert.rejects(assertDelegationRepositoryConforms(proxy(adapters.delegations, {
-    async createBatch(target, ...args) { return { ...(await target.createBatch(...args)), replayed: false }; },
-  })), nonconforming("delegation_repository_nonconforming"));
   await assert.rejects(assertLongTaskRepositoryConforms(proxy(adapters.longTasks, {
     async create(target, ...args) {
       const result = await target.create(...args);
@@ -108,6 +113,30 @@ function budget() {
     outputReserveTokens: 1_000,
     reserves: { safetyTokens: 500, runtimeTokens: 500, minimumMessageTokens: 500 },
   });
+}
+
+function modelCapabilities() {
+  return {
+    schemaVersion: 2,
+    profileId: "conformance-fixture",
+    providerProtocol: "custom",
+    contextWindowTokens: 16_000,
+    maxGenerationTokens: 2_048,
+    thinkingTokenAccounting: "unknown",
+    protocol: {
+      reasoningControl: "selectable",
+      reasoningReplay: "ignored",
+      toolCalling: "supported",
+      requiredToolChoice: "supported",
+      parallelToolCalls: "supported",
+      streaming: "unavailable",
+      cancellation: "supported",
+      assistantContentWithToolCalls: "optional",
+      jsonSchemaLevel: "unknown",
+      streamFinishSemantics: "normalized",
+      usageSemantics: "normalized",
+    },
+  };
 }
 
 function proxy(target, overrides) {

@@ -11,6 +11,8 @@ import {
   type JsonValue,
   type ContextProvider,
   type ModelGateway,
+  type ModelCapabilitySnapshot,
+  type ModelTokenUsage,
   type OutputEvent,
   type RetrievalHit,
   type RetrievalRequest,
@@ -19,6 +21,32 @@ import {
   type ToolDefinition,
   type ToolPlanningRequirement,
 } from "purra";
+
+// @ts-expect-error generation usage is mandatory; only reasoning detail may be unknown
+const incompleteUsage: ModelTokenUsage = { inputTokens: 1 };
+void incompleteUsage;
+
+const typedCapabilities = {
+  schemaVersion: 2,
+  profileId: "typed-consumer",
+  providerProtocol: "custom",
+  contextWindowTokens: 16_000,
+  maxGenerationTokens: 512,
+  thinkingTokenAccounting: "unknown",
+  protocol: {
+    reasoningControl: "selectable",
+    reasoningReplay: "ignored",
+    toolCalling: "supported",
+    requiredToolChoice: "supported",
+    parallelToolCalls: "supported",
+    streaming: "supported",
+    cancellation: "supported",
+    assistantContentWithToolCalls: "optional",
+    jsonSchemaLevel: "unknown",
+    streamFinishSemantics: "normalized",
+    usageSemantics: "normalized",
+  },
+} satisfies ModelCapabilitySnapshot;
 
 const budget = allocateContextBudget({
   windowTokens: 5_000,
@@ -31,18 +59,27 @@ const contextProvider: ContextProvider = {
 };
 
 const model: ModelGateway = {
-  async invoke() {
+  capabilities: typedCapabilities,
+  async invoke(request) {
     return {
       message: { role: "assistant", content: "typed" },
       finishReason: "stop",
+      appliedGenerationLimit: request.outputBudget.maxGenerationTokens,
     };
   },
-  async *stream() {
-    yield { contentDelta: "typed", finishReason: "stop" };
+  stream(request) {
+    return {
+      appliedGenerationLimit: request.outputBudget.maxGenerationTokens,
+      async *[Symbol.asyncIterator]() {
+        yield { contentDelta: "typed", finishReason: "stop" as const };
+      },
+    };
   },
 };
 const modelTasks = new ModelTaskRunner({ model, runId: "typed-model-task" });
 (await modelTasks.streamText([{ role: "user", content: "typed model task" }])).content satisfies string;
+// @ts-expect-error generation authority is bound when the runner is constructed, never per call
+await modelTasks.complete([{ role: "user", content: "typed model task" }], { maxGenerationTokens: 64 });
 new ModelWorkPlanner(modelTasks).createPlan satisfies Function;
 new ModelResponseJudge(modelTasks, {
   buildMessages({ content }) { return [{ role: "user", content }]; },
@@ -102,7 +139,7 @@ await assertRunRepositoryConforms(new InMemoryRunRepository());
 const handle: RunHandle = await agent.submit({
   messages: [{ role: "user", content: "hello" }],
 }, {
-  budgets: { maxRunOutputTokens: null },
+  budgets: { maxRunGenerationTokens: null },
 });
 (await handle.result).output satisfies JsonValue;
 for await (const event of handle.events()) {

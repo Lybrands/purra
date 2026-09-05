@@ -27,9 +27,10 @@ function messages(input: readonly Message[]): ChatCompletionMessageParam[] {
 }
 function usage(u: CompletionUsage | null | undefined): ModelTokenUsage | undefined {
   if (u?.prompt_tokens == null || u.completion_tokens == null) return undefined;
-  return { inputTokens: u.prompt_tokens, outputTokens: u.completion_tokens, totalTokens: u.total_tokens,
+  const reasoningTokens = u.completion_tokens_details?.reasoning_tokens;
+  return { inputTokens: u.prompt_tokens, generationTokens: u.completion_tokens, totalTokens: u.total_tokens,
     cachedInputTokens: u.prompt_tokens_details?.cached_tokens ?? 0,
-    reasoningOutputTokens: u.completion_tokens_details?.reasoning_tokens ?? 0 };
+    ...(reasoningTokens === undefined ? {} : { reasoningTokens }) };
 }
 function finish(reason: string): ModelTurn["finishReason"] {
   if (reason === "stop" || reason === "tool_calls") return reason;
@@ -66,9 +67,9 @@ export class OpenAIChatCompletionsGateway implements ModelGateway {
     this.#client = (options.client ?? new OpenAI()).withOptions({ maxRetries: 0, timeout: options.timeoutMs ?? 60000 });
   }
   #request(request: ModelRequest): ChatCompletionCreateParamsNonStreaming {
-    if (!request.outputLimit) throw new TypeError("OpenAI gateway requires a resolved output limit");
+    if (!request.outputBudget) throw new TypeError("OpenAI gateway requires a resolved generation budget");
     const o = this.#options;
-    return { model: o.model, messages: messages(request.messages), store: false, max_completion_tokens: request.outputLimit.maxTokens,
+    return { model: o.model, messages: messages(request.messages), store: false, max_completion_tokens: request.outputBudget.maxGenerationTokens,
       ...(o.reasoningEffort === undefined ? {} : { reasoning_effort: o.reasoningEffort }),
       ...(o.temperature === undefined ? {} : { temperature: o.temperature }),
       ...(o.topP === undefined ? {} : { top_p: o.topP }),
@@ -88,7 +89,7 @@ export class OpenAIChatCompletionsGateway implements ModelGateway {
         if (call.type !== "function") throw new Error("Unsupported tool type");
         return { id: call.id, name: call.function.name, arguments: JSON.parse(call.function.arguments) as JsonValue };
       }) }, finishReason: c.message.refusal ? "filtered" : finish(c.finish_reason),
-      appliedOutputLimit: request.outputLimit!.maxTokens, ...(tokenUsage === undefined ? {} : { usage: tokenUsage }) };
+      appliedGenerationLimit: request.outputBudget!.maxGenerationTokens, ...(tokenUsage === undefined ? {} : { usage: tokenUsage }) };
     } catch (error) { return failed(error, signal); }
   }
   async stream(request: ModelRequest, signal?: AbortSignal): Promise<ModelStream> {
@@ -124,6 +125,6 @@ export class OpenAIChatCompletionsGateway implements ModelGateway {
       } catch (error) { failed(error, signal); }
       finally { stream?.controller.abort(); }
     }
-    return { appliedOutputLimit: request.outputLimit!.maxTokens, activitySupport: "transport", [Symbol.asyncIterator]: chunks };
+    return { appliedGenerationLimit: request.outputBudget!.maxGenerationTokens, activitySupport: "transport", [Symbol.asyncIterator]: chunks };
   }
 }

@@ -34,8 +34,8 @@ function input(messages: readonly Message[]): ResponseInput {
 }
 function usage(response: Response): ModelTokenUsage | undefined {
   const u = response.usage;
-  return u == null ? undefined : { inputTokens: u.input_tokens, outputTokens: u.output_tokens, totalTokens: u.total_tokens,
-    cachedInputTokens: u.input_tokens_details.cached_tokens, reasoningOutputTokens: u.output_tokens_details.reasoning_tokens };
+  return u == null ? undefined : { inputTokens: u.input_tokens, generationTokens: u.output_tokens, totalTokens: u.total_tokens,
+    cachedInputTokens: u.input_tokens_details.cached_tokens, reasoningTokens: u.output_tokens_details.reasoning_tokens };
 }
 function finish(response: Response): ModelTurn["finishReason"] {
   if (response.status === "incomplete") return response.incomplete_details?.reason === "max_output_tokens" ? "length" : response.incomplete_details?.reason === "content_filter" ? "filtered" : "other";
@@ -78,9 +78,9 @@ export class OpenAIResponsesGateway implements ModelGateway {
     this.#client = (options.client ?? new OpenAI()).withOptions({ maxRetries: 0, timeout: options.timeoutMs ?? 60000 });
   }
   #request(request: ModelRequest): ResponseCreateParamsNonStreaming {
-    if (!request.outputLimit) throw new TypeError("OpenAI gateway requires a resolved output limit");
+    if (!request.outputBudget) throw new TypeError("OpenAI gateway requires a resolved generation budget");
     return { model: this.#model, input: input(request.messages), store: false, include: ["reasoning.encrypted_content"],
-      max_output_tokens: request.outputLimit.maxTokens,
+      max_output_tokens: request.outputBudget.maxGenerationTokens,
       tools: request.tools.map(t => ({ type: "function", name: t.name, description: t.description,
         parameters: JSON.parse(JSON.stringify(t.inputSchema)) as Record<string, unknown>, strict: false })),
       tool_choice: request.tools.length ? "auto" : "none",
@@ -94,7 +94,7 @@ export class OpenAIResponsesGateway implements ModelGateway {
       const tokenUsage = usage(response);
       return { message: { role: "assistant", content: response.output_text, providerData: attributes(response),
         toolCalls: response.output.filter(i => i.type === "function_call").map(i => ({ id: i.call_id, name: i.name, arguments: JSON.parse(i.arguments) as JsonValue })) },
-        finishReason: finish(response), appliedOutputLimit: request.outputLimit!.maxTokens,
+        finishReason: finish(response), appliedGenerationLimit: request.outputBudget!.maxGenerationTokens,
         ...(tokenUsage === undefined ? {} : { usage: tokenUsage }),
       };
     } catch (error) { return failed(error, signal); }
@@ -119,7 +119,7 @@ export class OpenAIResponsesGateway implements ModelGateway {
       } catch (error) { failed(error, signal); }
       finally { stream?.controller.abort(); }
     }
-    return { appliedOutputLimit: request.outputLimit!.maxTokens, activitySupport: "working", [Symbol.asyncIterator]: chunks };
+    return { appliedGenerationLimit: request.outputBudget!.maxGenerationTokens, activitySupport: "working", [Symbol.asyncIterator]: chunks };
   }
 }
 

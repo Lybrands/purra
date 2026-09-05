@@ -5,7 +5,7 @@ import OpenAI from 'openai';
 import { OpenAIChatCompletionsGateway } from '../dist/index.js';
 
 const fixture=JSON.parse(readFileSync(new URL('../../fixtures/chat.json',import.meta.url),'utf8'));
-const request={messages:[{role:'developer',content:'instructions'},{role:'user',content:'check'}],tools:[{name:'lookup',description:'lookup',inputSchema:{type:'object',properties:{query:{type:'string'}}}}],outputLimit:{maxTokens:128,source:'user_override',profileMaxTokens:256}};
+const request={messages:[{role:'developer',content:'instructions'},{role:'user',content:'check'}],tools:[{name:'lookup',description:'lookup',inputSchema:{type:'object',properties:{query:{type:'string'}}}}],outputBudget:{maxGenerationTokens:128,generationSource:'user',profileMaxGenerationTokens:256,requestedUserMaxGenerationTokens:128,resultCapacityTargetTokens:null,resultCapacitySource:null,nonResultHeadroomTokens:null}};
 function gateway(fetch){return new OpenAIChatCompletionsGateway({model:'fixture-model',capabilities:{},client:new OpenAI({apiKey:'fixture-not-a-key',fetch,maxRetries:5})});}
 function sse(events){return events.map(e=>`data: ${JSON.stringify(e)}\n\n`).join('')+'data: [DONE]\n\n';}
 
@@ -14,7 +14,7 @@ test('official Chat SDK maps tool continuations and usage after the finish marke
     assert.equal(new URL(url).pathname,'/v1/chat/completions');const body=JSON.parse(options.body);requests.push(body);
     return body.stream?new Response(sse(fixture.events),{headers:{'content-type':'text/event-stream'}}):Response.json(fixture.response);
   });
-  const result=await model.invoke(request);assert.equal(result.finishReason,'tool_calls');assert.equal(result.usage.reasoningOutputTokens,4);
+  const result=await model.invoke(request);assert.equal(result.finishReason,'tool_calls');assert.equal(result.usage.reasoningTokens,4);
   const chunks=[];for await(const chunk of await model.stream(request))chunks.push(chunk);
   assert.equal(chunks.filter(c=>c.finishReason).length,1);assert.deepEqual(chunks.at(-1).usage,result.usage);
   assert.equal(chunks.flatMap(c=>c.toolCallDeltas??[]).map(c=>c.argumentsFragment??'').join(''),'{"query":"中文"}');

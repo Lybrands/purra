@@ -224,7 +224,7 @@ export function restoreContext(
   throwIfCanceled(input.signal);
   const saved = copyPreparedContextSnapshot(snapshot);
   // Reuse resolved allocations, not the live provider. Recompute fixed reserves
-  // against the currently bound model, tools and per-call output limit.
+  // against the currently bound model, tools and per-call generation budget.
   const budget = allocateContextBudget({
     windowTokens: input.windowTokens,
     outputReserveTokens: input.outputReserveTokens,

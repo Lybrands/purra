@@ -13,7 +13,7 @@ import purra
 from purra.api import (
     AgentCore,
     AgentPreset,
-    DelegationPolicy,
+    AgentTreePolicy,
     InMemoryAgentAdapters,
 )
 from purra.contracts import (
@@ -130,8 +130,8 @@ async def main() -> None:
                             id="delegate-child",
                             name="delegateToAgents",
                             arguments_fragment=json.dumps({
-                                "delegations": [{
-                                    "agentName": "evidence-reader",
+                                "children": [{
+                                    "name": "evidence-reader",
                                     "title": "Evidence reader",
                                     "instruction": CHILD_INSTRUCTION,
                                     "objective": "Read and report the child status.",
@@ -153,7 +153,7 @@ async def main() -> None:
             return ModelStream(
                 chunks=chunks(),
                 model="local-child-agent-smoke",
-                applied_output_limit=invocation.output_limit.max_tokens,
+                applied_generation_limit=invocation.output_budget.max_generation_tokens,
             )
 
         async def complete(self, messages, invocation, signal=None):
@@ -164,7 +164,7 @@ async def main() -> None:
                     content="unused",
                 ),
                 model="local-child-agent-smoke",
-                applied_output_limit=invocation.output_limit.max_tokens,
+                applied_generation_limit=invocation.output_budget.max_generation_tokens,
                 finish_reason=ModelFinishReason.STOP,
             )
 
@@ -204,13 +204,13 @@ async def main() -> None:
         run_tree_repository=adapters.run_tree,
         root_agent_id="sdk-parity-root-agent",
         preset=AgentPreset(
-            runtime_limits=RuntimeLimits(max_run_output_tokens=None),
+            runtime_limits=RuntimeLimits(max_run_generation_tokens=None),
             id="sdk-parity-child-agent-smoke",
             revision="1",
             tool_catalog=catalog,
-            delegation_policy=DelegationPolicy(
-                max_agents_per_call=1,
-                max_parallel=1,
+            agent_tree_policy=AgentTreePolicy(
+                max_children_per_call=1,
+                max_parallel_runs=1,
             ),
         ),
     )
@@ -225,9 +225,9 @@ async def main() -> None:
             capability_snapshot=replace(
                 generic_capability_snapshot(),
                 profile_id="local:child-agent-smoke",
-                max_call_output_tokens=256,
+                max_generation_tokens=256,
             ),
-            options={"max_tokens": 128},
+            max_generation_tokens=128,
         ),
         domain_context=DomainContext(namespace="sdk.parity.child-agent-smoke"),
         context_window=65_536,

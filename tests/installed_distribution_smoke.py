@@ -85,7 +85,7 @@ class _Gateway:
         return ModelStream(
             chunks=planned() if planning else _chunks(),
             model="smoke-model",
-            applied_output_limit=invocation.output_limit.max_tokens,
+            applied_generation_limit=invocation.output_budget.max_generation_tokens,
             activity_support=ModelStreamActivitySupport.WORKING,
         )
 
@@ -97,7 +97,7 @@ class _Gateway:
                 content="installed PurrA is runnable",
             ),
             model="smoke-model",
-            applied_output_limit=invocation.output_limit.max_tokens,
+            applied_generation_limit=invocation.output_budget.max_generation_tokens,
             finish_reason=ModelFinishReason.STOP,
         )
 
@@ -149,7 +149,7 @@ async def _run() -> None:
         output_repository=adapters.outputs,
         output_publisher=adapters.publisher,
         preset=AgentPreset(
-            runtime_limits=RuntimeLimits(max_run_output_tokens=None),
+            runtime_limits=RuntimeLimits(max_run_generation_tokens=None),
             id="installed-smoke",
             revision="1",
             tool_catalog=InMemoryToolCatalog(()),
@@ -166,9 +166,9 @@ async def _run() -> None:
             capability_snapshot=replace(
                 generic_capability_snapshot(),
                 profile_id="smoke:model",
-                max_call_output_tokens=1_024,
+                max_generation_tokens=1_024,
             ),
-            options={"max_tokens": 256},
+            max_generation_tokens=256,
         ),
         domain_context=DomainContext(namespace="smoke"),
         context_window=8_192,
@@ -186,7 +186,11 @@ async def _run() -> None:
     assert result.status is RunStatus.DONE
     assert result.final_response == "installed PurrA is runnable"
     snapshot = events[0].payload["agentPreset"]
-    assert snapshot["snapshotVersion"] == 4
+    assert snapshot["snapshotVersion"] == 5
+    assert snapshot["composition"]["agentTree"] == {
+        "protocolVersion": 1,
+        "enabled": False,
+    }
     runtime_limits = snapshot["composition"]["runtimeLimits"]
     assert runtime_limits["providerActivityIdleTimeoutMs"] == 30_000
     assert runtime_limits["providerProgressIdleTimeoutMs"] == 60_000
@@ -217,7 +221,7 @@ async def _run() -> None:
     gateway = _Gateway()
     planned_core = AgentCore(model_gateway=gateway, planner=AgentPlanner(gateway), planning_policy=Policy(),
         run_repository=planned_storage.runs, output_repository=planned_storage.outputs,
-        output_publisher=planned_storage.publisher, runtime_limits=RuntimeLimits(max_run_output_tokens=None))
+        output_publisher=planned_storage.publisher, runtime_limits=RuntimeLimits(max_run_generation_tokens=None))
     try:
         planned_handle = await planned_core.submit(replace(
             request,

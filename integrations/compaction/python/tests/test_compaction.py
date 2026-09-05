@@ -20,14 +20,15 @@ class Tasks:
     async def complete(self, messages, call, signal):
         self.calls += 1
         assert "private-secret" not in str(messages)
-        assert call.request.options["max_tokens"] == 256
+        assert call.result_capacity_target_tokens == 256
+        assert call.output_budget.max_generation_tokens == 256
         return SimpleNamespace(completion=ModelCompletion(AgentMessage("assistant", self.content), "fixture", finish_reason=self.finish))
 
 
 def request():
     return AgentRunRequest(messages=(AgentMessage("system", "keep instructions"),
         AgentMessage("user", "old question " * 500), AgentMessage("assistant", "old answer", reasoning="private-secret"),
-        AgentMessage("user", "latest question")), model=ModelRequest("fixture", "fixture", replace(generic_capability_snapshot(), max_call_output_tokens=256)), domain_context=DomainContext("test"))
+        AgentMessage("user", "latest question")), model=ModelRequest("fixture", "fixture", replace(generic_capability_snapshot(), max_generation_tokens=256)), domain_context=DomainContext("test"))
 
 
 @pytest.mark.asyncio

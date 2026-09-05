@@ -48,7 +48,7 @@ class LocalModelGateway:
         return ModelStream(
             chunks=chunks(),
             model="local-example",
-            applied_output_limit=invocation.output_limit.max_tokens,
+            applied_generation_limit=invocation.output_budget.max_generation_tokens,
         )
 
     async def complete(self, messages, invocation, signal=None):
@@ -59,7 +59,7 @@ class LocalModelGateway:
                 content="PurrA is ready.",
             ),
             model="local-example",
-            applied_output_limit=invocation.output_limit.max_tokens,
+            applied_generation_limit=invocation.output_budget.max_generation_tokens,
             finish_reason=ModelFinishReason.STOP,
         )
 
@@ -89,7 +89,7 @@ async def main() -> None:
         output_repository=adapters.outputs,
         output_publisher=adapters.publisher,
         preset=AgentPreset(
-            runtime_limits=RuntimeLimits(max_run_output_tokens=None),
+            runtime_limits=RuntimeLimits(max_run_generation_tokens=None),
             id="quickstart",
             revision="1",
             tool_catalog=catalog,
@@ -106,9 +106,9 @@ async def main() -> None:
             capability_snapshot=replace(
                 generic_capability_snapshot(),
                 profile_id="local:example",
-                max_call_output_tokens=256,
+                max_generation_tokens=256,
             ),
-            options={"max_tokens": 128},
+            max_generation_tokens=128,
         ),
         domain_context=DomainContext(namespace="example.quickstart"),
         context_window=65_536,

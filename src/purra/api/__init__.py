@@ -43,6 +43,7 @@ from purra.agent_tree_execution import (
     AgentTreeRunSupervisor,
     RunCommandService,
 )
+from purra.agent_tree_policy import AgentTreePolicy
 from purra.agent_execution_checkpoint import AgentExecutionCheckpoint
 from purra.agent_tree_lease import (
     AgentRunLeaseClaim,
@@ -55,14 +56,6 @@ from purra.contracts import (
     WorkPlan,
     WorkStep,
 )
-from purra.delegation import (
-    DelegatedAgentExecutor,
-    DelegatedAgentRequest,
-    DelegatedAgentResult,
-    DelegationContextMode,
-    DelegationPolicy,
-)
-from purra.delegation.dynamic_executor import DynamicDelegatedAgentExecutor
 from purra.execution import AgentRunHandle
 from purra.model_execution import (
     AgentModelResponseJudge,
@@ -117,12 +110,7 @@ __all__ = [
     "ContextStrategy",
     "ContextEvidenceReceipt",
     "PlanningMode",
-    "DelegatedAgentExecutor",
-    "DelegatedAgentRequest",
-    "DelegatedAgentResult",
-    "DelegationContextMode",
-    "DelegationPolicy",
-    "DynamicDelegatedAgentExecutor",
+    "AgentTreePolicy",
     "DurableTaskContinuation",
     "ExecutionProfile",
     "PromptSection",

@@ -8,7 +8,7 @@ import pytest
 from anthropic import AsyncAnthropic
 from purra.cancellation import OperationCanceled
 from purra.contracts import AgentMessage, ModelRequest, ModelInvocation, ToolSchema, ToolCallResult
-from purra.model_protocol import generic_capability_snapshot, resolve_invocation_output_limit
+from purra.model_protocol import generic_capability_snapshot, resolve_invocation_output_budget
 from purra.runtime.model_round import ModelRoundAccumulator
 from purra.runtime.tool_round import continuation_messages
 from purra_anthropic import AnthropicMessagesGateway
@@ -18,9 +18,18 @@ MESSAGES = (AgentMessage('system', 'system'), AgentMessage('developer', 'develop
 
 
 def invocation(options=None, **kwargs):
-    model = ModelRequest('anthropic', 'fixture-model', replace(generic_capability_snapshot(), max_call_output_tokens=8192), options=options or {})
+    model = ModelRequest(
+        'anthropic',
+        'fixture-model',
+        replace(generic_capability_snapshot(), max_generation_tokens=8192),
+        max_generation_tokens=4096,
+        options=options or {},
+    )
     return ModelInvocation(model, tools=(ToolSchema('lookup', 'lookup', {'type': 'object', 'properties': {'query': {'type': 'string'}}}), ToolSchema('ready', 'ready', {'type': 'object'})),
-                           output_limit=resolve_invocation_output_limit(model.capability_snapshot, 4096), **kwargs)
+                           output_budget=resolve_invocation_output_budget(
+                               model.capability_snapshot,
+                               max_generation_tokens=model.max_generation_tokens,
+                           ), **kwargs)
 
 
 def sse(events):
@@ -42,8 +51,8 @@ async def test_sdk_tool_round_checkpoint_signed_thinking_and_cache_accounting():
         model = gateway(http); call = invocation({'thinking': {'type': 'adaptive'}}, reasoning_mode='enabled')
         complete = await model.complete(MESSAGES, call)
         assert complete.message.content == '先查资料。' and complete.message.reasoning is None
-        assert complete.finish_reason.value == 'tool_calls' and complete.applied_output_limit == 4096
-        assert complete.usage.input_tokens == 20 and complete.usage.output_tokens == 20
+        assert complete.finish_reason.value == 'tool_calls' and complete.applied_generation_limit == 4096
+        assert complete.usage.input_tokens == 20 and complete.usage.generation_tokens == 20
         assert complete.usage.cached_input_tokens == 7 and complete.usage.total_tokens == 40
         stream = await model.stream(MESSAGES, call)
         acc = ModelRoundAccumulator(); chunks = []
@@ -168,7 +177,7 @@ async def test_core_tool_round_keeps_thinking_private():
         core = AgentCore(model_gateway=gateway(http), run_repository=adapters.runs,
                          output_repository=adapters.outputs, output_publisher=adapters.publisher,
                          preset=AgentPreset(id='anthropic-fixture', revision='1', tool_catalog=InMemoryToolCatalog((lookup.registration,)),
-                                            runtime_limits=RuntimeLimits(max_run_output_tokens=10000)))
+                                            runtime_limits=RuntimeLimits(max_run_generation_tokens=10000)))
         try:
             handle = await core.submit(AgentRunRequest(messages=(AgentMessage('user','lookup'),), model=invocation().request,
                                                       domain_context=DomainContext('fixture'), context_window=65536, tools_enabled=True))

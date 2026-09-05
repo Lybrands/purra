@@ -60,8 +60,7 @@ execution fail closed instead of being replayed.
 | `planning/`, `extensions/` | Planning contracts and optional model-backed helpers | Product prompts, Provider SDKs, durable recovery |
 | `durable/` | Task admission, leases, checkpoints, continuation, orphan coordination | Product partitioning, merging, production storage |
 | `artifacts/` | Recoverable output lifecycle, revisions, access, writer claims | Run completion and product schemas |
-| `agent-tree*.ts` | Stable Agent identity, immutable Child Runs, bounded scheduling, continuation, lease fencing | Product roles, prompts, or persistence choices |
-| `delegation/` | Legacy bounded same-Run delegation compatibility | Recursive Child Run authority |
+| `agent-tree*.ts` | Stable Agent identity, immutable Child Runs, policy, bounded scheduling, continuation, lease fencing | Product roles, prompts, or persistence choices |
 | `operations/` | Optional operation receipts and timing | Run terminal state and product progress |
 | `observability/`, `evaluation/` | Read-only projections and deterministic checks | Runtime control and generated content |
 | `testing/` | Public contract probes and process-local reference adapters | Provider SDKs and production persistence |

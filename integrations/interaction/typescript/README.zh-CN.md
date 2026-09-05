@@ -36,7 +36,7 @@ const agent = new Agent({
 });
 ```
 
-通过 `agent.submit(request, { budgets: { maxRunOutputTokens: 8192 } })` 提交。
+通过 `agent.submit(request, { budgets: { maxRunGenerationTokens: 8192 } })` 提交。
 Agent 提问后，句柄的 `result` 会以 `purra` 导出的 `UserInputRequired` 拒绝。
 使用异常中的 `error.requestId` 调用 `await interaction.get(error.requestId)`，获取可展示的问题数据。
 

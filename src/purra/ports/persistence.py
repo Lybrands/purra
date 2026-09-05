@@ -2,16 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from typing import Any, Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable
 
-from purra.contracts import (
-    AgentDelegation,
-    DelegationContextMode,
-    DelegationAggregation,
-    RunExecutionLease,
-    RunId,
-)
+from purra.contracts import RunExecutionLease, RunId
 from purra.run_recovery import RunRecoverySnapshot
 from purra.run_control import (
     OrphanRunCandidate,
@@ -52,72 +45,6 @@ class ExecutionLeaseStore(Protocol):
     async def request_cancellation(self, run_id: RunId) -> bool: ...
 
     async def get(self, run_id: RunId) -> RunExecutionLease | None: ...
-
-
-@runtime_checkable
-class DelegationRepository(Protocol):
-    async def create(
-        self,
-        *,
-        run_id: RunId,
-        batch_id: str,
-        agent_name: str,
-        agent_title: str,
-        agent_instruction: str,
-        objective: str,
-        input_payload: Mapping[str, Any] | None = None,
-        context_mode: DelegationContextMode = DelegationContextMode.ISOLATED,
-        required: bool = True,
-        priority: int = 0,
-    ) -> AgentDelegation: ...
-
-    async def start(
-        self,
-        delegation_id: str,
-        *,
-        run_id: RunId,
-        batch_id: str,
-    ) -> AgentDelegation | None: ...
-
-    async def complete(
-        self,
-        delegation_id: str,
-        *,
-        run_id: RunId,
-        batch_id: str,
-        result_summary: str,
-    ) -> bool: ...
-
-    async def fail(
-        self,
-        delegation_id: str,
-        *,
-        run_id: RunId,
-        batch_id: str,
-        error: str,
-    ) -> bool: ...
-
-    async def cancel(
-        self,
-        delegation_id: str,
-        *,
-        run_id: RunId,
-        batch_id: str,
-        reason: str,
-    ) -> bool: ...
-
-    async def list_for_run(
-        self,
-        run_id: RunId,
-    ) -> tuple[AgentDelegation, ...]: ...
-
-    async def aggregate_batch(
-        self,
-        run_id: RunId,
-        batch_id: str,
-    ) -> DelegationAggregation: ...
-
-    async def cancel_batch(self, run_id: RunId, batch_id: str) -> int: ...
 
 
 @runtime_checkable

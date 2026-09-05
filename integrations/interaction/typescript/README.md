@@ -37,7 +37,7 @@ const agent = new Agent({
 });
 ```
 
-Submit through `agent.submit(request, { budgets: { maxRunOutputTokens: 8192 } })`.
+Submit through `agent.submit(request, { budgets: { maxRunGenerationTokens: 8192 } })`.
 When the Agent asks a question, the handle's `result` rejects with
 `UserInputRequired` from `purra`. Use `error.requestId` with
 `await interaction.get(error.requestId)` to obtain public question data.

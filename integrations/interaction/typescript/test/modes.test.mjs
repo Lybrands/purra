@@ -6,6 +6,7 @@ import test from "node:test";
 import { Agent, UserInputRequired } from "purra";
 import { SqliteAgentAdapters } from "purra-sqlite";
 import { SqliteClarification } from "../dist/index.js";
+import { TEST_MODEL_CAPABILITIES } from "./model-capabilities.mjs";
 
 const QUESTION = { questions: [{ id: "detail", prompt: "Choose a detail", choices: ["yes", "no"], allowFreeform: false }] };
 const answered = messages => messages.some(m => typeof m.content === "string" && m.content.includes("Answers to requested"));
@@ -21,13 +22,13 @@ function compose(path, script, planner, tree = false, replan = false) {
   const agent = new Agent({ runRepository: storage.runs, outputPublisher: storage.publisher,
     preset: { id: "modes", revision: "1" }, tools: [replan ? { ...interaction.tool, run: input => ({ ...interaction.tool.run(input), planningDisposition: "replan", planningReason: "Use the answer for the remaining work" }) } : interaction.tool], checkpointHandler: interaction.checkpointHandler,
     ...(planner ? { planning: { planner } } : {}),
-    ...(tree ? { agentTree: { repository: storage.runTree, policy: { allowRecursiveDelegation: true } } } : {}),
-    model: { async invoke(request) {
+    ...(tree ? { agentTree: { repository: storage.runTree, policy: { allowRecursiveAgents: true } } } : {}),
+    model: { capabilities: TEST_MODEL_CAPABILITIES, async invoke(request) {
       calls.push(request);
       const output = await script(request.messages, calls.length);
       return Array.isArray(output)
-        ? { message: { role: "assistant", content: "", toolCalls: [{ id: `call-${request.messages.flatMap(m => m.toolCalls ?? []).length + 1}`, name: output[0], arguments: output[1] }] }, finishReason: "tool_calls", usage: { inputTokens: 2, outputTokens: 2 } }
-        : { message: { role: "assistant", content: output }, finishReason: "stop", usage: { inputTokens: 2, outputTokens: 2 } };
+        ? { message: { role: "assistant", content: "", toolCalls: [{ id: `call-${request.messages.flatMap(m => m.toolCalls ?? []).length + 1}`, name: output[0], arguments: output[1] }] }, finishReason: "tool_calls", appliedGenerationLimit: request.outputBudget.maxGenerationTokens, usage: { inputTokens: 2, generationTokens: 2 } }
+        : { message: { role: "assistant", content: output }, finishReason: "stop", appliedGenerationLimit: request.outputBudget.maxGenerationTokens, usage: { inputTokens: 2, generationTokens: 2 } };
     } },
   });
   return { storage, interaction, agent, calls };
@@ -39,7 +40,7 @@ for (const mode of ["auto", "planned", "promoted", "remaining"]) test(`${mode} r
   const planning = mode === "auto" ? undefined : planner(mode !== "remaining");
   let host = compose(path, (_messages, count) => mode === "promoted" && count === 1 ? ["request_plan", {}] : ["request_user_input", QUESTION], planning);
   try {
-    const handle = await host.agent.submit({ messages: [{ role: "user", content: "Root task" }], planningMode: mode === "planned" ? "planned" : "auto" }, { budgets: { maxRunOutputTokens: 1000 } });
+    const handle = await host.agent.submit({ messages: [{ role: "user", content: "Root task" }], planningMode: mode === "planned" ? "planned" : "auto" }, { budgets: { maxRunGenerationTokens: 1000 } });
     let id;
     await assert.rejects(handle.result, error => { id = error.requestId; if (!(error instanceof UserInputRequired)) throw error; return true; });
     const checkpoint = (await handle.snapshot()).executionCheckpoint;
@@ -60,7 +61,7 @@ function treeScript(messages) {
   const instruction = messages.find(m => m.role === "system" && m.attributes?.agentId)?.content ?? "root";
   const delegated = messages.filter(m => m.role === "tool").map(m => typeof m.content === "string" ? JSON.parse(m.content) : m.content).filter(m => m?.pendingRunIds);
   if (["root", "middle"].includes(instruction)) {
-    if (!delegated.length) return ["delegateToAgents", { delegations: (instruction === "root" ? ["middle", "sibling"] : ["leaf"]).map(name => ({ agentName: name, title: name, instruction: name, objective: name })) }];
+    if (!delegated.length) return ["delegateToAgents", { children: (instruction === "root" ? ["middle", "sibling"] : ["leaf"]).map(name => ({ name, title: name, instruction: name, objective: name })) }];
     for (const result of delegated) assert.deepEqual(result.pendingRunIds, []);
     return "Tree finished";
   }
@@ -71,7 +72,7 @@ for (const cancel of [false, true]) test(`nested tree restart, multiple question
   const path = join(dir, "agent.db");
   let host = compose(path, treeScript, undefined, true);
   try {
-    const handle = await host.agent.submit({ messages: [{ role: "user", content: "Root task" }] }, { budgets: { maxRunOutputTokens: 1000 } });
+    const handle = await host.agent.submit({ messages: [{ role: "user", content: "Root task" }] }, { budgets: { maxRunGenerationTokens: 1000 } });
     await assert.rejects(handle.result, error => { if (!(error instanceof UserInputRequired)) throw error; return true; });
     const pending = await host.interaction.listWaiting();
     assert.equal(pending.length, 2);
@@ -108,7 +109,7 @@ test("replanning revision survives two input waits", async () => {
     ? ["request_user_input", QUESTION] : "Finished";
   let planning = makePlanner(), host = compose(path, script, planning, false, true);
   try {
-    let handle = await host.agent.submit({ messages: [{ role: "user", content: "Root task" }], planningMode: "planned" }, { budgets: { maxRunOutputTokens: 1000 } });
+    let handle = await host.agent.submit({ messages: [{ role: "user", content: "Root task" }], planningMode: "planned" }, { budgets: { maxRunGenerationTokens: 1000 } });
     for (const revision of [0, 1]) {
       let id;
       await assert.rejects(handle.result, error => { if (!(error instanceof UserInputRequired)) throw error; id = error.requestId; return true; });
@@ -148,7 +149,7 @@ test("Planned Root and Auto-promoted children resume together", async () => {
   };
   let planning = makePlanner(), host = compose(path, makeScript(), planning, true);
   try {
-    const handle = await host.agent.submit({ messages: [{ role: "user", content: "Root task" }], planningMode: "planned" }, { budgets: { maxRunOutputTokens: 1000, maxModelAttempts: 32 } });
+    const handle = await host.agent.submit({ messages: [{ role: "user", content: "Root task" }], planningMode: "planned" }, { budgets: { maxRunGenerationTokens: 1000, maxModelAttempts: 32 } });
     await assert.rejects(handle.result, error => { if (!(error instanceof UserInputRequired)) throw error; return true; });
     const pending = await host.interaction.listWaiting();
     assert.equal(pending.length, 2); assert.equal(planning.calls, 4);
@@ -172,7 +173,7 @@ test("duplicate Root resume cannot settle another owner's Agent tree", async () 
     return treeScript(messages);
   }, undefined, true);
   try {
-    const handle = await host.agent.submit({ messages: [{ role: "user", content: "Root task" }] }, { budgets: { maxRunOutputTokens: 1000 } });
+    const handle = await host.agent.submit({ messages: [{ role: "user", content: "Root task" }] }, { budgets: { maxRunGenerationTokens: 1000 } });
     await assert.rejects(handle.result, UserInputRequired);
     const pending = await host.interaction.listWaiting();
     for (const row of pending) await host.interaction.answer(row.id, { revision: 1, key: "a", answers: { detail: "yes" } });

@@ -45,7 +45,7 @@ def test_fixture_rejects_empty_success_and_path_traversal():
 
 
 def test_interrupted_trial_reports_unknown_usage_and_cannot_appear_passed(tmp_path):
-    report = {"status": "running", "calls": [{"phase": "review", "kind": "chat", "input_tokens": None, "output_tokens": None}]}
+    report = {"status": "running", "calls": [{"phase": "review", "kind": "chat", "input_tokens": None, "generation_tokens": None}]}
     output = tmp_path / "report.json"
     EVAL["save_report"](output, report)
     saved = json.loads(output.read_text())
@@ -95,7 +95,7 @@ async def test_transport_charges_exact_cap_and_rejects_before_network(monkeypatc
     http = Http()
     transport = Transport(config(), http)
     result = await transport.complete([AgentMessage(role="user", content="私有😀")], 32)
-    assert result.applied_output_limit == 32 and result.usage.output_tokens == 3
+    assert result.applied_generation_limit == 32 and result.usage.generation_tokens == 3
     assert http.requests[0][2]["json"]["max_tokens"] == 32
     assert transport.calls[0]["input_chars"] == 3
     assert all(secret not in json.dumps(transport.calls) for secret in ("private-key", "private model text", "私有"))

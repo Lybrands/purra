@@ -103,7 +103,7 @@ class StreamGateway:
                     else:
                         yield ModelStreamChunk(content_delta=item)
                 yield ModelStreamChunk(finish_reason=ModelFinishReason.STOP,
-                                       usage=ModelTokenUsage(input_tokens=10, output_tokens=8))
+                                       usage=ModelTokenUsage(input_tokens=10, generation_tokens=8))
             finally:
                 pass
         source = chunks()
@@ -118,7 +118,7 @@ class StreamGateway:
                     closed = True
                     gateway.closed += 1
                     await source.aclose()
-        return ModelStream(chunks=OwnedChunks(), model="portable-model", applied_output_limit=invocation.output_limit.max_tokens,
+        return ModelStream(chunks=OwnedChunks(), model="portable-model", applied_generation_limit=invocation.output_budget.max_generation_tokens,
                            activity_support=getattr(self, "activity_support", "semantic_only"))
 
 
@@ -210,7 +210,7 @@ async def test_planner_attempt_deadline_is_independent_from_run_timeout():
             attempt_timeout_ms=20,
         ),
         runtime_limits=RuntimeLimits(
-            max_run_output_tokens=None,
+            max_run_generation_tokens=None,
             provider_invocation_timeout_ms=1_000,
             root_run_timeout_ms=2_000,
         ),
@@ -257,8 +257,14 @@ async def test_format_and_host_repairs_receive_only_the_previous_output(repair_a
         "needsTodos": True,
         "title": "Draft selected items",
         "taskSpec": {"goal": "Draft three items", "operation": "write", "target": target},
-        "todos": [{"id": "draft", "title": "Draft selected items", "type": "write",
-                   "executor": "model", "riskLevel": "read"}],
+        "todos": [
+            {"id": "analyze", "title": "Analyze selected items", "type": "analyze",
+             "executor": "model", "riskLevel": "read"},
+            {"id": "draft", "title": "Draft selected items", "type": "write",
+             "executor": "model", "riskLevel": "read", "dependsOn": ["analyze"]},
+            {"id": "review", "title": "Review drafted items", "type": "review",
+             "executor": "model", "riskLevel": "read", "dependsOn": ["draft"]},
+        ],
         "repairEvidence": "PRIVATE_REPAIR_EVIDENCE",
     }
     invalid = {**plan, "taskSpec": {**plan["taskSpec"], "target": target["collection"]}}
@@ -327,8 +333,9 @@ async def test_rejected_planner_output_is_bounded_and_excluded_from_error_serial
         assert "rejected_output" not in vars(error)
         assert "😀" not in json.dumps(vars(error), ensure_ascii=False)
         assert "PRIVATE_REASONING" not in str(error.args)
-    assert evidence == rejected[:65_536]
-    assert len(evidence) == 65_536
+    expected_limit = 2_048 if repair_attempts else 65_536
+    assert evidence == rejected[:expected_limit]
+    assert len(evidence) == expected_limit
     assert gateway.opened == gateway.closed == repair_attempts + 1
 
 
@@ -415,10 +422,10 @@ async def test_projection_dedup_forgery_run_isolation_and_terminal_fences():
     ({"max_provider_output_bytes": 20}, [wire(text="准备检查。"), wire()]),
     ({"max_stream_content_chars": 20}, [wire()]),
     ({"max_stream_chunks": 1}, [wire(text="准备检查。"), wire()]),
-    ({"max_run_output_tokens": 7}, [wire()]),
+    ({"max_run_generation_tokens": 7}, [wire()]),
 ])
 async def test_planning_and_repair_share_run_and_stream_budgets(limits, script):
-    core, adapters, gateway = managed([script, script], runtime_limits=RuntimeLimits(**{"max_run_output_tokens": None, **limits}))
+    core, adapters, gateway = managed([script, script], runtime_limits=RuntimeLimits(**{"max_run_generation_tokens": None, **limits}))
     try:
         handle = await core.submit(_request())
         assert (await handle.wait()).status.value == "failed"
@@ -432,7 +439,7 @@ async def test_planning_and_repair_share_run_and_stream_budgets(limits, script):
 @pytest.mark.asyncio
 async def test_silent_planning_has_an_absolute_timeout_without_invented_progress():
     gate = asyncio.Event()
-    core, adapters, gateway = managed([[gate]], runtime_limits=RuntimeLimits(max_run_output_tokens=None, provider_invocation_timeout_ms=15))
+    core, adapters, gateway = managed([[gate]], runtime_limits=RuntimeLimits(max_run_generation_tokens=None, provider_invocation_timeout_ms=15))
     try:
         handle = await core.submit(_request())
         assert (await handle.wait()).status.value == "failed"
@@ -520,14 +527,18 @@ async def test_dynamic_revision_uses_the_managed_stream_and_keeps_completed_work
     from purra.ports import ToolRegistration
     from purra.tools import InMemoryToolCatalog
     initial = {"needsTodos": True, "title": "Inspect", "todos": [
-        {"id": "inspect", "title": "Inspect", "type": "read", "executor": "tool", "expectedTools": ["lookup"]}]}
+        {"id": "inspect", "title": "Inspect", "type": "read", "executor": "tool", "expectedTools": ["lookup"]},
+        {"id": "analyze", "title": "Analyze", "type": "analyze", "executor": "model", "dependsOn": ["inspect"]},
+        {"id": "review", "title": "Review", "type": "review", "executor": "model", "dependsOn": ["analyze"]},
+        {"id": "respond", "title": "Respond", "type": "review", "executor": "model", "dependsOn": ["review"]},
+    ]}
 
     class Gateway(StreamGateway):
         async def stream(self, messages, invocation, signal=None):
             if invocation.tools:
                 async def chunks():
                     yield ModelStreamChunk(tool_call_deltas=(ToolCallDelta(index=0, id="lookup-call", name="lookup", arguments_fragment="{}"),), finish_reason=ModelFinishReason.TOOL_CALLS)
-                return ModelStream(chunks=chunks(), model="portable-model", applied_output_limit=invocation.output_limit.max_tokens)
+                return ModelStream(chunks=chunks(), model="portable-model", applied_generation_limit=invocation.output_budget.max_generation_tokens)
             return await super().stream(messages, invocation, signal)
 
     gateway = Gateway([[wire(text="准备检查证据。"), wire(plan=initial)], [wire(text="准备依据结果组织回答。"), wire()]])
@@ -538,7 +549,7 @@ async def test_dynamic_revision_uses_the_managed_stream_and_keeps_completed_work
     adapters = InMemoryAgentAdapters()
     core = AgentCore(model_gateway=gateway, run_repository=adapters.runs, output_repository=adapters.outputs,
         output_publisher=adapters.publisher, context_provider=_Context(), planner=AgentPlanner(gateway),
-        planning_policy=Policy(), runtime_limits=RuntimeLimits(max_run_output_tokens=None),
+        planning_policy=Policy(), runtime_limits=RuntimeLimits(max_run_generation_tokens=None),
         tool_catalog=InMemoryToolCatalog((ToolRegistration(
             schema=ToolSchema(name="lookup", description="Inspect", parameters={"type": "object", "properties": {}}),
             handler=lookup, policy=ToolPolicy(mode="read", title="Inspect")),)))
@@ -611,7 +622,7 @@ async def test_non_streaming_planner_and_host_validator_fail_before_execution():
 @pytest.mark.asyncio
 async def test_active_planning_cannot_extend_its_absolute_deadline():
     core, _, gateway = managed([[wire()]], runtime_limits=RuntimeLimits(
-        max_run_output_tokens=None, provider_invocation_timeout_ms=20))
+        max_run_generation_tokens=None, provider_invocation_timeout_ms=20))
     original = gateway.stream
     async def stream(messages, invocation, signal=None):
         source = await original(messages, invocation, signal)
@@ -701,7 +712,7 @@ async def test_core_keeps_host_operation_observer_without_losing_canonical_plann
     gateway = StreamGateway([[wire(text='准备核对。'), wire()]])
     core = AgentCore(model_gateway=gateway, planner=AgentPlanner(gateway), planning_policy=Policy(),
         run_repository=adapters.runs, output_repository=adapters.outputs, output_publisher=adapters.publisher,
-        operation_controller=AgentOperationController(Observer()), runtime_limits=RuntimeLimits(max_run_output_tokens=None))
+        operation_controller=AgentOperationController(Observer()), runtime_limits=RuntimeLimits(max_run_generation_tokens=None))
     try:
         handle = await core.submit(replace(_request(), context_window=32768))
         assert (await handle.wait()).status.value == 'done'
@@ -743,7 +754,7 @@ async def test_host_admission_denial_does_not_succeed_or_install_plan(mode):
 async def test_cancel_settles_already_reported_planning_usage_once():
     gate = asyncio.Event()
     core, adapters, _ = managed([[ModelStreamChunk(content_delta=wire(text='准备检查。'),
-        usage=ModelTokenUsage(input_tokens=10, output_tokens=3)), gate, wire()]])
+        usage=ModelTokenUsage(input_tokens=10, generation_tokens=3)), gate, wire()]])
     try:
         handle = await core.submit(_request())
         async for event in handle.subscribe():
@@ -752,7 +763,7 @@ async def test_cancel_settles_already_reported_planning_usage_once():
         await handle.wait()
         usages = adapters.runs._state.runs[handle.run_id].model_usage_by_invocation
         assert len(usages) == 1
-        assert next(iter(usages.values())).output_tokens == 3
+        assert next(iter(usages.values())).generation_tokens == 3
         await handle.cancel('repeat cancellation')
         assert len(usages) == 1
     finally:

@@ -1,5 +1,5 @@
 import { AgentOperationController } from "../operations/index.js";
-import { estimateMessagesTokens } from "../context/budget.js";
+import { estimateMessagesTokens, maxGenerationTokensForContext } from "../context/budget.js";
 import type {
   ContextEvidenceReceipt,
   ModelInputEvidenceValidator,
@@ -21,10 +21,11 @@ import { AgentCanceledError, AgentError } from "../shared/errors.js";
 import {
   constrainModelInvocationTimeout,
   invokeModel,
+  modelFailureUsage,
   type ModelStreamLimits,
 } from "../model/stream.js";
 import type {
-  InvocationOutputLimit,
+  InvocationOutputBudget,
   Message,
   ModelCapabilitySnapshot,
   ModelGateway,
@@ -32,14 +33,16 @@ import type {
   ModelStreamChunk,
   ModelTokenUsage,
   ModelTurn,
+  ResultCapacitySource,
 } from "../model/types.js";
 import {
   copyCapabilitySnapshot,
   copyMessages,
-  resolveInvocationOutputLimit,
+  constrainOutputBudgetToContext,
+  resolveInvocationOutputBudget,
 } from "../model/validation.js";
 
-type ManagedModelRequest = ModelRequest & { readonly outputLimit: InvocationOutputLimit };
+type ManagedModelRequest = ModelRequest & { readonly outputBudget: InvocationOutputBudget };
 
 export const REJECTED_PLANNER_OUTPUT = Symbol("rejectedPlannerOutput");
 export type PlannerOutputError = AgentError & { readonly [REJECTED_PLANNER_OUTPUT]?: string };
@@ -72,12 +75,13 @@ export interface ModelTaskRunnerOptions {
   readonly operations?: AgentOperationController;
   readonly authority?: ModelTaskInvocationAuthority;
   readonly runtimeLimits?: ModelStreamLimits;
-  readonly maxCallOutputTokens?: number;
+  readonly maxGenerationTokens?: number;
   readonly evidenceValidator?: ModelInputEvidenceValidator;
 }
 
 export interface ModelTaskOptions {
-  readonly maxCallOutputTokens?: number;
+  readonly resultCapacityTargetTokens?: number;
+  readonly resultCapacitySource?: ResultCapacitySource;
   readonly signal?: AbortSignal;
 }
 
@@ -94,7 +98,7 @@ export interface ModelTaskPlanOptions extends ModelTaskOptions {
 
 export interface ModelTaskCompletion {
   readonly turn: ModelTurn;
-  readonly outputLimit: InvocationOutputLimit;
+  readonly outputBudget: InvocationOutputBudget;
 }
 
 export interface ModelTaskTextResult {
@@ -103,18 +107,18 @@ export interface ModelTaskTextResult {
   readonly finishReason: ModelTurn["finishReason"];
   readonly usage?: ModelTokenUsage;
   readonly attempts: number;
-  readonly outputLimit: InvocationOutputLimit;
+  readonly outputBudget: InvocationOutputBudget;
 }
 
 export class ModelTaskRunner {
   readonly #model: ModelGateway;
   readonly #runId: string;
-  readonly #capabilities: ModelCapabilitySnapshot | undefined;
+  readonly #capabilities: ModelCapabilitySnapshot;
   readonly #recovery: RecoveryPolicy;
   readonly #operations: AgentOperationController | undefined;
   readonly #authority: ModelTaskInvocationAuthority | undefined;
   readonly #runtimeLimits: ModelStreamLimits | undefined;
-  readonly #maxCallOutputTokens: number | undefined;
+  readonly #maxGenerationTokens: number | undefined;
   readonly #evidenceValidator: ModelInputEvidenceValidator | undefined;
   #contextEvidence: readonly ContextEvidenceReceipt[] = Object.freeze([]);
 
@@ -136,17 +140,33 @@ export class ModelTaskRunner {
       }
     }
     this.#model = options.model;
-    this.#capabilities = options.model.capabilities === undefined
-      ? undefined
-      : copyCapabilitySnapshot(options.model.capabilities);
-    if (this.#capabilities?.actionable === false) {
+    if (Object.prototype.hasOwnProperty.call(options, "maxCallOutputTokens")) {
+      throw new AgentError(
+        "model_output_budget_invalid",
+        "Legacy model-task output limits are unsupported",
+      );
+    }
+    if (options.model.capabilities === undefined) {
+      throw new AgentError(
+        "model_generation_limit_unknown",
+        "Model tasks require a verified model capability snapshot",
+      );
+    }
+    this.#capabilities = copyCapabilitySnapshot(options.model.capabilities);
+    if (this.#capabilities.maxGenerationTokens === null) {
+      throw new AgentError(
+        "model_generation_limit_unknown",
+        "Model capabilities do not declare a verified generation limit",
+      );
+    }
+    if (this.#capabilities.actionable === false) {
       throw new AgentError("model_capability_incompatible", "Model capability snapshot is not actionable");
     }
     this.#recovery = options.recovery ?? new RecoveryPolicy();
     this.#operations = options.operations;
     this.#authority = options.authority;
     this.#runtimeLimits = options.runtimeLimits;
-    this.#maxCallOutputTokens = options.maxCallOutputTokens;
+    this.#maxGenerationTokens = options.maxGenerationTokens;
     if (
       options.evidenceValidator !== undefined
       && typeof options.evidenceValidator.validateEvidence !== "function"
@@ -168,9 +188,9 @@ export class ModelTaskRunner {
     messages: readonly Message[],
     options: ModelTaskOptions = {},
   ): Promise<ModelTaskCompletion> {
-    const request = this.#request(messages, options.maxCallOutputTokens);
+    const request = this.#request(messages, options);
     const turn = await this.#invoke(request, options.signal, false);
-    return Object.freeze({ turn, outputLimit: request.outputLimit });
+    return Object.freeze({ turn, outputBudget: request.outputBudget });
   }
 
   public async plan(messages: readonly Message[], options: ModelTaskPlanOptions = {}): Promise<ModelTaskCompletion> {
@@ -191,7 +211,7 @@ export class ModelTaskRunner {
     let trailingHighSurrogate = false;
     const started = performance.now();
     const metrics: Record<string, JsonValue> = { attemptStartedAtMs: Date.now(), firstPublicProgressMs: null, planReceivedMs: null, rejectedPublicProgressRecords: 0, validationMs: null };
-    const request = this.#request(messages, options.maxCallOutputTokens);
+    const request = this.#request(messages, options);
     const turn = await this.#invoke(request, options.signal, true, async (chunk, receipt) => {
       for (const character of chunk.contentDelta ?? "") {
         const joinsSurrogate = trailingHighSurrogate && /^[\udc00-\udfff]$/u.test(character);
@@ -230,7 +250,7 @@ export class ModelTaskRunner {
       }
       throw error;
     });
-    return Object.freeze({ turn, outputLimit: request.outputLimit });
+    return Object.freeze({ turn, outputBudget: request.outputBudget });
   }
 
   public async streamText(
@@ -247,7 +267,7 @@ export class ModelTaskRunner {
 
     while (true) {
       attempts += 1;
-      const request = this.#request(active, options.maxCallOutputTokens);
+      const request = this.#request(active, options);
       const turn = await this.#invoke(request, options.signal, true, async (chunk) => {
         if ((chunk.toolCallDeltas?.length ?? 0) > 0) {
           throw new AgentError("model_task_tool_call_unsupported", "Model task cannot call tools");
@@ -263,7 +283,7 @@ export class ModelTaskRunner {
           finishReason: turn.finishReason,
           ...(turn.usage === undefined ? {} : { usage: turn.usage }),
           attempts,
-          outputLimit: request.outputLimit,
+          outputBudget: request.outputBudget,
         });
       }
 
@@ -298,27 +318,59 @@ export class ModelTaskRunner {
 
   #request(
     messages: readonly Message[],
-    maxCallOutputTokens: number | undefined,
+    options: ModelTaskOptions,
   ): ManagedModelRequest {
-    const outputLimit = resolveInvocationOutputLimit(
-      this.#capabilities,
-      maxCallOutputTokens ?? this.#maxCallOutputTokens,
-    );
-    if (outputLimit === undefined) {
+    if (
+      Object.prototype.hasOwnProperty.call(options, "maxGenerationTokens")
+      || Object.prototype.hasOwnProperty.call(options, "maxCallOutputTokens")
+    ) {
       throw new AgentError(
-        "model_output_limit_unknown",
-        "Model task requires capabilities with an exact output limit",
+        "model_output_budget_invalid",
+        "Model task generation allowance belongs to its bound Run request",
       );
     }
+    const baseOutputBudget = resolveInvocationOutputBudget(
+      this.#capabilities,
+      {
+        ...(this.#maxGenerationTokens === undefined
+          ? {}
+          : { maxGenerationTokens: this.#maxGenerationTokens, generationSource: "user" as const }),
+        ...(options.resultCapacityTargetTokens === undefined
+          ? {}
+          : {
+              resultCapacityTargetTokens: options.resultCapacityTargetTokens,
+              resultCapacitySource: options.resultCapacitySource ?? "user",
+            }),
+      },
+    );
+    let outputBudget: InvocationOutputBudget;
+    try {
+      outputBudget = constrainOutputBudgetToContext(
+        baseOutputBudget,
+        maxGenerationTokensForContext({
+          windowTokens: this.#capabilities.contextWindowTokens,
+          tools: [],
+        }),
+      );
+    } catch (error) {
+      if (error instanceof AgentError && error.code === "fixed_reserves_exceed_window") {
+        throw new AgentError(
+          "model_task_input_exceeds_budget",
+          "Model task input and output reserve exceed the model window",
+          { cause: error },
+        );
+      }
+      throw error;
+    }
     const copied = Object.freeze(copyMessages(messages));
-    if (estimateMessagesTokens(copied) + outputLimit.maxTokens > this.#capabilities!.contextWindowTokens) {
+    if (estimateMessagesTokens(copied) + outputBudget.maxGenerationTokens > this.#capabilities.contextWindowTokens) {
       throw new AgentError("model_task_input_exceeds_budget", "Model task input and output reserve exceed the model window");
     }
     return Object.freeze({
       messages: copied,
       tools: Object.freeze([]),
-      ...(this.#capabilities === undefined ? {} : { capabilitySnapshot: this.#capabilities }),
-      outputLimit,
+      capabilitySnapshot: this.#capabilities,
+      outputBudget,
     });
   }
 
@@ -338,7 +390,7 @@ export class ModelTaskRunner {
       tools: request.tools,
       evidence,
       capabilityProfileId: this.#capabilities?.profileId ?? null,
-      outputLimit: request.outputLimit.maxTokens,
+      outputBudget: request.outputBudget,
       ...planning,
     });
     let operation: OperationReceipt | undefined;
@@ -375,6 +427,7 @@ export class ModelTaskRunner {
           ),
         diagnostics === undefined ? undefined : (metrics) => { Object.assign(diagnostics, metrics); },
       );
+      latestUsage = turn.usage ?? latestUsage;
       assertNoToolCalls(turn);
       validateTurn?.();
       if (signal?.aborted === true) throw new AgentCanceledError();
@@ -394,7 +447,13 @@ export class ModelTaskRunner {
       if (receipt !== undefined && !settled) {
         try {
           settled = true;
-          await this.#authority!.settleInvocation(receipt, "failed", undefined, errorCode(error), latestUsage);
+          await this.#authority!.settleInvocation(
+            receipt,
+            "failed",
+            undefined,
+            errorCode(error),
+            latestUsage ?? modelFailureUsage(error),
+          );
         } catch (terminationError) {
           if (planning !== undefined) failure = planningTerminationFailure(failure, terminationError);
         }

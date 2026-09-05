@@ -74,7 +74,7 @@ from purra.model_invocation import (
 )
 from purra.model_invocation.evidence import bind_model_input_evidence
 from purra.model_invocation.manager import ModelInvocationOutputObserver
-from purra.model_protocol import InvocationOutputLimit, classify_model_termination
+from purra.model_protocol import InvocationOutputBudget, classify_model_termination
 from purra.planning_activation import (
     AUTO_PLANNING_TOOL_NAME,
     AUTO_REMAINING_PLANNING_TOOL_NAME,
@@ -234,7 +234,7 @@ class AgentRuntime:
         observer: RuntimeObserver | None = None,
         context_compressor: ConversationCompactor | None = None,
         limits: RuntimeLimits = RuntimeLimits(
-            max_run_output_tokens=None,
+            max_run_generation_tokens=None,
         ),
         recovery_policy: RecoveryPolicy = RecoveryPolicy(),
         operation_controller: AgentOperationController | None = None,
@@ -272,7 +272,7 @@ class AgentRuntime:
         run_id: RunId | None = None,
         turn_id: str | None = None,
         context_budget: ContextBudget | None = None,
-        output_limit: InvocationOutputLimit | None = None,
+        output_budget: InvocationOutputBudget | None = None,
         round_input_tokens: int | None = None,
         scope_tools_to_observer: bool = True,
         force_tool_choice: bool = False,
@@ -322,6 +322,7 @@ class AgentRuntime:
             tool_context_contracts=tool_context_contracts,
             tool_argument_limits=tool_argument_limits,
             model_round_limit=model_round_limit,
+            context_budget=context_budget,
         )
         start_round_index = 0
         if resume_checkpoint is not None:
@@ -408,7 +409,7 @@ class AgentRuntime:
                 request,
                 context_budget=context_budget,
                 round_input_tokens=round_input_tokens,
-                output_limit=output_limit,
+                output_budget=output_budget,
                 scope_tools_to_observer=scope_tools_to_observer,
                 reasoning_mode=reasoning_mode,
                 planning_hook=planning_hook,
@@ -425,7 +426,7 @@ class AgentRuntime:
             async for event in self._execute_provider_stream(
                 loop,
                 run_id=run_id,
-                output_limit=output_limit,
+                output_budget=output_budget,
                 signal=signal,
             ):
                 yield event
@@ -438,7 +439,7 @@ class AgentRuntime:
             async for event in self._classify_model_output(
                 loop,
                 response_constraints=response_constraints,
-                output_limit=output_limit,
+                output_budget=output_budget,
                 planning_hook=planning_hook,
                 planning_mode=planning_mode,
                 signal=signal,
@@ -1004,7 +1005,7 @@ class AgentRuntime:
         loop: _RuntimeLoopState,
         *,
         response_constraints: ResponseConstraints,
-        output_limit: InvocationOutputLimit | None,
+        output_budget: InvocationOutputBudget | None,
         planning_hook: RuntimePlanningHook | None,
         planning_mode: PlanningMode,
         signal: CancellationSignal | None,
@@ -1041,7 +1042,7 @@ class AgentRuntime:
                     finish_reason=finish_reason,
                     error_code=error_code,
                     emitted_delta_count=loop.emitted_delta_count,
-                    output_limit=output_limit,
+                    output_budget=output_budget,
                 ),
             )
             loop.terminal_result = _runtime_result(
@@ -1291,26 +1292,6 @@ class AgentRuntime:
                 return
 
         final_response = accumulator.content
-        if (
-            planning_mode is PlanningMode.AUTO
-            and loop.transaction_mode is ResponseTransactionMode.DIRECT_LIVE
-            and loop.stream is not None
-            and loop.stream.receipt.output_intent
-            is AgentOutputIntent.STRUCTURED_PRIVATE
-        ):
-            await self._model_manager.publish_model_stream_final(
-                loop.stream.receipt.output_stream_id
-            )
-            if self._observer is not None and final_response:
-                await self._observer.on_model_delta()
-            loop.terminal_result = _runtime_result(
-                run_id,
-                RuntimeOutcome.COMPLETED,
-                loop.used_model,
-                loop.round_number,
-                final_response=final_response,
-            )
-            return
         presentation_messages = public_presentation_messages(
             content=final_response,
             reasoning=accumulator.reasoning,
@@ -1347,7 +1328,7 @@ class AgentRuntime:
         loop: _RuntimeLoopState,
         *,
         run_id: RunId | None,
-        output_limit: InvocationOutputLimit | None,
+        output_budget: InvocationOutputBudget | None,
         signal: CancellationSignal | None,
     ) -> AsyncIterator[AgentEvent]:
         attempt = loop.provider_attempt
@@ -1552,19 +1533,19 @@ class AgentRuntime:
                     "attempt": attempt.attempt,
                     "logicalRound": attempt.logical_round,
                     "actualInputTokens": usage.input_tokens,
-                    "actualOutputTokens": usage.output_tokens,
+                    "actualGenerationTokens": usage.generation_tokens,
                     "actualTotalTokens": usage.total_tokens,
                     "cachedInputTokens": usage.cached_input_tokens,
-                    "reasoningOutputTokens": usage.reasoning_output_tokens,
-                    "requestedCallOutputTokens": (
-                        invocation.max_call_output_tokens
+                    "reasoningTokens": usage.reasoning_tokens,
+                    "requestedGenerationTokens": (
+                        invocation.max_generation_tokens
                     ),
                     "finishReason": (
                         finish_reason.value if finish_reason is not None else None
                     ),
-                    "outputLimit": (
-                        invocation.output_limit.to_mapping()
-                        if invocation.output_limit is not None
+                    "outputBudget": (
+                        invocation.output_budget.to_mapping()
+                        if invocation.output_budget is not None
                         else None
                     ),
                     "localInputEstimate": local_input_estimate,
@@ -1576,24 +1557,24 @@ class AgentRuntime:
                     run_id=run_id,
                     payload={
                         "actualInputTokens": usage.input_tokens,
-                        "actualOutputTokens": usage.output_tokens,
+                        "actualGenerationTokens": usage.generation_tokens,
                         "actualTotalTokens": usage.total_tokens,
                         "cachedInputTokens": usage.cached_input_tokens,
-                        "reasoningOutputTokens": usage.reasoning_output_tokens,
+                        "reasoningTokens": usage.reasoning_tokens,
                         "actualUsageRound": attempt.logical_round,
                         "inputTokenEstimateAtUsage": local_input_estimate,
                         "usageSource": "provider",
-                        "requestedCallOutputTokens": (
-                            invocation.max_call_output_tokens
+                        "requestedGenerationTokens": (
+                            invocation.max_generation_tokens
                         ),
                         "finishReason": (
                             finish_reason.value
                             if finish_reason is not None
                             else None
                         ),
-                        "outputLimit": (
-                            invocation.output_limit.to_mapping()
-                            if invocation.output_limit is not None
+                        "outputBudget": (
+                            invocation.output_budget.to_mapping()
+                            if invocation.output_budget is not None
                             else None
                         ),
                     },
@@ -1654,7 +1635,7 @@ class AgentRuntime:
         *,
         context_budget: ContextBudget | None,
         round_input_tokens: int | None,
-        output_limit: InvocationOutputLimit | None,
+        output_budget: InvocationOutputBudget | None,
         scope_tools_to_observer: bool,
         reasoning_mode: ReasoningMode,
         planning_hook: RuntimePlanningHook | None,
@@ -1727,7 +1708,7 @@ class AgentRuntime:
             request,
             context_budget=context_budget,
             round_input_tokens=round_input_tokens,
-            output_limit=output_limit,
+            output_budget=output_budget,
             scope_tools_to_observer=scope_tools_to_observer,
             reasoning_mode=reasoning_mode,
             stage_context_projection_enabled=stage_context_projection_enabled,
@@ -1742,7 +1723,7 @@ class AgentRuntime:
         *,
         context_budget: ContextBudget | None,
         round_input_tokens: int | None,
-        output_limit: InvocationOutputLimit | None,
+        output_budget: InvocationOutputBudget | None,
         scope_tools_to_observer: bool,
         reasoning_mode: ReasoningMode,
         stage_context_projection_enabled: bool,
@@ -1974,7 +1955,7 @@ class AgentRuntime:
                     if visible_tools
                     else ToolChoiceMode.NONE
                 ),
-                output_limit=output_limit,
+                output_budget=output_budget,
                 reasoning_mode=reasoning_mode,
             ),
             allowed_names=allowed_names,
@@ -2003,6 +1984,7 @@ class AgentRuntime:
         tool_context_contracts: Mapping[str, ToolContextContract] | None,
         tool_argument_limits: Mapping[str, int] | None,
         model_round_limit: int | None,
+        context_budget: ContextBudget | None,
     ) -> _RuntimeLoopState:
         messages = list(request.messages)
         validators = tuple(response_validators)
@@ -2054,6 +2036,22 @@ class AgentRuntime:
                 turn_id=turn_id,
                 requested_reasoning_mode=reasoning_mode,
                 tool_argument_limits=tool_argument_limits or {},
+                context_window_tokens=(
+                    context_budget.window_tokens
+                    if context_budget is not None
+                    else request.context_window
+                    or request.model.capability_snapshot.context_window_tokens
+                ),
+                safety_reserve_tokens=(
+                    context_budget.safety_reserve_tokens
+                    if context_budget is not None
+                    else None
+                ),
+                runtime_reserve_tokens=(
+                    context_budget.runtime_reserve_tokens
+                    if context_budget is not None
+                    else None
+                ),
             ),
             execution_state=execution_state or ExecutionState(),
             evidence_store=evidence_store,

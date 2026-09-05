@@ -27,7 +27,6 @@ from purra.output.contracts import (
     AgentOutputEvent,
     AgentOutputEventDraft,
     AgentOutputIntent,
-    DelegationOutputEvent,
     DomainEffectOutput,
     OutputChannel,
     OutputEventKind,
@@ -340,11 +339,11 @@ class AgentOutputProcessor:
                     visibility=OutputVisibility.PRIVATE,
                     payload={
                         "inputTokens": authorized.usage.input_tokens,
-                        "outputTokens": authorized.usage.output_tokens,
+                        "generationTokens": authorized.usage.generation_tokens,
                         "totalTokens": authorized.usage.total_tokens,
                         "cachedInputTokens": authorized.usage.cached_input_tokens,
-                        "reasoningOutputTokens": (
-                            authorized.usage.reasoning_output_tokens
+                        "reasoningTokens": (
+                            authorized.usage.reasoning_tokens
                         ),
                     },
                     occurred_at=occurred_at,
@@ -646,36 +645,6 @@ class AgentOutputProcessor:
             payload={
                 "eventType": event.event_type,
                 "data": payload,
-            },
-            occurred_at=event.occurred_at,
-        ))
-
-    async def accept_delegation_event(
-        self,
-        event: DelegationOutputEvent,
-    ) -> AgentOutputEvent:
-        if not isinstance(event, DelegationOutputEvent):
-            raise TypeError("output processor requires a DelegationOutputEvent")
-        return await self._append(AgentOutputEventDraft(
-            run_id=event.run_id,
-            turn_id=self._run_turn_ids.get(event.run_id),
-            output_stream_id=None,
-            invocation_id=None,
-            source_event_key=f"delegation-status:{event.event_id}",
-            source=OutputSource.RUNTIME,
-            kind=OutputEventKind.DELEGATION,
-            channel=OutputChannel.DELEGATION,
-            visibility=OutputVisibility.PUBLIC,
-            payload={
-                "eventType": "status",
-                "batchId": event.batch_id,
-                "delegationId": event.delegation_id,
-                "runId": event.run_id,
-                "agentName": event.agent_name,
-                "agentTitle": event.agent_title,
-                "objective": event.objective,
-                "status": event.status,
-                "errorCode": event.error_code,
             },
             occurred_at=event.occurred_at,
         ))

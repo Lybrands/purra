@@ -13,14 +13,14 @@ const calls = { llm: 0, embedding: 0 };
 const captured = [];
 function embed(text) { calls.embedding++; return [Number(text.includes("简短")), Number(text.includes("详细")), Number(text.includes("中文")), 1]; }
 const providers = {
-  budget: { key: "sdk-test", maxLlmCalls: 4, maxEmbeddingCalls: 64, maxInputChars: 100_000, maxOutputTokens: 8192, maxCallOutputTokens: 2048 },
+  budget: { key: "sdk-test", maxLlmCalls: 4, maxEmbeddingCalls: 64, maxInputChars: 100_000, maxOutputTokens: 8192, resultCapacityTargetTokens: 2048 },
   async complete(messages, cap, signal) {
     calls.llm++; captured.push(messages);
     const payload = messages[0].content.startsWith("Review a pending memory")
       ? { relations: JSON.parse(messages[1].content).related.map(r => ({ item: r.item, kind: "independent" })) }
       : { memory: [{ text: "用户希望使用中文回复。", entities: [] }] };
     return { message: { role: "assistant", content: JSON.stringify(payload) },
-      finishReason: "stop", appliedOutputLimit: cap, usage: { inputTokens: 100, outputTokens: 20 } };
+      finishReason: "stop", appliedGenerationLimit: cap, usage: { inputTokens: 100, generationTokens: 20 } };
   },
   async embed(texts, signal) { return { vectors: texts.map(embed), inputTokens: texts.reduce((n, t) => n + [...t].length, 0) }; },
 };
@@ -146,7 +146,7 @@ try {
         const supporting = this.test.answers.flatMap(answer => body.memories.filter(row => row.text.includes(answer)).map(row => [answer, row.id]))[0];
         payload = { answer: supporting?.[0] ?? null, evidence: supporting ? [supporting[1]] : [] };
       }
-      return { message: { role: "assistant", content: JSON.stringify(payload) }, finishReason: "stop", appliedOutputLimit: cap, usage: { inputTokens: 10, outputTokens: 20 } };
+      return { message: { role: "assistant", content: JSON.stringify(payload) }, finishReason: "stop", appliedGenerationLimit: cap, usage: { inputTokens: 10, generationTokens: 20 } };
     },
     async embed(texts) { return { vectors: texts.map(() => [1, 0]), inputTokens: texts.reduce((n, t) => n + [...t].length, 0) }; },
   };

@@ -108,7 +108,14 @@ def _usage(value):
         return None
     cached = value.get("cache_read_input_tokens") or 0
     inputs = value["input_tokens"] + cached + (value.get("cache_creation_input_tokens") or 0)
-    return ModelTokenUsage(input_tokens=inputs, output_tokens=value["output_tokens"], cached_input_tokens=cached)
+    return ModelTokenUsage(
+        input_tokens=inputs,
+        generation_tokens=value["output_tokens"],
+        cached_input_tokens=cached,
+        reasoning_tokens=(value.get("output_tokens_details") or {}).get(
+            "thinking_tokens"
+        ),
+    )
 
 
 def _finish(reason):
@@ -142,11 +149,11 @@ class AnthropicMessagesGateway:
     def _request(self, messages, invocation):
         if invocation.request.provider != "anthropic":
             raise ValueError("Anthropic gateway requires provider='anthropic'")
-        cap = invocation.max_call_output_tokens
+        cap = invocation.max_generation_tokens
         if cap is None:
-            raise ValueError("Anthropic gateway requires a resolved output limit")
+            raise ValueError("Anthropic gateway requires a resolved generation allowance")
         options = thaw_json_mapping(invocation.request.options)
-        if set(options) - {"max_tokens", "temperature", "top_p", "top_k", "thinking", "output_config"}:
+        if set(options) - {"temperature", "top_p", "top_k", "thinking", "output_config"}:
             raise ValueError("unsupported Anthropic model options")
         thinking = options.get("thinking")
         mode = invocation.reasoning_mode.value
@@ -185,7 +192,7 @@ class AnthropicMessagesGateway:
             return ModelCompletion(AgentMessage("assistant", content, tool_calls=calls,
                 provider_data=_attributes(raw["content"], params["model"])),
                 model=response.model, finish_reason=_finish(response.stop_reason), usage=_usage(raw.get("usage")),
-                applied_output_limit=params["max_tokens"])
+                applied_generation_limit=params["max_tokens"])
         except Exception as error:
             raise _error(error) from None
 
@@ -251,7 +258,7 @@ class AnthropicMessagesGateway:
             finally:
                 if stream is not None:
                     await stream.close()
-        return ModelStream(chunks(), invocation.request.model, applied_output_limit=params["max_tokens"],
+        return ModelStream(chunks(), invocation.request.model, applied_generation_limit=params["max_tokens"],
                            activity_support=ModelStreamActivitySupport.WORKING)
 
     async def close(self):

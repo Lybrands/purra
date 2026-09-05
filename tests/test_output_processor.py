@@ -56,7 +56,7 @@ def _limit():
         capability_snapshot=replace(
             generic_capability_snapshot(),
             profile_id="test:model",
-            max_call_output_tokens=200,
+            max_generation_tokens=200,
         ),
     )
     from purra.model_invocation import AgentModelCall
@@ -65,7 +65,7 @@ def _limit():
         request=request,
         output_intent=AgentOutputIntent.FINAL_PUBLIC,
         commit_mode=OutputCommitMode.LIVE,
-    ).output_limit
+    ).output_budget
 
 
 def _receipt(spec: OutputStreamSpec) -> ModelInvocationReceipt:
@@ -77,7 +77,7 @@ def _receipt(spec: OutputStreamSpec) -> ModelInvocationReceipt:
         model="model",
         output_intent=spec.intent,
         commit_mode=spec.commit_mode,
-        output_limit=_limit(),
+        output_budget=_limit(),
         input_fingerprint="input-fingerprint",
         tool_schema_fingerprint="tool-schema-fingerprint",
     )
@@ -447,7 +447,7 @@ async def test_ten_thousand_one_character_chunks_coalesce_deterministically():
             ModelStreamChunk(
                 content_delta="x",
                 usage=(
-                    ModelTokenUsage(input_tokens=0, output_tokens=0)
+                    ModelTokenUsage(input_tokens=0, generation_tokens=0)
                     if index == 9_999
                     else None
                 ),
@@ -786,7 +786,7 @@ async def test_eight_mib_candidate_clears_the_incident_corpus_with_two_x_headroo
             session_id=None,
             prompt="calibrate Provider output",
             mode=None,
-            runtime_limits=RuntimeLimits(max_run_output_tokens=None, max_provider_output_bytes=candidate),
+            runtime_limits=RuntimeLimits(max_run_generation_tokens=None, max_provider_output_bytes=candidate),
         ),
         AgentEvent(type="run.started"),
     )
@@ -834,7 +834,7 @@ async def test_eight_mib_candidate_rejects_oversize_before_provider_append():
             session_id=None,
             prompt="reject oversized Provider output",
             mode=None,
-            runtime_limits=RuntimeLimits(max_run_output_tokens=None, max_provider_output_bytes=candidate),
+            runtime_limits=RuntimeLimits(max_run_generation_tokens=None, max_provider_output_bytes=candidate),
         ),
         AgentEvent(type="run.started"),
     )
@@ -957,7 +957,6 @@ async def test_private_runtime_protocol_events_never_enter_canonical_journal():
         "model.call_recorded",
         "tool.calls_started",
         "tool.results",
-        "delegation.claimed",
     )):
         hidden = await processor.accept_runtime_event(RuntimeOutputEvent(
             event_id=f"private-{index}",

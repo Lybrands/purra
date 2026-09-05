@@ -308,17 +308,17 @@ class ContextCompressionCoordinator:
 
 
 def _default_budget(request: AgentRunRequest) -> ContextCompactionBudget:
-    output_tokens = 8_192
+    generation_tokens = 8_192
     allocated = allocate_context_budget(
         window_tokens=max(1, int(request.context_window or 128_000)),
-        output_reserve_tokens=output_tokens,
+        output_reserve_tokens=generation_tokens,
     )
     return ContextCompactionBudget(
         phase=ContextCompactionPhase.PRE_PLANNING,
         provider_input_tokens=allocated.provider_input_tokens,
         context_tokens=0,
         context_tokens_are_resolved=False,
-        output_reserve_tokens=output_tokens,
+        output_reserve_tokens=generation_tokens,
     )
 
 

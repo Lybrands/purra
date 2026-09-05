@@ -51,7 +51,11 @@ export class SemanticCompaction implements ContextCompressionHook {
       }) },
     ];
     if (estimateMessagesTokens(messages) > this.#inputTokens) throw new AgentError("context_overflow", "Semantic compaction input exceeds its configured limit");
-    const { turn } = await this.#tasks.complete(messages, { maxCallOutputTokens: this.#summaryTokens, ...(signal ? { signal } : {}) });
+    const { turn } = await this.#tasks.complete(messages, {
+      resultCapacityTargetTokens: this.#summaryTokens,
+      resultCapacitySource: "workflow_policy",
+      ...(signal ? { signal } : {}),
+    });
     if (turn.finishReason !== "stop" || turn.message.toolCalls?.length) throw new AgentError("compaction_invalid_summary", "Semantic compaction did not finish");
     let value: unknown;
     try { value = JSON.parse(typeof turn.message.content === "string" ? turn.message.content : ""); }

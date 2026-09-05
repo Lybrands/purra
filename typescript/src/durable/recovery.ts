@@ -83,8 +83,8 @@ export async function validateContinuation(input: {
   if (snapshot?.schemaVersion !== 1) {
     throw new AgentError("durable_recovery_snapshot_unsupported", "Recovery snapshot is unsupported");
   }
-  if (snapshot.preset.schemaVersion !== 4 || input.currentPreset.schemaVersion !== 4) {
-    throw new AgentError("agent_preset_snapshot_unsupported", "Durable continuation requires preset snapshot v4");
+  if (snapshot.preset.schemaVersion !== 5 || input.currentPreset.schemaVersion !== 5) {
+    throw new AgentError("agent_preset_snapshot_unsupported", "Durable continuation requires preset snapshot v5");
   }
   if (canonicalJson(snapshot.preset) !== canonicalJson(input.currentPreset)) {
     throw new AgentError("agent_preset_snapshot_mismatch", "Durable continuation preset does not match");
@@ -116,11 +116,17 @@ export async function validateContinuation(input: {
 
 function remainingBudgets(run: RunSnapshot): RunBudgets {
   if (
-    run.usage.unreportedUsageAttempts > 0
-    && (
-      run.budgets.maxInputTokens !== null
-      || run.budgets.maxRunOutputTokens !== null
-      || run.budgets.maxReasoningTokens !== null
+    (
+      run.usage.unreportedUsageAttempts > 0
+      && (
+        run.budgets.maxInputTokens !== null
+        || run.budgets.maxRunGenerationTokens !== null
+        || run.budgets.maxReasoningTokens !== null
+      )
+    )
+    || (
+      run.usage.unreportedReasoningAttempts > 0
+      && run.budgets.maxReasoningTokens !== null
     )
   ) {
     throw new AgentError(
@@ -131,9 +137,9 @@ function remainingBudgets(run: RunSnapshot): RunBudgets {
   return Object.freeze({
     maxModelAttempts: remaining(run.budgets.maxModelAttempts, run.usage.modelAttempts),
     maxInputTokens: remaining(run.budgets.maxInputTokens, run.usage.inputTokens),
-    maxRunOutputTokens: remaining(
-      run.budgets.maxRunOutputTokens,
-      run.usage.outputTokens,
+    maxRunGenerationTokens: remaining(
+      run.budgets.maxRunGenerationTokens,
+      run.usage.generationTokens,
     ),
     maxReasoningTokens: remaining(run.budgets.maxReasoningTokens, run.usage.reasoningTokens),
     maxOutputBytes: remaining(run.budgets.maxOutputBytes, run.usage.outputBytes),
@@ -155,9 +161,9 @@ function copyBudgets(value: RunBudgets): RunBudgets {
   return Object.freeze({
     maxModelAttempts: nullablePositive(value.maxModelAttempts, "maxModelAttempts"),
     maxInputTokens: nullablePositive(value.maxInputTokens, "maxInputTokens"),
-    maxRunOutputTokens: nullablePositive(
-      value.maxRunOutputTokens,
-      "maxRunOutputTokens",
+    maxRunGenerationTokens: nullablePositive(
+      value.maxRunGenerationTokens,
+      "maxRunGenerationTokens",
     ),
     maxReasoningTokens: nullablePositive(value.maxReasoningTokens, "maxReasoningTokens"),
     maxOutputBytes: nullablePositive(value.maxOutputBytes, "maxOutputBytes"),

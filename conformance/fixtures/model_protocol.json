@@ -77,44 +77,76 @@
       "errorCode": "unsupported_model_finish_reason"
     }
   ],
-  "outputLimitCases": [
+  "outputBudgetCases": [
     {
-      "profileMaxTokens": 1000,
-      "userOverride": null,
-      "outputLimit": {
-        "maxTokens": 1000,
-        "source": "model_profile",
-        "profileMaxTokens": 1000
+      "profileMaxGenerationTokens": 1000,
+      "maxGenerationTokens": null,
+      "generationSource": null,
+      "resultCapacityTargetTokens": null,
+      "resultCapacitySource": null,
+      "outputBudget": {
+        "maxGenerationTokens": 1000,
+        "generationSource": "model_profile",
+        "profileMaxGenerationTokens": 1000,
+        "requestedUserMaxGenerationTokens": null,
+        "resultCapacityTargetTokens": null,
+        "resultCapacitySource": null,
+        "nonResultHeadroomTokens": null
       },
       "errorCode": null
     },
     {
-      "profileMaxTokens": 1000,
-      "userOverride": 200,
-      "outputLimit": {
-        "maxTokens": 200,
-        "source": "user_override",
-        "profileMaxTokens": 1000
+      "profileMaxGenerationTokens": 1000,
+      "maxGenerationTokens": 600,
+      "generationSource": "user",
+      "resultCapacityTargetTokens": 200,
+      "resultCapacitySource": "workflow_policy",
+      "outputBudget": {
+        "maxGenerationTokens": 600,
+        "generationSource": "user",
+        "profileMaxGenerationTokens": 1000,
+        "requestedUserMaxGenerationTokens": 600,
+        "resultCapacityTargetTokens": 200,
+        "resultCapacitySource": "workflow_policy",
+        "nonResultHeadroomTokens": 400
       },
       "errorCode": null
     },
     {
-      "profileMaxTokens": 1000,
-      "userOverride": 1200,
-      "outputLimit": null,
-      "errorCode": "model_output_limit_exceeded"
+      "profileMaxGenerationTokens": 1000,
+      "maxGenerationTokens": 600,
+      "generationSource": "context_capacity",
+      "resultCapacityTargetTokens": null,
+      "resultCapacitySource": null,
+      "outputBudget": null,
+      "errorCode": "model_output_budget_invalid"
     },
     {
-      "profileMaxTokens": 1000,
-      "userOverride": 0,
-      "outputLimit": null,
-      "errorCode": "model_output_limit_invalid"
+      "profileMaxGenerationTokens": 1000,
+      "maxGenerationTokens": 1200,
+      "generationSource": "user",
+      "resultCapacityTargetTokens": null,
+      "resultCapacitySource": null,
+      "outputBudget": null,
+      "errorCode": "model_generation_limit_exceeded"
     },
     {
-      "profileMaxTokens": null,
-      "userOverride": null,
-      "outputLimit": null,
-      "errorCode": "model_output_limit_unknown"
+      "profileMaxGenerationTokens": 1000,
+      "maxGenerationTokens": 200,
+      "generationSource": "user",
+      "resultCapacityTargetTokens": 300,
+      "resultCapacitySource": "workflow_policy",
+      "outputBudget": null,
+      "errorCode": "model_output_budget_invalid"
+    },
+    {
+      "profileMaxGenerationTokens": null,
+      "maxGenerationTokens": null,
+      "generationSource": null,
+      "resultCapacityTargetTokens": null,
+      "resultCapacitySource": null,
+      "outputBudget": null,
+      "errorCode": "model_generation_limit_unknown"
     }
   ]
 }

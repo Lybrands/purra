@@ -31,6 +31,7 @@ from purra.contracts import (
     RuntimeLimits,
 )
 from purra.errors import ContractViolationError, InvalidPlannerOutputError, ModelGatewayError
+from purra.context_budget import max_generation_tokens_for_actual_input
 from purra.evidence import context_evidence_receipts
 from purra.model_invocation.evidence import (
     current_model_input_evidence,
@@ -45,7 +46,11 @@ from purra.model_invocation.contracts import (
     ModelInvocationContext,
     ModelInvocationReceipt,
 )
-from purra.model_protocol import classify_model_termination
+from purra.model_protocol import (
+    classify_model_termination,
+    constrain_output_budget_to_context,
+    resolve_invocation_output_budget,
+)
 from purra.operations import (
     AgentOperationController,
     OperationDisplay,
@@ -65,7 +70,11 @@ from purra.ports import (
 from purra.ports import RunRepository
 from purra.stream_ownership import OwnedAsyncIterator, close_async_resource
 from purra.planning_stream import PLANNING_STREAM_SCHEMA, PlanningStreamParser
-from purra.model_protocol import FeatureSupport
+from purra.model_protocol import (
+    FeatureSupport,
+    ReasoningUsageDetail,
+    ThinkingTokenAccounting,
+)
 
 
 class ModelInvocationOutputObserver(Protocol):
@@ -135,7 +144,7 @@ class AgentModelInvocationManager:
         operation_controller: AgentOperationController | None = None,
         invocation_timeout_ms: int | None = 300_000,
         runtime_limits: RuntimeLimits = RuntimeLimits(
-            max_run_output_tokens=None,
+            max_run_generation_tokens=None,
         ),
         max_tool_argument_chars: int = 1_000_000,
         budget_repository: RunRepository | None = None,
@@ -178,6 +187,7 @@ class AgentModelInvocationManager:
         _diagnostics: dict | None = None,
     ) -> ManagedInvocationStream:
         self._validate_call(call, context, public_stream_allowed=True)
+        call = self._fit_call_to_context(messages, call, context)
         invocation = _invocation(call)
         receipt, spec = self._receipt_and_spec(messages, call, context, invocation)
         if on_attempt is not None:
@@ -212,9 +222,9 @@ class AgentModelInvocationManager:
                 invocation_signal,
             )
             raise_if_stopped(invocation_signal)
-            _require_applied_output_limit(
+            _require_applied_generation_budget(
                 invocation,
-                stream.applied_output_limit,
+                stream.applied_generation_limit,
             )
             meter = self._stream_meter(context)
             liveness = _StreamLiveness(
@@ -280,7 +290,7 @@ class AgentModelInvocationManager:
                     operation_id,
                     meter,
                     liveness,
-                    invocation.output_limit.max_tokens,
+                    invocation,
                     call.request.protocol_capabilities.public_progress
                     is FeatureSupport.SUPPORTED,
                     receipt,
@@ -373,7 +383,9 @@ class AgentModelInvocationManager:
             completion=ModelCompletion(
                 message=AgentMessage(role=MessageRole.ASSISTANT, content=json.dumps(thaw_json_mapping(plan))),
                 model=call.request.model, usage=usage, finish_reason=reason,
-                applied_output_limit=call.output_limit.max_tokens,
+                applied_generation_limit=(
+                    stream.receipt.output_budget.max_generation_tokens
+                ),
             ), receipt=stream.receipt,
         )
 
@@ -403,6 +415,7 @@ class AgentModelInvocationManager:
         on_attempt: Callable[[Mapping[str, object]], Awaitable[None]] | None = None,
     ) -> ManagedInvocationCompletion:
         self._validate_call(call, context, public_stream_allowed=False)
+        call = self._fit_call_to_context(messages, call, context)
         invocation = _invocation(call)
         receipt, spec = self._receipt_and_spec(messages, call, context, invocation)
         if on_attempt is not None:
@@ -415,6 +428,7 @@ class AgentModelInvocationManager:
         attempt_reserved = False
         attempt_settled = False
         meter = self._stream_meter(context)
+        usage = None
         try:
             await self._validate_evidence(receipt, invocation_signal)
             await self._reserve_attempt(receipt)
@@ -425,11 +439,19 @@ class AgentModelInvocationManager:
                 self._gateway.complete(messages, invocation, invocation_signal),
                 invocation_signal,
             )
+            usage = completion.usage
             raise_if_stopped(invocation_signal)
-            _require_applied_output_limit(
+            _require_applied_generation_budget(
                 invocation,
-                completion.applied_output_limit,
-                completion.usage,
+                completion.applied_generation_limit,
+            )
+            _require_reported_usage_within_generation_budget(
+                invocation,
+                usage,
+                require_usage=self._requires_reported_usage(invocation),
+                require_reasoning_usage=(
+                    self._limits.max_reasoning_tokens is not None
+                ),
             )
             reason = completion.finish_reason
             if reason is None:
@@ -479,7 +501,7 @@ class AgentModelInvocationManager:
                 if attempt_reserved and not attempt_settled:
                     attempt_settled = True
                     try:
-                        await self._settle_attempt(receipt, None)
+                        await self._settle_attempt(receipt, usage)
                     except BaseException as budget_error:
                         selected_error = budget_error
                 if stream_opened and not output_settled:
@@ -528,6 +550,69 @@ class AgentModelInvocationManager:
                 "public output requires the streaming Provider boundary"
             )
 
+    def _fit_call_to_context(
+        self,
+        messages: Sequence[AgentMessage],
+        call: AgentModelCall,
+        context: ModelInvocationContext,
+    ) -> AgentModelCall:
+        """Apply the physical remainder of this exact Provider request.
+
+        Context planning reserves only a workflow result-capacity target.  The
+        actual Provider generation ceiling is resolved here, after messages
+        and tool schemas are final, so a large profile allowance cannot erase
+        the input budget and later rounds cannot silently overrun the window.
+        """
+
+        snapshot = call.request.capability_snapshot
+        window = context.context_window_tokens or snapshot.context_window_tokens
+        if window > snapshot.context_window_tokens:
+            raise ContractViolationError(
+                "model invocation context window exceeds the model profile",
+                code="model_context_capacity_incompatible",
+                details={
+                    "selectedContextWindowTokens": window,
+                    "profileContextWindowTokens": snapshot.context_window_tokens,
+                },
+            )
+        physical_maximum = max_generation_tokens_for_actual_input(
+            window_tokens=window,
+            messages=messages,
+            tools=call.tools,
+            safety_reserve_tokens=context.safety_reserve_tokens,
+            runtime_reserve_tokens=context.runtime_reserve_tokens,
+        )
+        base_budget = resolve_invocation_output_budget(
+            snapshot,
+            max_generation_tokens=call.request.max_generation_tokens,
+            result_capacity_target_tokens=(
+                call.output_budget.result_capacity_target_tokens
+            ),
+            result_capacity_source=call.output_budget.result_capacity_source,
+        )
+        budget = constrain_output_budget_to_context(
+            base_budget,
+            max_generation_tokens=physical_maximum,
+        )
+        return call if budget == call.output_budget else replace(
+            call,
+            output_budget=budget,
+        )
+
+    def _requires_reported_usage(self, invocation: ModelInvocation) -> bool:
+        return (
+            invocation.request.capability_snapshot.output.reasoning_usage_detail
+            is ReasoningUsageDetail.REQUIRED
+            or any(
+                value is not None
+                for value in (
+                    self._limits.max_input_tokens,
+                    self._limits.max_run_generation_tokens,
+                    self._limits.max_reasoning_tokens,
+                )
+            )
+        )
+
     def _receipt_and_spec(
         self,
         messages: Sequence[AgentMessage],
@@ -548,10 +633,22 @@ class AgentModelInvocationManager:
             model=call.request.model,
             output_intent=call.output_intent,
             commit_mode=call.commit_mode,
-            output_limit=call.output_limit,
-            input_fingerprint=_fingerprint([
-                message.to_mapping() for message in messages
-            ]),
+            output_budget=call.output_budget,
+            input_fingerprint=_fingerprint({
+                "messages": [message.to_mapping() for message in messages],
+                "modelRequest": {
+                    "provider": call.request.provider,
+                    "model": call.request.model,
+                    "profileId": call.request.profile_id,
+                    "capabilitySnapshotDigest": (
+                        call.request.capability_snapshot.digest()
+                    ),
+                    "requestedUserMaxGenerationTokens": (
+                        call.request.max_generation_tokens
+                    ),
+                    "options": thaw_json_mapping(call.request.options),
+                },
+            }),
             tool_schema_fingerprint=_fingerprint([
                 {
                     "name": tool.name,
@@ -666,7 +763,7 @@ class AgentModelInvocationManager:
         operation_id: str | None,
         meter: "_StreamMeter",
         liveness: "_StreamLiveness",
-        expected_output_limit: int,
+        invocation: ModelInvocation,
         public_progress_allowed: bool,
         budget_receipt: ModelInvocationReceipt,
         close_signal: Callable[[], None],
@@ -695,6 +792,15 @@ class AgentModelInvocationManager:
                         code="model_stream_item_invalid",
                     )
                 chunk = item
+                if chunk.usage is not None:
+                    usage = chunk.usage
+                    _require_reported_usage_within_generation_budget(
+                        invocation,
+                        usage,
+                        require_reasoning_usage=(
+                            self._limits.max_reasoning_tokens is not None
+                        ),
+                    )
                 if chunk.progress_delta and not public_progress_allowed:
                     raise ContractViolationError(
                         "model gateway emitted undeclared public progress",
@@ -702,11 +808,6 @@ class AgentModelInvocationManager:
                     )
                 meaningful = liveness.accept_chunk(chunk)
                 meter.accept(chunk)
-                usage = chunk.usage or usage
-                _require_reported_usage_within_limit(
-                    expected_output_limit,
-                    chunk.usage,
-                )
                 tool_indices.update(delta.index for delta in chunk.tool_call_deltas)
                 await await_with_cancellation(self._output.accept_provider_chunk(
                     receipt.output_stream_id, chunk,
@@ -716,6 +817,14 @@ class AgentModelInvocationManager:
                 raise_if_stopped(signal)
                 if chunk.finish_reason is not None:
                     liveness.close()
+                    _require_reported_usage_within_generation_budget(
+                        invocation,
+                        usage,
+                        require_usage=self._requires_reported_usage(invocation),
+                        require_reasoning_usage=(
+                            self._limits.max_reasoning_tokens is not None
+                        ),
+                    )
                     attempt_settled = True
                     await self._settle_attempt(budget_receipt, usage)
                     finish_reason = chunk.finish_reason
@@ -732,6 +841,15 @@ class AgentModelInvocationManager:
                         await self._fail_operation_code(
                             operation_id,
                             termination.error_code or "model_output_truncated",
+                        )
+                        operation_settled = True
+                        raise ModelGatewayError(
+                            "model output is incomplete",
+                            code=(
+                                termination.error_code
+                                or "model_output_truncated"
+                            ),
+                            retryable=False,
                         )
                     else:
                         await self._output.finish_model_stream(
@@ -886,37 +1004,76 @@ def _invocation(call: AgentModelCall) -> ModelInvocation:
         request=call.request,
         tools=call.tools,
         tool_choice=call.tool_choice,
-        output_limit=call.output_limit,
+        output_budget=call.output_budget,
         reasoning_mode=call.reasoning_mode,
     )
 
 
-def _require_applied_output_limit(
+def _require_applied_generation_budget(
     invocation: ModelInvocation,
-    applied_output_limit: int | None,
-    usage=None,
+    applied_generation_limit: int | None,
 ) -> None:
-    expected = invocation.output_limit.max_tokens
-    if applied_output_limit != expected:
+    expected = invocation.output_budget.max_generation_tokens
+    if applied_generation_limit != expected:
         raise ContractViolationError(
             "Model gateway did not apply the requested invocation output limit",
             code="model_gateway_contract_violation",
             details={
-                "expectedOutputLimit": expected,
-                "appliedOutputLimit": applied_output_limit,
+                "expectedGenerationLimit": expected,
+                "appliedGenerationLimit": applied_generation_limit,
             },
         )
-    _require_reported_usage_within_limit(expected, usage)
-
-
-def _require_reported_usage_within_limit(expected: int, usage) -> None:
-    if usage is not None and usage.output_tokens > expected:
+def _require_reported_usage_within_generation_budget(
+    invocation: ModelInvocation,
+    usage,
+    *,
+    require_usage: bool = False,
+    require_reasoning_usage: bool = False,
+) -> None:
+    if usage is None:
+        if require_usage:
+            raise ContractViolationError(
+                "Model gateway omitted required Provider usage",
+                code="model_gateway_contract_violation",
+                details={"usage": None},
+            )
+        return
+    expected = invocation.output_budget.max_generation_tokens
+    if usage.generation_tokens > expected:
         raise ContractViolationError(
-            "Model gateway reported output usage above the invocation limit",
+            "Model gateway reported generation usage above the invocation budget",
             code="model_gateway_contract_violation",
             details={
-                "expectedOutputLimit": expected,
-                "reportedOutputTokens": usage.output_tokens,
+                "expectedGenerationLimit": expected,
+                "reportedGenerationTokens": usage.generation_tokens,
+            },
+        )
+    capabilities = invocation.request.capability_snapshot.output
+    if (
+        (
+            capabilities.reasoning_usage_detail is ReasoningUsageDetail.REQUIRED
+            or require_reasoning_usage
+        )
+        and usage.reasoning_tokens is None
+    ):
+        raise ContractViolationError(
+            "Model gateway omitted required reasoning-token usage",
+            code="model_gateway_contract_violation",
+            details={"reasoningTokens": None},
+        )
+    if (
+        capabilities.thinking_token_accounting
+        is ThinkingTokenAccounting.INCLUDED
+        and usage.reasoning_tokens is not None
+        and usage.reasoning_tokens > usage.generation_tokens
+    ):
+        raise ContractViolationError(
+            "Model gateway reported included reasoning usage above total generation usage",
+            code="model_gateway_contract_violation",
+            details={
+                "reportedGenerationTokens": usage.generation_tokens,
+                "reportedReasoningTokens": usage.reasoning_tokens,
+                "thinkingTokenAccounting": "included",
             },
         )
 

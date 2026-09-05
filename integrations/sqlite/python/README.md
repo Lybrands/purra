@@ -33,7 +33,7 @@ core = AgentCore(
 ```
 
 Select `scope` from the application's authenticated user/project binding.
-The bundle also exposes `idempotency`, `run_tree`, `delegations`, `artifacts`,
+The bundle also exposes `idempotency`, `run_tree`, `artifacts`,
 and `long_tasks` for the corresponding Core ports.
 
 ## Recovery
@@ -49,9 +49,101 @@ before retrying. For persisted questions and answers, use
 
 ## Storage and shutdown
 
-Each scope is stored as one transactional snapshot. Loading and serialization
-cost grow with its history, so this adapter suits bounded local workloads.
+Canonical output events are appended as rows with Run and Root sequence indexes.
+Event additions and the execution snapshot commit in one transaction. Output
+pagination and subscription polling neither load the execution snapshot nor
+acquire a writer lock. Run queries, lease lookup and `list_running()` remain
+read-only. Tool receipts, lease renewal/release, cancellation requests, Agent
+tree, Artifact and Long Task repository operations skip journal hydration and
+flushing. Writes with an identifiable Run or output stream validate the Root
+tree's sequence counts in SQL and buffer new events without decoding its history.
+Core rules that inspect history (including planning projections and terminal
+operation settlement) load the required Run's original events on demand.
+Shared budgets still use all sibling Run counters; event-key replay uses indexed
+lookups. Run reads retain complete Root journal hydration.
+Cross-Root event keys use an index; Python SQLite requires `json_extract`, and
+opening an existing v3 database creates this index on first use. Lease acquisition,
+public `transaction()` and operations without an identifiable Run still validate
+the full scope. Execution snapshots retain Run history,
+checkpoints and receipts and are still loaded and saved at scope granularity.
+This adapter therefore still suits bounded local workloads.
+Storage v3 rejects v1/v2 data without automatic migration; existing databases
+cannot be resumed directly.
 Python and TypeScript execution snapshots are not interchangeable.
+Both SDKs defer history loading for Run-scoped writes. SQL sequence checks scan the
+selected Root's covering index without fetching event body rows or sorting by
+Run. Root headers also have a covering index. Existing v3 databases build these
+indexes on opening; this takes time and disk space, and inserts maintain them.
+Metadata snapshots remain scope-sized, so these writes are
+not constant-cost. Event bodies are validated when read; lease acquisition and
+public transactions continue to decode the full journal.
+Body Run/Root ids and sequence values must match their SQL columns on every
+event read, including indexed replay and pagination. Inconsistent rows raise
+`ValueError` and roll back the current transaction; they are not automatically
+repaired. Unread event bodies remain deferred.
+
+From the repository root, measure empty output polling and tail pagination with
+100, 1,000 and 5,000 historical events:
+
+```sh
+PYTHONPATH=src:integrations/sqlite/python/src .venv/bin/python integrations/sqlite/python/scripts/benchmark_reads.py
+```
+
+This temporary-database benchmark reports warm median read latency, not
+concurrent throughput or real-model end-to-end performance.
+
+Measure tool receipt writes at the same journal sizes, including both claim and
+result-commit transactions:
+
+```sh
+PYTHONPATH=src:integrations/sqlite/python/src .venv/bin/python integrations/sqlite/python/scripts/benchmark_writes.py
+```
+
+The tool callback is local and has no external side effect; this excludes real
+business-tool and model latency.
+
+Measure active Run event writes beside a growing unrelated Root:
+
+```sh
+PYTHONPATH=src:integrations/sqlite/python/src .venv/bin/python integrations/sqlite/python/scripts/benchmark_run_writes.py
+```
+
+This measures isolation from other Roots, not scaling within a single growing Root.
+
+Measure appends, model-attempt reservations and checkpoint commits within the same
+growing Root (two warmups and ten measured writes per operation):
+
+```sh
+PYTHONPATH=src:integrations/sqlite/python/src .venv/bin/python integrations/sqlite/python/scripts/benchmark_execution_writes.py
+```
+
+The history consists of private domain events. This excludes planning evidence
+replay, concurrent throughput and real Provider latency.
+Add `--profile` to report journal preparation, execution-state encoding/decoding
+and the remaining transaction time separately. Phase medians are calculated
+independently and need not sum to the total median.
 
 The application owns database access, backups, and retention. Checkpoints contain
 private model data. Call `await core.close()` before `storage.close()`.
+
+## Opt-in closeout verification
+
+After building TypeScript Core and SQLite, run both SDKs through separate writer
+processes, transaction termination, tool-receipt reconciliation and checkpoint
+reopening. The default fixture has 20 Roots, 60 Runs, 20,000 events and 64 KiB
+checkpoint messages per Root; all databases and effect markers are temporary.
+
+```sh
+PYTHONPATH=src:integrations/sqlite/python/src .venv/bin/python integrations/sqlite/python/scripts/verify_load.py --output /tmp/purra-load.json
+```
+
+`scripts/verify_provider.py` additionally runs a synthetic lookup task against a
+user-selected DeepSeek configuration in a PurrTypos settings database. It requires
+network access and consumes real API tokens. Supply `--config-db`, `--config-id`
+and `--output`; add `.:integrations/openai/python/src` to `PYTHONPATH` and install
+the OpenAI SDK. Credentials are read in memory, never written to the report.
+Its explicit test transport maps `max_completion_tokens` to `max_tokens`, disables
+thinking, drops OpenAI-only options, and maps `developer` messages to `system`.
+This does not certify unmodified OpenAI transport compatibility with DeepSeek.
+The eager reference is current code with deferred hydration disabled, not a
+historical release. One paired run is functional evidence, not a latency SLA.

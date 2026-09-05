@@ -8,7 +8,7 @@ and classifies the terminal provider reason.
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from purra.cancellation import await_with_cancellation, is_canceled
 from purra.contracts import (
@@ -29,9 +29,10 @@ from purra.model_invocation import (
     ModelInvocationContext,
 )
 from purra.model_protocol import (
-    InvocationOutputLimit,
+    InvocationOutputBudget,
+    ResultCapacitySource,
     classify_model_termination,
-    resolve_invocation_output_limit,
+    resolve_invocation_output_budget,
 )
 from purra.output import AgentOutputIntent, OutputCommitMode
 from purra.ports import CancellationSignal, ResponseJudgePolicy
@@ -50,19 +51,24 @@ class AgentModelTask:
     """Extension-declared intent for one PurrA-owned private model task."""
 
     request: ModelRequest
-    output_limit: InvocationOutputLimit | None = None
+    result_capacity_target_tokens: int | None = None
     reasoning_mode: ReasoningMode | None = None
+    output_budget: InvocationOutputBudget = field(init=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.request, ModelRequest):
             raise TypeError("managed model call requires a ModelRequest")
-        limit = self.output_limit or resolve_invocation_output_limit(
+        budget = resolve_invocation_output_budget(
             self.request.capability_snapshot,
-            self.request.options.get("max_tokens"),
+            max_generation_tokens=self.request.max_generation_tokens,
+            result_capacity_target_tokens=self.result_capacity_target_tokens,
+            result_capacity_source=(
+                ResultCapacitySource.WORKFLOW_POLICY
+                if self.result_capacity_target_tokens is not None
+                else None
+            ),
         )
-        if not isinstance(limit, InvocationOutputLimit):
-            raise TypeError("managed model call requires an InvocationOutputLimit")
-        object.__setattr__(self, "output_limit", limit)
+        object.__setattr__(self, "output_budget", budget)
         if self.reasoning_mode is not None:
             object.__setattr__(
                 self,
@@ -74,7 +80,7 @@ class AgentModelTask:
 @dataclass(frozen=True, slots=True)
 class AgentModelTaskCompletion:
     completion: ModelCompletion
-    output_limit: InvocationOutputLimit
+    output_budget: InvocationOutputBudget
     call_parameters: tuple[Mapping[str, object], ...]
 
 
@@ -82,7 +88,7 @@ class AgentModelTaskCompletion:
 class AgentModelTaskStream:
     chunks: AsyncIterator[ModelStreamChunk]
     model: str
-    output_limit: InvocationOutputLimit
+    output_budget: InvocationOutputBudget
     call_parameters: tuple[Mapping[str, object], ...]
 
 
@@ -105,13 +111,17 @@ class AgentModelTaskRunner:
         self,
         manager: AgentModelInvocationManager,
         context: ModelInvocationContext,
+        request: ModelRequest,
     ) -> None:
         if not isinstance(manager, AgentModelInvocationManager):
             raise TypeError("model task runner requires PurrA's invocation manager")
         if not isinstance(context, ModelInvocationContext):
             raise TypeError("model task runner requires a Run context")
+        if not isinstance(request, ModelRequest):
+            raise TypeError("model task runner requires the Root ModelRequest")
         self._manager = manager
         self._context = context
+        self._request = request
 
     @property
     def run_id(self) -> str:
@@ -129,6 +139,7 @@ class AgentModelTaskRunner:
             Callable[[Mapping[str, object]], Awaitable[None]] | None
         ) = None,
     ) -> AgentModelTaskCompletion:
+        self._require_root_request(call.request)
         managed = await self._manager.complete(
             messages,
             _agent_call(call, self._context.requested_reasoning_mode),
@@ -138,7 +149,7 @@ class AgentModelTaskRunner:
         )
         return AgentModelTaskCompletion(
             completion=managed.completion,
-            output_limit=managed.receipt.output_limit,
+            output_budget=managed.receipt.output_budget,
             call_parameters=managed.receipt.call_parameters,
         )
 
@@ -152,6 +163,7 @@ class AgentModelTaskRunner:
             Callable[[Mapping[str, object]], Awaitable[None]] | None
         ) = None,
     ) -> AgentModelTaskStream:
+        self._require_root_request(call.request)
         managed = await self._manager.stream(
             messages,
             _agent_call(call, self._context.requested_reasoning_mode),
@@ -162,9 +174,17 @@ class AgentModelTaskRunner:
         return AgentModelTaskStream(
             chunks=_validated_chunks(managed.chunks, signal),
             model=managed.receipt.model,
-            output_limit=managed.receipt.output_limit,
+            output_budget=managed.receipt.output_budget,
             call_parameters=managed.receipt.call_parameters,
         )
+
+    def _require_root_request(self, request: ModelRequest) -> None:
+        if request != self._request:
+            raise ModelGatewayError(
+                "managed model task differs from the Root model request",
+                code="model_request_identity_conflict",
+                retryable=False,
+            )
 
     async def stream_text(
         self,
@@ -311,7 +331,7 @@ def _agent_call(
         commit_mode=OutputCommitMode.PRIVATE,
         requires_full_text_validation=True,
         reasoning_mode=call.reasoning_mode or inherited_reasoning_mode,
-        output_limit=call.output_limit,
+        output_budget=call.output_budget,
     )
 
 

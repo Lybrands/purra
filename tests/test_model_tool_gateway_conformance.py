@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from purra.contracts import (
@@ -8,7 +10,7 @@ from purra.contracts import (
     ModelCompletion,
     ModelFinishReason,
     ModelInvocation,
-    InvocationOutputLimit,
+    InvocationOutputBudget,
     ModelRequest,
     ModelStream,
     ModelStreamChunk,
@@ -20,6 +22,7 @@ from purra.contracts import (
     ToolSchema,
 )
 from purra.operations import AgentOperationController
+from purra.model_protocol import generic_capability_snapshot
 from purra.ports import ToolRegistration
 from purra.testing import (
     assert_model_gateway_conforms,
@@ -53,13 +56,22 @@ def _tool() -> ToolSchema:
 
 def _invocation() -> ModelInvocation:
     return ModelInvocation(
-        request=ModelRequest(provider="portable", model="portable-model"),
+        request=ModelRequest(
+            provider="portable",
+            model="portable-model",
+            capability_snapshot=replace(
+                generic_capability_snapshot(),
+                max_generation_tokens=256,
+            ),
+            max_generation_tokens=256,
+        ),
         tools=(_tool(),),
         tool_choice="required",
-        output_limit=InvocationOutputLimit(
-            max_tokens=256,
-            source="workflow_policy",
-            profile_max_tokens=256,
+        output_budget=InvocationOutputBudget(
+            max_generation_tokens=256,
+            generation_source="user",
+            profile_max_generation_tokens=256,
+            requested_user_max_generation_tokens=256,
         ),
     )
 
@@ -86,7 +98,7 @@ class _PortableModelGateway:
         return ModelStream(
             chunks=chunks(),
             model="portable-model",
-            applied_output_limit=invocation.output_limit.max_tokens,
+            applied_generation_limit=invocation.output_budget.max_generation_tokens,
         )
 
     async def complete(self, messages, invocation, signal=None):
@@ -101,7 +113,7 @@ class _PortableModelGateway:
                 ),),
             ),
             model="portable-model",
-            applied_output_limit=invocation.output_limit.max_tokens,
+            applied_generation_limit=invocation.output_budget.max_generation_tokens,
             finish_reason=ModelFinishReason.TOOL_CALLS,
         )
 
@@ -132,7 +144,7 @@ async def test_model_gateway_probe_rejects_stream_without_terminal_reason():
             return ModelStream(
                 chunks=chunks(),
                 model="portable-model",
-                applied_output_limit=invocation.output_limit.max_tokens,
+                applied_generation_limit=invocation.output_budget.max_generation_tokens,
             )
 
     with pytest.raises(AssertionError):
@@ -162,7 +174,7 @@ async def test_model_gateway_probe_rejects_incomplete_tool_call():
             return ModelStream(
                 chunks=chunks(),
                 model="portable-model",
-                applied_output_limit=invocation.output_limit.max_tokens,
+                applied_generation_limit=invocation.output_budget.max_generation_tokens,
             )
 
     with pytest.raises(AssertionError, match="missing_tool_call_id"):

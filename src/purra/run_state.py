@@ -21,6 +21,7 @@ from purra.contracts import (
     ToolBatchOutcome,
 )
 from purra.normalization import (
+    optional_positive_int,
     optional_text as _optional_text,
     required_text,
 )
@@ -57,6 +58,9 @@ class RunSnapshot:
     execution_checkpoint: AgentExecutionCheckpoint | None = None
     agent_preset_snapshot: Mapping[str, Any] = field(default_factory=dict)
     deadline_at_ms: int | None = None
+    requested_user_max_generation_tokens: int | None = None
+    result_capacity_target_tokens: int | None = None
+    selected_context_window_tokens: int | None = None
 
     def __post_init__(self) -> None:
         run_id = required_text(self.run_id, "run snapshot run id")
@@ -103,6 +107,19 @@ class RunSnapshot:
             "agent_preset_snapshot",
             freeze_json_mapping(self.agent_preset_snapshot or {}),
         )
+        for name in (
+            "requested_user_max_generation_tokens",
+            "result_capacity_target_tokens",
+            "selected_context_window_tokens",
+        ):
+            object.__setattr__(
+                self,
+                name,
+                optional_positive_int(
+                    getattr(self, name),
+                    f"run snapshot {name}",
+                ),
+            )
         if self.execution_checkpoint is not None:
             if not isinstance(
                 self.execution_checkpoint,

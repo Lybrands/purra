@@ -10,10 +10,10 @@ from purra.api import (
     AgentComponentBinding,
     AgentCore,
     AgentCoreRunOptions,
+    AgentTreePolicy,
     AgentModelTaskRunner,
     AgentPreset,
     ContextStrategy,
-    DelegationPolicy,
     ExecutionProfile,
     InMemoryAgentAdapters,
     PromptSection,
@@ -89,7 +89,7 @@ class _Gateway:
         return ModelStream(
             chunks=_chunks(self.response),
             model="portable-model",
-            applied_output_limit=invocation.output_limit.max_tokens,
+            applied_generation_limit=invocation.output_budget.max_generation_tokens,
         )
 
     async def complete(self, messages, invocation, signal=None):
@@ -100,7 +100,7 @@ class _Gateway:
                 content=self.response,
             ),
             model="portable-model",
-            applied_output_limit=invocation.output_limit.max_tokens,
+            applied_generation_limit=invocation.output_budget.max_generation_tokens,
             finish_reason=ModelFinishReason.STOP,
         )
 
@@ -141,7 +141,7 @@ class _ScriptedToolGateway(_Gateway):
         return ModelStream(
             chunks=chunks(),
             model="portable-model",
-            applied_output_limit=invocation.output_limit.max_tokens,
+            applied_generation_limit=invocation.output_budget.max_generation_tokens,
         )
 
 
@@ -298,13 +298,51 @@ def _request() -> AgentRunRequest:
             capability_snapshot=replace(
                 generic_capability_snapshot(),
                 profile_id="portable:model",
-                max_call_output_tokens=1_024,
+                max_generation_tokens=1_024,
             ),
-            options={"max_tokens": 512},
+            max_generation_tokens=512,
         ),
         domain_context=DomainContext(namespace="portable.demo"),
         context_window=8_192,
     )
+
+
+@pytest.mark.asyncio
+async def test_large_profile_generation_limit_does_not_collapse_input_budget():
+    class BudgetContext(_Context):
+        def __init__(self):
+            super().__init__()
+            self.budgets = []
+
+        async def build_context(self, request, budget, signal=None):
+            self.budgets.append(budget)
+            return await super().build_context(request, budget, signal)
+
+    context = BudgetContext()
+    gateway = _Gateway("done")
+    request = replace(
+        _request(),
+        context_window=200_000,
+        model=replace(
+            _request().model,
+            max_generation_tokens=None,
+            capability_snapshot=replace(
+                _request().model.capability_snapshot,
+                context_window_tokens=200_000,
+                max_generation_tokens=100_000,
+            ),
+        ),
+    )
+    core = _core(gateway=gateway, context=context)
+    try:
+        result = await (await core.submit(request)).wait()
+    finally:
+        await core.close()
+
+    assert result.status is RunStatus.DONE
+    assert context.budgets[0].output_reserve_tokens == 8_192
+    assert context.budgets[0].provider_input_tokens > 100_000
+    assert gateway.invocations[0].max_generation_tokens == 100_000
 
 
 def _core(
@@ -315,7 +353,7 @@ def _core(
     adapters=None,
     runtime_limits=None,
     tool_catalog=None,
-    delegation=False,
+    agent_tree=False,
 ):
     adapters = adapters or InMemoryAgentAdapters()
     resolved_profile = profile or ExecutionProfile()
@@ -337,16 +375,15 @@ def _core(
         run_repository=adapters.runs,
         output_repository=adapters.outputs,
         output_publisher=adapters.publisher,
-        delegation_repository=(adapters.delegations if delegation else None),
-        tool_idempotency_gateway=(adapters.idempotency if delegation else None),
+        run_tree_repository=(adapters.run_tree if agent_tree else None),
         preset=AgentPreset(
             id="portable",
             revision="1",
             tool_catalog=tool_catalog or InMemoryToolCatalog(()),
             context_provider=context,
-            runtime_limits=runtime_limits or RuntimeLimits(max_run_output_tokens=None),
+            runtime_limits=runtime_limits or RuntimeLimits(max_run_generation_tokens=None),
             execution_profile=resolved_profile,
-            delegation_policy=(DelegationPolicy() if delegation else None),
+            agent_tree_policy=(AgentTreePolicy() if agent_tree else None),
             component_bindings=bindings,
             prompt_sections=(PromptSection(
                 name="identity",
@@ -376,7 +413,7 @@ class _BudgetExhaustingGateway(_Gateway):
         return ModelStream(
             chunks=chunks(),
             model="portable-model",
-            applied_output_limit=invocation.output_limit.max_tokens,
+            applied_generation_limit=invocation.output_budget.max_generation_tokens,
         )
 
 
@@ -394,7 +431,7 @@ class _UnknownStreamFailureGateway(_Gateway):
         return ModelStream(
             chunks=chunks(),
             model="portable-model",
-            applied_output_limit=invocation.output_limit.max_tokens,
+            applied_generation_limit=invocation.output_budget.max_generation_tokens,
         )
 
 
@@ -419,7 +456,7 @@ class _RetryableStreamFailureGateway(_Gateway):
         return ModelStream(
             chunks=chunks(),
             model="portable-model",
-            applied_output_limit=invocation.output_limit.max_tokens,
+            applied_generation_limit=invocation.output_budget.max_generation_tokens,
         )
 
 
@@ -469,7 +506,7 @@ async def test_reactive_run_bypasses_configured_planner_and_staged_context():
 
 
 @pytest.mark.asyncio
-async def test_auto_direct_answer_uses_one_model_call_and_no_planner_call():
+async def test_auto_direct_answer_uses_tool_free_live_presentation():
     async def lookup(state, arguments, signal=None):
         del state, arguments, signal
         return ToolHandlerResult(content="found", effect_state="not_started")
@@ -515,18 +552,32 @@ async def test_auto_direct_answer_uses_one_model_call_and_no_planner_call():
     assert result.status is RunStatus.DONE
     assert result.final_response == "portable direct answer"
     assert planner.calls == 0
-    assert len(gateway.invocations) == 1
+    assert len(gateway.invocations) == 2
     assert {tool.name for tool in gateway.invocations[0].tools} == {
         "lookup",
         "request_plan",
     }
+    assert gateway.invocations[1].tools == ()
+    assert [
+        (event.payload["outputIntent"], event.payload["commitMode"])
+        for event in events
+        if event.kind.value == "stream.opened"
+    ] == [
+        ("structured_private", "private"),
+        ("final_public", "live"),
+    ]
     assert (context.single_pass_calls, context.planning_calls) == (1, 0)
     assert [
-        event.payload["delta"]
+        entry["payload"]["delta"]
         for event in events
-        if event.kind.value == "provider.content_delta"
-        and event.channel.value == "final"
+        if event.channel.value == "final"
         and event.visibility.value == "public"
+        for entry in (
+            event.payload["entries"]
+            if event.kind.value == "provider.delta_batch"
+            else ({"kind": event.kind.value, "payload": event.payload},)
+        )
+        if entry["kind"] == "provider.content_delta"
     ] == ["portable direct answer"]
 
 
@@ -566,7 +617,7 @@ async def test_auto_request_plan_promotes_before_execution_and_stays_private():
         gateway=gateway,
         context=context,
         adapters=adapters,
-        delegation=True,
+        agent_tree=True,
         profile=ExecutionProfile(
             planner=planner,
             planning_policy=_AlwaysPlan(),
@@ -696,7 +747,7 @@ async def test_require_tool_call_does_not_assume_provider_required_choice_suppor
         tool_calls += 1
         return ToolHandlerResult(content="found", effect_state="not_started")
 
-    gateway = _ScriptedToolGateway(("lookup", None))
+    gateway = _ScriptedToolGateway(("lookup", None, None))
     core = _core(
         gateway=gateway,
         context=_Context(),
@@ -881,7 +932,7 @@ async def test_auto_planning_activation_uses_the_run_model_round_budget():
         ),
         runtime_limits=RuntimeLimits(
             max_model_rounds=1,
-            max_run_output_tokens=None,
+            max_run_generation_tokens=None,
         ),
     )
     try:
@@ -922,7 +973,7 @@ async def test_provider_output_budget_failure_reaches_run_without_retry():
         gateway=gateway,
         context=_Context(),
         adapters=adapters,
-        runtime_limits=RuntimeLimits(max_run_output_tokens=None, max_provider_output_bytes=1),
+        runtime_limits=RuntimeLimits(max_run_generation_tokens=None, max_provider_output_bytes=1),
     )
     try:
         result = await (await core.submit(_request())).wait()
@@ -990,7 +1041,7 @@ async def test_preset_context_factory_is_resolved_once_per_run():
         output_repository=adapters.outputs,
         output_publisher=adapters.publisher,
         preset=AgentPreset(
-            runtime_limits=RuntimeLimits(max_run_output_tokens=None),
+            runtime_limits=RuntimeLimits(max_run_generation_tokens=None),
             id="portable",
             revision="1",
             tool_catalog=InMemoryToolCatalog(()),

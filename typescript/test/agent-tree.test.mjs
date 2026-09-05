@@ -5,11 +5,13 @@ import {
   Agent,
   AgentCapabilityGrant,
   AgentTreeRunSupervisor,
+  AgentTreePolicy,
   InMemoryAgentAdapters,
   InMemoryRunRepository,
   InMemoryRunTreeRepository,
   RunCommandService,
 } from "../dist/index.js";
+import { testGateway } from "./support/model-gateway.mjs";
 
 const fixture = JSON.parse(readFileSync(
   new URL("../../conformance/fixtures/agent_tree_protocol.json", import.meta.url),
@@ -17,8 +19,32 @@ const fixture = JSON.parse(readFileSync(
 ));
 
 const RUN_OPTIONS = Object.freeze({
-  budgets: Object.freeze({ maxRunOutputTokens: null }),
+  budgets: Object.freeze({ maxRunGenerationTokens: null }),
 });
+
+function modelCapabilities() {
+  return {
+    schemaVersion: 2,
+    profileId: "test:model",
+    providerProtocol: "custom",
+    contextWindowTokens: 16_000,
+    maxGenerationTokens: 1_000,
+    thinkingTokenAccounting: "included",
+    protocol: {
+      reasoningControl: "selectable",
+      reasoningReplay: "ignored",
+      toolCalling: "supported",
+      requiredToolChoice: "supported",
+      parallelToolCalls: "supported",
+      streaming: "unavailable",
+      cancellation: "supported",
+      assistantContentWithToolCalls: "optional",
+      jsonSchemaLevel: "unknown",
+      streamFinishSemantics: "normalized",
+      usageSemantics: "normalized",
+    },
+  };
+}
 
 function grant(options = {}) {
   return new AgentCapabilityGrant({
@@ -78,7 +104,7 @@ async function rejectsCode(promise, code) {
 
 function invocationInput(runId, invocationId) {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     runId,
     invocationId,
     messageFingerprint: "message",
@@ -87,7 +113,7 @@ function invocationInput(runId, invocationId) {
     evidenceFingerprint: "evidence",
     contextEvidence: [],
     capabilityProfileId: null,
-    outputLimit: null,
+    outputBudget: null,
   };
 }
 
@@ -95,6 +121,15 @@ test("shared Agent tree protocol matches TypeScript contracts", () => {
   assert.equal(fixture.protocolVersion, 1);
   assert.equal(fixture.agentPresetSnapshotVersion, 5);
   assert.deepEqual(new AgentCapabilityGrant().toJSON(), fixture.policyDefaults);
+  assert.deepEqual(
+    new AgentTreePolicy().snapshot(),
+    fixture.agentTreePolicyDefaults,
+  );
+  assert.deepEqual(fixture.delegateToAgents, {
+    argumentField: "children",
+    childNameField: "name",
+    requiredFailureCode: "required_child_run_failed",
+  });
   assert.deepEqual(fixture.agentNodeStates, ["active", "closed"]);
   assert.deepEqual(fixture.agentRunStatuses, [
     "queued",
@@ -112,7 +147,7 @@ test("shared Agent tree protocol matches TypeScript contracts", () => {
   assert.deepEqual(fixture.authority.rootBudgetDimensions, [
     "model_attempts",
     "input_tokens",
-    "output_tokens",
+    "generation_tokens",
     "reasoning_tokens",
     "provider_output_events",
     "provider_output_bytes",
@@ -136,7 +171,7 @@ test("shared Agent tree protocol matches TypeScript contracts", () => {
     fences: ["spawn", "continue", "checkpoint", "budget", "output", "terminal"],
   });
   assert.deepEqual(fixture.recovery, {
-    executionCheckpointSchemaVersions: { python: 1, typescript: 2 },
+    executionCheckpointSchemaVersions: { python: 2, typescript: 2 },
     resumablePhase: "model_ready",
     resumableExecutionProfile: "reactive",
     inFlightProviderOrToolPolicy: "fail_stop",
@@ -147,41 +182,36 @@ test("shared Agent tree protocol matches TypeScript contracts", () => {
   );
 });
 
-test("Agent tree rejects the legacy delegation write authority", () => {
-  assert.throws(() => new Agent({
-    model: {
-      async invoke() {
-        return { message: { role: "assistant", content: "done" }, finishReason: "stop" };
-      },
-    },
-    delegation: {},
-    agentTree: { repository: new InMemoryRunTreeRepository() },
-  }), /mutually exclusive/);
-});
-
 test("Agent executes delegateToAgents through canonical Child Runs", async () => {
   const adapters = new InMemoryAgentAdapters();
   let modelCalls = 0;
+  const invocationBudgets = [];
   const agent = new Agent({
     model: {
+      capabilities: modelCapabilities(),
       async invoke(request) {
         modelCalls += 1;
+        invocationBudgets.push(request.outputBudget);
+        const acknowledged = (turn) => ({
+          ...turn,
+          appliedGenerationLimit: request.outputBudget?.maxGenerationTokens,
+        });
         if (request.messages.at(-1)?.attributes?.publicPresentation === true) {
           throw new Error("Agent Tree unexpectedly entered public presentation");
         }
         if (request.messages.some((message) => message.content === "Review evidence.")) {
-          return {
+          return acknowledged({
             message: { role: "assistant", content: "child result" },
             finishReason: "stop",
-          };
+          });
         }
         if (request.messages.at(-1)?.role === "tool") {
-          return {
+          return acknowledged({
             message: { role: "assistant", content: "root done" },
             finishReason: "stop",
-          };
+          });
         }
-        return {
+        return acknowledged({
           message: {
             role: "assistant",
             content: "",
@@ -189,8 +219,8 @@ test("Agent executes delegateToAgents through canonical Child Runs", async () =>
               id: "delegate-review",
               name: "delegateToAgents",
               arguments: {
-                delegations: [{
-                  agentName: "reviewer",
+                children: [{
+                  name: "reviewer",
                   title: "Reviewer",
                   instruction: "Review evidence.",
                   objective: "Check the evidence.",
@@ -199,7 +229,7 @@ test("Agent executes delegateToAgents through canonical Child Runs", async () =>
             }],
           },
           finishReason: "tool_calls",
-        };
+        });
       },
     },
     runRepository: adapters.runs,
@@ -213,13 +243,22 @@ test("Agent executes delegateToAgents through canonical Child Runs", async () =>
   const handle = await agent.submit({
     messages: [{ role: "user", content: "Use a reviewer." }],
     enabledTools: ["delegateToAgents"],
-  }, RUN_OPTIONS);
+    maxGenerationTokens: 200,
+  }, { ...RUN_OPTIONS, resultCapacityTargetTokens: 100 });
   const result = await handle.result;
   const descendants = await adapters.runTree.listDescendants(handle.runId);
   const journal = await adapters.runs.listRootEvents(handle.runId, 0);
 
   assert.equal(result.output, "root done");
   assert.equal(modelCalls, 3);
+  assert.deepEqual(
+    invocationBudgets.map((budget) => [budget.maxGenerationTokens, budget.generationSource]),
+    [[200, "user"], [200, "user"], [200, "user"]],
+  );
+  assert.deepEqual(
+    invocationBudgets.map((budget) => [budget.resultCapacityTargetTokens, budget.resultCapacitySource]),
+    [[100, "workflow_policy"], [100, "workflow_policy"], [100, "workflow_policy"]],
+  );
   assert.equal((await handle.snapshot()).preset.schemaVersion, 5);
   assert.equal(descendants.length, 1);
   assert.equal(descendants[0].status, "done");
@@ -241,7 +280,7 @@ test("Agent executes delegateToAgents through canonical Child Runs", async () =>
 test("Agent permits bounded recursive Child Runs", async () => {
   const adapters = new InMemoryAgentAdapters();
   const agent = new Agent({
-    model: {
+    model: testGateway({
       async invoke(request) {
         const system = request.messages.find((message) => message.role === "system")?.content;
         const afterTool = request.messages.at(-1)?.role === "tool";
@@ -275,8 +314,8 @@ test("Agent permits bounded recursive Child Runs", async () => {
               id: nested ? "delegate-nested" : "delegate-recursive",
               name: "delegateToAgents",
               arguments: {
-                delegations: [{
-                  agentName: nested ? "nested" : "recursive",
+                children: [{
+                  name: nested ? "nested" : "recursive",
                   title: nested ? "Nested" : "Recursive",
                   instruction: nested ? "Nested worker." : "Recursive worker.",
                   objective: nested ? "Finish nested work." : "Delegate once.",
@@ -287,16 +326,16 @@ test("Agent permits bounded recursive Child Runs", async () => {
           finishReason: "tool_calls",
         };
       },
-    },
+    }),
     runRepository: adapters.runs,
     outputPublisher: adapters.outputs,
     agentTree: {
       repository: adapters.runTree,
       rootAgentId: "recursive-typescript-root",
       policy: {
-        allowRecursiveDelegation: true,
+        allowRecursiveAgents: true,
         maxDepth: 2,
-        maxParallel: 1,
+        maxParallelRuns: 1,
       },
     },
   });
@@ -335,7 +374,7 @@ test("Agent host commands continue a canonical Child Agent", async () => {
   let releaseRoot;
   const rootGate = new Promise((resolve) => { releaseRoot = resolve; });
   const agent = new Agent({
-    model: {
+    model: testGateway({
       async invoke(request) {
         if (request.messages.some((message) => message.content === "Host child.")) {
           return {
@@ -349,13 +388,13 @@ test("Agent host commands continue a canonical Child Agent", async () => {
           finishReason: "stop",
         };
       },
-    },
+    }),
     runRepository: adapters.runs,
     outputPublisher: adapters.outputs,
     agentTree: {
       repository: adapters.runTree,
       rootAgentId: "host-command-root-agent",
-      policy: { maxParallel: 1 },
+      policy: { maxParallelRuns: 1 },
     },
   });
   const handle = await agent.submit({
@@ -393,7 +432,7 @@ test("Root completion is rejected before final output while a Child Run is pendi
   let releaseRoot;
   const rootGate = new Promise((resolve) => { releaseRoot = resolve; });
   const agent = new Agent({
-    model: {
+    model: testGateway({
       async invoke() {
         await rootGate;
         return {
@@ -401,13 +440,13 @@ test("Root completion is rejected before final output while a Child Run is pendi
           finishReason: "stop",
         };
       },
-    },
+    }),
     runRepository: adapters.runs,
     outputPublisher: adapters.outputs,
     agentTree: {
       repository: adapters.runTree,
       rootAgentId: "quiescence-root-agent",
-      policy: { maxParallel: 1 },
+      policy: { maxParallelRuns: 1 },
     },
   });
   const handle = await agent.submit({
@@ -442,7 +481,7 @@ test("new Agent instance rebinds and executes one committed Child Run", async ()
     requestedRunId: rootRunId,
     agentId: "rebound-root-agent",
     preset: {
-      schemaVersion: 4,
+      schemaVersion: 5,
       presetId: "rebound",
       presetRevision: "1",
       promptFingerprint: "prompt",
@@ -459,12 +498,13 @@ test("new Agent instance rebinds and executes one committed Child Run", async ()
         maxReasoningChars: 1_000_000,
         maxToolArgumentChars: 1_000_000,
       },
+      agentTree: { protocolVersion: 1, enabled: false },
     },
     deadlineAt: null,
     budgets: {
       maxModelAttempts: 4,
       maxInputTokens: null,
-      maxRunOutputTokens: null,
+      maxRunGenerationTokens: null,
       maxReasoningTokens: null,
       maxOutputBytes: 10_000,
       maxOutputEvents: 100,
@@ -497,7 +537,8 @@ test("new Agent instance rebinds and executes one committed Child Run", async ()
   })).items[0];
   let executions = 0;
   const agent = new Agent({
-    model: {
+    model: testGateway({
+      capabilities: { ...modelCapabilities(), profileId: "configured:model" },
       async invoke() {
         executions += 1;
         return {
@@ -505,13 +546,13 @@ test("new Agent instance rebinds and executes one committed Child Run", async ()
           finishReason: "stop",
         };
       },
-    },
+    }),
     runRepository: adapters.runs,
     outputPublisher: adapters.outputs,
     agentTree: {
       repository: adapters.runTree,
       rootAgentId: "rebound-root-agent",
-      policy: { maxParallel: 1 },
+      policy: { maxParallelRuns: 1 },
     },
   });
   const recoveryRequest = {
@@ -915,7 +956,7 @@ test("expired Agent tree lease fences canonical Run budget and output writes", a
     leaseValidator: (runId, claim) => tree.requireRunClaim(runId, claim),
   });
   const preset = {
-    schemaVersion: 4,
+    schemaVersion: 5,
     presetId: "fenced",
     presetRevision: "1",
     promptFingerprint: "prompt",
@@ -932,11 +973,12 @@ test("expired Agent tree lease fences canonical Run budget and output writes", a
       maxReasoningChars: 1_000_000,
       maxToolArgumentChars: 1_000_000,
     },
+    agentTree: { protocolVersion: 1, enabled: false },
   };
   const budgets = {
     maxModelAttempts: 2,
     maxInputTokens: null,
-    maxRunOutputTokens: null,
+    maxRunGenerationTokens: null,
     maxReasoningTokens: null,
     maxOutputBytes: 1_000,
     maxOutputEvents: 2,

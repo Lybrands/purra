@@ -12,7 +12,7 @@ protocol values, validation, state transitions, and error outcomes.
 | `tool_security.json`, `retrieval.json` | Tool schemas, retrieval results, and access boundaries |
 | `planning_protocol.json`, `planning_activation.json`, `planning_stream.json` | Plans, activation modes, and public progress streams |
 | `durable_protocol.json`, `recovery_protocol.json` | Durable execution and recovery |
-| `agent_tree_protocol.json`, `delegation_protocol.json` | Agent identity, delegation, and shared budgets |
+| `agent_tree_protocol.json` | Agent identity, Child Runs, and shared budgets |
 | `artifact_protocol.json`, `observability_protocol.json` | Artifacts, events, and diagnostics |
 
 ## Run

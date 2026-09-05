@@ -26,7 +26,7 @@ import {
 } from "purra";
 
 const RUN_OPTIONS = Object.freeze({
-  budgets: Object.freeze({ maxRunOutputTokens: null }),
+  budgets: Object.freeze({ maxRunGenerationTokens: null }),
 });
 
 await assertRunRepositoryConforms(new InMemoryAgentAdapters().runs);
@@ -95,7 +95,7 @@ const handle = await new Agent({
         yield { contentDelta: "installed", finishReason: "stop" };
       }
       return Object.assign(chunks(), {
-        appliedOutputLimit: request.outputLimit?.maxTokens,
+        appliedGenerationLimit: request.outputBudget?.maxGenerationTokens,
       });
     },
   },
@@ -166,7 +166,7 @@ assert.equal(result.output, "installed");
 assert.equal(events.at(-2).payload.output, "installed");
 const completedSnapshot = await handle.snapshot();
 assert.equal(completedSnapshot.status, "completed");
-assert.equal(completedSnapshot.preset.schemaVersion, 4);
+assert.equal(completedSnapshot.preset.schemaVersion, 5);
 assert.deepEqual(completedSnapshot.preset.runtimeLimits, {
   runTimeoutMs: 900_000,
   activityIdleTimeoutMs: 30_000,
@@ -273,67 +273,24 @@ const diagnostics = evaluateAgentRun({ id: "installed", status: "done" }, [
 assert.equal(diagnostics.verdict, "pass");
 assert.equal(JSON.stringify(diagnostics).includes("must-not-leak"), false);
 
-let delegationRootRounds = 0;
-const delegationHandle = await new Agent({
-  model: {
-    async invoke(request) {
-      if (request.messages[0]?.attributes?.delegatedAgentDefinition === "model") {
-        assert.deepEqual(request.tools, []);
-        return {
-          message: { role: "assistant", content: "installed delegation" },
-          finishReason: "stop",
-        };
-      }
-      delegationRootRounds += 1;
-      if (delegationRootRounds === 1) {
-        return {
-          message: {
-            role: "assistant",
-            content: "",
-            toolCalls: [{
-              id: "installed-delegation-call",
-              name: "delegateToAgents",
-              arguments: {
-                delegations: [{
-                  agentName: "installed",
-                  title: "Installed delegate",
-                  instruction: "Return the installed delegation result.",
-                  objective: "verify installed delegation",
-                }],
-              },
-            }],
-          },
-          finishReason: "tool_calls",
-        };
-      }
-      return { message: { role: "assistant", content: "installed root" }, finishReason: "stop" };
-    },
-  },
-  delegation: { policy: { maxAgentsPerCall: 1, maxParallel: 1 } },
-}).submit({ messages: [{ role: "user", content: "delegate" }] }, RUN_OPTIONS);
-assert.equal((await delegationHandle.result).output, "installed root");
-const delegationEvents = [];
-for await (const event of delegationHandle.events()) delegationEvents.push(event);
-assert.deepEqual(
-  delegationEvents
-    .filter((event) => event.kind === "delegation.status")
-    .map((event) => event.payload.status),
-  ["queued", "running", "done"],
-);
-
 const installedTreeAdapters = new InMemoryAgentAdapters();
 const installedTreeAgent = new Agent({
   model: {
+    capabilities: {
+      ...capabilities(),
+      profileId: "installed-tree",
+      protocol: { ...capabilities().protocol, streaming: "unavailable" },
+    },
     async invoke(request) {
       const system = request.messages.find((message) => message.role === "system")?.content;
       const afterTool = request.messages.at(-1)?.role === "tool";
       if (system === "Installed nested worker.") {
-        return finalTurn("installed nested done");
+        return finalTurn("installed nested done", request);
       }
       if (system === "Installed recursive worker." && afterTool) {
-        return finalTurn("installed child done");
+        return finalTurn("installed child done", request);
       }
-      if (afterTool) return finalTurn("installed tree root done");
+      if (afterTool) return finalTurn("installed tree root done", request);
       const nested = system === "Installed recursive worker.";
       return {
         message: {
@@ -343,8 +300,8 @@ const installedTreeAgent = new Agent({
             id: nested ? "installed-nested-call" : "installed-recursive-call",
             name: "delegateToAgents",
             arguments: {
-              delegations: [{
-                agentName: nested ? "nested" : "recursive",
+              children: [{
+                name: nested ? "nested" : "recursive",
                 title: nested ? "Nested" : "Recursive",
                 instruction: nested
                   ? "Installed nested worker."
@@ -355,6 +312,7 @@ const installedTreeAgent = new Agent({
           }],
         },
         finishReason: "tool_calls",
+        appliedGenerationLimit: request.outputBudget.maxGenerationTokens,
       };
     },
   },
@@ -364,9 +322,9 @@ const installedTreeAgent = new Agent({
     repository: installedTreeAdapters.runTree,
     rootAgentId: "installed-tree-root-agent",
     policy: {
-      allowRecursiveDelegation: true,
+      allowRecursiveAgents: true,
       maxDepth: 2,
-      maxParallel: 1,
+      maxParallelRuns: 1,
     },
   },
 });
@@ -478,7 +436,7 @@ const managedHandle = await new Agent({
     async stream(request) {
       const result = await this.invoke(request);
       const planning = request.messages.some((message) => message.attributes?.planningContract);
-      return { appliedOutputLimit: request.outputLimit.maxTokens,
+      return { appliedGenerationLimit: request.outputBudget.maxGenerationTokens,
         async *[Symbol.asyncIterator]() {
           if (planning) yield { contentDelta: JSON.stringify({ v: 1, type: "progress", text: "I will check the scope." }) + "\n" };
           yield { contentDelta: planning ? JSON.stringify({ v: 1, type: "plan", plan: JSON.parse(result.message.content) }) + "\n" : result.message.content,
@@ -578,11 +536,11 @@ assert.equal(managedEvents.filter((event) => event.kind === "model.diagnostics")
 
 function capabilities() {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     profileId: "installed",
     providerProtocol: "custom",
     contextWindowTokens: 16_000,
-    maxCallOutputTokens: 512,
+    maxGenerationTokens: 512,
     thinkingTokenAccounting: "unknown",
     protocol: {
       reasoningControl: "selectable",
@@ -612,9 +570,9 @@ function finalTurn(content, request) {
   return {
     message: { role: "assistant", content },
     finishReason: "stop",
-    ...(request?.outputLimit === undefined
+    ...(request?.outputBudget === undefined
       ? {}
-      : { appliedOutputLimit: request.outputLimit.maxTokens }),
+      : { appliedGenerationLimit: request.outputBudget.maxGenerationTokens }),
   };
 }
 
@@ -654,7 +612,7 @@ function durableInput() {
     budgets: {
       maxModelAttempts: 2,
       maxInputTokens: 100,
-      maxRunOutputTokens: 100,
+      maxRunGenerationTokens: 100,
       maxReasoningTokens: 100,
       maxOutputBytes: 1_000,
       maxOutputEvents: 100,

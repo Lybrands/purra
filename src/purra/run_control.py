@@ -225,7 +225,6 @@ class RunActivitySnapshot:
     requested_run_ids: tuple[str, ...] = ()
     requested_task_ids: tuple[str, ...] = ()
     active_run_ids: tuple[str, ...] = ()
-    active_delegation_run_ids: tuple[str, ...] = ()
     active_task_ids: tuple[str, ...] = ()
     draining_cancellation_run_ids: tuple[str, ...] = ()
 
@@ -233,13 +232,10 @@ class RunActivitySnapshot:
         requested_runs = _ids(self.requested_run_ids)
         requested_tasks = _ids(self.requested_task_ids)
         active_runs = _ids(self.active_run_ids)
-        active_delegations = _ids(self.active_delegation_run_ids)
         active_tasks = _ids(self.active_task_ids)
         draining = _ids(self.draining_cancellation_run_ids)
         if set(active_runs) - set(requested_runs):
             raise ValueError("active run ids must be requested")
-        if set(active_delegations) - set(requested_runs):
-            raise ValueError("active delegation run ids must be requested")
         if set(active_tasks) - set(requested_tasks):
             raise ValueError("active task ids must be requested")
         if set(draining) - set(requested_runs):
@@ -248,7 +244,6 @@ class RunActivitySnapshot:
             ("requested_run_ids", requested_runs),
             ("requested_task_ids", requested_tasks),
             ("active_run_ids", active_runs),
-            ("active_delegation_run_ids", active_delegations),
             ("active_task_ids", active_tasks),
             ("draining_cancellation_run_ids", draining),
         ):
@@ -258,7 +253,6 @@ class RunActivitySnapshot:
     def quiescent(self) -> bool:
         return not (
             self.active_run_ids
-            or self.active_delegation_run_ids
             or self.active_task_ids
             or self.draining_cancellation_run_ids
         )
@@ -270,7 +264,6 @@ class RunCancellationReceipt:
     status: RunStatus
     cancellation_epoch: int
     newly_requested: bool
-    delegations_canceled: int = 0
     terminalized: bool = False
     draining: bool = False
     tombstoned: bool = False
@@ -283,10 +276,6 @@ class RunCancellationReceipt:
         )
         status = RunStatus(self.status)
         epoch = positive_int(self.cancellation_epoch, "cancellation epoch")
-        delegations = non_negative_int(
-            self.delegations_canceled,
-            "canceled delegations",
-        )
         terminalized = bool(self.terminalized)
         draining = bool(self.draining)
         tombstoned = bool(self.tombstoned)
@@ -304,7 +293,6 @@ class RunCancellationReceipt:
         object.__setattr__(self, "status", status)
         object.__setattr__(self, "cancellation_epoch", epoch)
         object.__setattr__(self, "newly_requested", bool(self.newly_requested))
-        object.__setattr__(self, "delegations_canceled", delegations)
         object.__setattr__(self, "terminalized", terminalized)
         object.__setattr__(self, "draining", draining)
         object.__setattr__(self, "tombstoned", tombstoned)

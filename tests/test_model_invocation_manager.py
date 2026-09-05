@@ -19,11 +19,19 @@ from purra.contracts import (
     ToolCallDelta,
     ToolSchema,
 )
-from purra.errors import ContractViolationError
+from purra.errors import ContractViolationError, UnsupportedModelFeatureError
 from purra.evidence import ContextEvidenceReceipt
 from purra.model_invocation.evidence import bind_model_input_evidence
 from purra.cancellation import ExecutionDeadlineExceeded
-from purra.model_protocol import generic_capability_snapshot
+from purra.model_protocol import (
+    GenerationBudgetSource,
+    InvocationOutputBudget,
+    ReasoningUsageDetail,
+    ResultCapacitySource,
+    ThinkingTokenAccounting,
+    generic_capability_snapshot,
+    resolve_invocation_output_budget,
+)
 from purra.operations import (
     AgentOperationController,
     OperationKind,
@@ -54,7 +62,7 @@ def _request() -> ModelRequest:
         capability_snapshot=replace(
             generic_capability_snapshot(),
             profile_id="test:model",
-            max_call_output_tokens=200,
+            max_generation_tokens=200,
         ),
     )
 
@@ -74,7 +82,7 @@ class _Gateway:
         return ModelStream(
             chunks=chunks(),
             model="model",
-            applied_output_limit=invocation.output_limit.max_tokens,
+            applied_generation_limit=invocation.output_budget.max_generation_tokens,
         )
 
     async def complete(self, messages, invocation, signal=None):
@@ -87,7 +95,7 @@ class _CompletionGateway(_Gateway):
         return ModelCompletion(
             message=AgentMessage(role="assistant", content='{"plan":true}'),
             model="model",
-            applied_output_limit=invocation.output_limit.max_tokens,
+            applied_generation_limit=invocation.output_budget.max_generation_tokens,
             finish_reason=ModelFinishReason.STOP,
         )
 
@@ -111,7 +119,7 @@ class _NeverReturningGateway(_Gateway):
         return ModelStream(
             chunks=chunks(),
             model="model",
-            applied_output_limit=invocation.output_limit.max_tokens,
+            applied_generation_limit=invocation.output_budget.max_generation_tokens,
         )
 
 
@@ -130,7 +138,7 @@ class _ChunkGateway(_Gateway):
         return ModelStream(
             chunks=chunks(),
             model="model",
-            applied_output_limit=invocation.output_limit.max_tokens,
+            applied_generation_limit=invocation.output_budget.max_generation_tokens,
         )
 
 
@@ -271,6 +279,91 @@ async def test_undeclared_provider_progress_is_rejected_before_persistence():
 
 
 @pytest.mark.asyncio
+async def test_stream_contract_failure_settles_usage_from_the_rejected_chunk():
+    AgentModelCall, AgentModelInvocationManager, ModelInvocationContext = _types()
+    usage = ModelTokenUsage(input_tokens=11, generation_tokens=7)
+
+    class Repository:
+        def __init__(self):
+            self.settlements = []
+
+        async def reserve_model_attempt(self, *args):
+            return None
+
+        async def settle_model_attempt(self, *args):
+            self.settlements.append(args)
+
+    repository = Repository()
+    manager = AgentModelInvocationManager(
+        _ChunkGateway((ModelStreamChunk(
+            progress_delta="undeclared",
+            usage=usage,
+        ),)),
+        budget_repository=repository,
+    )
+    managed = await manager.stream(
+        (),
+        AgentModelCall(
+            request=_request(),
+            output_intent=AgentOutputIntent.STRUCTURED_PRIVATE,
+            commit_mode=OutputCommitMode.PRIVATE,
+        ),
+        ModelInvocationContext(run_id="run-rejected-usage"),
+    )
+
+    with pytest.raises(ContractViolationError):
+        await anext(managed.chunks)
+
+    assert repository.settlements[0][-1] == usage
+
+
+@pytest.mark.asyncio
+async def test_length_completion_fails_but_still_settles_reported_usage():
+    AgentModelCall, AgentModelInvocationManager, ModelInvocationContext = _types()
+    usage = ModelTokenUsage(input_tokens=11, generation_tokens=200)
+
+    class Repository:
+        def __init__(self):
+            self.settlements = []
+
+        async def reserve_model_attempt(self, *args):
+            return None
+
+        async def settle_model_attempt(self, *args):
+            self.settlements.append(args)
+
+    class LengthGateway(_CompletionGateway):
+        async def complete(self, messages, invocation, signal=None):
+            del messages, signal
+            return ModelCompletion(
+                message=AgentMessage(role="assistant", content="truncated"),
+                model="model",
+                applied_generation_limit=invocation.max_generation_tokens,
+                finish_reason=ModelFinishReason.LENGTH,
+                usage=usage,
+            )
+
+    repository = Repository()
+    manager = AgentModelInvocationManager(
+        LengthGateway(),
+        budget_repository=repository,
+    )
+    with pytest.raises(Exception) as captured:
+        await manager.complete(
+            (),
+            AgentModelCall(
+                request=_request(),
+                output_intent=AgentOutputIntent.STRUCTURED_PRIVATE,
+                commit_mode=OutputCommitMode.PRIVATE,
+            ),
+            ModelInvocationContext(run_id="run-length-usage"),
+        )
+
+    assert getattr(captured.value, "code", None) == "model_output_truncated"
+    assert repository.settlements[0][-1] == usage
+
+
+@pytest.mark.asyncio
 async def test_receipt_fingerprints_model_input_tools_and_context_provenance():
     AgentModelCall, AgentModelInvocationManager, ModelInvocationContext = _types()
     manager = AgentModelInvocationManager(_Gateway(), output_observer=_Observer())
@@ -319,6 +412,27 @@ async def test_receipt_fingerprints_model_input_tools_and_context_provenance():
         "version": 2,
     }]
     assert receipt.to_mapping()["callParameters"][0]["toolNames"] == ["lookup"]
+
+
+@pytest.mark.asyncio
+async def test_request_fingerprint_includes_the_user_generation_ceiling():
+    AgentModelCall, AgentModelInvocationManager, ModelInvocationContext = _types()
+    manager = AgentModelInvocationManager(_Gateway())
+    fingerprints = []
+    for ceiling in (None, 100):
+        managed = await manager.stream(
+            (AgentMessage(role="user", content="same"),),
+            AgentModelCall(
+                request=replace(_request(), max_generation_tokens=ceiling),
+                output_intent=AgentOutputIntent.STRUCTURED_PRIVATE,
+                commit_mode=OutputCommitMode.PRIVATE,
+            ),
+            ModelInvocationContext(run_id="run-fingerprint"),
+        )
+        fingerprints.append(managed.receipt.input_fingerprint)
+        await managed.chunks.aclose()
+
+    assert fingerprints[0] != fingerprints[1]
 
 
 @pytest.mark.asyncio
@@ -500,7 +614,7 @@ async def test_private_completion_is_observed_before_stream_commit():
 
 
 @pytest.mark.asyncio
-async def test_stream_rejects_a_missing_applied_output_limit_acknowledgment():
+async def test_stream_rejects_a_missing_applied_generation_limit_acknowledgment():
     AgentModelCall, AgentModelInvocationManager, ModelInvocationContext = _types()
 
     class MissingAcknowledgmentGateway(_Gateway):
@@ -529,14 +643,14 @@ async def test_stream_rejects_a_missing_applied_output_limit_acknowledgment():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("applied_output_limit", "usage"),
+    ("applied_generation_limit", "usage"),
     (
         (199, None),
-        (200, ModelTokenUsage(input_tokens=1, output_tokens=201)),
+        (200, ModelTokenUsage(input_tokens=1, generation_tokens=201)),
     ),
 )
-async def test_completion_rejects_a_false_output_limit_acknowledgment(
-    applied_output_limit,
+async def test_completion_rejects_a_false_generation_limit_acknowledgment(
+    applied_generation_limit,
     usage,
 ):
     AgentModelCall, AgentModelInvocationManager, ModelInvocationContext = _types()
@@ -547,7 +661,7 @@ async def test_completion_rejects_a_false_output_limit_acknowledgment(
             return ModelCompletion(
                 message=AgentMessage(role="assistant", content="done"),
                 model="model",
-                applied_output_limit=applied_output_limit,
+                applied_generation_limit=applied_generation_limit,
                 finish_reason=ModelFinishReason.STOP,
                 usage=usage,
             )
@@ -565,6 +679,259 @@ async def test_completion_rejects_a_false_output_limit_acknowledgment(
         )
 
     assert captured.value.code == "model_gateway_contract_violation"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("snapshot_changes", "usage"),
+    (
+        (
+            {"reasoning_usage_detail": ReasoningUsageDetail.REQUIRED},
+            ModelTokenUsage(input_tokens=1, generation_tokens=2),
+        ),
+        (
+            {"thinking_token_accounting": ThinkingTokenAccounting.INCLUDED},
+            ModelTokenUsage(
+                input_tokens=1,
+                generation_tokens=2,
+                reasoning_tokens=3,
+            ),
+        ),
+    ),
+)
+async def test_completion_rejects_inconsistent_reasoning_usage(
+    snapshot_changes,
+    usage,
+):
+    AgentModelCall, AgentModelInvocationManager, ModelInvocationContext = _types()
+    request = replace(
+        _request(),
+        capability_snapshot=replace(
+            _request().capability_snapshot,
+            **snapshot_changes,
+        ),
+    )
+
+    class InconsistentUsageGateway(_CompletionGateway):
+        async def complete(self, messages, invocation, signal=None):
+            del messages, signal
+            return ModelCompletion(
+                message=AgentMessage(role="assistant", content="done"),
+                model="model",
+                applied_generation_limit=(
+                    invocation.output_budget.max_generation_tokens
+                ),
+                finish_reason=ModelFinishReason.STOP,
+                usage=usage,
+            )
+
+    manager = AgentModelInvocationManager(InconsistentUsageGateway())
+    with pytest.raises(ContractViolationError) as captured:
+        await manager.complete(
+            (),
+            AgentModelCall(
+                request=request,
+                output_intent=AgentOutputIntent.STRUCTURED_PRIVATE,
+                commit_mode=OutputCommitMode.PRIVATE,
+            ),
+            ModelInvocationContext(run_id="run-inconsistent-reasoning-usage"),
+        )
+
+    assert captured.value.code == "model_gateway_contract_violation"
+
+
+@pytest.mark.asyncio
+async def test_required_reasoning_usage_rejects_an_entirely_missing_usage_report():
+    AgentModelCall, AgentModelInvocationManager, ModelInvocationContext = _types()
+    request = replace(
+        _request(),
+        capability_snapshot=replace(
+            _request().capability_snapshot,
+            reasoning_usage_detail=ReasoningUsageDetail.REQUIRED,
+        ),
+    )
+
+    manager = AgentModelInvocationManager(_CompletionGateway())
+    with pytest.raises(ContractViolationError) as captured:
+        await manager.complete(
+            (),
+            AgentModelCall(
+                request=request,
+                output_intent=AgentOutputIntent.STRUCTURED_PRIVATE,
+                commit_mode=OutputCommitMode.PRIVATE,
+            ),
+            ModelInvocationContext(run_id="run-missing-required-usage"),
+        )
+
+    assert captured.value.code == "model_gateway_contract_violation"
+
+
+@pytest.mark.asyncio
+async def test_actual_context_remainder_is_the_provider_generation_limit():
+    AgentModelCall, AgentModelInvocationManager, ModelInvocationContext = _types()
+    request = ModelRequest(
+        provider="test",
+        model="model",
+        capability_snapshot=replace(
+            generic_capability_snapshot(),
+            context_window_tokens=20_000,
+            max_generation_tokens=18_000,
+        ),
+    )
+
+    class RecordingGateway(_CompletionGateway):
+        async def complete(self, messages, invocation, signal=None):
+            self.calls.append((tuple(messages), invocation))
+            return await super().complete(messages, invocation, signal)
+
+    short_gateway = RecordingGateway()
+    long_gateway = RecordingGateway()
+    context = ModelInvocationContext(
+        run_id="run-dynamic-context",
+        context_window_tokens=20_000,
+        safety_reserve_tokens=100,
+        runtime_reserve_tokens=100,
+    )
+    call = AgentModelCall(
+        request=request,
+        output_intent=AgentOutputIntent.STRUCTURED_PRIVATE,
+        commit_mode=OutputCommitMode.PRIVATE,
+    )
+    short = await AgentModelInvocationManager(short_gateway).complete(
+        (AgentMessage(role="user", content="short"),),
+        call,
+        context,
+    )
+    long = await AgentModelInvocationManager(long_gateway).complete(
+        (AgentMessage(role="user", content="长" * 4_000),),
+        call,
+        context,
+    )
+
+    short_limit = short.receipt.output_budget.max_generation_tokens
+    long_limit = long.receipt.output_budget.max_generation_tokens
+    assert short_limit == 18_000
+    assert long_limit < short_limit
+    assert short_gateway.calls[0][1].max_generation_tokens == short_limit
+    assert long_gateway.calls[0][1].max_generation_tokens == long_limit
+
+
+@pytest.mark.asyncio
+async def test_result_capacity_target_does_not_become_the_provider_limit():
+    AgentModelCall, AgentModelInvocationManager, ModelInvocationContext = _types()
+    request = ModelRequest(
+        provider="test",
+        model="model",
+        capability_snapshot=replace(
+            generic_capability_snapshot(),
+            context_window_tokens=200_000,
+            max_generation_tokens=100_000,
+        ),
+    )
+    budget = resolve_invocation_output_budget(
+        request.capability_snapshot,
+        max_generation_tokens=None,
+        result_capacity_target_tokens=16_384,
+        result_capacity_source=ResultCapacitySource.WORKFLOW_POLICY,
+    )
+
+    class RecordingGateway(_CompletionGateway):
+        async def complete(self, messages, invocation, signal=None):
+            self.calls.append((tuple(messages), invocation))
+            return await super().complete(messages, invocation, signal)
+
+    gateway = RecordingGateway()
+    completed = await AgentModelInvocationManager(gateway).complete(
+        (AgentMessage(role="user", content="draft"),),
+        AgentModelCall(
+            request=request,
+            output_intent=AgentOutputIntent.STRUCTURED_PRIVATE,
+            commit_mode=OutputCommitMode.PRIVATE,
+            output_budget=budget,
+        ),
+        ModelInvocationContext(run_id="run-result-capacity"),
+    )
+
+    assert completed.receipt.output_budget.result_capacity_target_tokens == 16_384
+    assert completed.receipt.output_budget.max_generation_tokens == 100_000
+    assert gateway.calls[0][1].max_generation_tokens == 100_000
+
+
+@pytest.mark.asyncio
+async def test_caller_cannot_disguise_a_workflow_cap_as_context_capacity():
+    AgentModelCall, AgentModelInvocationManager, ModelInvocationContext = _types()
+    request = _request()
+    forged = InvocationOutputBudget(
+        max_generation_tokens=100,
+        generation_source=GenerationBudgetSource.CONTEXT_CAPACITY,
+        profile_max_generation_tokens=200,
+    )
+
+    class RecordingGateway(_CompletionGateway):
+        async def complete(self, messages, invocation, signal=None):
+            self.calls.append((tuple(messages), invocation))
+            return await super().complete(messages, invocation, signal)
+
+    gateway = RecordingGateway()
+    completed = await AgentModelInvocationManager(gateway).complete(
+        (),
+        AgentModelCall(
+            request=request,
+            output_intent=AgentOutputIntent.STRUCTURED_PRIVATE,
+            commit_mode=OutputCommitMode.PRIVATE,
+            output_budget=forged,
+        ),
+        ModelInvocationContext(run_id="run-no-workflow-cap"),
+    )
+
+    assert completed.receipt.output_budget.max_generation_tokens == 200
+    assert gateway.calls[0][1].max_generation_tokens == 200
+
+
+@pytest.mark.asyncio
+async def test_result_capacity_target_must_fit_the_actual_context_remainder():
+    AgentModelCall, AgentModelInvocationManager, ModelInvocationContext = _types()
+    request = ModelRequest(
+        provider="test",
+        model="model",
+        capability_snapshot=replace(
+            generic_capability_snapshot(),
+            context_window_tokens=10_000,
+            max_generation_tokens=8_000,
+        ),
+    )
+    budget = resolve_invocation_output_budget(
+        request.capability_snapshot,
+        max_generation_tokens=None,
+        result_capacity_target_tokens=4_000,
+        result_capacity_source=ResultCapacitySource.WORKFLOW_POLICY,
+    )
+
+    with pytest.raises(UnsupportedModelFeatureError) as captured:
+        await AgentModelInvocationManager(_CompletionGateway()).complete(
+            (AgentMessage(role="user", content="长" * 7_000),),
+            AgentModelCall(
+                request=request,
+                output_intent=AgentOutputIntent.STRUCTURED_PRIVATE,
+                commit_mode=OutputCommitMode.PRIVATE,
+                output_budget=budget,
+            ),
+            ModelInvocationContext(run_id="run-capacity-does-not-fit"),
+        )
+
+    assert captured.value.code == "model_result_capacity_incompatible"
+
+
+def test_reasoning_usage_unknown_is_distinct_from_reported_zero():
+    unknown = ModelTokenUsage(input_tokens=1, generation_tokens=2)
+    reported_zero = ModelTokenUsage(
+        input_tokens=1,
+        generation_tokens=2,
+        reasoning_tokens=0,
+    )
+
+    assert unknown.reasoning_tokens is None
+    assert reported_zero.reasoning_tokens == 0
 
 
 @pytest.mark.asyncio
@@ -680,7 +1047,7 @@ async def test_stream_limit_rejects_the_first_exceeding_fragment_before_output()
             ModelStreamChunk(content_delta="cd"),
         )),
         output_observer=observer,
-        runtime_limits=RuntimeLimits(max_run_output_tokens=None, max_stream_content_chars=3),
+        runtime_limits=RuntimeLimits(max_run_generation_tokens=None, max_stream_content_chars=3),
     )
     managed = await manager.stream(
         (),

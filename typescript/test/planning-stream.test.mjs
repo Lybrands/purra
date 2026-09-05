@@ -5,15 +5,19 @@ import { PlanningStreamParser } from "purra";
 import { Agent, AgentError, AgentOperationController, ModelWorkPlanner, InMemoryAgentAdapters, ModelTaskRunner } from "purra";
 
 const capabilities = {
-  schemaVersion: 1, profileId: "planning-stream-test", providerProtocol: "custom",
-  contextWindowTokens: 16000, maxCallOutputTokens: 512, thinkingTokenAccounting: "unknown",
+  schemaVersion: 2, profileId: "planning-stream-test", providerProtocol: "custom",
+  contextWindowTokens: 16000, maxGenerationTokens: 512, thinkingTokenAccounting: "unknown",
   protocol: { reasoningControl: "selectable", reasoningReplay: "ignored", toolCalling: "supported",
     requiredToolChoice: "supported", parallelToolCalls: "supported", streaming: "supported", cancellation: "supported",
     assistantContentWithToolCalls: "optional", jsonSchemaLevel: "unknown", streamFinishSemantics: "normalized", usageSemantics: "normalized" },
 };
-const plan = { workPlan: { title: "Plan", goal: "PRIVATE_PLAN_MARKER", steps: [{ id: "answer", title: "Answer", type: "review", executor: "model" }] } };
+const plan = { workPlan: { title: "Plan", goal: "PRIVATE_PLAN_MARKER", steps: [
+  { id: "answer", title: "Answer", type: "review", executor: "model" },
+  { id: "verify", title: "Verify", type: "analyze", executor: "model", dependsOn: ["answer"] },
+  { id: "deliver", title: "Deliver", type: "write", executor: "model", dependsOn: ["verify"] },
+] } };
 const wire = (text) => JSON.stringify(text === undefined ? { v: 1, type: "plan", plan } : { v: 1, type: "progress", text }) + "\n";
-const runOptions = { budgets: { maxRunOutputTokens: null } };
+const runOptions = { budgets: { maxRunGenerationTokens: null } };
 const input = { messages: [{ role: "user", content: "prepare" }], planningMode: "planned" };
 const collect = async (stream) => { const events = []; for await (const event of stream) events.push(event); return events; };
 const deferred = () => { let resolve; const promise = new Promise((done) => { resolve = done; }); return { promise, resolve }; };
@@ -40,7 +44,7 @@ function managed(scripts, options = {}, modelCapabilities = capabilities) {
       });
       void canceled.catch(() => undefined);
       return {
-        appliedOutputLimit: request.outputLimit.maxTokens,
+        appliedGenerationLimit: request.outputBudget.maxGenerationTokens,
         activitySupport: "transport",
         [Symbol.asyncIterator]() { return this; },
         async next() {
@@ -48,7 +52,7 @@ function managed(scripts, options = {}, modelCapabilities = capabilities) {
           const item = script[index++];
           if (item?.promise) { await Promise.race([item.promise, canceled]); return this.next(); }
           if (item instanceof Error) throw item;
-          if (item === undefined) return { value: { finishReason: "stop", usage: { inputTokens: 10, outputTokens: 8 } } };
+          if (item === undefined) return { value: { finishReason: "stop", usage: { inputTokens: 10, generationTokens: 8 } } };
           return { value: typeof item === "string" ? { contentDelta: item } : item };
         },
         async return() {
@@ -139,7 +143,7 @@ test("repair preserves failed attempt progress and one shared stage without dupl
   assert.equal(new Set(progress.map((e) => e.payload.operationId)).size, 1);
   assert.equal(new Set(progress.map((e) => e.payload.invocationId)).size, 2);
   assert.equal((await handle.snapshot()).usage.modelAttempts, 3);
-  assert.equal((await handle.snapshot()).usage.outputTokens, 24);
+  assert.equal((await handle.snapshot()).usage.generationTokens, 24);
   assert.equal(state.opened, state.closed);
 });
 
@@ -314,10 +318,10 @@ for (const [budgets, runtimeLimits, script] of [
   [{ maxOutputBytes: 20 }, {}, [wire("准备检查。"), wire()]],
   [{}, { maxContentChars: 20 }, [wire()]],
   [{}, { maxChunks: 1 }, [wire("准备检查。"), wire()]],
-  [{ maxRunOutputTokens: 7 }, {}, [wire()]],
+  [{ maxRunGenerationTokens: 7 }, {}, [wire()]],
 ]) test(`planning obeys shared budgets ${JSON.stringify({ budgets, runtimeLimits })}`, async () => {
   const { agent, state } = managed([script, script], { runtimeLimits });
-  const handle = await agent.submit(input, { budgets: { maxRunOutputTokens: null, ...budgets } });
+  const handle = await agent.submit(input, { budgets: { maxRunGenerationTokens: null, ...budgets } });
   await assert.rejects(handle.result);
   assert.equal(state.planningCalls, 1);
   assert.equal(state.executions, 0);
@@ -411,7 +415,12 @@ for (const planningMode of ["reactive", "planned"]) test(`custom Planner lifecyc
 
 test('dynamic planning uses distinct revision scopes and never repeats completed work', async () => {
   let plans = 0, tools = 0;
-  const toolPlan = { workPlan: { title: 'Inspect', steps: [{ id: 'inspect', title: 'Inspect', type: 'read', executor: 'tool', capabilityNames: ['lookup'] }] } };
+  const toolPlan = { workPlan: { title: 'Inspect', steps: [
+    { id: 'inspect', title: 'Inspect', type: 'read', executor: 'tool', capabilityNames: ['lookup'] },
+    { id: 'analyze', title: 'Analyze', type: 'analyze', executor: 'model', dependsOn: ['inspect'] },
+    { id: 'review', title: 'Review', type: 'review', executor: 'model', dependsOn: ['analyze'] },
+    { id: 'respond', title: 'Respond', type: 'review', executor: 'model', dependsOn: ['review'] },
+  ] } };
   const agent = new Agent({
     model: { capabilities,
       async invoke() { throw new Error('must stream'); },
@@ -419,7 +428,7 @@ test('dynamic planning uses distinct revision scopes and never repeats completed
         const planning = request.messages.some((m) => m.attributes?.planningContract);
         const revision = plans;
         if (planning) plans += 1;
-        return { appliedOutputLimit: request.outputLimit.maxTokens,
+        return { appliedGenerationLimit: request.outputBudget.maxGenerationTokens,
           async *[Symbol.asyncIterator]() {
             if (planning) {
               yield { contentDelta: wire(revision === 0 ? '准备检查证据。' : '准备组织回答。') };
@@ -459,7 +468,7 @@ test('active reasoning cannot renew the absolute planning deadline', async () =>
   let closed = false;
   const { agent } = managed([], { runtimeLimits: { invocationTimeoutMs: 20 }, model: { capabilities,
     async invoke() { throw new Error('must stream'); },
-    stream(request) { return { appliedOutputLimit: request.outputLimit.maxTokens,
+    stream(request) { return { appliedGenerationLimit: request.outputBudget.maxGenerationTokens,
       async *[Symbol.asyncIterator]() {
         try { while (true) { await new Promise((done) => setTimeout(done, 1)); yield { reasoningDelta: 'PRIVATE_ACTIVE' }; } }
         finally { closed = true; }
@@ -524,7 +533,7 @@ for (const scenario of fixture.managedRuns) test(`shared managed planning lifecy
 
 test('cancel settles already-reported planning usage exactly once', async () => {
   const gate = deferred();
-  const { agent } = managed([[{ contentDelta: wire('准备检查。'), usage: { inputTokens: 10, outputTokens: 3 } }, gate, wire()]]);
+  const { agent } = managed([[{ contentDelta: wire('准备检查。'), usage: { inputTokens: 10, generationTokens: 3 } }, gate, wire()]]);
   const handle = await agent.submit(input, runOptions);
   const result = handle.result.catch(() => undefined);
   for await (const event of handle.events()) if (event.kind === 'planning.progress') break;
@@ -532,7 +541,7 @@ test('cancel settles already-reported planning usage exactly once', async () => 
   await result;
   gate.resolve();
   const first = await handle.snapshot();
-  assert.equal(first.usage.outputTokens, 3);
+  assert.equal(first.usage.generationTokens, 3);
   assert.equal(first.usage.inputTokens, 10);
   await handle.cancel();
   assert.deepEqual((await handle.snapshot()).usage, first.usage);
@@ -545,7 +554,7 @@ test('revision repairs a reused completed id without accepting partial work', as
     stream(request) {
       calls += 1;
       const id = calls === 1 ? 'completed' : 'remaining';
-      return { appliedOutputLimit: request.outputLimit.maxTokens,
+      return { appliedGenerationLimit: request.outputBudget.maxGenerationTokens,
         async *[Symbol.asyncIterator]() { yield { contentDelta: JSON.stringify({ v: 1, type: 'plan', plan: { workPlan: {
           title: 'Remaining', steps: [{ id, title: id, type: 'review', executor: 'model' }],
         } } }) + '\n', finishReason: 'stop' }; },

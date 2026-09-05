@@ -27,13 +27,13 @@ class MemoryBudget:
     max_embedding_calls: int
     max_input_chars: int
     max_output_tokens: int
-    max_call_output_tokens: int
+    result_capacity_target_tokens: int
 
     def __post_init__(self):
         if not isinstance(self.key, str) or not self.key.strip() or len(self.key) > 512:
             raise ValueError("invalid budget key")
         for name, value in self.limits.items():
-            minimum = 1 if name == "max_call_output_tokens" else 0
+            minimum = 1 if name == "result_capacity_target_tokens" else 0
             if type(value) is not int or not minimum <= value <= 2**31 - 1:
                 raise ValueError(f"invalid {name}")
 
@@ -62,9 +62,9 @@ class EmbeddingResult:
 
 @dataclass(frozen=True, slots=True)
 class MemoryProviders:
-    """Trusted host callbacks. Apply the exact output cap; disable hidden retries.
+    """Trusted host callbacks with a result-capacity target per call.
 
-    ``complete`` receives messages, max output tokens and a cancellation signal.
+    ``complete`` receives messages, the result-capacity target and a signal.
     ``embed`` receives texts and the signal. Both callbacks run on the caller's
     event loop, even though Mem0 itself runs in a worker thread.
     """
@@ -86,8 +86,11 @@ def run_model(runner: AgentModelTaskRunner, request: ModelRequest):
     if not isinstance(runner, AgentModelTaskRunner) or not isinstance(request, ModelRequest):
         raise TypeError("run_model requires a PurrA runner and request")
 
-    async def complete(messages, max_output_tokens, signal):
-        task = AgentModelTask(request=replace(request, options={**request.options, "max_tokens": max_output_tokens}))
+    async def complete(messages, result_capacity_target_tokens, signal):
+        task = AgentModelTask(
+            request=request,
+            result_capacity_target_tokens=result_capacity_target_tokens,
+        )
         return (await runner.complete(messages, task, signal)).completion
 
     return complete
@@ -137,14 +140,18 @@ class ProviderExecution:
 
     def invoke(self, kind, values, *, extraction=True):
         self.check()
-        cap = self.providers.budget.max_call_output_tokens if kind == "llm" else 0
+        cap = (
+            self.providers.budget.result_capacity_target_tokens
+            if kind == "llm"
+            else 0
+        )
         chars = sum(len(v.content) for v in values) if kind == "llm" else sum(map(len, values))
         try:
             call_id = self.journal.admit(self.providers.budget.key, self.operation, kind, chars, cap)
         except Exception as error:
             self.stop(error.code if isinstance(error, MemoryError) else "memory_provider_error")
             raise MemoryError(self.error) from None
-        input_tokens = output_tokens = None
+        input_tokens = generation_tokens = None
         try:
             self.check()
             async def dispatch():
@@ -157,10 +164,10 @@ class ProviderExecution:
                 if not isinstance(result, ModelCompletion):
                     raise MemoryError("memory_provider_contract")
                 if result.usage is not None:
-                    input_tokens, output_tokens = result.usage.input_tokens, result.usage.output_tokens
-                if (result.applied_output_limit != cap or result.finish_reason != "stop"
+                    input_tokens, generation_tokens = result.usage.input_tokens, result.usage.generation_tokens
+                if (result.applied_generation_limit is None or result.finish_reason != "stop"
                         or result.message.tool_calls or result.message.role != "assistant"
-                        or (output_tokens is not None and output_tokens > cap)):
+                        or result.applied_generation_limit < cap):
                     raise MemoryError("memory_provider_contract")
                 content = result.message.content
                 if extraction:
@@ -180,7 +187,7 @@ class ProviderExecution:
             else:
                 if not isinstance(result, EmbeddingResult):
                     raise MemoryError("memory_provider_contract")
-                input_tokens, output_tokens = result.input_tokens, 0
+                input_tokens, generation_tokens = result.input_tokens, 0
                 if input_tokens is not None and (type(input_tokens) is not int or not 0 <= input_tokens <= 2**31 - 1):
                     input_tokens = None
                     raise MemoryError("memory_provider_contract")
@@ -191,10 +198,10 @@ class ProviderExecution:
                     raise MemoryError("memory_provider_contract")
                 content = vectors
             self.check()
-            self.journal.settle(call_id, "complete", input_tokens, output_tokens)
+            self.journal.settle(call_id, "complete", input_tokens, generation_tokens)
             return content
         except Exception as error:
-            self.journal.settle(call_id, "failed", input_tokens, output_tokens)
+            self.journal.settle(call_id, "failed", input_tokens, generation_tokens)
             code = error.code if isinstance(error, MemoryError) else "memory_provider_error"
             self.stop(code)
             raise MemoryError(self.error) from None

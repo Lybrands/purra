@@ -10,7 +10,7 @@ from types import MappingProxyType
 from typing import Any
 
 from purra.context_orchestration import ContextCompressionCoordinator
-from purra.delegation import DelegationPolicy
+from purra.agent_tree_policy import AgentTreePolicy
 
 from purra.contracts import (
     AgentMessage,
@@ -123,27 +123,26 @@ class AgentPresetSnapshot:
     revision: str
     fingerprint: str
     composition: Mapping[str, Any]
-    snapshot_version: int = 4
+    snapshot_version: int = 5
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "id", required_text(self.id, "agent preset id"))
-        if self.snapshot_version not in {4, 5}:
-            raise ValueError("agent preset snapshot version must be 4 or 5")
+        if self.snapshot_version != 5:
+            raise ValueError("agent preset snapshot version must be 5")
         object.__setattr__(
             self,
             "revision",
             required_text(self.revision, "agent preset revision"),
         )
         composition = freeze_json_mapping(self.composition)
-        if self.snapshot_version == 5:
-            agent_tree = composition.get("agentTree")
-            if (
-                not isinstance(agent_tree, Mapping)
-                or agent_tree.get("protocolVersion") != 1
-            ):
-                raise ValueError(
-                    "agent preset snapshot v5 requires Agent tree protocol v1"
-                )
+        agent_tree = composition.get("agentTree")
+        if (
+            not isinstance(agent_tree, Mapping)
+            or agent_tree.get("protocolVersion") != 1
+        ):
+            raise ValueError(
+                "agent preset snapshot v5 requires Agent tree protocol v1"
+            )
         object.__setattr__(self, "composition", composition)
         expected = _preset_fingerprint(
             self.id,
@@ -167,8 +166,8 @@ class AgentPresetSnapshot:
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "AgentPresetSnapshot":
         snapshot_version = value.get("snapshotVersion")
-        if snapshot_version not in {4, 5}:
-            raise ValueError("agent preset snapshot version must be 4 or 5")
+        if snapshot_version != 5:
+            raise ValueError("agent preset snapshot version must be 5")
         composition = value.get("composition")
         if not isinstance(composition, Mapping):
             raise TypeError("agent preset snapshot composition must be an object")
@@ -205,7 +204,7 @@ class AgentPreset:
     component_bindings: Mapping[str, AgentComponentBinding] = field(
         default_factory=dict
     )
-    delegation_policy: DelegationPolicy | None = None
+    agent_tree_policy: AgentTreePolicy | None = None
     recovery_policy: RecoveryPolicy = RecoveryPolicy()
 
     def __post_init__(self) -> None:
@@ -309,12 +308,12 @@ class AgentPreset:
             raise TypeError("agent preset runtime_limits must be RuntimeLimits")
         if not isinstance(self.recovery_policy, RecoveryPolicy):
             raise TypeError("agent preset recovery_policy must be RecoveryPolicy")
-        if self.delegation_policy is not None and not isinstance(
-            self.delegation_policy,
-            DelegationPolicy,
+        if self.agent_tree_policy is not None and not isinstance(
+            self.agent_tree_policy,
+            AgentTreePolicy,
         ):
             raise TypeError(
-                "agent preset delegation_policy must be DelegationPolicy or None"
+                "agent preset agent_tree_policy must be AgentTreePolicy or None"
             )
         self._validate_component_contract()
 
@@ -406,8 +405,8 @@ class AgentPreset:
                 "rootRunTimeoutMs": self.runtime_limits.root_run_timeout_ms,
                 "maxModelInvocationAttempts": self.runtime_limits.max_model_invocation_attempts,
                 "maxInputTokens": self.runtime_limits.max_input_tokens,
-                "maxRunOutputTokens": (
-                    self.runtime_limits.max_run_output_tokens
+                "maxRunGenerationTokens": (
+                    self.runtime_limits.max_run_generation_tokens
                 ),
                 "maxReasoningTokens": self.runtime_limits.max_reasoning_tokens,
                 "maxProviderOutputEvents": self.runtime_limits.max_provider_output_events,
@@ -423,11 +422,14 @@ class AgentPreset:
                     key=lambda item: item[0].value,
                 )
             },
-            "delegation": (
-                self.delegation_policy.snapshot_mapping()
-                if self.delegation_policy is not None
-                else {"enabled": False}
-            ),
+            "agentTree": {
+                "protocolVersion": 1,
+                **(
+                    self.agent_tree_policy.snapshot_mapping()
+                    if self.agent_tree_policy is not None
+                    else {"enabled": False}
+                ),
+            },
         }
         return AgentPresetSnapshot(
             id=self.id,

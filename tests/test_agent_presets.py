@@ -10,6 +10,7 @@ from purra.agent_presets import (
     AgentPresetSnapshot,
     PromptSection,
 )
+from purra.agent_tree_policy import AgentTreePolicy
 from purra.context_orchestration import (
     ContextCompressionCoordinator,
     ContextCompressionSettings,
@@ -31,7 +32,6 @@ from purra.contracts import (
 )
 from purra.model_protocol import generic_capability_snapshot
 from purra.ports import ToolRegistration
-from purra.delegation import DelegationPolicy
 from purra.recovery import RecoveryCause, RecoveryPolicy
 from purra.tools import InMemoryToolCatalog
 
@@ -65,7 +65,7 @@ def _request() -> AgentRunRequest:
 
 def test_preset_applies_ordered_trusted_prompt_sections():
     preset = AgentPreset(
-        runtime_limits=RuntimeLimits(max_run_output_tokens=None),
+        runtime_limits=RuntimeLimits(max_run_generation_tokens=None),
         id="operations",
         revision="1",
         tool_catalog=InMemoryToolCatalog(()),
@@ -94,7 +94,7 @@ def test_preset_applies_ordered_trusted_prompt_sections():
     assert preset.apply(request) is request
     with pytest.raises(ValueError, match="different AgentPreset"):
         AgentPreset(
-            runtime_limits=RuntimeLimits(max_run_output_tokens=None),
+            runtime_limits=RuntimeLimits(max_run_generation_tokens=None),
             id="other",
             revision="1",
             tool_catalog=InMemoryToolCatalog(()),
@@ -108,7 +108,7 @@ def test_preset_rejects_ambiguous_context_and_duplicate_sections():
     context = _ContextProvider()
     with pytest.raises(ValueError, match="mutually exclusive"):
         AgentPreset(
-            runtime_limits=RuntimeLimits(max_run_output_tokens=None),
+            runtime_limits=RuntimeLimits(max_run_generation_tokens=None),
             id="operations",
             revision="1",
             tool_catalog=InMemoryToolCatalog(()),
@@ -116,14 +116,14 @@ def test_preset_rejects_ambiguous_context_and_duplicate_sections():
             context_provider_factory=lambda _tasks: context,
         )
     assert AgentPreset(
-        runtime_limits=RuntimeLimits(max_run_output_tokens=None),
+        runtime_limits=RuntimeLimits(max_run_generation_tokens=None),
         id="context-free",
         revision="1",
         tool_catalog=InMemoryToolCatalog(()),
     ).context_provider is None
     with pytest.raises(ValueError, match="must be unique"):
         AgentPreset(
-            runtime_limits=RuntimeLimits(max_run_output_tokens=None),
+            runtime_limits=RuntimeLimits(max_run_generation_tokens=None),
             id="operations",
             revision="1",
             tool_catalog=InMemoryToolCatalog(()),
@@ -138,7 +138,7 @@ def test_preset_rejects_ambiguous_context_and_duplicate_sections():
 def test_preset_snapshot_detects_prompt_or_tool_drift():
     context = _ContextProvider()
     preset = AgentPreset(
-        runtime_limits=RuntimeLimits(max_run_output_tokens=None),
+        runtime_limits=RuntimeLimits(max_run_generation_tokens=None),
         id="operations",
         revision="1",
         tool_catalog=InMemoryToolCatalog(()),
@@ -155,7 +155,7 @@ def test_preset_snapshot_detects_prompt_or_tool_drift():
 
     changed = AgentPreset(
 
-        runtime_limits=RuntimeLimits(max_run_output_tokens=None),
+        runtime_limits=RuntimeLimits(max_run_generation_tokens=None),
         id="operations",
         revision="1",
         tool_catalog=InMemoryToolCatalog(()),
@@ -167,38 +167,43 @@ def test_preset_snapshot_detects_prompt_or_tool_drift():
         changed.require_snapshot(snapshot, _request())
 
 
-def test_preset_snapshot_covers_delegation_configuration():
+def test_preset_snapshot_covers_agent_tree_configuration():
     disabled = AgentPreset(
-        runtime_limits=RuntimeLimits(max_run_output_tokens=None),
+        runtime_limits=RuntimeLimits(max_run_generation_tokens=None),
         id="root",
         revision="1",
         tool_catalog=InMemoryToolCatalog(()),
     )
     enabled = AgentPreset(
-        runtime_limits=RuntimeLimits(max_run_output_tokens=None),
+        runtime_limits=RuntimeLimits(max_run_generation_tokens=None),
         id="root",
         revision="1",
         tool_catalog=InMemoryToolCatalog(()),
-        delegation_policy=DelegationPolicy(max_agents_per_call=2, max_parallel=1),
+        agent_tree_policy=AgentTreePolicy(
+            max_children_per_call=2,
+            max_parallel_runs=1,
+        ),
     )
 
     disabled_snapshot = disabled.snapshot(_request())
     enabled_snapshot = enabled.snapshot(_request())
 
-    assert disabled_snapshot.composition["delegation"] == {"enabled": False}
-    assert enabled_snapshot.composition["delegation"] == {
+    assert disabled_snapshot.composition["agentTree"] == {
+        "protocolVersion": 1,
+        "enabled": False,
+    }
+    assert enabled_snapshot.composition["agentTree"] == {
+        "protocolVersion": 1,
         "enabled": True,
-        "maxAgentsPerCall": 2,
-        "maxParallel": 1,
+        "maxChildrenPerCall": 2,
+        "maxParallelRuns": 1,
         "maxAgentNameChars": 64,
         "maxTitleChars": 120,
         "maxInstructionChars": 4_000,
         "maxObjectiveChars": 4_000,
         "maxDepth": 3,
         "maxAgentsPerRoot": 16,
-        "contextMode": "isolated",
-        "toolMode": "read",
-        "allowsRecursiveDelegation": False,
+        "allowsRecursiveAgents": False,
     }
     assert disabled_snapshot.fingerprint != enabled_snapshot.fingerprint
 
@@ -206,7 +211,7 @@ def test_preset_snapshot_covers_delegation_configuration():
 def test_preset_snapshot_requires_and_uses_opaque_component_bindings():
     with pytest.raises(ValueError, match="contextProvider"):
         AgentPreset(
-            runtime_limits=RuntimeLimits(max_run_output_tokens=None),
+            runtime_limits=RuntimeLimits(max_run_generation_tokens=None),
             id="portable",
             revision="1",
             tool_catalog=InMemoryToolCatalog(()),
@@ -214,7 +219,7 @@ def test_preset_snapshot_requires_and_uses_opaque_component_bindings():
         ).snapshot(_request())
     with pytest.raises(ValueError, match="executionStateFactory"):
         AgentPreset(
-            runtime_limits=RuntimeLimits(max_run_output_tokens=None),
+            runtime_limits=RuntimeLimits(max_run_generation_tokens=None),
             id="portable",
             revision="1",
             tool_catalog=InMemoryToolCatalog(()),
@@ -223,7 +228,7 @@ def test_preset_snapshot_requires_and_uses_opaque_component_bindings():
 
     first = AgentPreset(
 
-        runtime_limits=RuntimeLimits(max_run_output_tokens=None),
+        runtime_limits=RuntimeLimits(max_run_generation_tokens=None),
         id="portable",
         revision="1",
         tool_catalog=InMemoryToolCatalog(()),
@@ -258,7 +263,7 @@ def test_preset_snapshot_requires_and_uses_opaque_component_bindings():
 
 def test_preset_snapshot_derives_builtin_compaction_settings():
     first = AgentPreset(
-        runtime_limits=RuntimeLimits(max_run_output_tokens=None),
+        runtime_limits=RuntimeLimits(max_run_generation_tokens=None),
         id="portable",
         revision="1",
         tool_catalog=InMemoryToolCatalog(()),
@@ -283,16 +288,16 @@ def test_preset_snapshot_derives_builtin_compaction_settings():
     }
 
 
-def test_snapshot_v4_round_trip_rejects_v3_or_incomplete_values():
+def test_snapshot_v5_round_trip_rejects_old_or_incomplete_values():
     snapshot = AgentPreset(
-        runtime_limits=RuntimeLimits(max_run_output_tokens=None),
+        runtime_limits=RuntimeLimits(max_run_generation_tokens=None),
         id="portable",
         revision="1",
         tool_catalog=InMemoryToolCatalog(()),
     ).snapshot(_request())
 
-    assert snapshot.snapshot_version == 4
-    assert snapshot.to_mapping()["snapshotVersion"] == 4
+    assert snapshot.snapshot_version == 5
+    assert snapshot.to_mapping()["snapshotVersion"] == 5
     assert AgentPresetSnapshot.from_mapping(snapshot.to_mapping()) == snapshot
 
     legacy = snapshot.to_mapping()
@@ -300,26 +305,26 @@ def test_snapshot_v4_round_trip_rejects_v3_or_incomplete_values():
     with pytest.raises(ValueError, match="snapshot version"):
         AgentPresetSnapshot.from_mapping(legacy)
 
-    version_three = snapshot.to_mapping()
-    version_three["snapshotVersion"] = 3
+    version_four = snapshot.to_mapping()
+    version_four["snapshotVersion"] = 4
     with pytest.raises(ValueError, match="snapshot version"):
-        AgentPresetSnapshot.from_mapping(version_three)
+        AgentPresetSnapshot.from_mapping(version_four)
 
 
-def test_explicit_provider_output_limit_stays_in_snapshot_v4():
+def test_explicit_provider_generation_limit_stays_in_snapshot_v5():
     preset = AgentPreset(
-        id="legacy-budget",
+        id="bounded-output",
         revision="1",
         tool_catalog=InMemoryToolCatalog(()),
-        runtime_limits=RuntimeLimits(max_run_output_tokens=None, max_provider_output_bytes=1_000_000),
+        runtime_limits=RuntimeLimits(max_run_generation_tokens=None, max_provider_output_bytes=1_000_000),
     )
 
     snapshot = preset.snapshot(_request())
     recovered = AgentPresetSnapshot.from_mapping(snapshot.to_mapping())
 
-    assert snapshot.snapshot_version == 4
+    assert snapshot.snapshot_version == 5
     assert recovered.composition["runtimeLimits"]["maxProviderOutputBytes"] == 1_000_000
-    assert RuntimeLimits(max_run_output_tokens=None).max_provider_output_bytes == 8 * 1024 * 1024
+    assert RuntimeLimits(max_run_generation_tokens=None).max_provider_output_bytes == 8 * 1024 * 1024
 
 async def _tool_handler(state, arguments, signal=None):
     del state, arguments, signal
@@ -350,7 +355,7 @@ def test_preset_snapshot_covers_operational_capability_drift():
         component_bindings={
             "contextProvider": AgentComponentBinding("test.context", "1"),
         },
-        runtime_limits=RuntimeLimits(max_run_output_tokens=None, max_model_rounds=4),
+        runtime_limits=RuntimeLimits(max_run_generation_tokens=None, max_model_rounds=4),
         recovery_policy=RecoveryPolicy().with_overrides({
             RecoveryCause.EMPTY_MODEL_RESPONSE: 1,
         }),
@@ -372,7 +377,7 @@ def test_preset_snapshot_covers_operational_capability_drift():
         tool_catalog=_catalog(ToolExecutionMode.CONFIRM),
         context_provider=_ContextProvider(),
         component_bindings=original.component_bindings,
-        runtime_limits=RuntimeLimits(max_run_output_tokens=None, max_model_rounds=4),
+        runtime_limits=RuntimeLimits(max_run_generation_tokens=None, max_model_rounds=4),
         recovery_policy=original.recovery_policy,
     )
     with pytest.raises(ValueError, match="persisted snapshot"):

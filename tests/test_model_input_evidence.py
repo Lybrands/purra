@@ -44,7 +44,7 @@ def _request(messages: tuple[AgentMessage, ...]) -> AgentRunRequest:
             capability_snapshot=replace(
                 generic_capability_snapshot(),
                 profile_id="fixture:model",
-                max_call_output_tokens=128,
+                max_generation_tokens=128,
             ),
         ),
         domain_context=DomainContext(namespace="fixture"),
@@ -110,7 +110,7 @@ class _CountingGateway:
         return ModelStream(
             chunks=chunks(),
             model="fixture",
-            applied_output_limit=invocation.output_limit.max_tokens,
+            applied_generation_limit=invocation.output_budget.max_generation_tokens,
         )
 
     async def complete(self, messages, invocation, signal=None):
@@ -119,7 +119,7 @@ class _CountingGateway:
         return ModelCompletion(
             message=AgentMessage(role="assistant", content="compressed"),
             model="fixture",
-            applied_output_limit=invocation.output_limit.max_tokens,
+            applied_generation_limit=invocation.output_budget.max_generation_tokens,
             finish_reason=ModelFinishReason.STOP,
         )
 
@@ -144,7 +144,7 @@ class _ToolThenAnswerGateway(_CountingGateway):
         return ModelStream(
             chunks=chunks(),
             model="fixture",
-            applied_output_limit=invocation.output_limit.max_tokens,
+            applied_generation_limit=invocation.output_budget.max_generation_tokens,
         )
 
 
@@ -254,21 +254,22 @@ async def test_runtime_compaction_model_task_inherits_canonical_evidence():
     validator = _RejectingValidator()
     manager = AgentModelInvocationManager(
         gateway,
-        runtime_limits=RuntimeLimits(max_run_output_tokens=None),
+        runtime_limits=RuntimeLimits(max_run_generation_tokens=None),
         evidence_validator=validator,
     )
+    evidence = _receipt()
+    context = _evidence_message()
+    request = _request((context, AgentMessage(role="user", content="answer")))
     tasks = AgentModelTaskRunner(
         manager,
         ModelInvocationContext(run_id="run-compression"),
+        request.model,
     )
     runtime = AgentRuntime(
         model_gateway=gateway,
         model_manager=manager,
         context_compressor=_ModelCompactor(tasks),
     )
-    evidence = _receipt()
-    context = _evidence_message()
-    request = _request((context, AgentMessage(role="user", content="answer")))
     budget = allocate_context_budget(
         window_tokens=request.context_window,
         output_reserve_tokens=128,

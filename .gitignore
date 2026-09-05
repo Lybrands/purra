@@ -5,6 +5,7 @@ __pycache__/
 build/
 dist/
 docs/
+conformance/reports/
 node_modules/
 typescript/dist/
 typescript/.example-dist/

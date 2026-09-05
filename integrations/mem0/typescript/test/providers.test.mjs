@@ -14,9 +14,9 @@ const source = { id: "conversation", revision: "1" };
 const messages = [{ role: "user", content: "说中文" }];
 const request = { query: "中文", limit: 2, scope: {} };
 const budget = changes => ({ key: "job", maxLlmCalls: 2, maxEmbeddingCalls: 8, maxInputChars: 50_000,
-  maxOutputTokens: 64, maxCallOutputTokens: 32, ...changes });
+  maxOutputTokens: 64, resultCapacityTargetTokens: 32, ...changes });
 const complete = async (_, cap) => ({ message: { role: "assistant", content: JSON.stringify({ memory: [{ text: "中文", entities: [] }] }) },
-  finishReason: "stop", appliedOutputLimit: cap, usage: { inputTokens: 10, outputTokens: 5 } });
+  finishReason: "stop", appliedGenerationLimit: cap, usage: { inputTokens: 10, generationTokens: 5 } });
 const embed = async texts => ({ vectors: texts.map(() => [1, 0]), inputTokens: texts.reduce((n, t) => n + [...t].length, 0) });
 const deferred = () => { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; };
 
@@ -157,7 +157,7 @@ test("malformed model output does not become a successful empty extraction", asy
 
 test("missing output cap and invalid embeddings fail closed", async t => {
   const { create } = fixture(t);
-  const first = create({ providers: { complete: async (...args) => ({ ...await complete(...args), appliedOutputLimit: undefined }) } });
+  const first = create({ providers: { complete: async (...args) => ({ ...await complete(...args), appliedGenerationLimit: undefined }) } });
   await assert.rejects(first.extract(messages, { source, key: "cap" }), { code: "memory_provider_contract" });
   assert.equal(first.operation("cap").usage.reportedOutputTokens, 5);
   await first.discardExtraction("cap", { writerStopped: true });
@@ -165,6 +165,17 @@ test("missing output cap and invalid embeddings fail closed", async t => {
   await assert.rejects(second.add("中文", { source, key: "shape" }), { code: "memory_provider_contract" });
   assert.equal(second.operation("shape").usage.embeddingCalls, 1);
   assert.deepEqual((await second.list()).items, []);
+});
+
+test("result capacity does not require the Provider generation allowance to equal the target", async t => {
+  const { create } = fixture(t);
+  const memory = create({ providers: {
+    budget: budget({ resultCapacityTargetTokens: 16 }),
+    complete: async (...args) => ({ ...await complete(...args), appliedGenerationLimit: 32 }),
+  } });
+  const receipt = await memory.extract(messages, { source, key: "headroom" });
+  assert.equal(receipt.usage.reservedOutputTokens, 16);
+  assert.equal(receipt.usage.reportedOutputTokens, 5);
 });
 
 test("input envelope counts Unicode codepoints", async t => {
@@ -180,23 +191,31 @@ test("runModel uses the Agent-injected runner and the canonical invocation journ
   let memory, modelCalls = 0;
   const agent = new Agent({
     model: {
-      capabilities: { schemaVersion: 1, profileId: "memory-test", providerProtocol: "custom", contextWindowTokens: 8192, maxCallOutputTokens: 32,
+      capabilities: { schemaVersion: 2, profileId: "memory-test", providerProtocol: "custom", contextWindowTokens: 8192, maxGenerationTokens: 32,
         thinkingTokenAccounting: "included", protocol: { reasoningControl: "unavailable", reasoningReplay: "ignored", toolCalling: "unavailable",
           requiredToolChoice: "unavailable", parallelToolCalls: "unavailable", streaming: "unavailable", cancellation: "supported",
           assistantContentWithToolCalls: "optional", jsonSchemaLevel: "unknown", streamFinishSemantics: "normalized", usageSemantics: "normalized" } },
       async invoke(request) {
         modelCalls++;
-        if (modelCalls === 1) return complete(request.messages, request.outputLimit.maxTokens);
-        if (modelCalls === 2) return { ...await complete(request.messages, request.outputLimit.maxTokens),
+        assert.equal(request.outputBudget.maxGenerationTokens, 32);
+        if (modelCalls < 3) {
+          assert.equal(request.outputBudget.resultCapacityTargetTokens, 16);
+          assert.equal(request.outputBudget.resultCapacitySource, "workflow_policy");
+        }
+        if (modelCalls === 1) return complete(request.messages, request.outputBudget.maxGenerationTokens);
+        if (modelCalls === 2) return { ...await complete(request.messages, request.outputBudget.maxGenerationTokens),
           message: { role: "assistant", content: '{"relations":[{"item":"0","kind":"duplicate"}]}' } };
         return {
-          message: { role: "assistant", content: "done" }, finishReason: "stop", appliedOutputLimit: request.outputLimit.maxTokens,
-          usage: { inputTokens: 1, outputTokens: 1 },
+          message: { role: "assistant", content: "done" }, finishReason: "stop", appliedGenerationLimit: request.outputBudget.maxGenerationTokens,
+          usage: { inputTokens: 1, generationTokens: 1 },
         };
       },
     },
     context: { providerFactory(runner) {
-      memory = create({ providers: { complete: runModel(runner) } });
+      memory = create({ providers: {
+        budget: budget({ resultCapacityTargetTokens: 16 }),
+        complete: runModel(runner),
+      } });
       return { describeContextDemands() { return []; }, async buildContext() {
         await memory.add("中文", { source, key: "existing" });
         const receipt = await memory.extract(messages, { source, key: "run" });
@@ -205,7 +224,7 @@ test("runModel uses the Agent-injected runner and the canonical invocation journ
       } };
     } },
   });
-  const handle = await agent.submit({ messages: [{ role: "user", content: "run" }] }, { budgets: { maxRunOutputTokens: 96 } });
+  const handle = await agent.submit({ messages: [{ role: "user", content: "run" }] }, { budgets: { maxRunGenerationTokens: 96 } });
   assert.equal((await handle.result).output, "done");
   const events = []; for await (const event of handle.events({ visibility: "all" })) events.push(event);
   const invocations = events.filter(e => e.kind === "invocation.started");
@@ -219,7 +238,7 @@ test("a crashed reservation remains charged and visibly unsettled", t => {
   const { path } = fixture(t), journalPath = join(path, "crash.db");
   const script = `import { Journal } from ${JSON.stringify(new URL("../dist/journal.js", import.meta.url).href)};
     const j = new Journal(process.argv[1], 'scope');
-    j.budget('job', { max_llm_calls:0, max_embedding_calls:1, max_input_chars:20, max_output_tokens:0, max_call_output_tokens:1 });
+    j.budget('job', { max_llm_calls:0, max_embedding_calls:1, max_input_chars:20, max_output_tokens:0, result_capacity_target_tokens:1 });
     j.admit('job', undefined, 'embedding', 2, 0); process.exit(17);`;
   assert.equal(spawnSync(process.execPath, ["--input-type=module", "-e", script, journalPath]).status, 17);
   const journal = new Journal(journalPath, "scope");
@@ -230,7 +249,7 @@ test("a crashed reservation remains charged and visibly unsettled", t => {
 });
 
 const reviewFixture = JSON.parse(readFileSync(new URL("../../fixtures/review.json", import.meta.url), "utf8"));
-const reviewBudget = budget({ maxLlmCalls: 8, maxEmbeddingCalls: 32, maxOutputTokens: 4096, maxCallOutputTokens: 512 });
+const reviewBudget = budget({ maxLlmCalls: 8, maxEmbeddingCalls: 32, maxOutputTokens: 4096, resultCapacityTargetTokens: 512 });
 test("memory workflow requires host authorization and resumes from the journal", async t => {
   const { create } = fixture(t);
   const providers = { budget: reviewBudget, complete: classifier(["independent"], []) };

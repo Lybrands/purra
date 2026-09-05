@@ -7,7 +7,7 @@ import httpx2
 import pytest
 from openai import AsyncOpenAI
 from purra.contracts import AgentMessage, ModelRequest, ModelInvocation, ToolSchema, ToolHandlerResult, ToolCallResult
-from purra.model_protocol import generic_capability_snapshot, resolve_invocation_output_limit
+from purra.model_protocol import generic_capability_snapshot, resolve_invocation_output_budget
 from purra.runtime.model_round import ModelRoundAccumulator
 from purra.runtime.tool_round import continuation_messages
 from purra_openai import OpenAIResponsesGateway
@@ -16,9 +16,17 @@ RESPONSE = json.loads((Path(__file__).resolve().parents[2] / "fixtures/response.
 
 
 def invocation():
-    model = ModelRequest("openai", "fixture-model", replace(generic_capability_snapshot(), max_call_output_tokens=256))
+    model = ModelRequest(
+        "openai",
+        "fixture-model",
+        replace(generic_capability_snapshot(), max_generation_tokens=256),
+        max_generation_tokens=128,
+    )
     return ModelInvocation(model, tools=(ToolSchema("lookup", "look up", {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}),),
-                           output_limit=resolve_invocation_output_limit(model.capability_snapshot, 128))
+                           output_budget=resolve_invocation_output_budget(
+                               model.capability_snapshot,
+                               max_generation_tokens=model.max_generation_tokens,
+                           ))
 
 
 def sse():
@@ -44,7 +52,7 @@ async def test_sdk_completion_stream_and_tool_continuation_preserve_private_stat
         messages = (AgentMessage("user", "check"),)
         completion = await gateway.complete(messages, call)
         assert completion.finish_reason.value == "tool_calls"
-        assert completion.applied_output_limit == 128 and completion.usage.reasoning_output_tokens == 6
+        assert completion.applied_generation_limit == 128 and completion.usage.reasoning_tokens == 6
         assert completion.message.reasoning is None
         stream = await gateway.stream(messages, call)
         accumulator = ModelRoundAccumulator()
@@ -124,7 +132,7 @@ async def test_core_tool_round_keeps_encrypted_state_out_of_public_output():
         core = AgentCore(model_gateway=OpenAIResponsesGateway(AsyncOpenAI(api_key="fixture-not-a-key", http_client=http)),
                          run_repository=adapters.runs, output_repository=adapters.outputs, output_publisher=adapters.publisher,
                          preset=AgentPreset(id="openai-fixture", revision="1", tool_catalog=InMemoryToolCatalog((lookup.registration,)),
-                                            runtime_limits=RuntimeLimits(max_run_output_tokens=1000)))
+                                            runtime_limits=RuntimeLimits(max_run_generation_tokens=1000)))
         try:
             handle = await core.submit(AgentRunRequest(messages=(AgentMessage("user", "lookup"),), model=invocation().request,
                                                       domain_context=DomainContext("fixture"), context_window=65536, tools_enabled=True))

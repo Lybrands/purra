@@ -41,7 +41,7 @@ async def ask(gateway, model: ModelRequest, context_window: int):
             id="assistant",
             revision="1",
             tool_catalog=InMemoryToolCatalog(()),
-            runtime_limits=RuntimeLimits(max_run_output_tokens=8192),
+            runtime_limits=RuntimeLimits(max_run_generation_tokens=8192),
         ),
         run_repository=storage.runs,
         output_repository=storage.outputs,
@@ -77,9 +77,12 @@ JavaScript 和 TypeScript 用法见 [TypeScript 指南](typescript/README.zh-CN.
 
 ## 预算与恢复
 
-`max_call_output_tokens` 限制单次模型调用的输出，`max_run_output_tokens` 限制整个 Run
-累计的模型输出。累计预算必须显式设置；`None` 表示不设有限 Token 上限。
-使用有限预算时，模型服务必须报告实际用量。
+`ModelRequest.max_generation_tokens` 是用户对单次 Provider 总生成量的可选上限；
+当模型档案声明思考 Token 包含在生成量中时，这个上限也包含思考。
+`RuntimeLimits.max_run_generation_tokens` 限制整个 Run 的累计总生成量；`None`
+表示不设有限上限。使用有限预算时，模型服务必须报告实际用量。工作流可选的
+`result_capacity_target_tokens` 仅用于上下文容量规划和诊断，既不会缩小 Provider
+上限，也不保证实际可见正文数量。
 
 恢复从已提交的检查点继续。应用需要还原相同的模型和工具配置，并在重试前确认
 中断的外部写入是否已经执行。仅配置持久化存储，不能保证这类写入可以安全重放。

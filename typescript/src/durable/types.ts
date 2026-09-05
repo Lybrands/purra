@@ -56,14 +56,14 @@ export interface LongTaskUsage {
   readonly invocationCount: number;
   readonly unreportedUsageAttempts: number;
   readonly inputTokens: number;
-  readonly outputTokens: number;
+  readonly generationTokens: number;
   readonly reasoningTokens: number | null;
 }
 
 export interface LongTaskBudgetLimits {
   readonly maxInvocationAttempts: number | null;
   readonly maxInputTokens: number | null;
-  readonly maxRunOutputTokens: number | null;
+  readonly maxRunGenerationTokens: number | null;
   readonly maxReasoningTokens: number | null;
 }
 

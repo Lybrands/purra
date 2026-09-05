@@ -54,6 +54,9 @@ and uses the ordinary model/tool loop. A planning-required tool still needs
 Planner admission and cannot fall back to unplanned execution. Avoid assuming
 that a direct answer always costs one invocation: the configured response
 transaction may also require validation or a tool-free public presentation.
+When tools are present, provisional response text remains private and the
+tool-free presentation is the only public final stream; Core never promotes the
+completed private buffer as one bulk final event.
 
 Reactive execution is an explicit override that forbids Planner activation. A
 planning-required tool then fails closed with `planning_required`.
@@ -70,8 +73,8 @@ Configure the Python Planner through `ExecutionProfile.planner` in an
 `AgentPreset`, or the direct `AgentCore(planner=...)` composition. TypeScript
 uses `planning.planner` or `planning.plannerFactory`. A planning policy is
 optional in both SDKs. Full-Run callers must explicitly select the cumulative
-output budget: Python `RuntimeLimits(max_run_output_tokens=...)` and TypeScript
-`submit(request, { budgets: { maxRunOutputTokens: ... } })`.
+generation budget: Python `RuntimeLimits(max_run_generation_tokens=...)` and
+TypeScript `submit(request, { budgets: { maxRunGenerationTokens: ... } })`.
 
 Durable execution extends a valid Planned composition with task admission,
 leased task units, checkpoints, and authenticated continuation. A continuation
@@ -85,6 +88,12 @@ narrow down the tree. `delegateToAgents` is a synchronous create-and-wait
 facade; hosts may also use the public spawn, join, continue, cancel, and close
 commands directly. Root recovery rebinds the execution inputs and scans the
 complete persisted descendant set before replaying work.
+
+`AgentTreePolicy` is the only Child Agent policy surface. Python Agent Tree
+execution requires that policy inside an `AgentPreset`; `delegateToAgents`
+accepts `children`, and every newly persisted Agent preset uses snapshot v5.
+The former same-Run delegation repository, executor, events, and v4 snapshot
+execution path do not exist in the runtime.
 
 Reactive Child Runs persist a private `model_ready` checkpoint after a fully
 committed tool round. A replacement executor may attach to the same canonical

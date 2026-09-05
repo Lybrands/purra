@@ -18,12 +18,10 @@ from purra.model_protocol.capabilities import (
     ModelProtocolCapabilities,
     generic_capability_snapshot,
 )
-from purra.model_protocol.output_limits import InvocationOutputLimit
+from purra.model_protocol.output_limits import InvocationOutputBudget
 from purra.contracts.enums import (
     ApprovalDecision,
     ApprovalStatus,
-    DelegationContextMode,
-    DelegationStatus,
     MessageOrigin,
     MessageRole,
     ModelFinishReason,
@@ -169,6 +167,7 @@ class ModelRequest:
     capability_snapshot: ModelCapabilitySnapshot = field(
         default_factory=generic_capability_snapshot
     )
+    max_generation_tokens: int | None = None
     options: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -182,6 +181,14 @@ class ModelRequest:
             raise TypeError(
                 "model capability snapshot must be ModelCapabilitySnapshot"
             )
+        object.__setattr__(
+            self,
+            "max_generation_tokens",
+            optional_positive_int(
+                self.max_generation_tokens,
+                "model request max_generation_tokens",
+            ),
+        )
         object.__setattr__(self, "options", freeze_json_mapping(self.options))
 
     @property
@@ -198,26 +205,30 @@ class ModelInvocation:
     request: ModelRequest
     tools: tuple[ToolSchema, ...] = ()
     tool_choice: ToolChoiceMode = ToolChoiceMode.AUTO
-    output_limit: InvocationOutputLimit | None = None
+    output_budget: InvocationOutputBudget | None = None
     reasoning_mode: ReasoningMode = ReasoningMode.DEFAULT
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "tools", tuple(self.tools))
         object.__setattr__(self, "tool_choice", ToolChoiceMode(self.tool_choice))
         object.__setattr__(self, "reasoning_mode", ReasoningMode(self.reasoning_mode))
-        if self.output_limit is not None and not isinstance(
-            self.output_limit,
-            InvocationOutputLimit,
+        if self.output_budget is not None and not isinstance(
+            self.output_budget,
+            InvocationOutputBudget,
         ):
             raise TypeError(
-                "model output limit must be InvocationOutputLimit"
+                "model output budget must be InvocationOutputBudget"
             )
         if not self.tools and self.tool_choice is ToolChoiceMode.REQUIRED:
             raise ValueError("required tool choice needs at least one tool")
 
     @property
-    def max_call_output_tokens(self) -> int | None:
-        return self.output_limit.max_tokens if self.output_limit is not None else None
+    def max_generation_tokens(self) -> int | None:
+        return (
+            self.output_budget.max_generation_tokens
+            if self.output_budget is not None
+            else None
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -251,26 +262,30 @@ class ModelTokenUsage:
     """
 
     input_tokens: int
-    output_tokens: int = 0
+    generation_tokens: int
     total_tokens: int | None = None
     cached_input_tokens: int = 0
-    reasoning_output_tokens: int = 0
+    reasoning_tokens: int | None = None
 
     def __post_init__(self) -> None:
         for name in (
             "input_tokens",
-            "output_tokens",
+            "generation_tokens",
             "cached_input_tokens",
-            "reasoning_output_tokens",
         ):
             object.__setattr__(self, name, non_negative_int(
                 getattr(self, name), name
+            ))
+        if self.reasoning_tokens is not None:
+            object.__setattr__(self, "reasoning_tokens", non_negative_int(
+                self.reasoning_tokens,
+                "reasoning_tokens",
             ))
         if self.total_tokens is None:
             object.__setattr__(
                 self,
                 "total_tokens",
-                self.input_tokens + self.output_tokens,
+                self.input_tokens + self.generation_tokens,
             )
         else:
             object.__setattr__(self, "total_tokens", non_negative_int(
@@ -353,14 +368,14 @@ class ModelStream:
     activity_support: ModelStreamActivitySupport = (
         ModelStreamActivitySupport.SEMANTIC_ONLY
     )
-    applied_output_limit: int | None = None
+    applied_generation_limit: int | None = None
 
     def __post_init__(self) -> None:
         if self.transport_diagnostics is not None and not isinstance(self.transport_diagnostics, ModelTransportDiagnostics):
             raise TypeError("stream transport diagnostics must be typed")
         self.model = required_text(self.model, "model stream model name")
-        self.applied_output_limit = optional_positive_int(
-            self.applied_output_limit,
+        self.applied_generation_limit = optional_positive_int(
+            self.applied_generation_limit,
             "model stream applied output limit",
         )
         self.metadata = freeze_json_mapping(self.metadata)
@@ -376,7 +391,7 @@ class ModelCompletion:
     finish_reason: ModelFinishReason | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
     usage: ModelTokenUsage | None = None
-    applied_output_limit: int | None = None
+    applied_generation_limit: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "model", required_text(
@@ -384,9 +399,9 @@ class ModelCompletion:
         ))
         object.__setattr__(
             self,
-            "applied_output_limit",
+            "applied_generation_limit",
             optional_positive_int(
-                self.applied_output_limit,
+                self.applied_generation_limit,
                 "model completion applied output limit",
             ),
         )
@@ -621,7 +636,7 @@ class PlannerLimits:
     max_goal_chars: int = 160
     max_tool_steps: int = 4
     max_repair_attempts: int = 1
-    max_call_output_tokens: int | None = None
+    result_capacity_target_tokens: int | None = None
     attempt_timeout_ms: int | None = None
 
     def __post_init__(self) -> None:
@@ -638,10 +653,10 @@ class PlannerLimits:
         ))
         object.__setattr__(
             self,
-            "max_call_output_tokens",
+            "result_capacity_target_tokens",
             optional_positive_int(
-                self.max_call_output_tokens,
-                "max_call_output_tokens",
+                self.result_capacity_target_tokens,
+                "result_capacity_target_tokens",
             ),
         )
         object.__setattr__(
@@ -1427,6 +1442,8 @@ class RunExecutionIntent:
     tool_protocol_contract: str
     recovery_policy_id: str
     capability_snapshot_digest: str
+    requested_user_max_generation_tokens: int | None
+    result_capacity_target_tokens: int | None
 
     def __post_init__(self) -> None:
         mode = str(self.requested_reasoning_mode or "").strip().lower()
@@ -1451,6 +1468,18 @@ class RunExecutionIntent:
                 "run execution intent capability snapshot must be a SHA-256 digest"
             )
         object.__setattr__(self, "capability_snapshot_digest", digest)
+        for name in (
+            "requested_user_max_generation_tokens",
+            "result_capacity_target_tokens",
+        ):
+            object.__setattr__(
+                self,
+                name,
+                optional_positive_int(
+                    getattr(self, name),
+                    f"run execution intent {name}",
+                ),
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1523,74 +1552,6 @@ class RunExecutionLease:
 
 
 @dataclass(frozen=True, slots=True)
-class AgentDelegation:
-    id: str
-    batch_id: str
-    run_id: RunId
-    agent_name: str
-    agent_title: str
-    agent_instruction: str
-    objective: str
-    input_payload: Mapping[str, Any] = field(default_factory=dict)
-    context_mode: DelegationContextMode = DelegationContextMode.ISOLATED
-    status: DelegationStatus = DelegationStatus.QUEUED
-    required: bool = True
-    priority: int = 0
-    result_summary: str | None = None
-    error: str | None = None
-    created_at: str | None = None
-    updated_at: str | None = None
-
-    def __post_init__(self) -> None:
-        for name in (
-            "id",
-            "batch_id",
-            "run_id",
-            "agent_name",
-            "agent_title",
-            "agent_instruction",
-            "objective",
-        ):
-            object.__setattr__(self, name, required_text(
-                getattr(self, name), f"delegation {name}"
-            ))
-        object.__setattr__(self, "status", DelegationStatus(self.status))
-        object.__setattr__(
-            self,
-            "context_mode",
-            DelegationContextMode(self.context_mode),
-        )
-        object.__setattr__(
-            self,
-            "input_payload",
-            freeze_json_mapping(self.input_payload),
-        )
-        object.__setattr__(self, "required", bool(self.required))
-        object.__setattr__(self, "priority", int(self.priority))
-        object.__setattr__(self, "result_summary", _optional_text(self.result_summary))
-        object.__setattr__(self, "error", _optional_text(self.error))
-
-
-@dataclass(frozen=True, slots=True)
-class DelegationAggregation:
-    state: Literal["pending", "ready", "blocked"]
-    counts: Mapping[str, int]
-    required_failures: tuple[str, ...] = ()
-    results: tuple[Mapping[str, Any], ...] = ()
-
-    def __post_init__(self) -> None:
-        if self.state not in {"pending", "ready", "blocked"}:
-            raise ValueError("invalid delegation aggregate state")
-        object.__setattr__(self, "counts", freeze_json_mapping(self.counts))
-        object.__setattr__(self, "required_failures", tuple(self.required_failures))
-        object.__setattr__(
-            self,
-            "results",
-            tuple(freeze_json_mapping(item) for item in self.results),
-        )
-
-
-@dataclass(frozen=True, slots=True)
 class RunCreateParams:
     session_id: SessionId | None
     prompt: str
@@ -1601,10 +1562,13 @@ class RunCreateParams:
     deadline_at_ms: int | None = None
     runtime_limits: "RuntimeLimits" = field(
         default_factory=lambda: RuntimeLimits(
-            max_run_output_tokens=None,
+            max_run_generation_tokens=None,
         )
     )
     agent_preset_snapshot: Mapping[str, Any] = field(default_factory=dict)
+    requested_user_max_generation_tokens: int | None = None
+    result_capacity_target_tokens: int | None = None
+    selected_context_window_tokens: int | None = None
     requested_run_id: RunId | None = None
     root_run_id: RunId | None = None
     agent_id: str | None = None
@@ -1646,6 +1610,19 @@ class RunCreateParams:
             "deadline_at_ms",
             optional_positive_int(self.deadline_at_ms, "Run deadline_at_ms"),
         )
+        for name in (
+            "requested_user_max_generation_tokens",
+            "result_capacity_target_tokens",
+            "selected_context_window_tokens",
+        ):
+            object.__setattr__(
+                self,
+                name,
+                optional_positive_int(
+                    getattr(self, name),
+                    f"Run {name}",
+                ),
+            )
         if not isinstance(self.runtime_limits, RuntimeLimits):
             raise TypeError("Run runtime_limits must be RuntimeLimits")
         if self.provenance is not None and not isinstance(
@@ -1736,12 +1713,12 @@ class RuntimeLimits:
     plan step active. Such rounds may unlock the separately bounded progress
     allowance without turning malformed or stalled loops into unbounded runs.
 
-    ``max_run_output_tokens`` covers all model invocations charged
+    ``max_run_generation_tokens`` covers all model invocations charged
     to one Run. ``None`` is an explicit choice to leave that cumulative token
     budget without a finite ceiling; it is not a per-invocation model limit.
     """
 
-    max_run_output_tokens: int | None
+    max_run_generation_tokens: int | None
     max_model_rounds: int = 6
     max_progress_rounds: int = 32
     provider_activity_idle_timeout_ms: int | None = 30_000
@@ -1792,7 +1769,7 @@ class RuntimeLimits:
             )
         for name in (
             "max_input_tokens",
-            "max_run_output_tokens",
+            "max_run_generation_tokens",
             "max_reasoning_tokens",
         ):
             object.__setattr__(
@@ -1833,7 +1810,6 @@ def _tool_call_from_mapping(value: Mapping[str, Any]) -> ToolCall:
 
 
 __all__ = [
-    "AgentDelegation",
     "AgentMessage",
     "AgentRunRequest",
     "AgentRunResult",
@@ -1846,9 +1822,6 @@ __all__ = [
     "ContextBudget",
     "ContextBudgetClaim",
     "ContextBundle",
-    "DelegationAggregation",
-    "DelegationContextMode",
-    "DelegationStatus",
     "DomainContext",
     "DomainEffect",
     "ExecutionPlan",
@@ -1856,7 +1829,7 @@ __all__ = [
     "ExecutionRecipeStep",
     "ExecutionState",
     "ExecutionTransition",
-    "InvocationOutputLimit",
+    "InvocationOutputBudget",
     "MessageOrigin",
     "MessageRole",
     "ModelCapabilitySnapshot",

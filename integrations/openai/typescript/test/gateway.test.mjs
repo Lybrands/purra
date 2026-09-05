@@ -6,7 +6,8 @@ import { OpenAIResponsesGateway } from "../dist/index.js";
 
 const response = JSON.parse(readFileSync(new URL("../../fixtures/response.json", import.meta.url), "utf8"));
 const request = { messages: [{ role: "user", content: "check" }], tools: [{ name: "lookup", description: "lookup", inputSchema: { type: "object", properties: { query: { type: "string" } } } }],
-  outputLimit: { maxTokens: 128, source: "user_override", profileMaxTokens: 256 } };
+  outputBudget: { maxGenerationTokens: 128, generationSource: "user", profileMaxGenerationTokens: 256,
+    requestedUserMaxGenerationTokens: 128, resultCapacityTargetTokens: null, resultCapacitySource: null, nonResultHeadroomTokens: null } };
 function gateway(fetch) { return new OpenAIResponsesGateway({ model: "fixture-model", capabilities: {}, client: new OpenAI({ apiKey: "fixture-not-a-key", fetch, maxRetries: 5 }) }); }
 
 test("official SDK maps completion, SSE, encrypted continuity and real usage", async () => {
@@ -24,7 +25,7 @@ test("official SDK maps completion, SSE, encrypted continuity and real usage", a
   });
   const result = await model.invoke(request);
   assert.equal(result.finishReason, "tool_calls");
-  assert.equal(result.usage.reasoningOutputTokens, 6);
+  assert.equal(result.usage.reasoningTokens, 6);
   assert.equal(result.message.reasoning, undefined);
   const stream = await model.stream(request), chunks = [];
   for await (const chunk of stream) chunks.push(chunk);

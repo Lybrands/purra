@@ -10,7 +10,8 @@ export interface MemoryBudget {
   readonly maxEmbeddingCalls: number;
   readonly maxInputChars: number;
   readonly maxOutputTokens: number;
-  readonly maxCallOutputTokens: number;
+  /** Per-call result sizing target. This does not reduce the Provider generation allowance. */
+  readonly resultCapacityTargetTokens: number;
 }
 export interface MemoryUsage {
   readonly llmCalls: number;
@@ -23,16 +24,20 @@ export interface MemoryUsage {
   readonly unsettledCalls: number;
 }
 export interface EmbeddingResult { readonly vectors: readonly (readonly number[])[]; readonly inputTokens?: number }
-/** Trusted callbacks: apply the exact output cap and disable hidden retries. */
+/** Trusted callbacks: preserve the result-capacity target and disable hidden retries. */
 export interface MemoryProviders {
   readonly budget: MemoryBudget;
-  readonly complete: (messages: readonly Message[], maxOutputTokens: number, signal: AbortSignal) => Promise<ModelTurn>;
+  readonly complete: (messages: readonly Message[], resultCapacityTargetTokens: number, signal: AbortSignal) => Promise<ModelTurn>;
   readonly embed: (texts: readonly string[], signal: AbortSignal) => Promise<EmbeddingResult>;
 }
 
 /** Use the real Run-injected runner. Background ingestion must not fabricate a Run. */
 export function runModel(runner: ModelTaskRunner): MemoryProviders["complete"] {
-  return async (messages, maxCallOutputTokens, signal) => (await runner.complete(messages, { maxCallOutputTokens, signal })).turn;
+  return async (messages, resultCapacityTargetTokens, signal) => (await runner.complete(messages, {
+    resultCapacityTargetTokens,
+    resultCapacitySource: "workflow_policy",
+    signal,
+  })).turn;
 }
 
 export function providerLimits(providers: MemoryProviders): Record<string, number> {
@@ -40,9 +45,10 @@ export function providerLimits(providers: MemoryProviders): Record<string, numbe
   const b = providers.budget;
   if (typeof b?.key !== "string" || !b.key.trim() || [...b.key].length > 512) throw new TypeError("invalid budget key");
   const limits = { max_llm_calls: b.maxLlmCalls, max_embedding_calls: b.maxEmbeddingCalls,
-    max_input_chars: b.maxInputChars, max_output_tokens: b.maxOutputTokens, max_call_output_tokens: b.maxCallOutputTokens };
+    max_input_chars: b.maxInputChars, max_output_tokens: b.maxOutputTokens,
+    result_capacity_target_tokens: b.resultCapacityTargetTokens };
   for (const [name, value] of Object.entries(limits)) {
-    if (!Number.isSafeInteger(value) || value < (name === "max_call_output_tokens" ? 1 : 0) || value > 2 ** 31 - 1) throw new TypeError(`invalid ${name}`);
+    if (!Number.isSafeInteger(value) || value < (name === "result_capacity_target_tokens" ? 1 : 0) || value > 2 ** 31 - 1) throw new TypeError(`invalid ${name}`);
   }
   return limits;
 }
@@ -93,27 +99,34 @@ export class ProviderExecution {
   async invoke(kind: "embedding", values: readonly string[]): Promise<number[][]>;
   async invoke(kind: "llm" | "embedding", values: readonly Message[] | readonly string[], extraction = true): Promise<string | number[][]> {
     this.check();
-    const cap = kind === "llm" ? this.providers.budget.maxCallOutputTokens : 0;
+    const resultTarget = kind === "llm" ? this.providers.budget.resultCapacityTargetTokens : 0;
     const chars = values.reduce<number>((sum, value) => sum + [...(typeof value === "string" ? value : value.content as string)].length, 0);
     let id: string;
-    try { id = this.journal.admit(this.providers.budget.key, this.operation, kind, chars, cap); }
+    try { id = this.journal.admit(this.providers.budget.key, this.operation, kind, chars, resultTarget); }
     catch (error) { this.stop(error instanceof MemoryError ? error.code : "memory_provider_error"); throw new MemoryError(this.error!); }
     let inputTokens: number | null = null;
-    let outputTokens: number | null = null;
+    let generationTokens: number | null = null;
     try {
       this.check();
       let content: string | number[][];
       if (kind === "llm") {
-        const result = await this.providers.complete(values as readonly Message[], cap, this.controller.signal);
+        const result = await this.providers.complete(
+          values as readonly Message[],
+          resultTarget,
+          this.controller.signal,
+        );
         if (result?.usage) {
-          if (!validTokens(result.usage.inputTokens) || (result.usage.outputTokens !== undefined && !validTokens(result.usage.outputTokens))) {
+          if (!validTokens(result.usage.inputTokens) || (result.usage.generationTokens !== undefined && !validTokens(result.usage.generationTokens))) {
             throw new MemoryError("memory_provider_contract");
           }
           inputTokens = result.usage.inputTokens;
-          outputTokens = result.usage.outputTokens ?? null;
+          generationTokens = result.usage.generationTokens ?? null;
         }
-        if (result?.appliedOutputLimit !== cap || result.finishReason !== "stop" || result.message?.role !== "assistant"
-            || result.message.toolCalls?.length || typeof result.message.content !== "string" || (outputTokens !== null && outputTokens > cap)) {
+        const appliedGenerationLimit = result?.appliedGenerationLimit;
+        if (!Number.isSafeInteger(appliedGenerationLimit) || (appliedGenerationLimit as number) < resultTarget
+            || result.finishReason !== "stop" || result.message?.role !== "assistant"
+            || result.message.toolCalls?.length || typeof result.message.content !== "string"
+            || (generationTokens !== null && generationTokens > (appliedGenerationLimit as number))) {
           throw new MemoryError("memory_provider_contract");
         }
         content = result.message.content;
@@ -133,7 +146,7 @@ export class ProviderExecution {
         const result = await this.providers.embed(values as readonly string[], this.controller.signal);
         if (result?.inputTokens !== undefined && !validTokens(result.inputTokens)) throw new MemoryError("memory_provider_contract");
         inputTokens = result.inputTokens ?? null;
-        outputTokens = 0;
+        generationTokens = 0;
         if (!Array.isArray(result.vectors) || result.vectors.length !== values.length || result.vectors.some(v =>
           !Array.isArray(v) || v.length !== this.dimensions || v.some(x => typeof x !== "number" || !Number.isFinite(x)))) {
           throw new MemoryError("memory_provider_contract");
@@ -141,10 +154,10 @@ export class ProviderExecution {
         content = result.vectors.map(v => [...v]);
       }
       this.check();
-      this.journal.settle(id, "complete", inputTokens, outputTokens);
+      this.journal.settle(id, "complete", inputTokens, generationTokens);
       return content;
     } catch (error) {
-      this.journal.settle(id, "failed", inputTokens, outputTokens);
+      this.journal.settle(id, "failed", inputTokens, generationTokens);
       this.stop(error instanceof MemoryError ? error.code : "memory_provider_error");
       throw new MemoryError(this.error!);
     }

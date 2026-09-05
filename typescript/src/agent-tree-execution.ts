@@ -14,11 +14,11 @@ import {
   type SpawnAgentsCommand,
   type SpawnAgentsReceipt,
 } from "./agent-tree.js";
-import type { DelegationPolicyOptions } from "./delegation/types.js";
+import type { AgentTreePolicyOptions } from "./agent-tree-policy.js";
 
 export interface AgentTreeOptions {
   readonly repository: RunTreeRepository;
-  readonly policy?: DelegationPolicyOptions;
+  readonly policy?: AgentTreePolicyOptions;
   readonly rootAgentId?: string;
   readonly capabilityGrant?: AgentCapabilityGrant;
   readonly ownerId?: string;

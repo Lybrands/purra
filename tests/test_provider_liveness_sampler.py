@@ -12,6 +12,8 @@ from purra.contracts import (
     ModelInvocation,
     ModelRequest,
     ModelStream,
+    ModelStreamActivity,
+    ModelStreamActivitySupport,
     ModelStreamChunk,
     ModelTokenUsage,
     ToolCallDelta,
@@ -41,7 +43,7 @@ def _invocation() -> ModelInvocation:
         capability_snapshot=replace(
             generic_capability_snapshot(),
             profile_id="sample:model",
-            max_call_output_tokens=256,
+            max_generation_tokens=256,
         ),
     ))
 
@@ -65,7 +67,7 @@ class _StreamingGateway:
                 )
                 yield ModelStreamChunk(
                     content_delta="SECRET_OUTPUT",
-                    usage=ModelTokenUsage(input_tokens=3, output_tokens=2),
+                    usage=ModelTokenUsage(input_tokens=3, generation_tokens=2),
                 )
                 yield ModelStreamChunk(finish_reason=ModelFinishReason.STOP)
             finally:
@@ -90,6 +92,30 @@ class _FailingGateway(_StreamingGateway):
             code="upstream_stream_interrupted",
             retryable=True,
         )
+
+
+@pytest.mark.asyncio
+async def test_sampler_preserves_transport_activity_without_counting_it_as_progress():
+    activity = ModelStreamActivity("transport")
+    content = ModelStreamChunk(content_delta="ok", finish_reason=ModelFinishReason.STOP)
+    class Gateway(_StreamingGateway):
+        async def stream(self, messages, invocation, signal=None):
+            async def chunks():
+                yield activity
+                yield content
+            return ModelStream(chunks(), model="local", activity_support=ModelStreamActivitySupport.TRANSPORT)
+    samples = []
+    sampled = SamplingModelGateway(Gateway(), samples.append, clock_ns=_StepClock())
+    stream = await sampled.stream((), _invocation())
+    received = [item async for item in stream.chunks]
+    assert received[0] is activity and received[1] is content
+    assert stream.activity_support is ModelStreamActivitySupport.TRANSPORT
+    sample = samples[0]
+    assert sample.outcome == "completed"
+    assert sample.activity_evidence == "transport_and_semantic_chunks"
+    assert sample.chunk_count == 1 and sample.content_chars == 2
+    assert len(sample.activity_offsets_ms) == 2 and len(sample.progress_offsets_ms) == 1
+    assert sample.first_activity_ms < sample.first_progress_ms
 
 
 @pytest.mark.asyncio

@@ -43,22 +43,10 @@ export function allocateContextBudget(input: {
   const outputReserveTokens = positiveInteger(input.outputReserveTokens, "output reserve");
   const tools = input.tools ?? [];
   const toolSchemaTokens = estimateToolSchemaTokens(tools);
-  const safetyReserveTokens = reserve(
-    input.reserves?.safetyTokens,
-    Math.min(64_000, Math.max(4_096, Math.ceil(windowTokens * 0.05))),
-    "safety reserve",
-  );
-  const runtimeReserveTokens = reserve(
-    input.reserves?.runtimeTokens,
-    tools.length === 0
-      ? Math.min(16_000, Math.max(2_048, Math.floor(windowTokens / 25)))
-      : Math.min(64_000, Math.max(4_096, Math.floor(windowTokens / 10))),
-    "runtime reserve",
-  );
-  const minimumMessageTokens = reserve(
-    input.reserves?.minimumMessageTokens,
-    Math.min(8_192, Math.max(1_024, Math.floor(windowTokens / 100))),
-    "minimum message reserve",
+  const { safetyReserveTokens, runtimeReserveTokens, minimumMessageTokens } = fixedContextReserves(
+    windowTokens,
+    tools.length > 0,
+    input.reserves,
   );
   const providerInputTokens = windowTokens
     - outputReserveTokens
@@ -86,6 +74,34 @@ export function allocateContextBudget(input: {
     minimumMessageTokens,
     contextAllocations: Object.freeze(contextAllocations),
   });
+}
+
+/** Maximum physically valid Provider generation allowance for this context. */
+export function maxGenerationTokensForContext(input: {
+  readonly windowTokens: number;
+  readonly tools?: readonly ToolSpec[];
+  readonly reserves?: ContextReserves;
+}): number {
+  const windowTokens = positiveInteger(input.windowTokens, "context window");
+  const tools = input.tools ?? [];
+  const toolSchemaTokens = estimateToolSchemaTokens(tools);
+  const { safetyReserveTokens, runtimeReserveTokens, minimumMessageTokens } = fixedContextReserves(
+    windowTokens,
+    tools.length > 0,
+    input.reserves,
+  );
+  const result = windowTokens
+    - safetyReserveTokens
+    - runtimeReserveTokens
+    - toolSchemaTokens
+    - minimumMessageTokens;
+  if (result < 1) {
+    throw new AgentError(
+      "fixed_reserves_exceed_window",
+      "Fixed context reserves leave no generation budget",
+    );
+  }
+  return result;
 }
 
 export function normalizeClaims(values: readonly ContextBudgetClaim[]): readonly Required<ContextBudgetClaim>[] {
@@ -243,6 +259,36 @@ function estimateUnits(value: string, asciiDivisor: number): number {
 
 function reserve(value: number | undefined, fallback: number, label: string): number {
   return value === undefined ? fallback : nonNegativeInteger(value, label);
+}
+
+function fixedContextReserves(
+  windowTokens: number,
+  hasTools: boolean,
+  reserves: ContextReserves | undefined,
+): {
+  readonly safetyReserveTokens: number;
+  readonly runtimeReserveTokens: number;
+  readonly minimumMessageTokens: number;
+} {
+  return Object.freeze({
+    safetyReserveTokens: reserve(
+      reserves?.safetyTokens,
+      Math.min(64_000, Math.max(4_096, Math.ceil(windowTokens * 0.05))),
+      "safety reserve",
+    ),
+    runtimeReserveTokens: reserve(
+      reserves?.runtimeTokens,
+      hasTools
+        ? Math.min(64_000, Math.max(4_096, Math.floor(windowTokens / 10)))
+        : Math.min(16_000, Math.max(2_048, Math.floor(windowTokens / 25))),
+      "runtime reserve",
+    ),
+    minimumMessageTokens: reserve(
+      reserves?.minimumMessageTokens,
+      Math.min(8_192, Math.max(1_024, Math.floor(windowTokens / 100))),
+      "minimum message reserve",
+    ),
+  });
 }
 
 function requiredText(value: unknown, label: string): string {

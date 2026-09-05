@@ -18,7 +18,7 @@ const fixture = JSON.parse(readFileSync(
 ));
 
 const RUN_OPTIONS = Object.freeze({
-  budgets: Object.freeze({ maxRunOutputTokens: null }),
+  budgets: Object.freeze({ maxRunGenerationTokens: null }),
 });
 
 test("shared context estimates and claim allocation match Python", () => {
@@ -349,13 +349,13 @@ test("context provider conformance covers single-pass and staged task retrieval"
   assert.deepEqual(calls, ["single", "planning", "task", "base-demand", "task-demand"]);
 });
 
-function capabilities(contextWindowTokens = 16_000, maxCallOutputTokens = 512) {
+function capabilities(contextWindowTokens = 16_000, maxGenerationTokens = 512) {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     profileId: "context-fixture",
     providerProtocol: "custom",
     contextWindowTokens,
-    maxCallOutputTokens,
+    maxGenerationTokens,
     thinkingTokenAccounting: "unknown",
     protocol: {
       reasoningControl: "selectable",
@@ -387,7 +387,7 @@ function callsTurn(toolCalls, request) {
   return {
     message: { role: "assistant", content: "", toolCalls },
     finishReason: "tool_calls",
-    appliedOutputLimit: request.outputLimit?.maxTokens,
+    appliedGenerationLimit: request.outputBudget?.maxGenerationTokens,
   };
 }
 
@@ -395,7 +395,7 @@ function finalTurn(content, request) {
   return {
     message: { role: "assistant", content },
     finishReason: "stop",
-    appliedOutputLimit: request.outputLimit?.maxTokens,
+    appliedGenerationLimit: request.outputBudget?.maxGenerationTokens,
   };
 }
 

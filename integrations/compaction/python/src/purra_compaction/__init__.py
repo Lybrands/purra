@@ -67,9 +67,14 @@ class SemanticCompaction:
                           - self._summary_tokens - 128)
         if estimate_agent_messages_tokens(messages) > input_limit:
             raise ContextOverflowError("semantic_compaction_input_overflow")
-        model = replace(request.model, options={**request.model.options,
-                                               "max_tokens": self._summary_tokens})
-        result = await self._tasks.complete(messages, AgentModelTask(model), signal)
+        result = await self._tasks.complete(
+            messages,
+            AgentModelTask(
+                request.model,
+                result_capacity_target_tokens=self._summary_tokens,
+            ),
+            signal,
+        )
         completion = result.completion
         if completion.finish_reason is not ModelFinishReason.STOP or completion.message.tool_calls:
             raise ContractViolationError("semantic_compaction_incomplete")

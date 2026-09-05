@@ -399,7 +399,7 @@ function taskBudgets(value: import("../run/types.js").RunBudgets): import("./typ
   return Object.freeze({
     maxInvocationAttempts: value.maxModelAttempts,
     maxInputTokens: value.maxInputTokens,
-    maxRunOutputTokens: value.maxRunOutputTokens,
+    maxRunGenerationTokens: value.maxRunGenerationTokens,
     maxReasoningTokens: value.maxReasoningTokens,
   });
 }

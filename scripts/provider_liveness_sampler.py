@@ -20,6 +20,7 @@ from purra.contracts import (
     ModelCompletion,
     ModelInvocation,
     ModelStream,
+    ModelStreamActivity,
     ModelStreamChunk,
 )
 from purra.ports import CancellationSignal, ModelGateway
@@ -193,7 +194,7 @@ class SamplingModelGateway:
         return ModelStream(
             chunks=observed_chunks(),
             model=stream.model,
-            applied_output_limit=stream.applied_output_limit,
+            applied_generation_limit=stream.applied_generation_limit,
             metadata=stream.metadata,
             activity_support=stream.activity_support,
         )
@@ -262,13 +263,17 @@ class _SampleState:
         self.usage_observed = False
         self.finish_reason: str | None = None
         self._recorded = False
+        self.transport_activity_observed = False
 
     def elapsed_ms(self) -> int:
         return max(0, (int(self.clock_ns()) - self.started_ns) // 1_000_000)
 
-    def accept(self, chunk: ModelStreamChunk) -> None:
+    def accept(self, chunk: ModelStreamChunk | ModelStreamActivity) -> None:
         offset = self.elapsed_ms()
         self.activity_offsets.append(offset)
+        if isinstance(chunk, ModelStreamActivity):
+            self.transport_activity_observed = True
+            return
         self.chunk_count += 1
         self.content_chars += len(chunk.content_delta)
         self.reasoning_chars += len(chunk.reasoning_delta)
@@ -307,7 +312,8 @@ class _SampleState:
         return ProviderLivenessSample(
             sample_id=self.sample_id,
             mode=self.mode,
-            activity_evidence="semantic_chunks_only",
+            activity_evidence=("transport_and_semantic_chunks"
+                if self.transport_activity_observed else "semantic_chunks_only"),
             stream_open_ms=self.stream_open_ms,
             first_activity_ms=_first(self.activity_offsets),
             first_progress_ms=_first(self.progress_offsets),

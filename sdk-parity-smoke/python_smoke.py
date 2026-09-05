@@ -74,7 +74,7 @@ async def main() -> None:
             return ModelStream(
                 chunks=chunks(),
                 model="local-parity-smoke",
-                applied_output_limit=invocation.output_limit.max_tokens,
+                applied_generation_limit=invocation.output_budget.max_generation_tokens,
             )
 
         async def complete(self, messages, invocation, signal=None):
@@ -85,7 +85,7 @@ async def main() -> None:
                     content="PurrA is ready.",
                 ),
                 model="local-parity-smoke",
-                applied_output_limit=invocation.output_limit.max_tokens,
+                applied_generation_limit=invocation.output_budget.max_generation_tokens,
                 finish_reason=ModelFinishReason.STOP,
             )
 
@@ -123,7 +123,7 @@ async def main() -> None:
         output_repository=adapters.outputs,
         output_publisher=adapters.publisher,
         preset=AgentPreset(
-            runtime_limits=RuntimeLimits(max_run_output_tokens=None),
+            runtime_limits=RuntimeLimits(max_run_generation_tokens=None),
             id="sdk-parity-smoke",
             revision="1",
             tool_catalog=catalog,
@@ -140,9 +140,9 @@ async def main() -> None:
             capability_snapshot=replace(
                 generic_capability_snapshot(),
                 profile_id="local:parity-smoke",
-                max_call_output_tokens=256,
+                max_generation_tokens=256,
             ),
-            options={"max_tokens": 128},
+            max_generation_tokens=128,
         ),
         domain_context=DomainContext(namespace="sdk.parity.smoke"),
         context_window=65_536,

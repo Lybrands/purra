@@ -44,7 +44,7 @@ async def ask(gateway, model: ModelRequest, context_window: int):
             id="assistant",
             revision="1",
             tool_catalog=InMemoryToolCatalog(()),
-            runtime_limits=RuntimeLimits(max_run_output_tokens=8192),
+            runtime_limits=RuntimeLimits(max_run_generation_tokens=8192),
         ),
         run_repository=storage.runs,
         output_repository=storage.outputs,
@@ -82,9 +82,14 @@ are treated as data rather than instructions.
 
 ## Budgets and recovery
 
-`max_call_output_tokens` limits one model call; `max_run_output_tokens` limits
-cumulative model output for a Run. Set the cumulative budget explicitly;
-`None` means no finite token ceiling. A finite budget requires reported model usage.
+`ModelRequest.max_generation_tokens` is an optional user ceiling for one
+Provider call and includes every generated token the Provider counts, including
+reasoning when the profile declares inclusive accounting.
+`RuntimeLimits.max_run_generation_tokens` bounds that quantity cumulatively for
+a Run. `None` means no finite cumulative ceiling. A finite budget requires
+reported model usage. A workflow's optional `result_capacity_target_tokens` is
+only a context-sizing and diagnostic target; it does not reduce the Provider
+allowance or guarantee visible output.
 
 Recovery continues from committed checkpoints. The application must restore the
 same model and tool configuration and reconcile interrupted external writes

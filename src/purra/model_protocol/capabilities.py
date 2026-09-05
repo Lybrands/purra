@@ -34,6 +34,43 @@ class ThinkingTokenAccounting(StrEnum):
     UNKNOWN = "unknown"
 
 
+class ReasoningUsageDetail(StrEnum):
+    REQUIRED = "required"
+    OPTIONAL = "optional"
+    UNAVAILABLE = "unavailable"
+
+
+class ReasoningLimitKind(StrEnum):
+    NONE = "none"
+    SOFT = "soft"
+    HARD = "hard"
+
+
+class VisibleOutputReservation(StrEnum):
+    SUPPORTED = "supported"
+    UNAVAILABLE = "unavailable"
+    UNKNOWN = "unknown"
+
+
+class LengthReasonDetail(StrEnum):
+    REQUEST_CAP = "request_cap"
+    CONTEXT_CAP = "context_cap"
+    CONFLATED = "conflated"
+
+
+class ContinuationKind(StrEnum):
+    NONE = "none"
+    PREFIX_BETA = "prefix_beta"
+    OPAQUE_STATE = "opaque_state"
+    SIGNED_REPLAY = "signed_replay"
+
+
+class ContinuationSafety(StrEnum):
+    TEXT = "text"
+    STRUCTURED = "structured"
+    TOOL_CALL = "tool_call"
+
+
 class AssistantContentWithToolCalls(StrEnum):
     REQUIRED = "required"
     OPTIONAL = "optional"
@@ -146,26 +183,58 @@ class ModelProtocolCapabilities:
 class ModelOutputCapabilities:
     """Objective model output limits and token-accounting facts."""
 
-    max_call_output_tokens: int | None = None
+    max_generation_tokens: int | None = None
     thinking_token_accounting: ThinkingTokenAccounting = (
         ThinkingTokenAccounting.UNKNOWN
     )
+    reasoning_usage_detail: ReasoningUsageDetail = ReasoningUsageDetail.OPTIONAL
+    reasoning_limit_kind: ReasoningLimitKind = ReasoningLimitKind.NONE
+    visible_output_reservation: VisibleOutputReservation = (
+        VisibleOutputReservation.UNKNOWN
+    )
+    length_reason_detail: LengthReasonDetail = LengthReasonDetail.CONFLATED
+    continuation_kind: ContinuationKind = ContinuationKind.NONE
+    continuation_safe_for: tuple[ContinuationSafety, ...] = ()
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "max_call_output_tokens", optional_positive_int(
-            self.max_call_output_tokens,
-            "model max tokens per invocation",
+        object.__setattr__(self, "max_generation_tokens", optional_positive_int(
+            self.max_generation_tokens,
+            "model max generation tokens per invocation",
         ))
         object.__setattr__(
             self,
             "thinking_token_accounting",
             ThinkingTokenAccounting(self.thinking_token_accounting),
         )
+        for name, enum in (
+            ("reasoning_usage_detail", ReasoningUsageDetail),
+            ("reasoning_limit_kind", ReasoningLimitKind),
+            ("visible_output_reservation", VisibleOutputReservation),
+            ("length_reason_detail", LengthReasonDetail),
+            ("continuation_kind", ContinuationKind),
+        ):
+            object.__setattr__(self, name, enum(getattr(self, name)))
+        safe_for = tuple(
+            ContinuationSafety(value) for value in self.continuation_safe_for
+        )
+        if len(safe_for) != len(set(safe_for)):
+            raise ValueError("continuation safety targets must be unique")
+        if self.continuation_kind is ContinuationKind.NONE and safe_for:
+            raise ValueError("continuation safety requires a continuation kind")
+        object.__setattr__(self, "continuation_safe_for", safe_for)
 
     def to_mapping(self) -> dict[str, object]:
         return {
-            "maxCallOutputTokens": self.max_call_output_tokens,
+            "maxGenerationTokens": self.max_generation_tokens,
             "thinkingTokenAccounting": self.thinking_token_accounting.value,
+            "reasoningUsageDetail": self.reasoning_usage_detail.value,
+            "reasoningLimitKind": self.reasoning_limit_kind.value,
+            "visibleOutputReservation": self.visible_output_reservation.value,
+            "lengthReasonDetail": self.length_reason_detail.value,
+            "continuationKind": self.continuation_kind.value,
+            "continuationSafeFor": [
+                value.value for value in self.continuation_safe_for
+            ],
         }
 
 
@@ -177,9 +246,17 @@ class ModelCapabilitySnapshot:
     profile_id: str
     provider_protocol: str
     context_window_tokens: int
-    max_call_output_tokens: int | None
+    max_generation_tokens: int | None
     thinking_token_accounting: ThinkingTokenAccounting
     protocol: ModelProtocolCapabilities
+    reasoning_usage_detail: ReasoningUsageDetail = ReasoningUsageDetail.OPTIONAL
+    reasoning_limit_kind: ReasoningLimitKind = ReasoningLimitKind.NONE
+    visible_output_reservation: VisibleOutputReservation = (
+        VisibleOutputReservation.UNKNOWN
+    )
+    length_reason_detail: LengthReasonDetail = LengthReasonDetail.CONFLATED
+    continuation_kind: ContinuationKind = ContinuationKind.NONE
+    continuation_safe_for: tuple[ContinuationSafety, ...] = ()
     actionable: bool = True
     source: str | None = None
 
@@ -187,6 +264,8 @@ class ModelCapabilitySnapshot:
         object.__setattr__(self, "schema_version", positive_int(
             self.schema_version, "capability snapshot schema version"
         ))
+        if self.schema_version != 2:
+            raise ValueError("unsupported model capability snapshot schema version")
         object.__setattr__(self, "profile_id", required_text(
             self.profile_id, "capability snapshot profile id"
         ))
@@ -196,15 +275,31 @@ class ModelCapabilitySnapshot:
         object.__setattr__(self, "context_window_tokens", positive_int(
             self.context_window_tokens, "capability snapshot context window"
         ))
-        object.__setattr__(self, "max_call_output_tokens", optional_positive_int(
-            self.max_call_output_tokens,
-            "capability snapshot max tokens per invocation",
+        object.__setattr__(self, "max_generation_tokens", optional_positive_int(
+            self.max_generation_tokens,
+            "capability snapshot max generation tokens per invocation",
         ))
         object.__setattr__(
             self,
             "thinking_token_accounting",
             ThinkingTokenAccounting(self.thinking_token_accounting),
         )
+        for name, enum in (
+            ("reasoning_usage_detail", ReasoningUsageDetail),
+            ("reasoning_limit_kind", ReasoningLimitKind),
+            ("visible_output_reservation", VisibleOutputReservation),
+            ("length_reason_detail", LengthReasonDetail),
+            ("continuation_kind", ContinuationKind),
+        ):
+            object.__setattr__(self, name, enum(getattr(self, name)))
+        safe_for = tuple(
+            ContinuationSafety(value) for value in self.continuation_safe_for
+        )
+        if len(safe_for) != len(set(safe_for)):
+            raise ValueError("continuation safety targets must be unique")
+        if self.continuation_kind is ContinuationKind.NONE and safe_for:
+            raise ValueError("continuation safety requires a continuation kind")
+        object.__setattr__(self, "continuation_safe_for", safe_for)
         if not isinstance(self.protocol, ModelProtocolCapabilities):
             raise TypeError(
                 "capability snapshot protocol must be ModelProtocolCapabilities"
@@ -216,8 +311,14 @@ class ModelCapabilitySnapshot:
     @property
     def output(self) -> ModelOutputCapabilities:
         return ModelOutputCapabilities(
-            max_call_output_tokens=self.max_call_output_tokens,
+            max_generation_tokens=self.max_generation_tokens,
             thinking_token_accounting=self.thinking_token_accounting,
+            reasoning_usage_detail=self.reasoning_usage_detail,
+            reasoning_limit_kind=self.reasoning_limit_kind,
+            visible_output_reservation=self.visible_output_reservation,
+            length_reason_detail=self.length_reason_detail,
+            continuation_kind=self.continuation_kind,
+            continuation_safe_for=self.continuation_safe_for,
         )
 
     def to_mapping(self, *, include_digest: bool = False) -> dict[str, object]:
@@ -226,8 +327,16 @@ class ModelCapabilitySnapshot:
             "profileId": self.profile_id,
             "providerProtocol": self.provider_protocol,
             "contextWindowTokens": self.context_window_tokens,
-            "maxCallOutputTokens": self.max_call_output_tokens,
+            "maxGenerationTokens": self.max_generation_tokens,
             "thinkingTokenAccounting": self.thinking_token_accounting.value,
+            "reasoningUsageDetail": self.reasoning_usage_detail.value,
+            "reasoningLimitKind": self.reasoning_limit_kind.value,
+            "visibleOutputReservation": self.visible_output_reservation.value,
+            "lengthReasonDetail": self.length_reason_detail.value,
+            "continuationKind": self.continuation_kind.value,
+            "continuationSafeFor": [
+                value.value for value in self.continuation_safe_for
+            ],
             "protocol": self.protocol.to_mapping(),
             "actionable": self.actionable,
             "source": self.source,
@@ -248,11 +357,11 @@ class ModelCapabilitySnapshot:
 
 def generic_capability_snapshot() -> ModelCapabilitySnapshot:
     return ModelCapabilitySnapshot(
-        schema_version=1,
+        schema_version=2,
         profile_id="generic",
         provider_protocol="custom",
         context_window_tokens=200_000,
-        max_call_output_tokens=None,
+        max_generation_tokens=None,
         thinking_token_accounting=ThinkingTokenAccounting.UNKNOWN,
         protocol=ModelProtocolCapabilities(),
         actionable=True,
@@ -261,12 +370,18 @@ def generic_capability_snapshot() -> ModelCapabilitySnapshot:
 
 __all__ = [
     "AssistantContentWithToolCalls",
+    "ContinuationKind",
+    "ContinuationSafety",
     "FeatureSupport",
+    "LengthReasonDetail",
     "ModelCapabilitySnapshot",
     "ModelOutputCapabilities",
     "ModelProtocolCapabilities",
     "ReasoningControl",
+    "ReasoningLimitKind",
     "ReasoningReplayPolicy",
+    "ReasoningUsageDetail",
     "ThinkingTokenAccounting",
+    "VisibleOutputReservation",
     "generic_capability_snapshot",
 ]

@@ -2,7 +2,15 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 
-import { Agent, AgentCanceledError, AgentError } from "purra";
+import {
+  Agent,
+  AgentCanceledError,
+  AgentError,
+  constrainOutputBudgetToContext,
+  maxGenerationTokensForContext,
+  resolveInvocationOutputBudget,
+} from "purra";
+import { testGateway } from "./support/model-gateway.mjs";
 
 const fixture = JSON.parse(readFileSync(
   new URL("../../conformance/fixtures/model_protocol.json", import.meta.url),
@@ -27,7 +35,7 @@ test("Agent consumes model chunks, tool deltas, usage, and output limits", async
               yield {
                 contentDelta: "sunny",
                 finishReason: "stop",
-                usage: { inputTokens: 12, outputTokens: 2 },
+                usage: { inputTokens: 12, generationTokens: 2 },
               };
               return;
             }
@@ -36,7 +44,7 @@ test("Agent consumes model chunks, tool deltas, usage, and output limits", async
               yield {
                 contentDelta: "candidate",
                 finishReason: "stop",
-                usage: { inputTokens: 12, outputTokens: 2 },
+                usage: { inputTokens: 12, generationTokens: 2 },
               };
               return;
             }
@@ -60,7 +68,7 @@ test("Agent consumes model chunks, tool deltas, usage, and output limits", async
           }
         })();
         return Object.assign(stream, {
-          appliedOutputLimit: request.outputLimit?.maxTokens,
+          appliedGenerationLimit: request.outputBudget?.maxGenerationTokens,
         });
       },
     },
@@ -73,16 +81,20 @@ test("Agent consumes model chunks, tool deltas, usage, and output limits", async
 
   const result = await agent.invoke({
     messages: [{ role: "user", content: "Weather?" }],
-    maxCallOutputTokens: 200,
+    maxGenerationTokens: 200,
   });
 
   assert.equal(result.output, "Weather: sunny");
   assert.equal(result.rounds, 3);
   assert.equal(closed, 3);
-  assert.deepEqual(requests[0].outputLimit, {
-    maxTokens: 200,
-    source: "user_override",
-    profileMaxTokens: 1000,
+  assert.deepEqual(requests[0].outputBudget, {
+    maxGenerationTokens: 200,
+    generationSource: "user",
+    profileMaxGenerationTokens: 1000,
+    requestedUserMaxGenerationTokens: 200,
+    resultCapacityTargetTokens: null,
+    resultCapacitySource: null,
+    nonResultHeadroomTokens: null,
   });
   assert.equal(requests[0].capabilitySnapshot.profileId, "fixture");
   assert.deepEqual(requests[2].tools, []);
@@ -97,7 +109,7 @@ test("Agent consumes model chunks, tool deltas, usage, and output limits", async
 test("Agent retries one private interrupted stream and closes both attempts", async () => {
   let closed = 0;
   const agent = new Agent({
-    model: {
+    model: testGateway({
       async invoke() { throw new Error("stream should be used"); },
       async *stream() {
         try {
@@ -106,7 +118,7 @@ test("Agent retries one private interrupted stream and closes both attempts", as
           closed += 1;
         }
       },
-    },
+    }),
   });
 
   await assert.rejects(
@@ -119,7 +131,7 @@ test("Agent retries one private interrupted stream and closes both attempts", as
 test("Agent.stream does not retry after a public delta was emitted", async () => {
   let closed = 0;
   const agent = new Agent({
-    model: {
+    model: testGateway({
       async invoke() { throw new Error("stream should be used"); },
       async *stream() {
         try {
@@ -128,7 +140,7 @@ test("Agent.stream does not retry after a public delta was emitted", async () =>
           closed += 1;
         }
       },
-    },
+    }),
   });
 
   const stream = agent.stream({ messages: [{ role: "user", content: "Hello" }] })[Symbol.asyncIterator]();
@@ -152,7 +164,7 @@ test("Agent.stream emits native public progress separately from answer text", as
         return Object.assign((async function* () {
           yield { progressDelta: "正在核对人物动机" };
           yield { contentDelta: "分析完成", finishReason: "stop" };
-        })(), { appliedOutputLimit: request.outputLimit?.maxTokens });
+        })(), { appliedGenerationLimit: request.outputBudget?.maxGenerationTokens });
       },
     },
   });
@@ -187,12 +199,12 @@ test("Agent closes a pending model stream when canceled", async () => {
     },
   };
   const agent = new Agent({
-    model: {
+    model: testGateway({
       async invoke() { throw new Error("stream should be used"); },
       stream() {
         return { [Symbol.asyncIterator]: () => iterator };
       },
-    },
+    }),
   });
 
   const running = agent.invoke({
@@ -211,12 +223,12 @@ test("Agent stops waiting for a completion gateway when canceled", async () => {
   let started;
   const invocationStarted = new Promise((resolve) => { started = resolve; });
   const agent = new Agent({
-    model: {
+    model: testGateway({
       invoke() {
         started();
         return new Promise(() => {});
       },
-    },
+    }),
   });
 
   const running = agent.invoke({
@@ -231,7 +243,7 @@ test("Agent stops waiting for a completion gateway when canceled", async () => {
 
 test("Agent enforces one invocation deadline for a never-returning gateway", async () => {
   const agent = new Agent({
-    model: { invoke: () => new Promise(() => {}) },
+    model: testGateway({ invoke: () => new Promise(() => {}) }),
     runtimeLimits: { invocationTimeoutMs: 100 },
   });
 
@@ -245,7 +257,7 @@ test("Agent enforces one invocation deadline for a never-returning gateway", asy
 test("semantic-only streams ignore idle limits and keep the absolute fuse", async () => {
   let closed = 0;
   const agent = new Agent({
-    model: {
+    model: testGateway({
       async invoke() { throw new Error("stream should be used"); },
       stream() {
         return streamWithSupport("semantic_only", async function* () {
@@ -257,7 +269,7 @@ test("semantic-only streams ignore idle limits and keep the absolute fuse", asyn
           }
         });
       },
-    },
+    }),
     runtimeLimits: {
       activityIdleTimeoutMs: 5,
       progressIdleTimeoutMs: 10,
@@ -273,7 +285,7 @@ test("semantic-only streams ignore idle limits and keep the absolute fuse", asyn
 test("working activity renews both leases and never enters stream budgets", async () => {
   let closed = 0;
   const agent = new Agent({
-    model: {
+    model: testGateway({
       async invoke() { throw new Error("stream should be used"); },
       stream() {
         return streamWithSupport("working", async function* () {
@@ -289,7 +301,7 @@ test("working activity renews both leases and never enters stream budgets", asyn
           }
         });
       },
-    },
+    }),
     runtimeLimits: {
       activityIdleTimeoutMs: 7,
       progressIdleTimeoutMs: 7,
@@ -305,14 +317,14 @@ test("working activity renews both leases and never enters stream budgets", asyn
 
 test("undeclared activity fails before output with the stable code", async () => {
   const agent = new Agent({
-    model: {
+    model: testGateway({
       async invoke() { throw new Error("stream should be used"); },
       stream() {
         return streamWithSupport("semantic_only", async function* () {
           yield { type: "activity", kind: "transport" };
         });
       },
-    },
+    }),
   });
 
   await assert.rejects(
@@ -325,7 +337,7 @@ test("undeclared activity fails before output with the stable code", async () =>
 test("Transport-only activity expires progress with the stable code", async () => {
   let closed = 0;
   const agent = new Agent({
-    model: {
+    model: testGateway({
       async invoke() { throw new Error("stream should be used"); },
       stream() {
         return streamWithSupport("transport", async function* () {
@@ -339,7 +351,7 @@ test("Transport-only activity expires progress with the stable code", async () =
           }
         });
       },
-    },
+    }),
     runtimeLimits: {
       activityIdleTimeoutMs: 8,
       progressIdleTimeoutMs: 18,
@@ -360,7 +372,7 @@ test("declared stream silence expires activity with the stable code", async () =
   let closed = 0;
   let stoppedBeforeClose = false;
   const agent = new Agent({
-    model: {
+    model: testGateway({
       async invoke() { throw new Error("stream should be used"); },
       stream(_request, signal) {
         signal.addEventListener("abort", () => { stoppedBeforeClose = closed === 0; }, { once: true });
@@ -372,7 +384,7 @@ test("declared stream silence expires activity with the stable code", async () =
           }
         });
       },
-    },
+    }),
     runtimeLimits: {
       activityIdleTimeoutMs: 12,
       progressIdleTimeoutMs: 40,
@@ -392,7 +404,7 @@ test("declared stream silence expires activity with the stable code", async () =
 test("continuous semantic progress still stops at the absolute fuse", async () => {
   let closed = 0;
   const agent = new Agent({
-    model: {
+    model: testGateway({
       async invoke() { throw new Error("stream should be used"); },
       stream() {
         return streamWithSupport("working", async function* () {
@@ -406,7 +418,7 @@ test("continuous semantic progress still stops at the absolute fuse", async () =
           }
         });
       },
-    },
+    }),
     runtimeLimits: {
       activityIdleTimeoutMs: 10,
       progressIdleTimeoutMs: 10,
@@ -425,13 +437,13 @@ test("continuous semantic progress still stops at the absolute fuse", async () =
 
 test("Agent rejects the first oversized stream fragment before materializing it", async () => {
   const agent = new Agent({
-    model: {
+    model: testGateway({
       async invoke() { throw new Error("stream should be used"); },
       async *stream() {
         yield { contentDelta: "ab" };
         yield { contentDelta: "cd", finishReason: "stop" };
       },
-    },
+    }),
     runtimeLimits: { maxContentChars: 3 },
   });
 
@@ -445,7 +457,7 @@ test("Agent rejects the first oversized stream fragment before materializing it"
 test("Agent rejects malformed streamed tool calls before execution", async () => {
   let executions = 0;
   const agent = new Agent({
-    model: {
+    model: testGateway({
       async invoke() { throw new Error("stream should be used"); },
       async *stream() {
         yield {
@@ -453,7 +465,7 @@ test("Agent rejects malformed streamed tool calls before execution", async () =>
           finishReason: "stop",
         };
       },
-    },
+    }),
     tools: [readTool("known", () => {
       executions += 1;
       return { content: null, effectState: "not_started" };
@@ -470,7 +482,7 @@ test("Agent rejects malformed streamed tool calls before execution", async () =>
 test("Agent accepts detached, immutable JSON messages", async () => {
   const input = { role: "developer", content: { rules: ["safe", 1] } };
   const agent = new Agent({
-    model: {
+    model: testGateway({
       async invoke(request) {
         assert.notEqual(request.messages[0].content, input.content);
         assert.equal(Object.isFrozen(request.messages[0].content), true);
@@ -480,7 +492,7 @@ test("Agent accepts detached, immutable JSON messages", async () => {
           finishReason: "stop",
         };
       },
-    },
+    }),
   });
 
   const result = await agent.invoke({ messages: [input] });
@@ -491,12 +503,12 @@ test("Agent accepts detached, immutable JSON messages", async () => {
 test("shared message and tool-call cases preserve the Python semantics", async () => {
   let received;
   const agent = new Agent({
-    model: {
+    model: testGateway({
       async invoke(request) {
         received = request.messages;
         return { message: { role: "assistant", content: "done" }, finishReason: "stop" };
       },
-    },
+    }),
   });
 
   await agent.invoke({ messages: fixture.messageCases });
@@ -512,7 +524,7 @@ test("shared termination cases produce the Python safety outcomes", async () => 
     let invocation = 0;
     let executions = 0;
     const agent = new Agent({
-      model: {
+      model: testGateway({
         async invoke() {
           invocation += 1;
           if (invocation > 1) {
@@ -532,7 +544,7 @@ test("shared termination cases produce the Python safety outcomes", async () => 
             finishReason: row.finishReason,
           };
         },
-      },
+      }),
       tools: [readTool("known", () => {
         executions += 1;
         return { content: null, effectState: "not_started" };
@@ -552,39 +564,67 @@ test("shared termination cases produce the Python safety outcomes", async () => 
   }
 });
 
-test("shared output-limit cases produce the Python request or error", async () => {
-  for (const row of fixture.outputLimitCases) {
-    const requests = [];
-    const agent = new Agent({
-      model: {
-        capabilities: capabilities(row.profileMaxTokens, "unavailable"),
-        async invoke(request) {
-          requests.push(request);
-          return {
-            message: { role: "assistant", content: "done" },
-            finishReason: "stop",
-            appliedOutputLimit: request.outputLimit?.maxTokens,
-          };
-        },
-      },
-    });
-    const input = {
-      messages: [{ role: "user", content: "Run" }],
-      ...(row.userOverride === null
+test("shared output-budget cases produce the Python contract or error", () => {
+  for (const row of fixture.outputBudgetCases) {
+    const snapshot = capabilities(row.profileMaxGenerationTokens, "unavailable");
+    const options = {
+      ...(row.maxGenerationTokens === null
         ? {}
-        : { maxCallOutputTokens: row.userOverride }),
+        : { maxGenerationTokens: row.maxGenerationTokens }),
+      ...(row.generationSource === null ? {} : { generationSource: row.generationSource }),
+      ...(row.resultCapacityTargetTokens === null
+        ? {}
+        : { resultCapacityTargetTokens: row.resultCapacityTargetTokens }),
+      ...(row.resultCapacitySource === null
+        ? {}
+        : { resultCapacitySource: row.resultCapacitySource }),
     };
     if (row.errorCode !== null) {
-      await assert.rejects(
-        agent.invoke(input),
+      assert.throws(
+        () => resolveInvocationOutputBudget(snapshot, options),
         (error) => error instanceof AgentError && error.code === row.errorCode,
       );
-      assert.equal(requests.length, 0);
       continue;
     }
-    await agent.invoke(input);
-    assert.deepEqual(requests[0].outputLimit, row.outputLimit);
+    assert.deepEqual(resolveInvocationOutputBudget(snapshot, options), row.outputBudget);
   }
+});
+
+test("context ceilings clamp generation without reusing workflow capacity", () => {
+  const snapshot = capabilities(393_216, "unavailable");
+  const base = resolveInvocationOutputBudget(snapshot);
+  const large = constrainOutputBudgetToContext(
+    base,
+    maxGenerationTokensForContext({ windowTokens: 1_000_000 }),
+  );
+  assert.equal(large, base);
+  assert.equal(large.generationSource, "model_profile");
+
+  const medium = constrainOutputBudgetToContext(
+    base,
+    maxGenerationTokensForContext({ windowTokens: 256_000 }),
+  );
+  assert.equal(medium.maxGenerationTokens, 230_400);
+  assert.equal(medium.generationSource, "context_capacity");
+
+  const small = constrainOutputBudgetToContext(
+    base,
+    maxGenerationTokensForContext({ windowTokens: 32_000 }),
+  );
+  assert.equal(small.maxGenerationTokens, 24_832);
+  assert.equal(small.generationSource, "context_capacity");
+
+  const targeted = resolveInvocationOutputBudget(snapshot, {
+    resultCapacityTargetTokens: 25_000,
+    resultCapacitySource: "workflow_policy",
+  });
+  assert.throws(
+    () => constrainOutputBudgetToContext(
+      targeted,
+      maxGenerationTokensForContext({ windowTokens: 32_000 }),
+    ),
+    (error) => error instanceof AgentError && error.code === "model_result_capacity_incompatible",
+  );
 });
 
 test("Model gateways must acknowledge the exact applied output limit", async () => {
@@ -608,13 +648,13 @@ test("Model gateways must acknowledge the exact applied output limit", async () 
     {
       message: { role: "assistant", content: "wrong limit" },
       finishReason: "stop",
-      appliedOutputLimit: 199,
+      appliedGenerationLimit: 199,
     },
     {
       message: { role: "assistant", content: "impossible usage" },
       finishReason: "stop",
-      appliedOutputLimit: 200,
-      usage: { inputTokens: 1, outputTokens: 201 },
+      appliedGenerationLimit: 200,
+      usage: { inputTokens: 1, generationTokens: 201 },
     },
   ]) {
     const falseAcknowledgment = new Agent({
@@ -630,13 +670,168 @@ test("Model gateways must acknowledge the exact applied output limit", async () 
   }
 });
 
-function capabilities(maxCallOutputTokens, streaming = "supported") {
+test("streamed LENGTH failures retain validated Provider usage", async () => {
+  const agent = new Agent({
+    model: {
+      capabilities: capabilities(200),
+      async invoke() { throw new Error("stream should be used"); },
+      stream(request) {
+        return Object.assign((async function* () {
+          yield {
+            contentDelta: "partial",
+            finishReason: "length",
+            usage: { inputTokens: 3, generationTokens: 7 },
+          };
+        })(), { appliedGenerationLimit: request.outputBudget.maxGenerationTokens });
+      },
+    },
+  });
+  const run = await agent.submit(
+    { messages: [{ role: "user", content: "write" }] },
+    { budgets: { maxRunGenerationTokens: 100 } },
+  );
+  await assert.rejects(
+    run.result,
+    (error) => error instanceof AgentError && error.code === "model_output_truncated",
+  );
+  const snapshot = await run.snapshot();
+  assert.equal(snapshot.usage.inputTokens, 3);
+  assert.equal(snapshot.usage.generationTokens, 7);
+  assert.equal(snapshot.usage.unreportedUsageAttempts, 0);
+});
+
+test("reasoning usage stays unknown and accounting semantics govern its relationship", async () => {
+  const invokeWith = async (thinkingTokenAccounting, reasoningUsageDetail, usage) => {
+    const base = capabilities(200, "unavailable");
+    const agent = new Agent({
+      model: {
+        capabilities: { ...base, thinkingTokenAccounting, reasoningUsageDetail },
+        async invoke(request) {
+          return {
+            message: { role: "assistant", content: "done" },
+            finishReason: "stop",
+            appliedGenerationLimit: request.outputBudget.maxGenerationTokens,
+            usage,
+          };
+        },
+      },
+    });
+    return agent.invoke({ messages: [{ role: "user", content: "run" }] });
+  };
+
+  await assert.rejects(
+    invokeWith("included", "required", { inputTokens: 1, generationTokens: 10 }),
+    (error) => error instanceof AgentError && error.code === "model_gateway_contract_violation",
+  );
+  await assert.rejects(
+    invokeWith("included", "optional", {
+      inputTokens: 1,
+      generationTokens: 10,
+      reasoningTokens: 11,
+    }),
+    (error) => error instanceof AgentError && error.code === "model_gateway_contract_violation",
+  );
+  assert.equal((await invokeWith("separate", "optional", {
+    inputTokens: 1,
+    generationTokens: 10,
+    reasoningTokens: 11,
+  })).output, "done");
+});
+
+test("capability snapshots reject the pre-budget-contract schema", () => {
+  assert.throws(
+    () => new Agent({
+      model: {
+        capabilities: { ...capabilities(1000), schemaVersion: 1 },
+        async invoke() {
+          return { message: { role: "assistant", content: "unsafe" }, finishReason: "stop" };
+        },
+      },
+    }),
+    { message: "Unsupported model capability schema version" },
+  );
+});
+
+test("Agent admission requires an actionable exact generation capability", () => {
+  let calls = 0;
+  assert.throws(
+    () => new Agent({
+      model: {
+        async invoke() { calls += 1; throw new Error("unreachable"); },
+      },
+    }),
+    (error) => error instanceof AgentError && error.code === "model_generation_limit_unknown",
+  );
+  assert.throws(
+    () => new Agent({
+      model: {
+        capabilities: { ...capabilities(100), maxGenerationTokens: null },
+        async invoke() { calls += 1; throw new Error("unreachable"); },
+      },
+    }),
+    (error) => error instanceof AgentError && error.code === "model_generation_limit_unknown",
+  );
+  assert.equal(calls, 0);
+});
+
+test("legacy or missing generation usage fails closed after one Provider call", async () => {
+  for (const usage of [
+    { inputTokens: 1, outputTokens: 2 },
+    { inputTokens: 1 },
+    { inputTokens: 1, generationTokens: 2, outputTokens: 2 },
+  ]) {
+    let calls = 0;
+    const agent = new Agent({
+      model: {
+        capabilities: capabilities(100, "unavailable"),
+        async invoke(request) {
+          calls += 1;
+          return {
+            message: { role: "assistant", content: "invalid usage" },
+            finishReason: "stop",
+            appliedGenerationLimit: request.outputBudget.maxGenerationTokens,
+            usage,
+          };
+        },
+      },
+    });
+    await assert.rejects(
+      agent.invoke({ messages: [{ role: "user", content: "run" }] }),
+      (error) => error instanceof AgentError && error.code === "invalid_model_response",
+    );
+    assert.equal(calls, 1);
+  }
+
+  let streamCalls = 0;
+  const streamed = new Agent({
+    model: {
+      capabilities: capabilities(100),
+      async invoke() { throw new Error("stream should be used"); },
+      stream(request) {
+        streamCalls += 1;
+        return Object.assign((async function* () {
+          yield {
+            finishReason: "stop",
+            usage: { inputTokens: 1, outputTokens: 2 },
+          };
+        })(), { appliedGenerationLimit: request.outputBudget.maxGenerationTokens });
+      },
+    },
+  });
+  await assert.rejects(
+    streamed.invoke({ messages: [{ role: "user", content: "run" }] }),
+    (error) => error instanceof AgentError && error.code === "invalid_model_response",
+  );
+  assert.equal(streamCalls, 1);
+});
+
+function capabilities(maxGenerationTokens, streaming = "supported") {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     profileId: "fixture",
     providerProtocol: "custom",
-    contextWindowTokens: 4000,
-    maxCallOutputTokens,
+    contextWindowTokens: 16_000,
+    maxGenerationTokens,
     thinkingTokenAccounting: "unknown",
     protocol: {
       reasoningControl: "selectable",

@@ -34,6 +34,7 @@ from purra.agent_tree_execution import (
 )
 from purra.agent_tree_lease import bind_agent_run_lease
 from purra.agent_tree_tool import build_agent_tree_tool_registration
+from purra.agent_tree_policy import AgentTreePolicy
 from purra.agent_presets import (
     AgentPreset,
     AgentPresetSnapshot,
@@ -51,6 +52,7 @@ from purra.context_budget import (
     estimate_agent_messages_tokens,
     estimate_json_tokens,
     estimate_tool_schema_tokens,
+    max_generation_tokens_for_context,
     resolve_context_budget_claims,
     resolve_task_context_budget_claims,
 )
@@ -126,10 +128,7 @@ from purra.engine.options import AgentCoreRunOptions, restore_continuation_prese
 from purra.engine.planning_phase import PlanningCapability, PlanningPhaseResult
 from purra.engine.dynamic_planning import DynamicPlanningOrchestrator
 from purra.engine.task_orchestration import TaskOrchestrationCapability
-from purra.delegation import DelegatedAgentExecutor, DelegationCoordinator, DelegationPolicy
-from purra.engine.delegation_assembly import assemble_delegation
 from purra.engine.tool_catalog import AugmentedToolCatalog
-from purra.delegation.dynamic_executor import DynamicDelegatedAgentExecutor
 from purra.execution import AgentRunHandle, AgentRunSupervisor
 from purra.engine.planning_validation import (
     effective_registrations as _effective_registrations,
@@ -137,7 +136,11 @@ from purra.engine.planning_validation import (
 from purra.execution_profiles import ExecutionProfile
 from purra.host_planned_tool_gateway import HostPlannedToolGateway
 from purra.json_values import freeze_json_mapping, thaw_json_mapping
-from purra.model_protocol import resolve_invocation_output_limit
+from purra.model_protocol import (
+    ResultCapacitySource,
+    constrain_output_budget_to_context,
+    resolve_invocation_output_budget,
+)
 from purra.model_invocation import (
     AgentModelInvocationManager,
     ModelInvocationContext,
@@ -159,7 +162,6 @@ from purra.ports import (
     CONTROLLER_OWNED_RUN_EVENT_TYPES,
     ContextProvider,
     ConversationCompactor,
-    DelegationRepository,
     ExecutionLeaseStore,
     ExecutionStateFactory,
     PlanningPolicy,
@@ -210,7 +212,6 @@ class _PreparedRuntimePhase:
     budget: ContextBudget
     state: ExecutionState
     events: tuple[AgentEvent, ...]
-    delegation_bound: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -427,7 +428,7 @@ def _require_runtime_limits(value: RuntimeLimits | None) -> RuntimeLimits:
     if value is None:
         raise TypeError(
             "AgentCore requires RuntimeLimits with an explicit "
-            "max_run_output_tokens value"
+            "max_run_generation_tokens value"
         )
     return value
 
@@ -459,7 +460,6 @@ class AgentCore:
         conversation_compactor_factory: Callable[[AgentModelTaskRunner], ConversationCompactor] | None = None,
         execution_state_factory: ExecutionStateFactory | None = None,
         tool_catalog: ToolCatalog | None = None,
-        delegation_policy: DelegationPolicy | None = None,
         task_admission_evaluator: TaskAdmissionEvaluator | None = None,
         long_task_dispatcher: LongTaskDispatcher | None = None,
         approval_gateway: ApprovalGateway | None = None,
@@ -474,8 +474,6 @@ class AgentCore:
         execution_lease_store: ExecutionLeaseStore | None = None,
         execution_owner_id: str | None = None,
         execution_lease_duration_ms: int | None = None,
-        delegation_repository: DelegationRepository | None = None,
-        delegated_agent_executor: DelegatedAgentExecutor | None = None,
         run_tree_repository: RunTreeRepository | None = None,
         root_agent_id: str | None = None,
         agent_capability_grant: AgentCapabilityGrant | None = None,
@@ -495,7 +493,6 @@ class AgentCore:
                 conversation_compactor_factory is not None,
                 execution_state_factory is not None,
                 tool_catalog is not None,
-                delegation_policy is not None,
                 task_admission_evaluator is not None,
                 long_task_dispatcher is not None,
                 runtime_limits is not None,
@@ -511,16 +508,21 @@ class AgentCore:
             conversation_compactor_factory = preset.conversation_compactor_factory
             execution_state_factory = preset.execution_state_factory
             tool_catalog = preset.tool_catalog
-            delegation_policy = preset.delegation_policy
+            agent_tree_policy = preset.agent_tree_policy
             runtime_limits = preset.runtime_limits
             recovery_policy = preset.recovery_policy
+        else:
+            agent_tree_policy = None
         runtime_limits = _require_runtime_limits(runtime_limits)
-        if delegation_policy is not None and not isinstance(delegation_policy, DelegationPolicy):
+        if agent_tree_policy is not None and not isinstance(
+            agent_tree_policy,
+            AgentTreePolicy,
+        ):
             raise TypeError(
-                "delegation_policy must be a DelegationPolicy or None"
+                "agent_tree_policy must be an AgentTreePolicy or None"
             )
         self._preset = preset
-        self._delegation_policy = delegation_policy
+        self._agent_tree_policy = agent_tree_policy
         self._model_gateway, self._evidence_validator = model_gateway, evidence_validator
         self._output_repository = output_repository
         self._runtime_limits, self._tool_execution_limits = runtime_limits, tool_execution_limits
@@ -606,20 +608,12 @@ class AgentCore:
                 "Agent tree execution requires output repository and publisher"
             )
         base_tool_catalog = tool_catalog or InMemoryToolCatalog(())
-        self._configure_delegation_capability(
+        self._configure_agent_tree_capability(
             base_tool_catalog=base_tool_catalog,
-            policy=delegation_policy,
-            legacy_repository=delegation_repository,
-            legacy_executor=delegated_agent_executor,
+            policy=agent_tree_policy,
             run_tree_repository=run_tree_repository,
             root_agent_id=root_agent_id,
             agent_capability_grant=agent_capability_grant,
-            idempotency=tool_idempotency_gateway,
-            context_provider=context_provider,
-            context_provider_factory=context_provider_factory,
-            conversation_compactor=conversation_compactor,
-            conversation_compactor_factory=conversation_compactor_factory,
-            execution_state_factory=execution_state_factory,
         )
         self._registrations = tuple(self._tool_catalog.registrations())
         if any(
@@ -766,17 +760,17 @@ class AgentCore:
         self,
         request: AgentRunRequest,
     ) -> AgentCapabilityGrant:
-        policy = self._delegation_policy
+        policy = self._agent_tree_policy
         if policy is None:
             raise ContractViolationError(
-                "Agent tree execution has no delegation policy"
+                "Agent tree execution has no policy"
             )
         return AgentCapabilityGrant(
             can_spawn_agents=True,
             max_depth=policy.max_depth,
-            max_children_per_call=policy.max_agents_per_call,
+            max_children_per_call=policy.max_children_per_call,
             max_agents_per_root=policy.max_agents_per_root,
-            max_parallel_runs=policy.max_parallel,
+            max_parallel_runs=policy.max_parallel_runs,
             allowed_tools=tuple(
                 registration.schema.name
                 for registration in self._registrations
@@ -785,22 +779,14 @@ class AgentCore:
             allowed_models=(request.model.model,),
         )
 
-    def _configure_delegation_capability(
+    def _configure_agent_tree_capability(
         self,
         *,
         base_tool_catalog: ToolCatalog,
-        policy: DelegationPolicy | None,
-        legacy_repository: DelegationRepository | None,
-        legacy_executor: DelegatedAgentExecutor | None,
+        policy: AgentTreePolicy | None,
         run_tree_repository: RunTreeRepository | None,
         root_agent_id: str | None,
         agent_capability_grant: AgentCapabilityGrant | None,
-        idempotency: ToolIdempotencyGateway | None,
-        context_provider: ContextProvider | None,
-        context_provider_factory,
-        conversation_compactor: ConversationCompactor | None,
-        conversation_compactor_factory,
-        execution_state_factory: ExecutionStateFactory | None,
     ) -> None:
         if run_tree_repository is not None and not isinstance(
             run_tree_repository,
@@ -812,14 +798,13 @@ class AgentCore:
             AgentCapabilityGrant,
         ):
             raise TypeError("agent_capability_grant is invalid")
-        if run_tree_repository is not None and (
-            legacy_repository is not None or legacy_executor is not None
-        ):
-            raise ValueError(
-                "Agent tree execution cannot share the legacy delegation lifecycle"
-            )
         if run_tree_repository is not None and policy is None:
-            raise ValueError("Agent tree execution requires a delegation policy")
+            raise ValueError(
+                "Agent tree execution requires an AgentPreset with "
+                "AgentTreePolicy"
+            )
+        if policy is not None and run_tree_repository is None:
+            raise ValueError("AgentTreePolicy requires a RunTreeRepository")
         self._run_tree_repository = run_tree_repository
         self._root_agent_id = str(
             root_agent_id or f"root-agent-{uuid4().hex}"
@@ -827,7 +812,6 @@ class AgentCore:
         if not self._root_agent_id:
             raise ValueError("root_agent_id must be non-empty")
         self._configured_agent_grant = agent_capability_grant
-        self._agent_tree_policy = policy if run_tree_repository is not None else None
         self._agent_tree_child_allowed_tools: tuple[str, ...] = ()
         self._agent_tree_roots: dict[str, _AgentTreeRootBinding] = {}
         self._run_commands: RunCommandService | None = None
@@ -851,8 +835,6 @@ class AgentCore:
                 if registration.policy.mode.value == "read"
             )
             self._agent_tree_child_allowed_tools = readable_tools
-            self._delegation_coordinator = None
-            self._dynamic_delegated_executor = None
             self._tool_catalog = AugmentedToolCatalog(
                 base_tool_catalog,
                 (build_agent_tree_tool_registration(
@@ -862,36 +844,11 @@ class AgentCore:
                 ),),
             )
             return
-        (
-            self._delegation_coordinator,
-            self._dynamic_delegated_executor,
-            self._tool_catalog,
-        ) = assemble_delegation(
-            base_tool_catalog=base_tool_catalog,
-            policy=policy,
-            repository=legacy_repository,
-            executor=legacy_executor,
-            idempotency=idempotency,
-            output=self._output_processor,
-            operations=self._operations,
-            model_gateway=self._model_gateway,
-            model_manager=self._model_invocations,
-            approval=self._approval_gateway,
-            context_provider=context_provider,
-            context_provider_factory=context_provider_factory,
-            conversation_compactor=conversation_compactor,
-            conversation_compactor_factory=conversation_compactor_factory,
-            execution_state_factory=execution_state_factory,
-            runtime_limits=self._runtime_limits,
-            recovery_policy=self._recovery_policy,
-            tool_execution_limits=self._tool_execution_limits,
-        )
+        self._tool_catalog = base_tool_catalog
 
     async def close(self) -> None:
         if self._run_supervisor is not None:
             await self._run_supervisor.close()
-        if self._delegation_coordinator is not None:
-            await self._delegation_coordinator.close()
 
     async def resume(self, run_id, request, *, options=None):
         """Resume a canonical checkpoint using the host's execution lease store."""
@@ -929,17 +886,16 @@ class AgentCore:
                 request,
                 tool_catalog=self._tool_catalog,
             )
+            tree_grant: AgentCapabilityGrant | None = None
             if self._run_tree_repository is not None:
                 tree_grant = (
                     self._configured_agent_grant
                     or self._root_agent_grant(request)
                 )
-                tree_composition = {
-                    **thaw_json_mapping(snapshot.composition),
-                    "agentTree": {
-                        "protocolVersion": 1,
-                        "capabilityGrant": tree_grant.to_mapping(),
-                    },
+                tree_composition = thaw_json_mapping(snapshot.composition)
+                tree_composition["agentTree"] = {
+                    **tree_composition["agentTree"],
+                    "capabilityGrant": tree_grant.to_mapping(),
                 }
                 snapshot = AgentPresetSnapshot(
                     id=snapshot.id,
@@ -950,7 +906,6 @@ class AgentCore:
                         tree_composition,
                     ),
                     composition=tree_composition,
-                    snapshot_version=5,
                 )
             persisted = resolved_options.agent_preset_snapshot
             if persisted is not None and persisted != snapshot:
@@ -1081,6 +1036,21 @@ class AgentCore:
         request: AgentRunRequest,
         options: AgentCoreRunOptions,
     ) -> RunCreateParams:
+        execution_intent = (
+            options.provenance.execution_intent
+            if options.provenance is not None
+            else None
+        )
+        if execution_intent is not None and (
+            execution_intent.requested_user_max_generation_tokens
+            != request.model.max_generation_tokens
+            or execution_intent.result_capacity_target_tokens
+            != options.result_capacity_target_tokens
+        ):
+            raise ContractViolationError(
+                "Run provenance generation intent differs from the request",
+                code="run_identity_conflict",
+            )
         return RunCreateParams(
             session_id=request.session_id,
             prompt=request.latest_user_text(),
@@ -1094,6 +1064,16 @@ class AgentCore:
                 options.agent_preset_snapshot.to_mapping()
                 if options.agent_preset_snapshot is not None
                 else {}
+            ),
+            requested_user_max_generation_tokens=(
+                request.model.max_generation_tokens
+            ),
+            result_capacity_target_tokens=(
+                options.result_capacity_target_tokens
+            ),
+            selected_context_window_tokens=_selected_context_window_tokens(
+                request,
+                options,
             ),
             requested_run_id=options.agent_tree_run_id,
             root_run_id=options.agent_tree_root_run_id,
@@ -1175,25 +1155,12 @@ class AgentCore:
             deadline_code="run_deadline_exceeded",
         )
         signal = owned_stop
-        output_limit = options.output_limit or resolve_invocation_output_limit(
-            request.model.capability_snapshot,
-            request.model.options.get("max_tokens"),
-        )
-        selected_context_window = (
-            request.context_window or options.default_context_window_tokens
-        )
-        if output_limit.max_tokens >= selected_context_window:
-            raise UnsupportedModelFeatureError(
-                "model output limit leaves no room for provider input",
-                code="model_context_capacity_incompatible",
-                retryable=False,
-            )
+        output_budget = _resolve_run_output_budget(request, options)
         sink = _BufferedEventSink(self._output_processor)
         controller = AgentRunController(
             repository=self._repository,
             event_sink=sink,
         )
-        delegation_bound = False
         agent_tree_root_owner = False
         agent_tree_context_version: int | None = None
         compaction_source_request = request
@@ -1205,7 +1172,7 @@ class AgentCore:
                 agent_tree_root_owner,
                 agent_tree_context_version,
             ) = await self._bind_agent_tree_run(request, options, controller)
-            dependencies = self._runtime_dependencies(controller, options)
+            dependencies = self._runtime_dependencies(controller, options, request)
             model_tasks = dependencies.model_tasks
             context_provider = dependencies.context_provider
             conversation_compactor = dependencies.conversation_compactor
@@ -1227,7 +1194,7 @@ class AgentCore:
                     controller,
                     sink,
                     model_tasks,
-                    output_limit,
+                    output_budget,
                     signal,
                 ):
                     yield event
@@ -1265,6 +1232,7 @@ class AgentCore:
                     controller=controller,
                     sink=sink,
                     continuation=continuation,
+                    output_budget=output_budget,
                     signal=signal,
                 ):
                     yield update
@@ -1310,12 +1278,20 @@ class AgentCore:
                     if auto_planning_available
                     else ()
                 )
+                reserved_output_reserve = _context_planning_reserve_tokens(
+                    output_budget,
+                    window_tokens=_selected_context_window_tokens(request, options),
+                    tools=reserved_schemas,
+                    safety_reserve_tokens=options.safety_reserve_tokens,
+                    runtime_reserve_tokens=options.runtime_reserve_tokens,
+                    minimum_message_tokens=options.minimum_message_tokens,
+                )
                 reserved_budget = allocate_context_budget(
-                    window_tokens=(
-                        request.context_window
-                        or options.default_context_window_tokens
+                    window_tokens=_selected_context_window_tokens(
+                        request,
+                        options,
                     ),
-                    output_reserve_tokens=output_limit.max_tokens,
+                    output_reserve_tokens=reserved_output_reserve,
                     tools=reserved_schemas,
                     claims=context_claims,
                     safety_reserve_tokens=options.safety_reserve_tokens,
@@ -1435,6 +1411,7 @@ class AgentCore:
                     controller=controller,
                     sink=sink,
                     signal=signal,
+                    output_budget=output_budget,
                 ):
                     yield update
                 return
@@ -1470,7 +1447,6 @@ class AgentCore:
                 if auto_planning_available
                 else ()
             )
-
             setup_started = perf_counter()
             try:
                 prepared = await self._prepare_runtime_phase(
@@ -1489,7 +1465,7 @@ class AgentCore:
                     context_claims=context_claims,
                     reserved_budget=reserved_budget,
                     pre_planning_compaction=pre_planning_compaction,
-                    output_limit=output_limit,
+                    output_budget=output_budget,
                     planned=planning_required,
                     signal=signal,
                 )
@@ -1497,7 +1473,6 @@ class AgentCore:
                 prepared_request = prepared.prepared_request
                 budget = prepared.budget
                 state = prepared.state
-                delegation_bound = prepared.delegation_bound
                 for event in prepared.events:
                     yield event
             except OperationCanceled:
@@ -1554,7 +1529,7 @@ class AgentCore:
                 plan=plan,
                 state=state,
                 budget=budget,
-                output_limit=output_limit,
+                output_budget=output_budget,
                 planning_available=auto_planning_available,
                 signal=signal,
             )
@@ -1571,6 +1546,7 @@ class AgentCore:
                 options=options,
                 controller=controller,
                 result=runtime_result,
+                output_budget=output_budget,
                 signal=signal,
             )
             for event in sink.drain():
@@ -1594,8 +1570,6 @@ class AgentCore:
             if run_id is not None:
                 with suppress(Exception):
                     await self._approval_gateway.cancel_pending(run_id)
-                if delegation_bound and self._dynamic_delegated_executor is not None:
-                    self._dynamic_delegated_executor.release_run(run_id)
             snapshot = controller.snapshot
             if snapshot is not None and not snapshot.terminal and not input_suspended:
                 # Supervisor shutdown closes this iterator; subscriptions do not.
@@ -1705,7 +1679,7 @@ class AgentCore:
         plan: ExecutionPlan | None,
         state: ExecutionState,
         budget: ContextBudget,
-        output_limit,
+        output_budget,
         planning_available: bool,
         signal: CancellationSignal | None,
         resume_checkpoint: AgentExecutionCheckpoint | None = None,
@@ -1728,7 +1702,7 @@ class AgentCore:
             plan=plan,
             state=state,
             budget=budget,
-            output_limit=output_limit,
+            output_budget=output_budget,
             planning_mode=PlanningMode.PLANNED if plan is not None else request.planning_mode,
             planning_available=planning_available,
             planning_required_tool_names=frozenset(
@@ -1756,7 +1730,7 @@ class AgentCore:
             display_locale=display_locale,
             context_claims=context_claims,
             reserved_budget=reserved_budget,
-            output_limit=output_limit,
+            output_budget=output_budget,
             state=state,
             budget=budget,
             signal=signal,
@@ -1779,7 +1753,7 @@ class AgentCore:
         display_locale: str,
         context_claims: Sequence[ContextBudgetClaim],
         reserved_budget: ContextBudget,
-        output_limit,
+        output_budget,
         state: ExecutionState,
         budget: ContextBudget,
         signal: CancellationSignal | None,
@@ -1978,7 +1952,7 @@ class AgentCore:
                 plan=plan,
                 state=state,
                 budget=resumed_budget,
-                output_limit=output_limit,
+                output_budget=output_budget,
                 planning_mode=PlanningMode.PLANNED,
                 planning_available=True,
                 planning_required_tool_names=frozenset(),
@@ -2008,9 +1982,8 @@ class AgentCore:
                 context_claims=context_claims,
                 reserved_budget=reserved_budget,
                 pre_planning_compaction=pre_planning_compaction,
-                output_limit=output_limit,
+                output_budget=output_budget,
                 planned=True,
-                bind_delegation=False,
                 signal=signal,
             )
             events.extend(prepared.events)
@@ -2051,7 +2024,7 @@ class AgentCore:
             plan=plan,
             state=prepared.state,
             budget=prepared.budget,
-            output_limit=output_limit,
+            output_budget=output_budget,
             planning_mode=PlanningMode.PLANNED,
             planning_available=True,
             planning_required_tool_names=frozenset(),
@@ -2089,12 +2062,25 @@ class AgentCore:
                 "Agent composition differs from the checkpointed Run",
                 code="agent_preset_mismatch",
             )
+        if (
+            persisted.requested_user_max_generation_tokens
+            != request.model.max_generation_tokens
+            or persisted.result_capacity_target_tokens
+            != options.result_capacity_target_tokens
+            or persisted.selected_context_window_tokens
+            != _selected_context_window_tokens(request, options)
+        ):
+            raise ContractViolationError(
+                "Model generation intent differs from the checkpointed Run",
+                code="run_identity_conflict",
+            )
         await controller.attach(persisted)
 
     def _runtime_dependencies(
         self,
         controller: AgentRunController,
         options: AgentCoreRunOptions,
+        request: AgentRunRequest,
     ) -> _RuntimeDependencies:
         model_tasks = AgentModelTaskRunner(
             self._model_invocations,
@@ -2103,7 +2089,14 @@ class AgentCore:
                 turn_id=options.turn_id,
                 requested_reasoning_mode=options.reasoning_mode,
                 deadline_at_ms=options.deadline_at_ms,
+                context_window_tokens=_selected_context_window_tokens(
+                    request,
+                    options,
+                ),
+                safety_reserve_tokens=options.safety_reserve_tokens,
+                runtime_reserve_tokens=options.runtime_reserve_tokens,
             ),
+            request.model,
         )
         context_provider = (
             self._context_provider_factory(model_tasks)
@@ -2154,7 +2147,7 @@ class AgentCore:
         controller: AgentRunController,
         sink: _BufferedEventSink,
         model_tasks: AgentModelTaskRunner,
-        output_limit,
+        output_budget,
         signal: CancellationSignal | None,
     ) -> tuple[AgentRuntimeResult | None, tuple[AgentEvent, ...]]:
         checkpoint = options.agent_execution_checkpoint
@@ -2201,12 +2194,29 @@ class AgentCore:
             for registration in registrations
             if registration.schema.name in selected_names
         ) + (AUTO_PLANNING_TOOL_SCHEMAS if planning_available else ())
-        budget = allocate_context_budget(
-            window_tokens=(
-                request.context_window
-                or options.default_context_window_tokens
+        physical_generation_capacity = max_generation_tokens_for_context(
+            window_tokens=_selected_context_window_tokens(
+                request,
+                options,
             ),
-            output_reserve_tokens=output_limit.max_tokens,
+            tools=schemas,
+            safety_reserve_tokens=options.safety_reserve_tokens,
+            runtime_reserve_tokens=options.runtime_reserve_tokens,
+            minimum_message_tokens=options.minimum_message_tokens,
+        )
+        constrain_output_budget_to_context(
+            output_budget,
+            max_generation_tokens=physical_generation_capacity,
+        )
+        budget = allocate_context_budget(
+            window_tokens=_selected_context_window_tokens(
+                request,
+                options,
+            ),
+            output_reserve_tokens=_context_result_reserve_tokens(
+                output_budget,
+                physical_generation_capacity=physical_generation_capacity,
+            ),
             tools=schemas,
             claims=(),
             safety_reserve_tokens=options.safety_reserve_tokens,
@@ -2222,7 +2232,7 @@ class AgentCore:
             domain=thaw_json_mapping(checkpoint.execution_state_domain),
             run_id=controller.run_id,
         )
-        dependencies = self._runtime_dependencies(controller, options)
+        dependencies = self._runtime_dependencies(controller, options, request)
         return await self._execute_runtime_with_auto_promotion(
             request=request,
             prepared_request=prepared_request,
@@ -2244,7 +2254,7 @@ class AgentCore:
             plan=plan,
             state=state,
             budget=budget,
-            output_limit=output_limit,
+            output_budget=output_budget,
             planning_available=planning_available,
             signal=signal,
             resume_checkpoint=checkpoint,
@@ -2257,12 +2267,17 @@ class AgentCore:
         controller: AgentRunController,
         sink: _BufferedEventSink,
         model_tasks: AgentModelTaskRunner,
-        output_limit,
+        output_budget,
         signal: CancellationSignal | None,
     ) -> AsyncIterator[AgentEvent | AgentRunResult]:
         checkpoint = options.agent_execution_checkpoint
         if self._run_tree_repository is not None:
-            checkpoint = await self._resume_tree_delegations(checkpoint, options, controller, signal)
+            checkpoint = await self._resume_child_runs(
+                checkpoint,
+                options,
+                controller,
+                signal,
+            )
             options = replace(options, agent_execution_checkpoint=checkpoint)
         runtime_result, runtime_events = await self._resume_runtime(
             request=request,
@@ -2270,7 +2285,7 @@ class AgentCore:
             controller=controller,
             sink=sink,
             model_tasks=model_tasks,
-            output_limit=output_limit,
+            output_budget=output_budget,
             signal=signal,
         )
         for event in runtime_events:
@@ -2280,6 +2295,7 @@ class AgentCore:
             options=options,
             controller=controller,
             result=runtime_result,
+            output_budget=output_budget,
             signal=signal,
         )
         for event in sink.drain():
@@ -2293,7 +2309,7 @@ class AgentCore:
             ),
         )
 
-    async def _resume_tree_delegations(self, checkpoint, options, controller, signal):
+    async def _resume_child_runs(self, checkpoint, options, controller, signal):
         calls = {call.id for message in checkpoint.messages for call in message.tool_calls if call.name == "delegateToAgents"}
         messages = list(checkpoint.messages)
         evidence = RunEvidenceStore.from_checkpoint_mapping(checkpoint.evidence_state)
@@ -2315,13 +2331,19 @@ class AgentCore:
                 "state": "blocked" if failures else "ready", "pendingRunIds": [], "requiredFailures": failures,
                 "results": [*payload["results"], *(thaw_json_mapping(row) for row in aggregate.results)],
             }, ensure_ascii=False, separators=(",", ":")))
-            evidence.resolve_delegation(message.tool_call_id, messages[index].content)
+            evidence.resolve_child_runs(
+                message.tool_call_id,
+                messages[index].content,
+            )
         if tuple(messages) != checkpoint.messages:
             checkpoint = replace(checkpoint, messages=tuple(messages), input_revision=checkpoint.input_revision + 1,
                                  evidence_state=evidence.checkpoint_mapping())
             await controller.save_execution_checkpoint(checkpoint)
         if required_failure:
-            raise ContractViolationError("A required Child Run failed", code="required_delegation_failed")
+            raise ContractViolationError(
+                "A required Child Run failed",
+                code="required_child_run_failed",
+            )
         return checkpoint
 
     async def _prepare_runtime_phase(
@@ -2342,9 +2364,8 @@ class AgentCore:
         context_claims: Sequence[ContextBudgetClaim],
         reserved_budget: ContextBudget,
         pre_planning_compaction: Mapping[str, Any],
-        output_limit,
+        output_budget,
         planned: bool,
-        bind_delegation: bool = True,
         signal: CancellationSignal | None,
     ) -> _PreparedRuntimePhase:
         setup_started = perf_counter()
@@ -2377,11 +2398,29 @@ class AgentCore:
             context_claims,
             task_context_claims,
         )
-        budget = allocate_context_budget(
-            window_tokens=(
-                request.context_window or options.default_context_window_tokens
+        physical_generation_capacity = max_generation_tokens_for_context(
+            window_tokens=_selected_context_window_tokens(
+                request,
+                options,
             ),
-            output_reserve_tokens=output_limit.max_tokens,
+            tools=schemas,
+            safety_reserve_tokens=options.safety_reserve_tokens,
+            runtime_reserve_tokens=options.runtime_reserve_tokens,
+            minimum_message_tokens=options.minimum_message_tokens,
+        )
+        constrain_output_budget_to_context(
+            output_budget,
+            max_generation_tokens=physical_generation_capacity,
+        )
+        budget = allocate_context_budget(
+            window_tokens=_selected_context_window_tokens(
+                request,
+                options,
+            ),
+            output_reserve_tokens=_context_result_reserve_tokens(
+                output_budget,
+                physical_generation_capacity=physical_generation_capacity,
+            ),
             tools=schemas,
             claims=effective_context_claims,
             safety_reserve_tokens=options.safety_reserve_tokens,
@@ -2507,7 +2546,7 @@ class AgentCore:
                 "providerInputTokens": budget.provider_input_tokens,
                 "estimatedInputTokens": estimated_input_tokens,
                 "outputReserveTokens": budget.output_reserve_tokens,
-                "outputLimit": output_limit.to_mapping(),
+                "outputBudget": output_budget.to_mapping(),
                 "runtimeReserveTokens": budget.runtime_reserve_tokens,
                 "safetyReserveTokens": budget.safety_reserve_tokens,
                 "toolSchemaTokens": budget.tool_schema_tokens,
@@ -2537,24 +2576,12 @@ class AgentCore:
             },
         )
         await self._publish_runtime_event(controller.run_id, budget_event)
-        delegation_bound = bool(
-            bind_delegation and self._dynamic_delegated_executor is not None
-        )
-        if delegation_bound:
-            assert self._dynamic_delegated_executor is not None
-            self._dynamic_delegated_executor.bind_run(
-                controller.run_id,
-                request,
-                prepared_request.messages,
-                options.reasoning_mode,
-            )
         return _PreparedRuntimePhase(
             request=request,
             prepared_request=prepared_request,
             budget=budget,
             state=state,
             events=(*events, budget_event),
-            delegation_bound=delegation_bound,
         )
 
     async def _continue_durable_run(
@@ -2565,6 +2592,7 @@ class AgentCore:
         controller: AgentRunController,
         sink: _BufferedEventSink,
         continuation: DurableTaskContinuation,
+        output_budget,
         signal: CancellationSignal | None,
     ) -> AsyncIterator[AgentEvent | AgentRunResult]:
         orchestration = self._task_orchestration or TaskOrchestrationCapability(
@@ -2585,6 +2613,7 @@ class AgentCore:
             options=options,
             controller=controller,
             sink=sink,
+            output_budget=output_budget,
             signal=signal,
         ):
             yield update
@@ -2597,6 +2626,7 @@ class AgentCore:
         options: AgentCoreRunOptions,
         controller: AgentRunController,
         sink: _BufferedEventSink,
+        output_budget,
         signal: CancellationSignal | None,
     ) -> AsyncIterator[AgentEvent | AgentRunResult]:
         durable_result = None
@@ -2615,6 +2645,7 @@ class AgentCore:
                 options=options,
                 controller=controller,
                 result=durable_result,
+                output_budget=output_budget,
                 signal=signal,
             )
             for event in sink.drain():
@@ -2628,6 +2659,7 @@ class AgentCore:
         options: AgentCoreRunOptions,
         controller: AgentRunController,
         result: AgentRuntimeResult | None,
+        output_budget,
         signal: CancellationSignal | None,
     ) -> None:
         if result is None:
@@ -2680,7 +2712,13 @@ class AgentCore:
                             turn_id=options.turn_id,
                             requested_reasoning_mode=options.reasoning_mode,
                             deadline_at_ms=options.deadline_at_ms,
+                            context_window_tokens=(
+                                _selected_context_window_tokens(request, options)
+                            ),
+                            safety_reserve_tokens=options.safety_reserve_tokens,
+                            runtime_reserve_tokens=options.runtime_reserve_tokens,
                         ),
+                        output_budget=output_budget,
                         signal=signal,
                     )
             if validated_result is None:
@@ -2744,7 +2782,7 @@ class AgentCore:
         plan: ExecutionPlan | None,
         state: ExecutionState,
         budget: ContextBudget,
-        output_limit,
+        output_budget,
         planning_mode: PlanningMode = PlanningMode.REACTIVE,
         planning_available: bool = False,
         planning_required_tool_names: frozenset[str] = frozenset(),
@@ -2837,7 +2875,7 @@ class AgentCore:
                 run_id=controller.run_id,
                 turn_id=options.turn_id,
                 context_budget=budget,
-                output_limit=output_limit,
+                output_budget=output_budget,
                 scope_tools_to_observer=plan is not None,
                 force_tool_choice=bool(
                     plan is not None
@@ -3213,6 +3251,87 @@ def _uses_validated_result(options: AgentCoreRunOptions) -> bool:
     return (
         options.resolved_response_transaction_policy.mode
         is ResponseTransactionMode.VALIDATED_RESULT
+    )
+
+
+def _selected_context_window_tokens(
+    request: AgentRunRequest,
+    options: AgentCoreRunOptions,
+) -> int:
+    """Resolve context capacity from explicit selection or the model snapshot."""
+
+    profile_window = request.model.capability_snapshot.context_window_tokens
+    selected = (
+        request.context_window
+        or options.default_context_window_tokens
+        or profile_window
+    )
+    if selected > profile_window:
+        raise UnsupportedModelFeatureError(
+            "selected context window exceeds the model capability snapshot",
+            code="model_context_capacity_exceeded",
+            retryable=False,
+        )
+    return selected
+
+
+def _resolve_run_output_budget(
+    request: AgentRunRequest,
+    options: AgentCoreRunOptions,
+):
+    target = options.result_capacity_target_tokens
+    return resolve_invocation_output_budget(
+        request.model.capability_snapshot,
+        max_generation_tokens=request.model.max_generation_tokens,
+        result_capacity_target_tokens=target,
+        result_capacity_source=(
+            ResultCapacitySource.WORKFLOW_POLICY if target is not None else None
+        ),
+    )
+
+
+def _context_result_reserve_tokens(
+    output_budget,
+    *,
+    physical_generation_capacity: int,
+) -> int:
+    """Size Provider input without treating its generation cap as a reserve.
+
+    A declared result-capacity target is used for context planning only.  When
+    a workflow has no target, Core keeps a conservative 8K planning reserve;
+    the exact Provider maximum is still derived from actual input at the
+    invocation boundary.
+    """
+
+    physical = int(physical_generation_capacity)
+    target = output_budget.result_capacity_target_tokens
+    desired = 8_192 if target is None else target
+    return min(desired, output_budget.max_generation_tokens, physical)
+
+
+def _context_planning_reserve_tokens(
+    output_budget,
+    *,
+    window_tokens: int,
+    tools=(),
+    safety_reserve_tokens: int | None = None,
+    runtime_reserve_tokens: int | None = None,
+    minimum_message_tokens: int | None = None,
+) -> int:
+    physical = max_generation_tokens_for_context(
+        window_tokens=window_tokens,
+        tools=tools,
+        safety_reserve_tokens=safety_reserve_tokens,
+        runtime_reserve_tokens=runtime_reserve_tokens,
+        minimum_message_tokens=minimum_message_tokens,
+    )
+    constrain_output_budget_to_context(
+        output_budget,
+        max_generation_tokens=physical,
+    )
+    return _context_result_reserve_tokens(
+        output_budget,
+        physical_generation_capacity=physical,
     )
 
 

@@ -157,6 +157,12 @@ class AgentRunController:
         snapshot = replace(
             RunStateMachine.initialize(begun.run_id),
             agent_preset_snapshot=params.agent_preset_snapshot,
+            deadline_at_ms=params.deadline_at_ms,
+            requested_user_max_generation_tokens=(
+                params.requested_user_max_generation_tokens
+            ),
+            result_capacity_target_tokens=params.result_capacity_target_tokens,
+            selected_context_window_tokens=params.selected_context_window_tokens,
         )
         self._snapshot = snapshot
         _raise_if_canceled(canceled)

@@ -60,7 +60,7 @@ test("transport applies exact cap, accounts before dispatch and records no conte
     return Response.json({ choices: [{ finish_reason: "stop", message: { role: "assistant", content: "private model text" } }], usage: { prompt_tokens: 7, completion_tokens: 3 } });
   });
   const result = await transport.complete([{ role: "user", content: "私有😀" }], 32);
-  assert.equal(result.appliedOutputLimit, 32); assert.equal(result.usage.outputTokens, 3);
+  assert.equal(result.appliedGenerationLimit, 32); assert.equal(result.usage.generationTokens, 3);
   assert.equal(JSON.parse(requests[0].options.body).max_tokens, 32); assert.equal(transport.calls[0].input_chars, 3);
   for (const secret of ["private-key", "private model text", "私有"]) assert.ok(!JSON.stringify(transport.calls).includes(secret));
   transport.reserved = LIMITS.reserved_output_tokens;

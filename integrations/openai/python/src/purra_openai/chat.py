@@ -24,10 +24,10 @@ def _usage(value):
     if not value or value.get("prompt_tokens") is None or value.get("completion_tokens") is None:
         return None
     return ModelTokenUsage(
-        input_tokens=value["prompt_tokens"], output_tokens=value["completion_tokens"],
+        input_tokens=value["prompt_tokens"], generation_tokens=value["completion_tokens"],
         total_tokens=value.get("total_tokens"),
         cached_input_tokens=(value.get("prompt_tokens_details") or {}).get("cached_tokens", 0),
-        reasoning_output_tokens=(value.get("completion_tokens_details") or {}).get("reasoning_tokens", 0),
+        reasoning_tokens=(value.get("completion_tokens_details") or {}).get("reasoning_tokens"),
     )
 
 
@@ -61,17 +61,19 @@ class OpenAIChatCompletionsGateway:
     def _request(self, messages, invocation):
         if invocation.request.provider != "openai":
             raise ValueError("OpenAI gateway requires provider='openai'")
-        cap = invocation.max_call_output_tokens
+        cap = invocation.max_generation_tokens
         if cap is None:
-            raise ValueError("OpenAI gateway requires a resolved output limit")
+            raise ValueError("OpenAI gateway requires a resolved generation allowance")
         options = thaw_json_mapping(invocation.request.options)
-        if set(options) - {"max_tokens", "temperature", "top_p", "reasoning_effort"}:
+        if set(options) - {"temperature", "top_p", "reasoning_effort"}:
             raise ValueError("unsupported OpenAI model options")
         effort = options.get("reasoning_effort")
+        if invocation.reasoning_mode.value == "disabled" and effort not in (None, "none"):
+            raise ValueError("reasoning effort conflicts with disabled reasoning")
         if invocation.reasoning_mode.value == "disabled":
             effort = "none"
-        elif invocation.reasoning_mode.value == "enabled" and effort in (None, "none"):
-            effort = "medium"
+        elif invocation.reasoning_mode.value == "enabled" and effort == "none":
+            raise ValueError("reasoning effort conflicts with enabled reasoning")
         rows = []
         for message in messages:
             if message.tool_calls and message.role.value != "assistant":
@@ -110,7 +112,7 @@ class OpenAIChatCompletionsGateway:
                     for c in message.get("tool_calls") or ())),
                 model=response.model,
                 finish_reason=ModelFinishReason.FILTERED if message.get("refusal") else _finish(choice["finish_reason"]),
-                usage=_usage(raw.get("usage")), applied_output_limit=params["max_completion_tokens"],
+                usage=_usage(raw.get("usage")), applied_generation_limit=params["max_completion_tokens"],
             )
         except Exception as error:
             raise _error(error) from None
@@ -162,7 +164,7 @@ class OpenAIChatCompletionsGateway:
             finally:
                 if stream is not None:
                     await stream.close()
-        return ModelStream(chunks(), invocation.request.model, applied_output_limit=params["max_completion_tokens"],
+        return ModelStream(chunks(), invocation.request.model, applied_generation_limit=params["max_completion_tokens"],
                            activity_support=ModelStreamActivitySupport.TRANSPORT)
 
     async def close(self):

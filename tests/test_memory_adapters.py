@@ -26,10 +26,7 @@ from purra.output import (
     OutputSource,
     OutputStreamSpec,
 )
-from purra.testing import (
-    assert_delegation_repository_conforms,
-    assert_host_adapters_conform,
-)
+from purra.testing import assert_host_adapters_conform
 from purra.ports import RunCommit
 
 
@@ -41,23 +38,6 @@ async def test_memory_host_adapters_pass_the_shared_conformance_suite():
         outputs=adapters.outputs,
         publisher=adapters.publisher,
         session_id="portable-session",
-    )
-
-
-@pytest.mark.asyncio
-async def test_memory_delegations_pass_the_shared_conformance_suite():
-    adapters = InMemoryAgentAdapters()
-
-    async def create_run() -> str:
-        begun = await adapters.runs.begin(
-            RunCreateParams(session_id=None, prompt="delegate", mode="agent"),
-            AgentEvent(type="run.started"),
-        )
-        return begun.run_id
-
-    await assert_delegation_repository_conforms(
-        adapters.delegations,
-        create_run,
     )
 
 
@@ -78,7 +58,7 @@ async def test_memory_idempotency_replays_one_tool_result_and_rejects_key_drift(
     tool_call = ToolCall(
         id="call-1",
         name="delegateToAgents",
-        arguments_json='{"delegations":[]}',
+        arguments_json='{"children":[]}',
     )
     first = await adapters.idempotency.execute_once(
         begin.run_id,
@@ -100,7 +80,7 @@ async def test_memory_idempotency_replays_one_tool_result_and_rejects_key_drift(
             ToolCall(
                 id="call-1",
                 name="delegateToAgents",
-                arguments_json='{"delegations":[{}]}',
+                arguments_json='{"children":[{}]}',
             ),
             operation,
         )
@@ -114,7 +94,7 @@ async def test_run_repository_reserves_attempts_and_keeps_authoritative_usage():
             session_id=None,
             prompt="budget",
             mode=None,
-            runtime_limits=RuntimeLimits(max_run_output_tokens=None,
+            runtime_limits=RuntimeLimits(max_run_generation_tokens=None,
                 max_model_invocation_attempts=1,
                 max_input_tokens=3,
             ),
@@ -138,7 +118,7 @@ async def test_run_repository_reserves_attempts_and_keeps_authoritative_usage():
     assert attempts.value.code == "runtime_budget_exceeded"
     assert attempts.value.details["budgetKind"] == "model_attempts"
 
-    usage = ModelTokenUsage(input_tokens=4, output_tokens=1)
+    usage = ModelTokenUsage(input_tokens=4, generation_tokens=1)
     with pytest.raises(ContractViolationError) as tokens:
         await adapters.runs.settle_model_attempt(
             begun.run_id,
@@ -163,7 +143,7 @@ async def test_output_batch_is_atomic_and_consumes_canonical_provider_budget():
             session_id=None,
             prompt="output budget",
             mode=None,
-            runtime_limits=RuntimeLimits(max_run_output_tokens=None, max_provider_output_events=1),
+            runtime_limits=RuntimeLimits(max_run_generation_tokens=None, max_provider_output_events=1),
         ),
         AgentEvent(type="run.started"),
     )
@@ -213,7 +193,7 @@ async def test_provider_output_bytes_use_canonical_utf8_and_reject_before_append
             session_id=None,
             prompt="byte budget",
             mode=None,
-            runtime_limits=RuntimeLimits(max_run_output_tokens=None, max_provider_output_bytes=1),
+            runtime_limits=RuntimeLimits(max_run_generation_tokens=None, max_provider_output_bytes=1),
         ),
         AgentEvent(type="run.started"),
     )
@@ -246,7 +226,7 @@ async def test_provider_output_bytes_use_canonical_utf8_and_reject_before_append
 @pytest.mark.asyncio
 async def test_child_runs_share_root_budget_and_one_canonical_journal():
     adapters = InMemoryAgentAdapters()
-    limits = RuntimeLimits(max_run_output_tokens=None,
+    limits = RuntimeLimits(max_run_generation_tokens=None,
         max_model_invocation_attempts=2,
         max_input_tokens=3,
         max_provider_output_events=1,
@@ -301,7 +281,7 @@ async def test_child_runs_share_root_budget_and_one_canonical_journal():
             adapters.runs.settle_model_attempt(
                 children[index].run_id,
                 f"invocation-{index + 1}",
-                ModelTokenUsage(input_tokens=2, output_tokens=0),
+                ModelTokenUsage(input_tokens=2, generation_tokens=0),
             )
             for index, item in enumerate(attempts)
             if not isinstance(item, Exception)

@@ -99,7 +99,7 @@ const memory = new Mem0Memory({
       maxEmbeddingCalls: 64,
       maxInputChars: 100_000,
       maxOutputTokens: 8192,
-      maxCallOutputTokens: 2048,
+      resultCapacityTargetTokens: 2048,
     },
     complete: runModel(modelTasks),
     embed,
@@ -109,6 +109,10 @@ const memory = new Mem0Memory({
 
 Use `memory.budgetUsage()` to inspect admitted and reported usage. Raw SDK mode
 reports internal usage as unknown.
+
+`resultCapacityTargetTokens` reserves the expected per-call memory result size.
+It is not the Provider generation limit; `runModel()` preserves the Run's user
+generation ceiling and records the memory value as a workflow capacity target.
 
 ## Extract and review
 

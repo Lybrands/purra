@@ -157,9 +157,9 @@ export class Journal {
       return id;
     });
   }
-  settle(id: string, state: string, inputTokens: number | null = null, outputTokens: number | null = null): void {
+  settle(id: string, state: string, inputTokens: number | null = null, generationTokens: number | null = null): void {
     this.db.prepare("UPDATE purra_mem0_calls SET state=?,input_tokens=?,output_tokens=? WHERE scope=? AND id=?")
-      .run(state, inputTokens, outputTokens, this.scope, id);
+      .run(state, inputTokens, generationTokens, this.scope, id);
   }
   providerError(key: string, code: string): void {
     this.transaction(() => {

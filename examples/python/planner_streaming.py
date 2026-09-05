@@ -50,7 +50,7 @@ class FixtureGateway:
             yield ModelStreamChunk(finish_reason="stop")
 
         return ModelStream(chunks=chunks(), model="fixture",
-                           applied_output_limit=invocation.output_limit.max_tokens)
+                           applied_generation_limit=invocation.output_budget.max_generation_tokens)
 
 
 async def exercise() -> None:
@@ -59,12 +59,12 @@ async def exercise() -> None:
     core = AgentCore(model_gateway=gateway, planner=AgentPlanner(gateway),
                      planning_policy=Policy(), run_repository=storage.runs,
                      output_repository=storage.outputs, output_publisher=storage.publisher,
-                     runtime_limits=RuntimeLimits(max_run_output_tokens=None))
+                     runtime_limits=RuntimeLimits(max_run_generation_tokens=None))
     request = AgentRunRequest(
         messages=(AgentMessage(role="user", content="Give a concise answer."),),
         model=ModelRequest(provider="fixture", model="fixture",
             capability_snapshot=replace(generic_capability_snapshot(), profile_id="example:planner",
-                                        max_call_output_tokens=512)),
+                                        max_generation_tokens=512)),
         domain_context=DomainContext(namespace="example"), context_window=32_768,
         planning_mode=PlanningMode.PLANNED,
     )

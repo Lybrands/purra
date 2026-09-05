@@ -1,6 +1,9 @@
 import { AgentError } from "../shared/errors.js";
 import type {
-  InvocationOutputLimit,
+  ContinuationKind,
+  ContinuationSafety,
+  GenerationBudgetSource,
+  InvocationOutputBudget,
   JsonValue,
   Message,
   ModelCapabilitySnapshot,
@@ -8,6 +11,7 @@ import type {
   ModelStreamChunk,
   ModelTokenUsage,
   ModelTurn,
+  ResultCapacitySource,
   ToolCallDelta,
 } from "./types.js";
 
@@ -17,6 +21,13 @@ const FEATURE_SUPPORT = ["supported", "unavailable", "unknown"] as const;
 const REASONING_CONTROL = ["selectable", "always_enabled", "unavailable"] as const;
 const REASONING_REPLAY = ["required", "forbidden", "ignored"] as const;
 const THINKING_TOKEN_ACCOUNTING = ["included", "separate", "unknown"] as const;
+const REASONING_USAGE_DETAIL = ["required", "optional", "unavailable"] as const;
+const REASONING_LIMIT_KIND = ["none", "soft", "hard"] as const;
+const VISIBLE_OUTPUT_RESERVATION = ["supported", "unavailable", "unknown"] as const;
+const LENGTH_REASON_DETAIL = ["request_cap", "context_cap", "conflated"] as const;
+const CONTINUATION_KIND = ["none", "prefix_beta", "opaque_state", "signed_replay"] as const;
+const CONTINUATION_SAFETY = ["text", "structured", "tool_call"] as const;
+const RESULT_CAPACITY_SOURCE = ["user", "workflow_policy"] as const;
 const ASSISTANT_CONTENT_WITH_TOOL_CALLS = ["required", "optional", "forbidden"] as const;
 
 export function copyMessages(messages: readonly Message[]): Message[] {
@@ -33,15 +44,17 @@ export function validateModelTurn(turn: ModelTurn): ModelTurn {
   }
   let message: Message;
   let usage: ModelTokenUsage | undefined;
-  let appliedOutputLimit: number | null | undefined;
+  let appliedGenerationLimit: number;
   try {
+    if (Object.prototype.hasOwnProperty.call(turn, "appliedOutputLimit")) {
+      throw new TypeError("Legacy applied output limits are unsupported");
+    }
     message = copyMessage(turn.message);
     usage = turn.usage === undefined ? undefined : copyTokenUsage(turn.usage);
-    appliedOutputLimit = turn.appliedOutputLimit === undefined
-      ? undefined
-      : turn.appliedOutputLimit === null
-      ? null
-      : positiveInteger(turn.appliedOutputLimit, "applied output limit");
+    appliedGenerationLimit = positiveInteger(
+      turn.appliedGenerationLimit,
+      "applied generation limit",
+    );
   } catch (error) {
     throw new AgentError("invalid_model_response", "Model gateway returned invalid data", {
       cause: error,
@@ -53,7 +66,7 @@ export function validateModelTurn(turn: ModelTurn): ModelTurn {
   return Object.freeze({
     message,
     finishReason: turn.finishReason,
-    ...(appliedOutputLimit === undefined ? {} : { appliedOutputLimit }),
+    appliedGenerationLimit,
     ...(usage === undefined ? {} : { usage }),
   });
 }
@@ -105,28 +118,66 @@ export function copyCapabilitySnapshot(value: ModelCapabilitySnapshot): ModelCap
   if (!isObject(value) || !isObject(value.protocol)) {
     throw new TypeError("Model capabilities must be an object");
   }
+  if (value.schemaVersion !== 2) {
+    throw new TypeError("Unsupported model capability schema version");
+  }
   const protocol = value.protocol;
-  const maxCallOutputTokens = value.maxCallOutputTokens === null
+  const maxGenerationTokens = value.maxGenerationTokens === null
     ? null
     : positiveInteger(
-      value.maxCallOutputTokens,
+      value.maxGenerationTokens,
       "model max tokens per invocation",
     );
   const source = optionalText(value.source);
+  const continuationKind = enumValue(
+    CONTINUATION_KIND,
+    value.continuationKind ?? "none",
+    "continuation kind",
+  );
+  const continuationSafeFor = copyEnumArray(
+    CONTINUATION_SAFETY,
+    value.continuationSafeFor ?? [],
+    "continuation safety",
+  );
+  if (continuationKind === "none" && continuationSafeFor.length > 0) {
+    throw new TypeError("Continuation safety requires a continuation kind");
+  }
   if (value.actionable !== undefined && typeof value.actionable !== "boolean") {
     throw new TypeError("Model capability actionable flag must be a boolean");
   }
   return Object.freeze({
-    schemaVersion: positiveInteger(value.schemaVersion, "capability schema version"),
+    schemaVersion: 2,
     profileId: requiredText(value.profileId, "capability profile id"),
     providerProtocol: requiredText(value.providerProtocol, "provider protocol"),
     contextWindowTokens: positiveInteger(value.contextWindowTokens, "context window tokens"),
-    maxCallOutputTokens,
+    maxGenerationTokens,
     thinkingTokenAccounting: enumValue(
       THINKING_TOKEN_ACCOUNTING,
       value.thinkingTokenAccounting,
       "thinking token accounting",
     ),
+    reasoningUsageDetail: enumValue(
+      REASONING_USAGE_DETAIL,
+      value.reasoningUsageDetail ?? "optional",
+      "reasoning usage detail",
+    ),
+    reasoningLimitKind: enumValue(
+      REASONING_LIMIT_KIND,
+      value.reasoningLimitKind ?? "none",
+      "reasoning limit kind",
+    ),
+    visibleOutputReservation: enumValue(
+      VISIBLE_OUTPUT_RESERVATION,
+      value.visibleOutputReservation ?? "unknown",
+      "visible output reservation",
+    ),
+    lengthReasonDetail: enumValue(
+      LENGTH_REASON_DETAIL,
+      value.lengthReasonDetail ?? "conflated",
+      "length reason detail",
+    ),
+    continuationKind,
+    continuationSafeFor,
     protocol: Object.freeze({
       reasoningControl: enumValue(
         REASONING_CONTROL,
@@ -173,45 +224,141 @@ export function copyCapabilitySnapshot(value: ModelCapabilitySnapshot): ModelCap
   });
 }
 
-export function resolveInvocationOutputLimit(
+export interface InvocationOutputBudgetOptions {
+  readonly maxGenerationTokens?: number;
+  readonly generationSource?: GenerationBudgetSource;
+  readonly resultCapacityTargetTokens?: number;
+  readonly resultCapacitySource?: ResultCapacitySource;
+}
+
+export function resolveInvocationOutputBudget(
   snapshot: ModelCapabilitySnapshot | undefined,
-  explicitMaxTokens: number | undefined,
-): InvocationOutputLimit | undefined {
+  options: InvocationOutputBudgetOptions = {},
+): InvocationOutputBudget {
   if (snapshot === undefined) {
-    if (explicitMaxTokens === undefined) return undefined;
     throw new AgentError(
-      "model_output_limit_unknown",
-      "Model capabilities do not declare an output limit",
+      "model_generation_limit_unknown",
+      "Model capabilities do not declare a verified generation limit",
     );
   }
-  const profileMaximum = snapshot.maxCallOutputTokens;
+  const profileMaximum = snapshot.maxGenerationTokens;
   if (profileMaximum === null) {
     throw new AgentError(
-      "model_output_limit_unknown",
-      "Model capabilities do not declare an output limit",
+      "model_generation_limit_unknown",
+      "Model capabilities do not declare a verified generation limit",
     );
   }
-  let maxTokens = profileMaximum;
-  let source: InvocationOutputLimit["source"] = "model_profile";
-  if (explicitMaxTokens !== undefined) {
+  let maxGenerationTokens = profileMaximum;
+  let generationSource: GenerationBudgetSource = "model_profile";
+  if (options.maxGenerationTokens !== undefined) {
     try {
-      maxTokens = positiveInteger(explicitMaxTokens, "model output limit");
+      maxGenerationTokens = positiveInteger(
+        options.maxGenerationTokens,
+        "maximum generated tokens",
+      );
     } catch (error) {
       throw new AgentError(
-        "model_output_limit_invalid",
-        "Model output limit must be a positive integer",
+        "model_output_budget_invalid",
+        "Invocation output budget values must be positive integers",
         { cause: error },
       );
     }
-    if (maxTokens > profileMaximum) {
+    if (maxGenerationTokens > profileMaximum) {
       throw new AgentError(
-        "model_output_limit_exceeded",
-        "Model output limit exceeds the model profile maximum",
+        "model_generation_limit_exceeded",
+        "Generation budget exceeds the model profile maximum",
       );
     }
-    source = "user_override";
+    generationSource = options.generationSource ?? "user";
+    if (generationSource !== "user") {
+      throw new AgentError("model_output_budget_invalid", "Invalid generation budget source");
+    }
+  } else if (
+    options.generationSource !== undefined
+    && options.generationSource !== "model_profile"
+  ) {
+    throw new AgentError(
+      "model_output_budget_invalid",
+      "Generation source conflicts with the model-profile allowance",
+    );
   }
-  return Object.freeze({ maxTokens, source, profileMaxTokens: profileMaximum });
+
+  let resultCapacityTargetTokens: number | null = null;
+  let resultCapacitySource: ResultCapacitySource | null = null;
+  if (options.resultCapacityTargetTokens !== undefined) {
+    try {
+      resultCapacityTargetTokens = positiveInteger(
+        options.resultCapacityTargetTokens,
+        "result capacity target",
+      );
+    } catch (error) {
+      throw new AgentError(
+        "model_output_budget_invalid",
+        "Invocation output budget values must be positive integers",
+        { cause: error },
+      );
+    }
+    if (resultCapacityTargetTokens > maxGenerationTokens) {
+      throw new AgentError(
+        "model_output_budget_invalid",
+        "Result capacity target exceeds the generation budget",
+      );
+    }
+    if (
+      options.resultCapacitySource === undefined
+      || !includes(RESULT_CAPACITY_SOURCE, options.resultCapacitySource)
+    ) {
+      throw new AgentError(
+        "model_output_budget_invalid",
+        "Result capacity target requires its own source",
+      );
+    }
+    resultCapacitySource = options.resultCapacitySource;
+  } else if (options.resultCapacitySource !== undefined) {
+    throw new AgentError(
+      "model_output_budget_invalid",
+      "Result capacity source requires a target",
+    );
+  }
+  return Object.freeze({
+    maxGenerationTokens,
+    generationSource,
+    profileMaxGenerationTokens: profileMaximum,
+    requestedUserMaxGenerationTokens: options.maxGenerationTokens ?? null,
+    resultCapacityTargetTokens,
+    resultCapacitySource,
+    nonResultHeadroomTokens: resultCapacityTargetTokens === null
+      ? null
+      : maxGenerationTokens - resultCapacityTargetTokens,
+  });
+}
+
+export function constrainOutputBudgetToContext(
+  budget: InvocationOutputBudget,
+  maxGenerationTokens: number,
+): InvocationOutputBudget {
+  const contextMaximum = positiveInteger(
+    maxGenerationTokens,
+    "context maximum generation tokens",
+  );
+  if (budget.maxGenerationTokens <= contextMaximum) return budget;
+  if (
+    budget.resultCapacityTargetTokens !== null
+    && budget.resultCapacityTargetTokens > contextMaximum
+  ) {
+    throw new AgentError(
+      "model_result_capacity_incompatible",
+      "Result capacity target does not fit the selected context window",
+    );
+  }
+  return Object.freeze({
+    ...budget,
+    maxGenerationTokens: contextMaximum,
+    generationSource: "context_capacity",
+    nonResultHeadroomTokens: budget.resultCapacityTargetTokens === null
+      ? null
+      : contextMaximum - budget.resultCapacityTargetTokens,
+  });
 }
 
 export function throwForIncompleteFinish(
@@ -322,20 +469,26 @@ function copyToolCallDelta(delta: ToolCallDelta): ToolCallDelta {
 
 function copyTokenUsage(usage: ModelTokenUsage): ModelTokenUsage {
   if (!isObject(usage)) throw new TypeError("Invalid model token usage");
+  if (
+    Object.prototype.hasOwnProperty.call(usage, "outputTokens")
+    || Object.prototype.hasOwnProperty.call(usage, "reasoningOutputTokens")
+  ) {
+    throw new TypeError("Legacy model token usage fields are unsupported");
+  }
   const inputTokens = nonNegativeInteger(usage.inputTokens, "input tokens");
-  const outputTokens = nonNegativeInteger(usage.outputTokens ?? 0, "output tokens");
+  const generationTokens = nonNegativeInteger(usage.generationTokens, "generation tokens");
+  const reasoningTokens = usage.reasoningTokens === undefined
+    ? undefined
+    : nonNegativeInteger(usage.reasoningTokens, "reasoning tokens");
   return Object.freeze({
     inputTokens,
-    outputTokens,
+    generationTokens,
     totalTokens: nonNegativeInteger(
-      usage.totalTokens ?? inputTokens + outputTokens,
+      usage.totalTokens ?? inputTokens + generationTokens,
       "total tokens",
     ),
     cachedInputTokens: nonNegativeInteger(usage.cachedInputTokens ?? 0, "cached input tokens"),
-    reasoningOutputTokens: nonNegativeInteger(
-      usage.reasoningOutputTokens ?? 0,
-      "reasoning output tokens",
-    ),
+    ...(reasoningTokens === undefined ? {} : { reasoningTokens }),
   });
 }
 
@@ -362,6 +515,19 @@ function enumValue<const T extends readonly string[]>(
 ): T[number] {
   if (!includes(values, value)) throw new TypeError(`Invalid ${label}`);
   return value;
+}
+
+function copyEnumArray<const T extends readonly string[]>(
+  values: T,
+  input: unknown,
+  label: string,
+): readonly T[number][] {
+  if (!Array.isArray(input)) throw new TypeError(`${label} must be an array`);
+  const result = input.map((value) => enumValue(values, value, label));
+  if (new Set(result).size !== result.length) {
+    throw new TypeError(`${label} values must be unique`);
+  }
+  return Object.freeze(result);
 }
 
 function requiredText(value: unknown, label: string): string {

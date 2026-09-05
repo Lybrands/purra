@@ -1,5 +1,5 @@
 import { AgentError } from "./shared/errors.js";
-import { DelegationPolicy } from "./delegation/policy.js";
+import { AgentTreePolicy } from "./agent-tree-policy.js";
 import type { JsonValue } from "./model/types.js";
 import type { ToolContext, ToolDefinition } from "./tools/types.js";
 import { RunCommandService } from "./agent-tree-execution.js";
@@ -7,21 +7,21 @@ import { RunCommandService } from "./agent-tree-execution.js";
 /** Model-visible create-and-wait facade over the canonical Agent tree. */
 export function buildAgentTreeTool(options: {
   readonly commands: RunCommandService;
-  readonly policy: DelegationPolicy;
+  readonly policy: AgentTreePolicy;
   readonly childAllowedTools?: readonly string[];
 }): ToolDefinition {
   if (!(options.commands instanceof RunCommandService)) {
     throw new TypeError("Agent tree tool requires RunCommandService");
   }
-  if (!(options.policy instanceof DelegationPolicy)) {
-    throw new TypeError("Agent tree tool requires DelegationPolicy");
+  if (!(options.policy instanceof AgentTreePolicy)) {
+    throw new TypeError("Agent tree tool requires AgentTreePolicy");
   }
   const limits = options.policy.snapshot();
   const childAllowedTools = Object.freeze([...(options.childAllowedTools ?? [])]);
   return Object.freeze({
     name: "delegateToAgents",
     description: (
-      `Create 1-${limits.maxAgentsPerCall} bounded Child Agents, run them `
+      `Create 1-${limits.maxChildrenPerCall} bounded Child Agents, run them `
       + "independently, wait for completion, and return attributed results."
     ),
     displayNames: Object.freeze({
@@ -31,14 +31,14 @@ export function buildAgentTreeTool(options: {
     inputSchema: Object.freeze({
       type: "object",
       properties: {
-        delegations: {
+        children: {
           type: "array",
           minItems: 1,
-          maxItems: limits.maxAgentsPerCall,
+          maxItems: limits.maxChildrenPerCall,
           items: {
             type: "object",
             properties: {
-              agentName: { type: "string", minLength: 1, maxLength: limits.maxAgentNameChars },
+              name: { type: "string", minLength: 1, maxLength: limits.maxAgentNameChars },
               title: { type: "string", minLength: 1, maxLength: limits.maxTitleChars },
               instruction: { type: "string", minLength: 1, maxLength: limits.maxInstructionChars },
               objective: { type: "string", minLength: 1, maxLength: limits.maxObjectiveChars },
@@ -46,12 +46,12 @@ export function buildAgentTreeTool(options: {
               required: { type: "boolean" },
               priority: { type: "integer" },
             },
-            required: ["agentName", "title", "instruction", "objective"],
+            required: ["name", "title", "instruction", "objective"],
             additionalProperties: false,
           },
         },
       },
-      required: ["delegations"],
+      required: ["children"],
       additionalProperties: false,
     }),
     policy: Object.freeze({
@@ -64,8 +64,8 @@ export function buildAgentTreeTool(options: {
     async run(input: JsonValue, context: ToolContext) {
       const runId = requiredText(context.runId, "Agent tree Run id");
       const raw = input as Readonly<Record<string, JsonValue>>;
-      const children = options.policy.validate(raw.delegations).map((item) => ({
-        name: item.agentName,
+      const children = options.policy.validateChildren(raw.children).map((item) => ({
+        name: item.name,
         title: item.title,
         instruction: item.instruction,
         objective: item.objective,
@@ -74,7 +74,7 @@ export function buildAgentTreeTool(options: {
         ...(item.priority === undefined ? {} : { priority: item.priority }),
       }));
       const grant = await options.commands.compileChildGrant(runId, {
-        canSpawnAgents: limits.allowsRecursiveDelegation,
+        canSpawnAgents: limits.allowsRecursiveAgents,
         allowedTools: childAllowedTools,
       });
       const claim = context.leaseOwnerId === undefined
@@ -107,7 +107,7 @@ export function buildAgentTreeTool(options: {
         }),
         effectState: "committed",
         ...(aggregate.state === "blocked"
-          ? { errorCode: "required_delegation_failed" }
+          ? { errorCode: "required_child_run_failed" }
           : {}),
       });
     },

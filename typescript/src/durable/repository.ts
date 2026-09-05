@@ -28,8 +28,8 @@ const ZERO_USAGE: LongTaskUsage = Object.freeze({
   invocationCount: 0,
   unreportedUsageAttempts: 0,
   inputTokens: 0,
-  outputTokens: 0,
-  reasoningTokens: 0,
+  generationTokens: 0,
+  reasoningTokens: null,
 });
 
 export class InMemoryLongTaskRepository implements LongTaskRepository {
@@ -506,14 +506,19 @@ export class InMemoryLongTaskRepository implements LongTaskRepository {
       usage.unreportedUsageAttempts > 0
       && (
         budgets.maxInputTokens !== null
-        || budgets.maxRunOutputTokens !== null
+        || budgets.maxRunGenerationTokens !== null
         || budgets.maxReasoningTokens !== null
       )
     ) return "provider_usage_unreported";
+    if (
+      usage.invocationCount > 0
+      && usage.reasoningTokens === null
+      && budgets.maxReasoningTokens !== null
+    ) return "reasoning_tokens_unreported";
     const rows = [
       ["model_attempts", usage.invocationCount, budgets.maxInvocationAttempts],
       ["input_tokens", usage.inputTokens, budgets.maxInputTokens],
-      ["output_tokens", usage.outputTokens, budgets.maxRunOutputTokens],
+      ["generation_tokens", usage.generationTokens, budgets.maxRunGenerationTokens],
       ["reasoning_tokens", usage.reasoningTokens, budgets.maxReasoningTokens],
     ] as const;
     return rows.find(([, used, maximum]) => (
@@ -619,18 +624,18 @@ function normalizeUsage(value: ModelTokenUsage | null): LongTaskUsage {
     invocationCount: 1,
     unreportedUsageAttempts: 1,
     inputTokens: 0,
-    outputTokens: 0,
-    reasoningTokens: 0,
+    generationTokens: 0,
+    reasoningTokens: null,
   });
   if (value === null || typeof value !== "object") throw new TypeError("Usage must be an object");
   return Object.freeze({
     invocationCount: 1,
     unreportedUsageAttempts: 0,
     inputTokens: nonNegativeInteger(value.inputTokens, "usage inputTokens"),
-    outputTokens: nonNegativeInteger(value.outputTokens ?? 0, "usage outputTokens"),
-    reasoningTokens: value.reasoningOutputTokens === undefined
-      ? 0
-      : nonNegativeInteger(value.reasoningOutputTokens, "usage reasoningOutputTokens"),
+    generationTokens: nonNegativeInteger(value.generationTokens ?? 0, "usage generationTokens"),
+    reasoningTokens: value.reasoningTokens === undefined
+      ? null
+      : nonNegativeInteger(value.reasoningTokens, "usage reasoningTokens"),
   });
 }
 
@@ -639,8 +644,12 @@ function addUsage(left: LongTaskUsage, right: LongTaskUsage): LongTaskUsage {
     invocationCount: left.invocationCount + right.invocationCount,
     unreportedUsageAttempts: left.unreportedUsageAttempts + right.unreportedUsageAttempts,
     inputTokens: left.inputTokens + right.inputTokens,
-    outputTokens: left.outputTokens + right.outputTokens,
-    reasoningTokens: left.reasoningTokens === null || right.reasoningTokens === null
+    generationTokens: left.generationTokens + right.generationTokens,
+    reasoningTokens: left.invocationCount === 0
+      ? right.reasoningTokens
+      : right.invocationCount === 0
+      ? left.reasoningTokens
+      : left.reasoningTokens === null || right.reasoningTokens === null
       ? null
       : left.reasoningTokens + right.reasoningTokens,
   });

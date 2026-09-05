@@ -1,20 +1,26 @@
 import { UserInputRequired } from "../interaction.js";
 import type {
-  InvocationOutputLimit,
+  InvocationOutputBudget,
   JsonValue,
   Message,
   ModelCapabilitySnapshot,
   ModelGateway,
   ModelStreamChunk,
+  ModelTokenUsage,
   ModelTurn,
 } from "../model/types.js";
-import { invokeModel, type ModelStreamLimits } from "../model/stream.js";
+import {
+  invokeModel,
+  modelFailureUsage,
+  type ModelStreamLimits,
+} from "../model/stream.js";
 import { ModelTaskRunner } from "../extensions/model-tasks.js";
 import {
   copyCapabilitySnapshot,
   copyJsonValue,
   copyMessages,
-  resolveInvocationOutputLimit,
+  constrainOutputBudgetToContext,
+  resolveInvocationOutputBudget,
   throwForIncompleteFinish,
 } from "../model/validation.js";
 import { AgentCanceledError, AgentError } from "../shared/errors.js";
@@ -36,6 +42,7 @@ import type {
   PreparedContext,
   StagedContextPreparation,
 } from "../context/types.js";
+import { maxGenerationTokensForContext } from "../context/budget.js";
 import { PlannedExecutionCoordinator } from "../planning/coordinator.js";
 import {
   ResponseValidationCoordinator,
@@ -96,6 +103,10 @@ import {
   type AgentTreeOptions,
 } from "../agent-tree-execution.js";
 import { buildAgentTreeTool } from "../agent-tree-tool.js";
+import {
+  AgentTreePolicy,
+  type AgentTreePolicySnapshot,
+} from "../agent-tree-policy.js";
 import { ToolCatalog } from "../tools/catalog.js";
 import type {
   ToolApprovalGateway,
@@ -118,12 +129,6 @@ import type {
   LongTaskDispatchReceipt,
   TaskAdmissionDecision,
 } from "../durable/types.js";
-import { DelegationCoordinator } from "../delegation/coordinator.js";
-import { DynamicDelegatedAgentExecutor } from "../delegation/executor.js";
-import { DelegationPolicy } from "../delegation/policy.js";
-import { InMemoryDelegationRepository } from "../delegation/repository.js";
-import { buildDelegationTool } from "../delegation/tool.js";
-import type { DelegationOptions, DelegationPolicySnapshot } from "../delegation/types.js";
 import { AgentOperationController } from "../operations/index.js";
 import {
   EMPTY_RESPONSE_RETRY_GUIDANCE,
@@ -150,7 +155,6 @@ export interface AgentOptions {
   readonly planning?: PlanningOptions;
   readonly responseValidation?: ResponseValidationOptions;
   readonly durable?: DurableOptions;
-  readonly delegation?: DelegationOptions;
   readonly agentTree?: AgentTreeOptions;
   readonly recovery?: RecoveryPolicy;
   readonly operations?: AgentOperationController;
@@ -168,7 +172,8 @@ export interface AgentRunInput {
   readonly messages: readonly Message[];
   readonly planningMode?: PlanningMode;
   readonly signal?: AbortSignal;
-  readonly maxCallOutputTokens?: number;
+  readonly maxGenerationTokens?: number;
+  readonly resultCapacityTargetTokens?: number;
   readonly enabledTools?: readonly string[];
 }
 
@@ -209,7 +214,7 @@ export class Agent {
   readonly #maxRounds: number;
   readonly #runtimeLimits: AgentRuntimeLimits;
   readonly #outputBatchLimits: OutputBatchLimits;
-  readonly #capabilities: ModelCapabilitySnapshot | undefined;
+  readonly #capabilities: ModelCapabilitySnapshot;
   readonly #useStream: boolean;
   readonly #preset: AgentPreset & { readonly promptSections: readonly PromptSection[] };
   readonly #runRepository: RunRepository;
@@ -219,12 +224,10 @@ export class Agent {
   readonly #planning: PlanningOptions | undefined;
   readonly #responseValidationOptions: ResponseValidationOptions;
   readonly #durable: DurableOptions | undefined;
-  readonly #delegationCoordinator: DelegationCoordinator | undefined;
-  readonly #dynamicDelegatedExecutor: DynamicDelegatedAgentExecutor | undefined;
-  readonly #delegationPolicy: DelegationPolicySnapshot | undefined;
   readonly #agentTreeRepository: RunTreeRepository | undefined;
   readonly #agentTreeCommands: RunCommandService | undefined;
-  readonly #agentTreePolicy: DelegationPolicy | undefined;
+  readonly #agentTreePolicy: AgentTreePolicy | undefined;
+  readonly #agentTreePolicySnapshot: AgentTreePolicySnapshot | undefined;
   readonly #agentTreeRootId: string | undefined;
   readonly #configuredAgentTreeGrant: AgentCapabilityGrant | undefined;
   readonly #agentTreeRoots = new Map<string, AgentTreeRootBinding>();
@@ -259,10 +262,6 @@ export class Agent {
     if (reservedPlanningControl !== undefined) {
       throw new TypeError(`${reservedPlanningControl.name} is reserved for Planner activation`);
     }
-    if (options.agentTree !== undefined && options.delegation !== undefined) {
-      throw new TypeError("Agent tree and legacy delegation are mutually exclusive");
-    }
-    let delegationPolicy: DelegationPolicy | undefined;
     let effectiveDefinitions: readonly ToolDefinition[];
     if (options.agentTree !== undefined) {
       const tree = options.agentTree;
@@ -273,7 +272,7 @@ export class Agent {
       if (repository === null || typeof repository !== "object") {
         throw new TypeError("Agent tree requires a RunTreeRepository");
       }
-      const policy = new DelegationPolicy(tree.policy);
+      const policy = new AgentTreePolicy(tree.policy);
       const commands = new RunCommandService(
         repository,
         new AgentTreeRunSupervisor({
@@ -295,6 +294,7 @@ export class Agent {
       this.#agentTreeRepository = repository;
       this.#agentTreeCommands = commands;
       this.#agentTreePolicy = policy;
+      this.#agentTreePolicySnapshot = policy.snapshot();
       this.#agentTreeRootId = requiredText(
         tree.rootAgentId ?? `root-agent-${globalThis.crypto.randomUUID()}`,
         "root Agent id",
@@ -306,9 +306,6 @@ export class Agent {
         throw new TypeError("Agent tree capability grant is invalid");
       }
       this.#configuredAgentTreeGrant = tree.capabilityGrant;
-      this.#delegationCoordinator = undefined;
-      this.#dynamicDelegatedExecutor = undefined;
-      this.#delegationPolicy = policy.snapshot();
       effectiveDefinitions = Object.freeze([
         ...definitions,
         buildAgentTreeTool({
@@ -321,49 +318,10 @@ export class Agent {
       this.#agentTreeRepository = undefined;
       this.#agentTreeCommands = undefined;
       this.#agentTreePolicy = undefined;
+      this.#agentTreePolicySnapshot = undefined;
       this.#agentTreeRootId = undefined;
       this.#configuredAgentTreeGrant = undefined;
-      if (options.delegation === undefined) {
-        this.#delegationCoordinator = undefined;
-        this.#dynamicDelegatedExecutor = undefined;
-        this.#delegationPolicy = undefined;
-        effectiveDefinitions = definitions;
-      } else {
-        if (options.delegation === null || typeof options.delegation !== "object") {
-          throw new TypeError("delegation must be an object");
-        }
-        const policy = new DelegationPolicy(options.delegation.policy);
-        delegationPolicy = policy;
-        this.#delegationPolicy = policy.snapshot();
-        const repository = options.delegation.repository ?? new InMemoryDelegationRepository();
-        const dynamic = options.delegation.executor === undefined
-          ? new DynamicDelegatedAgentExecutor({
-              model: options.model,
-              runtimeLimits: this.#runtimeLimits,
-              tools: definitions,
-              ...(this.#context === undefined ? {} : { context: this.#context }),
-              ...(options.recovery === undefined ? {} : { recovery: options.recovery }),
-              ...(options.operations === undefined ? {} : { operations: options.operations }),
-              ...(options.evidenceValidator === undefined
-                ? {}
-                : { evidenceValidator: options.evidenceValidator }),
-              maxRounds,
-            })
-          : undefined;
-        this.#dynamicDelegatedExecutor = dynamic;
-        this.#delegationCoordinator = new DelegationCoordinator({
-          repository,
-          executor: options.delegation.executor ?? dynamic!,
-          policy,
-        });
-        effectiveDefinitions = Object.freeze([
-          ...definitions,
-          buildDelegationTool({
-            coordinator: this.#delegationCoordinator,
-            policy: delegationPolicy,
-          }),
-        ]);
-      }
+      effectiveDefinitions = definitions;
     }
     this.#tools = new ToolCatalog(effectiveDefinitions, {
       ...(options.approval === undefined ? {} : { approval: options.approval }),
@@ -393,10 +351,20 @@ export class Agent {
       throw new TypeError("evidenceValidator must implement validateEvidence");
     }
     this.#evidenceValidator = options.evidenceValidator;
-    this.#capabilities = options.model.capabilities === undefined
-      ? undefined
-      : copyCapabilitySnapshot(options.model.capabilities);
-    if (this.#capabilities?.actionable === false) {
+    if (options.model.capabilities === undefined) {
+      throw new AgentError(
+        "model_generation_limit_unknown",
+        "Agent requires a verified model capability snapshot",
+      );
+    }
+    this.#capabilities = copyCapabilitySnapshot(options.model.capabilities);
+    if (this.#capabilities.maxGenerationTokens === null) {
+      throw new AgentError(
+        "model_generation_limit_unknown",
+        "Model capabilities do not declare a verified generation limit",
+      );
+    }
+    if (this.#capabilities.actionable === false) {
       throw new AgentError(
         "model_capability_incompatible",
         "Model capability snapshot is not actionable",
@@ -548,29 +516,29 @@ export class Agent {
     const treeGrant = this.#agentTreeRepository === undefined
       ? undefined
       : treeScope?.agent.capabilityGrant ?? this.#rootAgentTreeGrant();
-    const snapshotVersion = treeGrant === undefined ? 4 : 5;
+    const agentTreeSnapshot = treeGrant === undefined
+      ? Object.freeze({ protocolVersion: 1 as const, enabled: false as const })
+      : Object.freeze({
+          protocolVersion: 1 as const,
+          ...this.#agentTreePolicySnapshot!,
+          capabilityGrant: treeGrant.toJSON(),
+        });
     const [promptFingerprint, toolFingerprint, compositionFingerprint] = await Promise.all([
       stableFingerprint(copyJsonValue(this.#preset.promptSections)),
       stableFingerprint(copyJsonValue(tools)),
       stableFingerprint(copyJsonValue({
-        schemaVersion: snapshotVersion,
+        schemaVersion: 5,
         maxRounds: this.#maxRounds,
         runtimeLimits: this.#runtimeLimits,
         contextStrategy: this.#context?.strategy ?? "single_pass",
         planningBinding: this.#planning?.binding ?? null,
         durableBinding: this.#durable?.binding ?? null,
-        delegation: this.#delegationPolicy ?? { enabled: false },
-        ...(treeGrant === undefined ? {} : {
-          agentTree: {
-            protocolVersion: 1,
-            capabilityGrant: treeGrant.toJSON(),
-          },
-        }),
+        agentTree: agentTreeSnapshot,
         recovery: this.#recoveryPolicy.snapshot(),
       })),
     ]);
     const preset: AgentPresetSnapshot = Object.freeze({
-      schemaVersion: snapshotVersion,
+      schemaVersion: 5,
       presetId: this.#preset.id,
       presetRevision: this.#preset.revision,
       promptFingerprint,
@@ -578,12 +546,7 @@ export class Agent {
       capabilityProfileId: this.#capabilities?.profileId ?? null,
       compositionFingerprint,
       runtimeLimits: this.#runtimeLimits,
-      ...(treeGrant === undefined ? {} : {
-        agentTree: Object.freeze({
-          protocolVersion: 1,
-          capabilityGrant: treeGrant.toJSON(),
-        }),
-      }),
+      agentTree: agentTreeSnapshot,
     }) as AgentPresetSnapshot;
     let continuation: DurableRecoverySnapshot | undefined;
     let deadlineAt = normalizeDeadline(
@@ -738,9 +701,12 @@ export class Agent {
       ]),
       signal: session.signal,
       planningMode: resolvePlanningMode(request.planningMode),
-      ...(request.maxCallOutputTokens === undefined
+      ...(request.maxGenerationTokens === undefined
         ? {}
-        : { maxCallOutputTokens: request.maxCallOutputTokens }),
+        : { maxGenerationTokens: request.maxGenerationTokens }),
+      ...(options.resultCapacityTargetTokens === undefined
+        ? {}
+        : { resultCapacityTargetTokens: options.resultCapacityTargetTokens }),
       ...(enabledTools === undefined ? {} : { enabledTools }),
     });
 
@@ -794,9 +760,9 @@ export class Agent {
     return new AgentCapabilityGrant({
       canSpawnAgents: true,
       maxDepth: limits.maxDepth,
-      maxChildrenPerCall: limits.maxAgentsPerCall,
+      maxChildrenPerCall: limits.maxChildrenPerCall,
       maxAgentsPerRoot: limits.maxAgentsPerRoot,
-      maxParallelRuns: limits.maxParallel,
+      maxParallelRuns: limits.maxParallelRuns,
       allowedTools: this.#tools.readToolNamesFor(),
       allowedModels: [modelId],
     });
@@ -845,6 +811,9 @@ export class Agent {
       ]),
       planningMode: "auto",
       enabledTools,
+      ...(binding.request.maxGenerationTokens === undefined
+        ? {}
+        : { maxGenerationTokens: binding.request.maxGenerationTokens }),
       metadata: Object.freeze({
         ...(binding.request.metadata ?? {}),
         agentId: agent.agentId,
@@ -859,6 +828,9 @@ export class Agent {
     const baseOptions = binding.options.durableContinuation === undefined
       ? Object.freeze({
           budgets: binding.options.budgets,
+          ...(binding.options.resultCapacityTargetTokens === undefined
+            ? {}
+            : { resultCapacityTargetTokens: binding.options.resultCapacityTargetTokens }),
           ...(binding.options.deadlineAt === undefined
             ? {}
             : { deadlineAt: binding.options.deadlineAt }),
@@ -1055,22 +1027,12 @@ export class Agent {
     resumeCheckpoint?: AgentExecutionCheckpoint,
   ): Promise<RunResult> {
     if (this.#operations !== undefined) session.operations = this.#operations.withOutput(session);
-    let delegationBound = false;
-    let dynamicExecutorBound = false;
     try {
       if (resumeCheckpoint !== undefined && this.#agentTreeRepository !== undefined) {
-        resumeCheckpoint = await this.#resumeTreeDelegations(resumeCheckpoint, session);
-      }
-      if (this.#delegationCoordinator !== undefined) {
-        this.#delegationCoordinator.bindRun(
-          session.runId,
-          (event) => session.publishDelegation(event),
+        resumeCheckpoint = await this.#resumeChildRuns(
+          resumeCheckpoint,
+          session,
         );
-        delegationBound = true;
-      }
-      if (this.#dynamicDelegatedExecutor !== undefined) {
-        this.#dynamicDelegatedExecutor.bindRun(session.runId, session);
-        dynamicExecutorBound = true;
       }
       if (continuation !== undefined) {
         const result = await this.#continueDurable(input, session, continuation);
@@ -1128,9 +1090,6 @@ export class Agent {
       }
       await session.fail(errorCode(error));
       throw error;
-    } finally {
-      if (dynamicExecutorBound) this.#dynamicDelegatedExecutor?.releaseRun(session.runId);
-      if (delegationBound) this.#delegationCoordinator?.releaseRun(session.runId);
     }
   }
 
@@ -1157,9 +1116,19 @@ export class Agent {
     const executionKey = session?.runId
       ?? transientExecutionKey
       ?? `${this.#idempotencyNamespace}:${++this.#invocationSequence}`;
-    const outputLimit: InvocationOutputLimit | undefined = resolveInvocationOutputLimit(
+    const baseOutputBudget: InvocationOutputBudget | undefined = resolveInvocationOutputBudget(
       this.#capabilities,
-      input.maxCallOutputTokens,
+      {
+        ...(input.maxGenerationTokens === undefined
+          ? {}
+          : { maxGenerationTokens: input.maxGenerationTokens, generationSource: "user" as const }),
+        ...(input.resultCapacityTargetTokens === undefined
+          ? {}
+          : {
+              resultCapacityTargetTokens: input.resultCapacityTargetTokens,
+              resultCapacitySource: "workflow_policy" as const,
+            }),
+      },
     );
     let pendingReplan = resumeCheckpoint?.pendingReplan;
     let responseAttempts = resumeCheckpoint?.responseAttempts ?? 0;
@@ -1219,10 +1188,6 @@ export class Agent {
         ? input.enabledTools
         : transition?.allowedToolNames ?? [];
       if (publicPresentationPending) enabledTools = Object.freeze([]);
-      if (session === undefined && this.#delegationCoordinator !== undefined) {
-        enabledTools = Object.freeze((enabledTools ?? this.#tools.specsFor().map((tool) => tool.name))
-          .filter((name) => name !== "delegateToAgents"));
-      }
       const businessTools = this.#tools.specsFor(enabledTools);
       const tools = Object.freeze([
         ...businessTools,
@@ -1236,6 +1201,16 @@ export class Agent {
             : []
         ),
       ]);
+      const outputBudget = constrainOutputBudgetToContext(
+        baseOutputBudget,
+        maxGenerationTokensForContext({
+          windowTokens: this.#capabilities.contextWindowTokens,
+          tools,
+          ...(this.#context?.reserves === undefined
+            ? {}
+            : { reserves: this.#context.reserves }),
+        }),
+      );
       modelTasks?.bindEvidence(mergeEvidence(
         activeEvidence,
         context?.evidence ?? [],
@@ -1246,10 +1221,8 @@ export class Agent {
       const modelRequest = Object.freeze({
         messages: projectedMessages,
         tools,
-        ...(this.#capabilities === undefined
-          ? {}
-          : { capabilitySnapshot: this.#capabilities }),
-        ...(outputLimit === undefined ? {} : { outputLimit }),
+        capabilitySnapshot: this.#capabilities,
+        outputBudget,
       });
       let turn: ModelTurn;
       let receipt: ModelInvocationReceipt | undefined;
@@ -1266,9 +1239,10 @@ export class Agent {
               tools: modelRequest.tools,
               evidence: invocationEvidence,
               capabilityProfileId: this.#capabilities?.profileId ?? null,
-              outputLimit: outputLimit?.maxTokens ?? null,
+              outputBudget: outputBudget ?? null,
             });
         let chunkIndex = 0;
+        let latestUsage: ModelTokenUsage | undefined;
         try {
           await validateEvidence(
             this.#evidenceValidator,
@@ -1281,6 +1255,7 @@ export class Agent {
             input.signal,
             this.#useStream,
             async (chunk) => {
+              latestUsage = chunk.usage ?? latestUsage;
               if (
                 chunk.progressDelta !== undefined
                 && chunk.progressDelta !== ""
@@ -1305,13 +1280,20 @@ export class Agent {
             },
             this.#runtimeLimits,
           );
+          latestUsage = turn.usage ?? latestUsage;
           if (session !== undefined && receipt !== undefined && !this.#useStream) {
             await session.persistCompletion(receipt, turn);
           }
         } catch (error) {
           if (session !== undefined && receipt !== undefined) {
             try {
-              await session.settleInvocation(receipt, "failed", undefined, errorCode(error));
+              await session.settleInvocation(
+                receipt,
+                "failed",
+                undefined,
+                errorCode(error),
+                latestUsage ?? modelFailureUsage(error),
+              );
             } catch {
               // The terminal Run commit fences an invocation left open by a
               // repository or deadline failure.
@@ -1547,9 +1529,6 @@ export class Agent {
               : { parentRunId: session.parentRunId }),
             ...session.leaseClaim,
           }),
-          ...(this.#delegationCoordinator === undefined
-            ? {}
-            : { delegationEnabledTools: this.#tools.readToolNamesFor(input.enabledTools) }),
           ...(input.signal === undefined ? {} : { signal: input.signal }),
           ...(
             emit === undefined && session === undefined
@@ -1639,7 +1618,7 @@ export class Agent {
     throw new AgentError("max_rounds_exceeded", "Agent exceeded its model round limit");
   }
 
-  async #resumeTreeDelegations(checkpoint: AgentExecutionCheckpoint, session: RunSession): Promise<AgentExecutionCheckpoint> {
+  async #resumeChildRuns(checkpoint: AgentExecutionCheckpoint, session: RunSession): Promise<AgentExecutionCheckpoint> {
     const calls = new Set(checkpoint.messages.flatMap(m => m.toolCalls ?? []).filter(c => c.name === "delegateToAgents").map(c => c.id));
     const messages = [...checkpoint.messages];
     let changed = false;
@@ -1661,7 +1640,12 @@ export class Agent {
     if (!changed) return checkpoint;
     const updated = { ...checkpoint, inputRevision: (checkpoint.inputRevision ?? 0) + 1, messages };
     await session.saveExecutionCheckpoint(updated);
-    if (requiredFailure) throw new AgentError("required_delegation_failed", "A required Child Run failed");
+    if (requiredFailure) {
+      throw new AgentError(
+        "required_child_run_failed",
+        "A required Child Run failed",
+      );
+    }
     return updated;
   }
 
@@ -1803,7 +1787,7 @@ export class Agent {
     readonly modelTasks?: ModelTaskRunner;
     readonly autoPlanning?: AutoPlanningPreparation;
   }> {
-    const modelTasks = this.#modelTasksForExecution(runId, authority, input.maxCallOutputTokens);
+    const modelTasks = this.#modelTasksForExecution(runId, authority, input.maxGenerationTokens);
     modelTasks?.bindEvidence(evidence);
     const contextOptions = resumeCheckpoint === undefined ? this.#contextForExecution(modelTasks) : undefined;
     const planningMode = resolvePlanningMode(input.planningMode);
@@ -2055,18 +2039,28 @@ export class Agent {
     if (contextOptions === undefined) return undefined;
     if (
       this.#capabilities === undefined
-      || this.#capabilities.maxCallOutputTokens === null
+      || this.#capabilities.maxGenerationTokens === null
     ) {
       throw new AgentError(
         "context_model_capabilities_required",
-        "Context budgeting requires model window and output-limit capabilities",
+        "Context budgeting requires model window and generation-limit capabilities",
       );
     }
     const tools = this.#tools.specsFor(input.enabledTools);
-    const outputLimit = resolveInvocationOutputLimit(
+    const outputBudget = resolveInvocationOutputBudget(
       this.#capabilities,
-      input.maxCallOutputTokens,
+      input.maxGenerationTokens === undefined
+        ? {}
+        : { maxGenerationTokens: input.maxGenerationTokens, generationSource: "user" },
     )!;
+    const constrainedOutputBudget = constrainOutputBudgetToContext(
+      outputBudget,
+      maxGenerationTokensForContext({
+        windowTokens: this.#capabilities.contextWindowTokens,
+        tools,
+        ...(contextOptions.reserves === undefined ? {} : { reserves: contextOptions.reserves }),
+      }),
+    );
     return prepareContext(contextOptions, {
       request: {
         messages: input.messages,
@@ -2075,7 +2069,7 @@ export class Agent {
       },
       tools,
       windowTokens: this.#capabilities.contextWindowTokens,
-      outputReserveTokens: outputLimit.maxTokens,
+      outputReserveTokens: constrainedOutputBudget.maxGenerationTokens,
       ...(input.signal === undefined ? {} : { signal: input.signal }),
     });
   }
@@ -2115,7 +2109,7 @@ export class Agent {
   #modelTasksForExecution(
     runId: string,
     authority?: RunSession,
-    maxCallOutputTokens?: number,
+    maxGenerationTokens?: number,
   ): ModelTaskRunner | undefined {
     const required = this.#context?.providerFactory !== undefined
       || this.#context?.compressionFactory !== undefined
@@ -2127,7 +2121,7 @@ export class Agent {
       runId,
       runtimeLimits: this.#runtimeLimits,
       recovery: this.#recoveryPolicy,
-      ...(maxCallOutputTokens === undefined ? {} : { maxCallOutputTokens }),
+      ...(maxGenerationTokens === undefined ? {} : { maxGenerationTokens }),
       ...((authority?.operations ?? this.#operations) === undefined ? {} : { operations: authority?.operations ?? this.#operations! }),
       ...(authority === undefined ? {} : { authority }),
       ...(this.#evidenceValidator === undefined
@@ -2142,18 +2136,28 @@ export class Agent {
   ): Parameters<typeof prepareContext>[1] {
     if (
       this.#capabilities === undefined
-      || this.#capabilities.maxCallOutputTokens === null
+      || this.#capabilities.maxGenerationTokens === null
     ) {
       throw new AgentError(
         "context_model_capabilities_required",
-        "Context budgeting requires model window and output-limit capabilities",
+        "Context budgeting requires model window and generation-limit capabilities",
       );
     }
     const tools = this.#tools.specsFor(input.enabledTools);
-    const outputLimit = resolveInvocationOutputLimit(
+    const outputBudget = resolveInvocationOutputBudget(
       this.#capabilities,
-      input.maxCallOutputTokens,
+      input.maxGenerationTokens === undefined
+        ? {}
+        : { maxGenerationTokens: input.maxGenerationTokens, generationSource: "user" },
     )!;
+    const constrainedOutputBudget = constrainOutputBudgetToContext(
+      outputBudget,
+      maxGenerationTokensForContext({
+        windowTokens: this.#capabilities.contextWindowTokens,
+        tools,
+        ...(this.#context?.reserves === undefined ? {} : { reserves: this.#context.reserves }),
+      }),
+    );
     return Object.freeze({
       request: {
         messages: input.messages,
@@ -2162,7 +2166,7 @@ export class Agent {
       },
       tools,
       windowTokens: this.#capabilities.contextWindowTokens,
-      outputReserveTokens: outputLimit.maxTokens,
+      outputReserveTokens: constrainedOutputBudget.maxGenerationTokens,
       ...(input.signal === undefined ? {} : { signal: input.signal }),
     });
   }
@@ -2579,18 +2583,18 @@ function resolveBudgets(
   if (value === null || typeof value !== "object") {
     throw new TypeError("Run options.budgets is required");
   }
-  if (!Object.prototype.hasOwnProperty.call(value, "maxRunOutputTokens")) {
+  if (!Object.prototype.hasOwnProperty.call(value, "maxRunGenerationTokens")) {
     throw new TypeError(
-      "Run budgets.maxRunOutputTokens must be a number or explicit null",
+      "Run budgets.maxRunGenerationTokens must be a number or explicit null",
     );
   }
   return Object.freeze({
     maxModelAttempts: budgetValue(value?.maxModelAttempts, maxRounds, "maxModelAttempts"),
     maxInputTokens: budgetValue(value?.maxInputTokens, null, "maxInputTokens"),
-    maxRunOutputTokens: budgetValue(
-      value.maxRunOutputTokens,
+    maxRunGenerationTokens: budgetValue(
+      value.maxRunGenerationTokens,
       null,
-      "maxRunOutputTokens",
+      "maxRunGenerationTokens",
     ),
     maxReasoningTokens: budgetValue(value?.maxReasoningTokens, null, "maxReasoningTokens"),
     maxOutputBytes: budgetValue(value?.maxOutputBytes, 8 * 1024 * 1024, "maxOutputBytes"),
@@ -2604,7 +2608,17 @@ function requireRunOptions(value: RunOptions): RunOptions {
   }
   if (value.durableContinuation === undefined) {
     resolveBudgets(value.budgets, 1);
-  } else if (value.budgets !== undefined || value.deadlineAt !== undefined) {
+    if (
+      value.resultCapacityTargetTokens !== undefined
+      && (!Number.isSafeInteger(value.resultCapacityTargetTokens) || value.resultCapacityTargetTokens < 1)
+    ) {
+      throw new TypeError("resultCapacityTargetTokens must be a positive integer");
+    }
+  } else if (
+    value.budgets !== undefined
+    || value.deadlineAt !== undefined
+    || value.resultCapacityTargetTokens !== undefined
+  ) {
     throw new AgentError(
       "durable_continuation_authority_override",
       "Continuation cannot replace its persisted deadline or budgets",

@@ -16,10 +16,6 @@ from typing import Any
 from uuid import uuid4
 
 from purra.contracts import (
-    AgentDelegation,
-    DelegationAggregation,
-    DelegationContextMode,
-    DelegationStatus,
     ModelFinishReason,
     ModelTokenUsage,
     ExecutionPlan,
@@ -55,7 +51,7 @@ from purra.ports.run_lifecycle import (
     RunRepository,
     validate_run_commit_lifecycle,
 )
-from purra.ports import DelegationRepository, ToolIdempotencyGateway
+from purra.ports import ToolIdempotencyGateway
 from purra.normalization import required_text
 from purra.adapters.durable_memory import InMemoryDurableAdapters
 from purra.run_state import RunSnapshot
@@ -111,7 +107,6 @@ class _MemoryState:
         self.sequences: dict[str, int] = {}
         self.root_sequences: dict[str, int] = {}
         self.published_sequences: dict[str, int] = {}
-        self.delegations: dict[str, AgentDelegation] = {}
         self.tool_receipts: dict[
             tuple[str, str], tuple[ToolCall, ToolHandlerResult]
         ] = {}
@@ -119,17 +114,11 @@ class _MemoryState:
             tuple[str, str], tuple[ToolCall, asyncio.Task[ToolHandlerResult]]
         ] = {}
         self.run_count = 0
-        self.delegation_count = 0
         self.run_tree_authority = None
 
     def next_run_id(self) -> str:
         self.run_count += 1
         return f"memory-run-{self.run_count}"
-
-    def next_delegation_id(self) -> str:
-        self.delegation_count += 1
-        return f"memory-delegation-{self.delegation_count}"
-
 
 def _require_run(state: _MemoryState, run_id: str) -> _RunRecord:
     try:
@@ -156,6 +145,15 @@ def _run_snapshot(run_id: RunId, record: _RunRecord) -> RunSnapshot:
         execution_checkpoint=record.execution_checkpoint,
         agent_preset_snapshot=record.params.agent_preset_snapshot,
         deadline_at_ms=record.params.deadline_at_ms,
+        requested_user_max_generation_tokens=(
+            record.params.requested_user_max_generation_tokens
+        ),
+        result_capacity_target_tokens=(
+            record.params.result_capacity_target_tokens
+        ),
+        selected_context_window_tokens=(
+            record.params.selected_context_window_tokens
+        ),
     )
 
 
@@ -663,233 +661,6 @@ class _InMemoryRunRepository:
     async def append_trace(self, run_id: RunId, trace: TraceRecord) -> None:
         async with self._state.lock:
             _require_run_write(self._state, run_id).traces.append(trace)
-
-
-class _InMemoryDelegationRepository:
-    def __init__(self, state: _MemoryState) -> None:
-        self._state = state
-
-    async def create(
-        self,
-        *,
-        run_id: RunId,
-        batch_id: str,
-        agent_name: str,
-        agent_title: str,
-        agent_instruction: str,
-        objective: str,
-        input_payload: Mapping[str, Any] | None = None,
-        context_mode: DelegationContextMode = DelegationContextMode.ISOLATED,
-        required: bool = True,
-        priority: int = 0,
-    ) -> AgentDelegation:
-        async with self._state.lock:
-            _require_run(self._state, run_id)
-            timestamp = _now().isoformat()
-            row = AgentDelegation(
-                id=self._state.next_delegation_id(),
-                batch_id=batch_id,
-                run_id=run_id,
-                agent_name=agent_name,
-                agent_title=agent_title,
-                agent_instruction=agent_instruction,
-                objective=objective,
-                input_payload=input_payload or {},
-                context_mode=context_mode,
-                required=required,
-                priority=priority,
-                created_at=timestamp,
-                updated_at=timestamp,
-            )
-            self._state.delegations[row.id] = row
-            return row
-
-    async def start(
-        self,
-        delegation_id: str,
-        *,
-        run_id: RunId,
-        batch_id: str,
-    ) -> AgentDelegation | None:
-        async with self._state.lock:
-            row = self._owned(delegation_id, run_id, batch_id)
-            if row.status is not DelegationStatus.QUEUED:
-                return None
-            row = replace(
-                row,
-                status=DelegationStatus.RUNNING,
-                updated_at=_now().isoformat(),
-            )
-            self._state.delegations[row.id] = row
-            return row
-
-    async def complete(
-        self,
-        delegation_id: str,
-        *,
-        run_id: RunId,
-        batch_id: str,
-        result_summary: str,
-    ) -> bool:
-        return await self._finish(
-            delegation_id,
-            run_id,
-            batch_id,
-            status=DelegationStatus.DONE,
-            result_summary=result_summary,
-        )
-
-    async def fail(
-        self,
-        delegation_id: str,
-        *,
-        run_id: RunId,
-        batch_id: str,
-        error: str,
-    ) -> bool:
-        return await self._finish(
-            delegation_id,
-            run_id,
-            batch_id,
-            status=DelegationStatus.FAILED,
-            error=error,
-        )
-
-    async def cancel(
-        self,
-        delegation_id: str,
-        *,
-        run_id: RunId,
-        batch_id: str,
-        reason: str,
-    ) -> bool:
-        return await self._finish(
-            delegation_id,
-            run_id,
-            batch_id,
-            status=DelegationStatus.CANCELED,
-            error=reason,
-        )
-
-    async def list_for_run(self, run_id: RunId) -> tuple[AgentDelegation, ...]:
-        async with self._state.lock:
-            _require_run(self._state, run_id)
-            return tuple(
-                row
-                for row in self._state.delegations.values()
-                if row.run_id == run_id
-            )
-
-    async def aggregate_batch(
-        self,
-        run_id: RunId,
-        batch_id: str,
-    ) -> DelegationAggregation:
-        async with self._state.lock:
-            _require_run(self._state, run_id)
-            rows = tuple(
-                row
-                for row in self._state.delegations.values()
-                if row.run_id == run_id and row.batch_id == batch_id
-            )
-            counts = {
-                status.value: sum(row.status is status for row in rows)
-                for status in DelegationStatus
-            }
-            failures = tuple(
-                row.id
-                for row in rows
-                if row.required
-                and row.status in {
-                    DelegationStatus.FAILED,
-                    DelegationStatus.CANCELED,
-                }
-            )
-            pending = counts["queued"] + counts["running"]
-            return DelegationAggregation(
-                state=(
-                    "pending" if pending else "blocked" if failures else "ready"
-                ),
-                counts=counts,
-                required_failures=failures,
-                results=tuple(
-                    {
-                        "delegationId": row.id,
-                        "agentName": row.agent_name,
-                        "agentTitle": row.agent_title,
-                        "summary": row.result_summary or "",
-                    }
-                    for row in rows
-                    if row.status is DelegationStatus.DONE
-                ),
-            )
-
-    async def cancel_batch(self, run_id: RunId, batch_id: str) -> int:
-        async with self._state.lock:
-            _require_run(self._state, run_id)
-            canceled = 0
-            for row in tuple(self._state.delegations.values()):
-                if row.run_id != run_id or row.batch_id != batch_id:
-                    continue
-                if row.status not in {
-                    DelegationStatus.QUEUED,
-                    DelegationStatus.RUNNING,
-                }:
-                    continue
-                self._state.delegations[row.id] = replace(
-                    row,
-                    status=DelegationStatus.CANCELED,
-                    error="delegation_canceled",
-                    updated_at=_now().isoformat(),
-                )
-                canceled += 1
-            return canceled
-
-    async def _finish(
-        self,
-        delegation_id: str,
-        run_id: RunId,
-        batch_id: str,
-        *,
-        status: DelegationStatus,
-        result_summary: str | None = None,
-        error: str | None = None,
-    ) -> bool:
-        async with self._state.lock:
-            row = self._owned(delegation_id, run_id, batch_id)
-            allowed = (
-                {DelegationStatus.RUNNING}
-                if status is DelegationStatus.DONE
-                else {DelegationStatus.QUEUED, DelegationStatus.RUNNING}
-            )
-            if row.status not in allowed:
-                return False
-            self._state.delegations[row.id] = replace(
-                row,
-                status=status,
-                result_summary=result_summary,
-                error=error,
-                updated_at=_now().isoformat(),
-            )
-            return True
-
-    def _owned(
-        self,
-        delegation_id: str,
-        run_id: RunId,
-        batch_id: str,
-    ) -> AgentDelegation:
-        try:
-            row = self._state.delegations[delegation_id]
-        except KeyError as error:
-            raise ContractViolationError(
-                f"delegation {delegation_id!r} does not exist"
-            ) from error
-        if row.run_id != run_id or row.batch_id != batch_id:
-            raise ContractViolationError(
-                "delegation does not belong to the requested Root Run batch"
-            )
-        return row
 
 
 class _InMemoryToolIdempotencyGateway:
@@ -1666,9 +1437,17 @@ def _run_budget_snapshot(run: _RunRecord):
         unreported_usage_attempts=sum(
             usage is None for usage in run.model_usage_by_invocation.values()
         ),
+        unreported_reasoning_attempts=sum(
+            usage is not None and usage.reasoning_tokens is None
+            for usage in run.model_usage_by_invocation.values()
+        ),
         input_tokens=sum(usage.input_tokens for usage in usages),
-        output_tokens=sum(usage.output_tokens for usage in usages),
-        reasoning_tokens=sum(usage.reasoning_output_tokens for usage in usages),
+        generation_tokens=sum(usage.generation_tokens for usage in usages),
+        reasoning_tokens=sum(
+            usage.reasoning_tokens
+            for usage in usages
+            if usage.reasoning_tokens is not None
+        ),
     )
 
 
@@ -1684,7 +1463,7 @@ def _require_root_token_budgets(
         limit is not None
         for limit in (
             limits.max_input_tokens,
-            limits.max_run_output_tokens,
+            limits.max_run_generation_tokens,
             limits.max_reasoning_tokens,
         )
     ):
@@ -1693,6 +1472,15 @@ def _require_root_token_budgets(
             code="runtime_budget_exceeded",
             details={"budgetKind": "provider_usage_unreported"},
         )
+    if (
+        limits.max_reasoning_tokens is not None
+        and sum(item.unreported_reasoning_attempts for item in snapshots)
+    ):
+        raise ContractViolationError(
+            "Root Run Provider reasoning usage was not reported",
+            code="runtime_budget_exceeded",
+            details={"budgetKind": "reasoning_tokens_unreported"},
+        )
     for kind, value, limit in (
         (
             "input_tokens",
@@ -1700,9 +1488,9 @@ def _require_root_token_budgets(
             limits.max_input_tokens,
         ),
         (
-            "output_tokens",
-            sum(item.output_tokens for item in snapshots),
-            limits.max_run_output_tokens,
+            "generation_tokens",
+            sum(item.generation_tokens for item in snapshots),
+            limits.max_run_generation_tokens,
         ),
         (
             "reasoning_tokens",
@@ -1734,9 +1522,6 @@ class InMemoryAgentAdapters:
         self.runs: RunRepository = _InMemoryRunRepository(state)
         self.outputs: AgentOutputRepository = _InMemoryAgentOutputRepository(state)
         self.publisher: AgentOutputPublisher = _InMemoryAgentOutputPublisher(state)
-        self.delegations: DelegationRepository = (
-            _InMemoryDelegationRepository(state)
-        )
         self.idempotency: ToolIdempotencyGateway = (
             _InMemoryToolIdempotencyGateway(state)
         )

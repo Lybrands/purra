@@ -14,6 +14,7 @@ from purra.agent_tree import (
     InMemoryRunTreeRepository,
     SpawnAgentsCommand,
 )
+from purra.agent_tree_policy import AgentTreePolicy
 from purra.errors import ContractViolationError
 
 
@@ -101,6 +102,15 @@ def test_shared_agent_tree_protocol_matches_python_contracts():
     assert FIXTURE["protocolVersion"] == 1
     assert FIXTURE["agentPresetSnapshotVersion"] == 5
     assert FIXTURE["policyDefaults"] == AgentCapabilityGrant().to_mapping()
+    assert (
+        FIXTURE["agentTreePolicyDefaults"]
+        == AgentTreePolicy().snapshot_mapping()
+    )
+    assert FIXTURE["delegateToAgents"] == {
+        "argumentField": "children",
+        "childNameField": "name",
+        "requiredFailureCode": "required_child_run_failed",
+    }
     assert FIXTURE["agentNodeStates"] == ["active", "closed"]
     assert FIXTURE["agentRunStatuses"] == [
         "queued",
@@ -115,7 +125,7 @@ def test_shared_agent_tree_protocol_matches_python_contracts():
     assert "agent_execution_checkpoint_conflict" in FIXTURE["stableErrorCodes"]
     assert "agent_preset_mismatch" in FIXTURE["stableErrorCodes"]
     assert FIXTURE["recovery"] == {
-        "executionCheckpointSchemaVersions": {"python": 1, "typescript": 2},
+        "executionCheckpointSchemaVersions": {"python": 2, "typescript": 2},
         "resumablePhase": "model_ready",
         "resumableExecutionProfile": "reactive",
         "inFlightProviderOrToolPolicy": "fail_stop",
@@ -124,7 +134,7 @@ def test_shared_agent_tree_protocol_matches_python_contracts():
     assert FIXTURE["authority"]["rootBudgetDimensions"] == [
         "model_attempts",
         "input_tokens",
-        "output_tokens",
+        "generation_tokens",
         "reasoning_tokens",
         "provider_output_events",
         "provider_output_bytes",

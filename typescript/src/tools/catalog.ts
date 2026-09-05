@@ -32,7 +32,6 @@ interface ExecuteOptions {
   readonly parentRunId?: string;
   readonly leaseOwnerId?: string;
   readonly leaseEpoch?: number;
-  readonly delegationEnabledTools?: readonly string[];
   readonly signal?: AbortSignal;
   readonly onEvent?: (event: ToolExecutionEvent) => Promise<void> | void;
 }
@@ -160,7 +159,6 @@ export class ToolCatalog {
         options.parentRunId,
         options.leaseOwnerId,
         options.leaseEpoch,
-        options.delegationEnabledTools,
       );
       await options.onEvent?.(Object.freeze({
         type: "tool_completed",
@@ -327,7 +325,6 @@ export class ToolCatalog {
     parentRunId: string | undefined,
     leaseOwnerId: string | undefined,
     leaseEpoch: number | undefined,
-    delegationEnabledTools: readonly string[] | undefined,
   ): Promise<ToolHandlerResult> {
     const operation = async (): Promise<ToolHandlerResult> => tool.definition.run(
       call.arguments,
@@ -340,7 +337,6 @@ export class ToolCatalog {
         parentRunId,
         leaseOwnerId,
         leaseEpoch,
-        delegationEnabledTools,
       ),
     );
     const guarded = tool.policy.mode !== "read" && tool.definition.hostManagedDurability !== true
@@ -650,7 +646,6 @@ function context(
   parentRunId?: string,
   leaseOwnerId?: string,
   leaseEpoch?: number,
-  enabledTools?: readonly string[],
 ) {
   return Object.freeze({
     call,
@@ -661,7 +656,6 @@ function context(
     ...(parentRunId === undefined ? {} : { parentRunId }),
     ...(leaseOwnerId === undefined ? {} : { leaseOwnerId }),
     ...(leaseEpoch === undefined ? {} : { leaseEpoch }),
-    ...(enabledTools === undefined ? {} : { enabledTools }),
   });
 }
 

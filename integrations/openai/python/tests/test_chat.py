@@ -30,7 +30,7 @@ async def test_completion_stream_tool_round_and_trailing_usage():
     async with httpx2.AsyncClient(transport=httpx2.MockTransport(respond)) as http:
         model=gateway(http); call=invocation()
         result=await model.complete(MESSAGES,call)
-        assert result.usage.reasoning_output_tokens == 4 and result.message.reasoning is None
+        assert result.usage.reasoning_tokens == 4 and result.message.reasoning is None
         stream=await model.stream(MESSAGES,call); acc=ModelRoundAccumulator(); terminal=[]
         async for chunk in stream.chunks:
             if hasattr(chunk,'finish_reason'):

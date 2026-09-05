@@ -37,12 +37,12 @@ The constructor accepts `thinking`, `outputConfig`, `temperature`, `topP`, and
 `topK`. Choose options supported by the selected model. For example,
 `thinking: { type: "adaptive" }` requires a model that supports adaptive thinking.
 Manual thinking budgets must be integers, at least 1024, and below Core's resolved
-output limit.
+total-generation limit.
 
 ## Behavior
 
 SDK retries are disabled; Core controls retry and budget accounting. The gateway
-applies Core's output limit and combines system/developer instructions into the
+applies Core's total-generation limit and combines system/developer instructions into the
 system field. Tool choice is automatic when tools are available.
 
 Signed thinking and redacted blocks are retained as private continuation data.

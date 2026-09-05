@@ -96,7 +96,7 @@ class _ScriptedPlannerGateway:
         async def chunks():
             yield ModelStreamChunk(content_delta=json.dumps({"v": 1, "type": "plan", "plan": json.loads(output)}) + "\n")
             yield ModelStreamChunk(finish_reason=ModelFinishReason.STOP)
-        return ModelStream(chunks=chunks(), model="test-model", applied_output_limit=invocation.output_limit.max_tokens)
+        return ModelStream(chunks=chunks(), model="test-model", applied_generation_limit=invocation.output_budget.max_generation_tokens)
 
     async def complete(self, messages, invocation, signal=None):
         del signal
@@ -105,7 +105,7 @@ class _ScriptedPlannerGateway:
         return ModelCompletion(
             message=AgentMessage(role="assistant", content=self.outputs.pop(0)),
             model="test-model",
-            applied_output_limit=invocation.output_limit.max_tokens,
+            applied_generation_limit=invocation.output_budget.max_generation_tokens,
             finish_reason=ModelFinishReason.STOP,
         )
 
@@ -128,7 +128,7 @@ def _request(
             capability_snapshot=replace(
                 generic_capability_snapshot(),
                 profile_id="test:model",
-                max_call_output_tokens=4_096,
+                max_generation_tokens=4_096,
             ),
         ),
         domain_context=DomainContext(namespace="test.domain"),
@@ -183,7 +183,7 @@ def _always_reasoning_request() -> AgentRunRequest:
 
 def test_planner_receives_only_budgeted_planning_context_blocks():
     request = AgentPreset(
-        runtime_limits=RuntimeLimits(max_run_output_tokens=None),
+        runtime_limits=RuntimeLimits(max_run_generation_tokens=None),
         id="portable",
         revision="1",
         tool_catalog=InMemoryToolCatalog(()),
@@ -240,13 +240,29 @@ async def test_planner_repairs_a_host_rejected_normalized_result():
             "operation": "answer",
             "deliverable": "must not exist",
         },
-        "todos": [{
-            "id": "answer",
-            "title": "Answer",
-            "type": "review",
-            "executor": "model",
-            "riskLevel": "read",
-        }],
+        "todos": [
+            {
+                "id": "analyze",
+                "title": "Analyze",
+                "type": "analyze",
+                "executor": "model",
+                "riskLevel": "read",
+            },
+            {
+                "id": "draft",
+                "title": "Draft",
+                "type": "write",
+                "executor": "model",
+                "riskLevel": "read",
+            },
+            {
+                "id": "answer",
+                "title": "Answer",
+                "type": "review",
+                "executor": "model",
+                "riskLevel": "read",
+            },
+        ],
     }
     repaired = {
         **domain_invalid,
@@ -265,10 +281,13 @@ async def test_planner_repairs_a_host_rejected_normalized_result():
     }
     generic_invalid = {
         **domain_invalid,
-        "todos": [{
-            **domain_invalid["todos"][0],
-            "riskLevel": "review",
-        }],
+        "todos": [
+            {
+                **domain_invalid["todos"][0],
+                "riskLevel": "review",
+            },
+            *domain_invalid["todos"][1:],
+        ],
     }
     gateway = _ScriptedPlannerGateway([
         json.dumps(generic_invalid),
@@ -294,7 +313,7 @@ async def test_planner_repairs_a_host_rejected_normalized_result():
     )
     assert len(gateway.message_rounds) == 4
     assert (
-        "planner step 'answer' has unsupported riskLevel 'review'; "
+        "planner step 'analyze' has unsupported riskLevel 'review'; "
         "allowed values: read, write, destructive"
     ) in (
         gateway.message_rounds[1][-1].content
@@ -327,7 +346,7 @@ async def test_planner_uses_the_run_reasoning_mode():
 
 
 @pytest.mark.asyncio
-async def test_planner_applies_its_own_output_budget():
+async def test_planner_capacity_target_does_not_shrink_generation_allowance():
     gateway = _ScriptedPlannerGateway([json.dumps({
         "needsTodos": False,
         "title": "Answer",
@@ -336,17 +355,19 @@ async def test_planner_applies_its_own_output_budget():
 
     await AgentPlanner(
         gateway,
-        limits=PlannerLimits(max_call_output_tokens=512),
+        limits=PlannerLimits(result_capacity_target_tokens=512),
     ).create_plan(_request(), PlanningCapabilities())
 
-    output_limit = gateway.invocations[0].output_limit
-    assert output_limit.max_tokens == 512
-    assert output_limit.source.value == "workflow_policy"
+    output_budget = gateway.invocations[0].output_budget
+    assert output_budget.max_generation_tokens == 4_096
+    assert output_budget.generation_source.value == "model_profile"
+    assert output_budget.result_capacity_target_tokens == 512
+    assert output_budget.result_capacity_source.value == "workflow_policy"
 
 
 def test_planner_budget_limits_require_positive_values():
-    with pytest.raises(ValueError, match="max_call_output_tokens"):
-        PlannerLimits(max_call_output_tokens=0)
+    with pytest.raises(ValueError, match="result_capacity_target_tokens"):
+        PlannerLimits(result_capacity_target_tokens=0)
     with pytest.raises(ValueError, match="attempt_timeout_ms"):
         PlannerLimits(attempt_timeout_ms=0)
 
@@ -421,8 +442,59 @@ def test_planner_prompt_uses_only_an_explicit_total_step_limit():
 
     assert "1-8" not in system.content
     assert "smallest non-redundant set" in system.content
+    assert "at least 3" in system.content
+    assert json.loads(default_user.content)["minVisiblePlanSteps"] == 3
     assert "maxPlanSteps" not in json.loads(default_user.content)
     assert json.loads(capped_user.content)["maxPlanSteps"] == 3
+
+
+@pytest.mark.asyncio
+async def test_planner_repairs_an_initial_plan_with_fewer_than_three_steps():
+    short = {
+        "needsTodos": True,
+        "title": "Too short",
+        "todos": [
+            {
+                "id": f"step-{index}",
+                "title": f"Step {index}",
+                "type": "review",
+                "executor": "model",
+            }
+            for index in range(1, 3)
+        ] + [{
+            "id": "respond",
+            "title": "Respond",
+            "type": "review",
+            "executor": "model",
+        }],
+    }
+    repaired = {
+        **short,
+        "todos": [
+            *short["todos"][:-1],
+            {
+                "id": "step-3",
+                "title": "Step 3",
+                "type": "review",
+                "executor": "model",
+            },
+            short["todos"][-1],
+        ],
+    }
+    gateway = _ScriptedPlannerGateway([
+        json.dumps(short),
+        json.dumps(repaired),
+    ])
+
+    planning = await AgentPlanner(gateway).create_plan(
+        _request(),
+        PlanningCapabilities(),
+    )
+
+    assert len(planning.work_plan.steps) == 4
+    assert "at least 3 visible semantic steps" in (
+        gateway.message_rounds[1][-1].content
+    )
 
 
 @pytest.mark.asyncio
@@ -558,7 +630,7 @@ def test_low_level_core_accepts_a_planner_without_an_activation_policy():
         run_repository=adapters.runs,
         planner=_Planner(),
         runtime_limits=RuntimeLimits(
-            max_run_output_tokens=None,
+            max_run_generation_tokens=None,
         ),
     )
 
@@ -568,7 +640,7 @@ def test_low_level_core_accepts_a_planner_without_an_activation_policy():
 def test_agent_core_requires_an_explicit_cumulative_output_budget():
     adapters = InMemoryAgentAdapters()
 
-    with pytest.raises(TypeError, match="max_run_output_tokens"):
+    with pytest.raises(TypeError, match="max_run_generation_tokens"):
         AgentCore(
             model_gateway=_Gateway(),
             run_repository=adapters.runs,
@@ -577,7 +649,7 @@ def test_agent_core_requires_an_explicit_cumulative_output_budget():
 
 def test_preset_snapshot_includes_planning_behavior():
     preset = AgentPreset(
-        runtime_limits=RuntimeLimits(max_run_output_tokens=None),
+        runtime_limits=RuntimeLimits(max_run_generation_tokens=None),
         id="portable",
         revision="1",
         tool_catalog=InMemoryToolCatalog(()),

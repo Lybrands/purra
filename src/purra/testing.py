@@ -95,7 +95,6 @@ from purra.output.ports import AgentOutputPublisher, AgentOutputRepository
 from purra.ports import (
     ContextCompressionHook,
     ContextProvider,
-    DelegationRepository,
     ExecutionLeaseStore,
     ModelGateway,
     RunCommit,
@@ -180,62 +179,6 @@ async def assert_execution_lease_store_conforms(
     assert await store.release(run_id, "owner-a")
     released = await store.get(run_id)
     assert released is not None and released.owner_id is None
-
-
-async def assert_delegation_repository_conforms(
-    repository: DelegationRepository,
-    create_run: Callable[[], Awaitable[str]],
-) -> None:
-    """Exercise one-Run delegation lifecycle and batch aggregation."""
-
-    assert isinstance(repository, DelegationRepository)
-    run_id = await create_run()
-    batch_id = "contract-batch"
-    low = await repository.create(
-        run_id=run_id,
-        batch_id=batch_id,
-        agent_name="role-low",
-        agent_title="Low priority Agent",
-        agent_instruction="Complete the low-priority objective.",
-        objective="low priority work",
-        priority=1,
-    )
-    high = await repository.create(
-        run_id=run_id,
-        batch_id=batch_id,
-        agent_name="role-high",
-        agent_title="High priority Agent",
-        agent_instruction="Complete the high-priority objective.",
-        objective="high priority work",
-        priority=9,
-    )
-    started = await repository.start(
-        high.id,
-        run_id=run_id,
-        batch_id=batch_id,
-    )
-    assert started is not None and started.status.value == "running"
-    await _require_failure(
-        repository.start(
-            "missing",
-            run_id=run_id,
-            batch_id=batch_id,
-        ),
-        "a missing delegation id must fail closed",
-    )
-    assert await repository.complete(
-        high.id,
-        run_id=run_id,
-        batch_id=batch_id,
-        result_summary="done",
-    )
-    rows = await repository.list_for_run(run_id)
-    assert {row.id for row in rows} == {low.id, high.id}
-    assert high.agent_title == "High priority Agent"
-    assert high.agent_instruction == "Complete the high-priority objective."
-    assert (await repository.aggregate_batch(run_id, batch_id)).state == "pending"
-    assert await repository.cancel_batch(run_id, batch_id) == 1
-    assert (await repository.aggregate_batch(run_id, batch_id)).state == "blocked"
 
 
 async def assert_tool_idempotency_gateway_conforms(
@@ -330,7 +273,7 @@ async def assert_host_adapters_conform(
     assert (await runs.get(begun.run_id)).execution_checkpoint == checkpoint
 
     authority_limits = RuntimeLimits(
-        max_run_output_tokens=None,
+        max_run_generation_tokens=None,
         max_model_invocation_attempts=2,
         max_input_tokens=3,
         max_provider_output_events=1,
@@ -382,7 +325,7 @@ async def assert_host_adapters_conform(
             runs.settle_model_attempt(
                 authority_children[index],
                 f"authority-invocation-{index + 1}",
-                ModelTokenUsage(input_tokens=2, output_tokens=0),
+                ModelTokenUsage(input_tokens=2, generation_tokens=0),
             )
             for index, item in enumerate(attempt_results)
             if not isinstance(item, Exception)
@@ -722,8 +665,8 @@ async def assert_model_gateway_conforms(
     assert isinstance(gateway, ModelGateway)
     stream = await gateway.stream(messages, invocation, None)
     assert isinstance(stream, ModelStream)
-    if invocation.output_limit is not None:
-        assert stream.applied_output_limit == invocation.output_limit.max_tokens
+    if invocation.output_budget is not None:
+        assert stream.applied_generation_limit == invocation.output_budget.max_generation_tokens
     if expected_model is not None:
         assert stream.model == expected_model
     chunks = tuple([chunk async for chunk in stream.chunks])
@@ -753,8 +696,8 @@ async def assert_model_gateway_conforms(
 
     completion = await gateway.complete(messages, invocation, None)
     assert isinstance(completion, ModelCompletion)
-    if invocation.output_limit is not None:
-        assert completion.applied_output_limit == invocation.output_limit.max_tokens
+    if invocation.output_budget is not None:
+        assert completion.applied_generation_limit == invocation.output_budget.max_generation_tokens
     assert completion.message.role is MessageRole.ASSISTANT
     assert completion.finish_reason is not None
     if expected_model is not None:
@@ -1244,7 +1187,7 @@ async def assert_long_task_repository_conforms(
         owner_id=f"usage-owner-{suffix}",
         metadata={"sessionId": f"usage-session-{suffix}"},
     ))
-    usage = LongTaskUsage(invocation_count=1, input_tokens=10, output_tokens=2)
+    usage = LongTaskUsage(invocation_count=1, input_tokens=10, generation_tokens=2)
     recorded = await repository.record_usage(
         usage_task.id,
         run_id=command.created_by_run_id,
@@ -1337,7 +1280,6 @@ __all__ = [
     "assert_artifact_store_conforms",
     "assert_context_compression_hook_conforms",
     "assert_context_provider_conforms",
-    "assert_delegation_repository_conforms",
     "assert_execution_lease_store_conforms",
     "assert_host_adapters_conform",
     "assert_long_task_dispatcher_conforms",

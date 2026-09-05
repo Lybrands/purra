@@ -119,6 +119,15 @@ class LongTaskCoordinator:
                 await self._cancel_active(active)
 
     async def _run_claimed_unit(self, task, unit, runner, signal):
+        settled = await self._settle_claimed_unit(task, unit, runner, signal)
+        # Settlement observers run after the Unit's durable transition. Their
+        # failures are execution-boundary failures, not Unit failures: trying
+        # to settle an already-completed Unit again replaces the real error
+        # with long_task_unit_lease_lost and can leave the task spinning.
+        await self._notify_settled(runner, task.id)
+        return settled
+
+    async def _settle_claimed_unit(self, task, unit, runner, signal):
         try:
             local_stop = asyncio.Event()
             combined_signal = _CombinedCancellationSignal(signal, local_stop)
@@ -141,7 +150,6 @@ class LongTaskCoordinator:
                 if _is_lease_lost(error):
                     return await self._require(task.id)
                 raise
-            await self._notify_settled(runner, task.id)
             return settled
         except asyncio.CancelledError:
             return await self._checkpoint_interrupted(
@@ -201,7 +209,6 @@ class LongTaskCoordinator:
                         split=split,
                         decision=decision,
                     )
-                    await self._notify_settled(runner, task.id)
                     return settled
                 decision = decide_failure(
                     FailureSignal(
@@ -226,7 +233,6 @@ class LongTaskCoordinator:
                 if lease_error.code == "long_task_deadline_exceeded":
                     return await self._require(task.id)
                 raise
-            await self._notify_settled(runner, task.id)
             return settled
 
     async def _run_with_heartbeat(

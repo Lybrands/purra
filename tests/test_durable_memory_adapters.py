@@ -20,6 +20,8 @@ from purra.long_tasks import (
     LongTaskSplitResult,
     LongTaskUnitResult,
     LongTaskUnitSpec,
+    LongTaskStatus,
+    LongTaskUnitStatus,
 )
 from purra.errors import ContractViolationError
 from purra.recovery import (
@@ -262,6 +264,51 @@ def test_unit_lease_epoch_fences_same_worker_reclaim_and_renews_atomically():
     asyncio.run(scenario())
 
 
+def test_exhausted_expired_unit_is_a_terminal_failure_not_a_pause():
+    async def scenario() -> None:
+        now = 1_000
+        repository = InMemoryDurableAdapters(clock_ms=lambda: now).long_tasks
+        task = await repository.create(
+            "task-expired-attempts",
+            LongTaskCreateCommand(
+                namespace="operations",
+                kind="report",
+                owner_id="incident-42",
+                created_by_run_id="run-1",
+                units=(
+                    LongTaskUnitSpec(
+                        id="report",
+                        position=0,
+                        max_attempts=1,
+                    ),
+                ),
+            ),
+        )
+        await repository.start(task.id, expected_revision=task.revision)
+        claimed = await repository.claim_ready_unit(
+            task.id,
+            worker_id="worker-1",
+            lease_duration_ms=10,
+        )
+        assert claimed is not None
+
+        now = 1_010
+        assert await repository.claim_ready_unit(
+            task.id,
+            worker_id="worker-2",
+            lease_duration_ms=10,
+        ) is None
+
+        failed = await repository.load(task.id)
+        units = await repository.list_units(task.id)
+        assert failed is not None
+        assert failed.status is LongTaskStatus.FAILED
+        assert units[0].status is LongTaskUnitStatus.FAILED
+        assert units[0].error_code == "lease_expired_attempts_exhausted"
+
+    asyncio.run(scenario())
+
+
 def test_long_task_deadline_fails_atomically_before_a_new_claim():
     async def scenario() -> None:
         now = 5_000
@@ -295,7 +342,7 @@ def test_long_task_deadline_fails_atomically_before_a_new_claim():
     asyncio.run(scenario())
 
 
-def test_heartbeat_lease_loss_cancels_local_executor_before_any_settlement():
+def test_heartbeat_lease_loss_cancels_executor_and_fails_after_attempts():
     async def scenario() -> None:
         now = 1_000
         base = InMemoryDurableAdapters(clock_ms=lambda: now).long_tasks
@@ -342,9 +389,55 @@ def test_heartbeat_lease_loss_cancels_local_executor_before_any_settlement():
             idle_poll_ms=1,
         ).run(task.id, runner)
         units = await base.list_units(task.id)
-        assert settled.status.value == "paused"
+        assert settled.status.value == "failed"
         assert runner.cancellations == 2
-        assert units[0].status.value == "blocked"
+        assert units[0].status.value == "failed"
+        assert units[0].error_code == "lease_expired_attempts_exhausted"
         assert units[0].output_ref is None
+
+    asyncio.run(scenario())
+
+
+def test_settlement_observer_failure_is_not_reclassified_as_unit_failure():
+    async def scenario() -> None:
+        repository = InMemoryDurableAdapters().long_tasks
+        task = await repository.create(
+            "task-settlement-observer-failure",
+            LongTaskCreateCommand(
+                namespace="operations",
+                kind="report",
+                owner_id="incident-42",
+                created_by_run_id="run-1",
+                units=(
+                    LongTaskUnitSpec(id="first", position=0),
+                    LongTaskUnitSpec(
+                        id="second",
+                        position=1,
+                        dependencies=("first",),
+                    ),
+                ),
+            ),
+        )
+
+        class Runner:
+            async def run_unit(self, task, unit, signal=None):
+                del task, signal
+                return LongTaskUnitResult(output_ref=f"memory://{unit.id}")
+
+            async def on_unit_settled(self, task_id):
+                del task_id
+                raise RuntimeError("checkpoint_observer_failed")
+
+        with pytest.raises(RuntimeError, match="checkpoint_observer_failed"):
+            await LongTaskCoordinator(
+                repository,
+                worker_id="worker-1",
+                idle_poll_ms=1,
+            ).run(task.id, Runner())
+
+        units = await repository.list_units(task.id)
+        assert units[0].status is LongTaskUnitStatus.COMPLETED
+        assert units[0].error_code is None
+        assert units[1].status is LongTaskUnitStatus.PENDING
 
     asyncio.run(scenario())

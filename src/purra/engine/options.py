@@ -22,7 +22,6 @@ from purra.normalization import (
     optional_positive_int,
     positive_int,
 )
-from purra.model_protocol import InvocationOutputLimit
 from purra.output.contracts import (
     PublicPresentationMode,
     ResponseTransactionMode,
@@ -64,8 +63,8 @@ class AgentCoreRunOptions:
 
     context_claims: tuple[ContextBudgetClaim, ...] = ()
     turn_id: str | None = None
-    output_limit: InvocationOutputLimit | None = None
-    default_context_window_tokens: int = 128_000
+    result_capacity_target_tokens: int | None = None
+    default_context_window_tokens: int | None = None
     safety_reserve_tokens: int | None = None
     runtime_reserve_tokens: int | None = None
     minimum_message_tokens: int | None = None
@@ -105,16 +104,19 @@ class AgentCoreRunOptions:
         object.__setattr__(
             self,
             "default_context_window_tokens",
-            positive_int(
+            optional_positive_int(
                 self.default_context_window_tokens,
                 "default_context_window_tokens",
             ),
         )
-        if self.output_limit is not None and not isinstance(
-            self.output_limit,
-            InvocationOutputLimit,
-        ):
-            raise TypeError("output limit must be InvocationOutputLimit")
+        object.__setattr__(
+            self,
+            "result_capacity_target_tokens",
+            optional_positive_int(
+                self.result_capacity_target_tokens,
+                "result_capacity_target_tokens",
+            ),
+        )
         for name in (
             "safety_reserve_tokens",
             "runtime_reserve_tokens",

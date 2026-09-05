@@ -29,7 +29,7 @@ def is_input_checkpoint_update(current, updated):
                 or len(new["results"]) != len(expected)
                 or any(row not in new["results"] for row in old["results"])):
                 return False
-            evidence.resolve_delegation(before.tool_call_id, after.content)
+            evidence.resolve_child_runs(before.tool_call_id, after.content)
         except (ValueError, TypeError, KeyError):
             return False
         changed = True

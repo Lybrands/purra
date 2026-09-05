@@ -78,7 +78,6 @@ MOVED_TOP_LEVEL_DEFINITIONS = {
     "contracts/__init__.py": {
         "ApprovalDecision",
         "ApprovalStatus",
-        "DelegationStatus",
         "MessageOrigin",
         "MessageRole",
         "ModelFinishReason",
@@ -112,6 +111,7 @@ REQUIRED_CORE_MODULES = {
     "adapters/durable_memory.py",
     "adapters/memory.py",
     "agent_presets.py",
+    "agent_tree_policy.py",
     "artifacts/ownership.py",
     "contracts/enums.py",
     "contracts/host.py",
@@ -122,7 +122,6 @@ REQUIRED_CORE_MODULES = {
     "engine/context_capability.py",
     "engine/context_phase.py",
     "engine/compaction_phase.py",
-    "engine/delegation_assembly.py",
     "engine/durable_execution.py",
     "engine/dynamic_planning.py",
     "engine/options.py",
@@ -466,7 +465,7 @@ def test_recovery_persists_complete_execution_authority():
     continuation = (CORE_DIR / "engine" / "options.py").read_text(
         encoding="utf-8"
     )
-    delegation = (CORE_DIR / "delegation" / "coordinator.py").read_text(
+    agent_tree = (CORE_DIR / "agent_tree.py").read_text(
         encoding="utf-8"
     )
     contracts = (CORE_DIR / "contracts" / "__init__.py").read_text(
@@ -488,17 +487,17 @@ def test_recovery_persists_complete_execution_authority():
     assert "execution_plan: ExecutionPlan" in recovery
     assert "source: RunRecoverySnapshot" in continuation
     assert "source_root_run_id" not in continuation
-    assert "class DelegationCoordinator" in delegation
-    for removed_child_run_contract in (
+    assert "class RunTreeRepository" in agent_tree
+    for removed_delegation_contract in (
         "RunLineage",
         "child_run_id",
         "attach_child_run",
         "LiveDelegationCoordinator",
         "AgentDelegationCoordinator",
+        "DelegationRepository",
+        "DelegatedAgentExecutor",
     ):
-        assert removed_child_run_contract not in (
-            delegation + contracts + persistence
+        assert removed_delegation_contract not in (
+            agent_tree + contracts + persistence
         )
-    assert "batch_id: str" in contracts
     assert "run_id: RunId" in contracts
-    assert "class DelegatedAgentExecutor" in delegation

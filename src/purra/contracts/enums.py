@@ -18,19 +18,6 @@ class RunStatus(StrEnum):
     CANCELED = "canceled"
 
 
-class DelegationStatus(StrEnum):
-    QUEUED = "queued"
-    RUNNING = "running"
-    DONE = "done"
-    FAILED = "failed"
-    CANCELED = "canceled"
-
-
-class DelegationContextMode(StrEnum):
-    ISOLATED = "isolated"
-    SELECTED_PARENT = "selected_parent_context"
-
-
 TerminalRunStatus: TypeAlias = Literal[
     RunStatus.DONE,
     RunStatus.BLOCKED,

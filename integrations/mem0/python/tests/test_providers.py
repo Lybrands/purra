@@ -52,7 +52,7 @@ def budget(**changes):
 
 async def complete(messages, cap, signal):
     return ModelCompletion(message=AgentMessage(role="assistant", content=json.dumps({"memory": [{"text": "中文", "entities": []}]})),
-                           model="test", finish_reason="stop", applied_output_limit=cap, usage=ModelTokenUsage(10, 5))
+                           model="test", finish_reason="stop", applied_generation_limit=cap, usage=ModelTokenUsage(10, 5))
 
 
 async def embed(texts, signal):
@@ -194,11 +194,11 @@ async def test_concurrent_readers_share_quota_and_unknown_is_not_zero(managed):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("invalid_cap", [False, True])
-async def test_invalid_extraction_and_output_cap_fail_closed(managed, invalid_cap):
+async def test_invalid_extraction_and_result_capacity_fail_closed(managed, invalid_cap):
     create, _ = managed
     async def invalid(messages, cap, signal):
         if invalid_cap:
-            return replace(await complete(messages, cap, signal), applied_output_limit=cap + 1)
+            return replace(await complete(messages, cap, signal), applied_generation_limit=cap - 1)
         return replace(await complete(messages, cap, signal), message=AgentMessage(role="assistant", content="not json"))
     memory = create(completion=invalid)
     with pytest.raises(Exception, match="memory_provider_contract" if invalid_cap else "memory_invalid_extraction"):
@@ -241,20 +241,24 @@ async def test_run_bridge_uses_existing_reservation_and_usage_settlement(managed
         async def stream(self, *args, **kwargs):
             raise AssertionError("memory uses completion")
         async def complete(self, messages, invocation, signal=None):
-            assert reservations and invocation.max_call_output_tokens == 32
+            assert reservations and invocation.max_generation_tokens >= 32
             result = await complete(messages, 32, signal)
             if messages[0].content.startswith("Review a pending memory"):
                 result = replace(result, message=AgentMessage(role="assistant", content='{"relations":[{"item":"0","kind":"duplicate"}]}'))
             return result
-    request = ModelRequest(provider="test", model="test", capability_snapshot=replace(generic_capability_snapshot(), max_call_output_tokens=32))
-    runner = AgentModelTaskRunner(AgentModelInvocationManager(Gateway(), budget_repository=Repository()), ModelInvocationContext(run_id="existing-run"))
+    request = ModelRequest(provider="test", model="test", capability_snapshot=replace(generic_capability_snapshot(), max_generation_tokens=32))
+    runner = AgentModelTaskRunner(
+        AgentModelInvocationManager(Gateway(), budget_repository=Repository()),
+        ModelInvocationContext(run_id="existing-run"),
+        request,
+    )
     memory = create(completion=run_model(runner, request))
     await memory.add("中文", source=SOURCE, key="existing")
     receipt = await memory.extract([{"role": "user", "content": "中文"}], source=SOURCE, key="run")
     review = await memory.review(MemoryRef(receipt.ids[0], 1), key="run-review")
     assert len(reservations) == len(settlements) == 2 and review.review.proposal.kind == "duplicate"
     assert reservations[0][0] == settlements[0][0] == "existing-run"
-    assert settlements[0][-1].output_tokens == receipt.usage.reported_output_tokens == 5
+    assert settlements[0][-1].generation_tokens == receipt.usage.reported_output_tokens == 5
     assert settlements[1][0] == "existing-run" and review.usage.reported_output_tokens == 5
 
 

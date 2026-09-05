@@ -10,6 +10,23 @@
     "allowedTools": [],
     "allowedModels": []
   },
+  "agentTreePolicyDefaults": {
+    "enabled": true,
+    "maxChildrenPerCall": 3,
+    "maxParallelRuns": 3,
+    "maxAgentNameChars": 64,
+    "maxTitleChars": 120,
+    "maxInstructionChars": 4000,
+    "maxObjectiveChars": 4000,
+    "maxDepth": 3,
+    "maxAgentsPerRoot": 16,
+    "allowsRecursiveAgents": false
+  },
+  "delegateToAgents": {
+    "argumentField": "children",
+    "childNameField": "name",
+    "requiredFailureCode": "required_child_run_failed"
+  },
   "agentNodeStates": [
     "active",
     "closed"
@@ -43,7 +60,11 @@
     "child_run_join_canceled",
     "child_spawn_idempotency_conflict",
     "root_run_not_active",
-    "root_run_not_quiescent"
+    "root_run_not_quiescent",
+    "invalid_child_agent_batch",
+    "invalid_child_agent",
+    "duplicate_child_agent",
+    "required_child_run_failed"
   ],
   "scheduling": {
     "order": "priority_desc_created_sequence_asc",
@@ -70,7 +91,7 @@
     "crossRootScope": true
   },
   "recovery": {
-    "executionCheckpointSchemaVersions": { "python": 1, "typescript": 2 },
+    "executionCheckpointSchemaVersions": { "python": 2, "typescript": 2 },
     "resumablePhase": "model_ready",
     "resumableExecutionProfile": "reactive",
     "inFlightProviderOrToolPolicy": "fail_stop"
@@ -82,7 +103,7 @@
     "rootBudgetDimensions": [
       "model_attempts",
       "input_tokens",
-      "output_tokens",
+      "generation_tokens",
       "reasoning_tokens",
       "provider_output_events",
       "provider_output_bytes"

@@ -22,6 +22,14 @@ from purra.long_tasks import (
     LongTaskUnitSpec,
 )
 from purra.observability import build_canonical_run_observation
+from purra.recovery import (
+    FailureCategory,
+    FailureDisposition,
+    FailureScope,
+    FailureSignal,
+    RecoveryEffectState,
+    decide_failure,
+)
 
 
 class _ClaimRepository:
@@ -124,3 +132,47 @@ def test_observability_is_derived_from_events_without_recovery_state():
     ))
 
     assert observation.by_stage["planner"][0]["outcome"] == "model_plan"
+
+
+@pytest.mark.parametrize(
+    ("category", "retryable", "scope"),
+    (
+        (FailureCategory.MODEL_OUTPUT_INVALID, False, FailureScope.LOCAL),
+        (FailureCategory.TRANSIENT_PROVIDER, True, FailureScope.LOCAL),
+        (
+            FailureCategory.PROTOCOL_INCOMPATIBLE,
+            False,
+            FailureScope.SYSTEMIC,
+        ),
+    ),
+)
+def test_exhausted_failures_are_terminal_instead_of_implicitly_paused(
+    category,
+    retryable,
+    scope,
+):
+    decision = decide_failure(
+        FailureSignal(
+            category=category,
+            code="injected_failure",
+            retryable=retryable,
+            scope=scope,
+        ),
+        attempts_remaining=0,
+    )
+
+    assert decision.disposition is FailureDisposition.FAIL_PERMANENT
+
+
+def test_unsafe_effect_uncertainty_fails_without_automatic_replay():
+    decision = decide_failure(
+        FailureSignal(
+            category=FailureCategory.TOOL_EXECUTION,
+            code="tool_effect_unknown",
+            retryable=True,
+            effect_state=RecoveryEffectState.UNKNOWN,
+        ),
+        attempts_remaining=3,
+    )
+
+    assert decision.disposition is FailureDisposition.FAIL_PERMANENT

@@ -201,28 +201,13 @@ def allocate_context_budget(
         raise ValueError("output reserve must be positive")
 
     schemas = tuple(tools)
-    schema_tokens = estimate_tool_schema_tokens(schemas)
-    safety = (
-        int(safety_reserve_tokens)
-        if safety_reserve_tokens is not None
-        else min(64_000, max(4_096, math.ceil(window * 0.05)))
+    safety, runtime, schema_tokens, minimum = _fixed_context_reserves(
+        window_tokens=window,
+        tools=schemas,
+        safety_reserve_tokens=safety_reserve_tokens,
+        runtime_reserve_tokens=runtime_reserve_tokens,
+        minimum_message_tokens=minimum_message_tokens,
     )
-    runtime = (
-        int(runtime_reserve_tokens)
-        if runtime_reserve_tokens is not None
-        else (
-            min(64_000, max(4_096, window // 10))
-            if schemas
-            else min(16_000, max(2_048, window // 25))
-        )
-    )
-    minimum = (
-        int(minimum_message_tokens)
-        if minimum_message_tokens is not None
-        else min(8_192, max(1_024, window // 100))
-    )
-    if min(safety, runtime, minimum) < 0:
-        raise ValueError("context reserves must be non-negative")
 
     provider_input = window - output - safety - runtime - schema_tokens
     if provider_input < minimum:
@@ -259,6 +244,124 @@ def allocate_context_budget(
         minimum_message_tokens=minimum,
         context_allocations=allocations,
     )
+
+
+def max_generation_tokens_for_context(
+    *,
+    window_tokens: int,
+    tools: Sequence[ToolSchema] = (),
+    safety_reserve_tokens: int | None = None,
+    runtime_reserve_tokens: int | None = None,
+    minimum_message_tokens: int | None = None,
+) -> int:
+    """Return the physical generation ceiling after fixed input reserves."""
+
+    window = int(window_tokens)
+    if window <= 0:
+        raise ValueError("context window must be positive")
+    safety, runtime, schemas, minimum = _fixed_context_reserves(
+        window_tokens=window,
+        tools=tools,
+        safety_reserve_tokens=safety_reserve_tokens,
+        runtime_reserve_tokens=runtime_reserve_tokens,
+        minimum_message_tokens=minimum_message_tokens,
+    )
+    maximum = window - safety - runtime - schemas - minimum
+    if maximum <= 0:
+        raise ContextOverflowError(
+            "fixed tool, safety, runtime and input reserves leave no generation capacity",
+            reason_code="fixed_reserves_exceed_window",
+            details={
+                "windowTokens": window,
+                "safetyReserveTokens": safety,
+                "runtimeReserveTokens": runtime,
+                "toolSchemaTokens": schemas,
+                "minimumMessageTokens": minimum,
+            },
+        )
+    return maximum
+
+
+def max_generation_tokens_for_actual_input(
+    *,
+    window_tokens: int,
+    messages: Sequence[AgentMessage],
+    tools: Sequence[ToolSchema] = (),
+    safety_reserve_tokens: int | None = None,
+    runtime_reserve_tokens: int | None = None,
+) -> int:
+    """Return the physical generation ceiling for one compiled invocation.
+
+    Unlike :func:`max_generation_tokens_for_context`, this is evaluated only
+    after the exact message list and tool schemas for a Provider attempt are
+    known.  The Provider allowance is therefore bounded by the remaining
+    context capacity without reserving the entire profile maximum up front.
+    """
+
+    window = int(window_tokens)
+    if window <= 0:
+        raise ValueError("context window must be positive")
+    safety, runtime, schemas, _ = _fixed_context_reserves(
+        window_tokens=window,
+        tools=tools,
+        safety_reserve_tokens=(
+            0 if safety_reserve_tokens is None else safety_reserve_tokens
+        ),
+        runtime_reserve_tokens=(
+            0 if runtime_reserve_tokens is None else runtime_reserve_tokens
+        ),
+        minimum_message_tokens=0,
+    )
+    input_tokens = estimate_agent_messages_tokens(messages)
+    maximum = window - safety - runtime - schemas - input_tokens
+    if maximum <= 0:
+        raise ContextOverflowError(
+            "compiled model input leaves no generation capacity",
+            reason_code="compiled_input_exceeds_window",
+            details={
+                "windowTokens": window,
+                "safetyReserveTokens": safety,
+                "runtimeReserveTokens": runtime,
+                "toolSchemaTokens": schemas,
+                "estimatedInputTokens": input_tokens,
+            },
+        )
+    return maximum
+
+
+def _fixed_context_reserves(
+    *,
+    window_tokens: int,
+    tools: Sequence[ToolSchema],
+    safety_reserve_tokens: int | None,
+    runtime_reserve_tokens: int | None,
+    minimum_message_tokens: int | None,
+) -> tuple[int, int, int, int]:
+    window = int(window_tokens)
+    schemas = tuple(tools)
+    schema_tokens = estimate_tool_schema_tokens(schemas)
+    safety = (
+        int(safety_reserve_tokens)
+        if safety_reserve_tokens is not None
+        else min(64_000, max(4_096, math.ceil(window * 0.05)))
+    )
+    runtime = (
+        int(runtime_reserve_tokens)
+        if runtime_reserve_tokens is not None
+        else (
+            min(64_000, max(4_096, window // 10))
+            if schemas
+            else min(16_000, max(2_048, window // 25))
+        )
+    )
+    minimum = (
+        int(minimum_message_tokens)
+        if minimum_message_tokens is not None
+        else min(8_192, max(1_024, window // 100))
+    )
+    if min(safety, runtime, minimum) < 0:
+        raise ValueError("context reserves must be non-negative")
+    return safety, runtime, schema_tokens, minimum
 
 
 def _allocate_claims(
@@ -428,6 +531,8 @@ __all__ = [
     "estimate_json_tokens",
     "estimate_text_tokens",
     "estimate_tool_schema_tokens",
+    "max_generation_tokens_for_actual_input",
+    "max_generation_tokens_for_context",
     "resolve_context_budget_claims",
     "resolve_task_context_budget_claims",
     "trim_agent_messages_by_turn",

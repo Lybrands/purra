@@ -92,7 +92,7 @@ const memory = new Mem0Memory({
       maxEmbeddingCalls: 64,
       maxInputChars: 100_000,
       maxOutputTokens: 8192,
-      maxCallOutputTokens: 2048,
+      resultCapacityTargetTokens: 2048,
     },
     complete: runModel(modelTasks),
     embed,
@@ -101,6 +101,9 @@ const memory = new Mem0Memory({
 ```
 
 通过 `memory.budgetUsage()` 查看已准入调用和报告用量。原生 SDK 模式的内部用量记为未知。
+
+`resultCapacityTargetTokens` 用于预留单次记忆结果的预期容量，并不是 Provider 生成上限。
+`runModel()` 会保留 Run 的用户生成上限，并把该值记录为工作流容量目标。
 
 ## 提取与审查
 

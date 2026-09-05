@@ -5,8 +5,8 @@ import {
 } from "purra";
 
 const capabilities: ModelCapabilitySnapshot = {
-  schemaVersion: 1, profileId: "example:planner", providerProtocol: "custom",
-  contextWindowTokens: 32768, maxCallOutputTokens: 512, thinkingTokenAccounting: "unknown",
+  schemaVersion: 2, profileId: "example:planner", providerProtocol: "custom",
+  contextWindowTokens: 32768, maxGenerationTokens: 512, thinkingTokenAccounting: "unknown",
   protocol: { reasoningControl: "selectable", reasoningReplay: "ignored", toolCalling: "supported",
     requiredToolChoice: "supported", parallelToolCalls: "supported", streaming: "supported", cancellation: "supported",
     assistantContentWithToolCalls: "optional", jsonSchemaLevel: "unknown", streamFinishSemantics: "normalized", usageSemantics: "normalized" },
@@ -23,7 +23,7 @@ const model: ModelGateway = {
   async invoke() { throw new Error("This example uses managed streams"); },
   stream(request, signal) {
     const planning = request.messages.some((message) => message.attributes?.planningContract);
-    return { ...(request.outputLimit === undefined ? {} : { appliedOutputLimit: request.outputLimit.maxTokens }),
+    return { appliedGenerationLimit: request.outputBudget.maxGenerationTokens,
       async *[Symbol.asyncIterator]() {
         if (planning) {
           yield { contentDelta: JSON.stringify({ v: 1, type: "progress", text: "I will check the request's scope." }) + "\n" };
@@ -34,7 +34,11 @@ const model: ModelGateway = {
             if (signal?.aborted) return;
           } finally { signal?.removeEventListener("abort", cancel); }
           yield { contentDelta: JSON.stringify({ v: 1, type: "plan", plan: { workPlan: {
-            title: "Answer", steps: [{ id: "answer", title: "Answer", type: "review", executor: "model" }],
+            title: "Compare options", steps: [
+              { id: "analyze", title: "Analyze requirements", type: "analyze", executor: "model" },
+              { id: "compare", title: "Compare options", type: "analyze", executor: "model", dependsOn: ["analyze"] },
+              { id: "recommend", title: "Recommend an option", type: "review", executor: "model", dependsOn: ["compare"] },
+            ],
           } } }) + "\n" };
         } else yield { contentDelta: "The answer is ready." };
         yield { finishReason: "stop" as const };
@@ -47,8 +51,8 @@ const storage = new InMemoryAgentAdapters(); // Replace runs for durable canonic
 const agent = new Agent({ model, runRepository: storage.runs, outputPublisher: storage.outputs,
   planning: { plannerFactory: (tasks) => new ModelWorkPlanner(tasks) },
 });
-const input = { messages: [{ role: "user" as const, content: "Give a concise answer." }], planningMode: "planned" as const };
-const options = { budgets: { maxRunOutputTokens: null } };
+const input = { messages: [{ role: "user" as const, content: "Analyze my requirements, compare the options, and recommend one." }], planningMode: "planned" as const };
+const options = { budgets: { maxRunGenerationTokens: null } };
 const handle = await agent.submit(input, options);
 const live: OutputEvent[] = [];
 for await (const event of handle.events()) {

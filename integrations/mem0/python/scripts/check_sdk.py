@@ -39,7 +39,7 @@ async def check(root):
             related = json.loads(messages[1].content)["related"]
             payload = {"relations": [{"item": r["item"], "kind": "independent"} for r in related]}
         return ModelCompletion(message=AgentMessage(role="assistant", content=json.dumps(payload, ensure_ascii=False)),
-                               model="fixture", finish_reason="stop", applied_output_limit=cap, usage=ModelTokenUsage(100, 20))
+                               model="fixture", finish_reason="stop", applied_generation_limit=cap, usage=ModelTokenUsage(100, 20))
 
     providers = MemoryProviders(MemoryBudget("sdk-test", 4, 64, 100_000, 8192, 2048), generate_response, embed)
 
@@ -198,7 +198,7 @@ async def check(root):
                 supporting = next(((answer, row["id"]) for answer in self.test["answers"] for row in body["memories"] if answer in row["text"]), None)
                 payload = {"answer": None if supporting is None else supporting[0], "evidence": [] if supporting is None else [supporting[1]]}
             return ModelCompletion(message=AgentMessage(role="assistant", content=json.dumps(payload, ensure_ascii=False)),
-                                   model="fixture", finish_reason="stop", applied_output_limit=cap, usage=ModelTokenUsage(10, 20))
+                                   model="fixture", finish_reason="stop", applied_generation_limit=cap, usage=ModelTokenUsage(10, 20))
         async def embed(self, texts, signal):
             return EmbeddingResult([[1.0, 0.0] for _ in texts], sum(map(len, texts)))
     transport = FixtureTransport()

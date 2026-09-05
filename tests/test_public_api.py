@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import inspect
 from types import ModuleType
 
 def test_complete_run_api_is_importable_from_the_package_boundary():
@@ -21,12 +22,7 @@ def test_complete_run_api_is_importable_from_the_package_boundary():
         AgentRunLeaseClaim,
         ContextStrategy,
         ContextEvidenceReceipt,
-        DelegatedAgentExecutor,
-        DelegatedAgentRequest,
-        DelegatedAgentResult,
-        DelegationContextMode,
-        DelegationPolicy,
-        DynamicDelegatedAgentExecutor,
+        AgentTreePolicy,
         ExecutionProfile,
         InMemoryAgentAdapters,
         InMemoryRunTreeRepository,
@@ -84,12 +80,7 @@ def test_complete_run_api_is_importable_from_the_package_boundary():
         "evidence-1", "memory", "fixture", "item-1", 1
     ).version == 1
     assert ModelInputEvidenceValidator is not None
-    assert DelegationContextMode.ISOLATED.value == "isolated"
-    assert DelegationPolicy().max_agents_per_call == 3
-    assert DelegatedAgentExecutor.__module__.startswith("purra.")
-    assert DynamicDelegatedAgentExecutor.__module__.startswith("purra.")
-    assert DelegatedAgentRequest.__module__.startswith("purra.")
-    assert DelegatedAgentResult.__module__.startswith("purra.")
+    assert AgentTreePolicy().max_children_per_call == 3
     assert ExecutionProfile().context_strategy is ContextStrategy.SINGLE_PASS
     adapters = InMemoryAgentAdapters()
     assert InMemoryRunTreeRepository.__module__.startswith("purra.")
@@ -112,6 +103,9 @@ def test_complete_run_api_is_importable_from_the_package_boundary():
     assert hasattr(AgentCore, "bind_agent_tree_root")
     assert hasattr(AgentCore, "recover_agent_tree_root")
     assert not hasattr(AgentCore, "run")
+    assert "agent_tree_policy" not in inspect.signature(
+        AgentCore.__init__
+    ).parameters
 
 
 def test_public_host_contract_is_importable_without_runtime_internals():
@@ -129,7 +123,6 @@ def test_public_host_contract_is_importable_without_runtime_internals():
     )
     from purra.testing import (
         assert_context_provider_conforms,
-        assert_delegation_repository_conforms,
         assert_execution_lease_store_conforms,
         assert_host_adapters_conform,
         assert_model_gateway_conforms,
@@ -153,7 +146,6 @@ def test_public_host_contract_is_importable_without_runtime_internals():
         RunRepository,
         ToolCatalog,
         assert_context_provider_conforms,
-        assert_delegation_repository_conforms,
         assert_execution_lease_store_conforms,
         assert_host_adapters_conform,
         assert_model_gateway_conforms,
@@ -206,13 +198,13 @@ def test_facades_do_not_reexport_private_implementation_helpers():
 def test_public_facades_have_explicit_non_module_exports():
     facade_names = (
         "adapters",
-        "agent_tree",
-        "agent_tree_execution",
+            "agent_tree",
+            "agent_tree_execution",
+            "agent_tree_policy",
         "api",
         "artifacts",
         "context_orchestration",
         "contracts",
-        "delegation",
         "engine",
         "evaluation",
         "execution",

@@ -6,7 +6,6 @@ from purra.recovery.contracts import (
     FailureCategory,
     FailureDecision,
     FailureDisposition,
-    FailureScope,
     FailureSignal,
     RecoveryEffectState,
 )
@@ -30,15 +29,13 @@ def decide_failure(
         disposition = FailureDisposition.CANCEL
     elif signal.category in _PERMANENT_CATEGORIES:
         disposition = FailureDisposition.FAIL_PERMANENT
-    elif signal.scope is FailureScope.SYSTEMIC:
-        disposition = FailureDisposition.PAUSE_RECOVERABLE
     elif signal.effect_state is RecoveryEffectState.UNKNOWN:
-        disposition = FailureDisposition.PAUSE_RECOVERABLE
+        disposition = FailureDisposition.FAIL_PERMANENT
     elif signal.effect_state is RecoveryEffectState.COMMITTED:
         disposition = (
             FailureDisposition.RESUME_CHECKPOINT
             if signal.checkpoint_available
-            else FailureDisposition.PAUSE_RECOVERABLE
+            else FailureDisposition.FAIL_PERMANENT
         )
     elif signal.checkpoint_available:
         disposition = FailureDisposition.RESUME_CHECKPOINT
@@ -50,11 +47,6 @@ def decide_failure(
             if signal.checkpoint_available
             else FailureDisposition.RETRY_ATTEMPT
         )
-    elif signal.retryable or signal.category in {
-        FailureCategory.PROTOCOL_INCOMPATIBLE,
-        FailureCategory.MODEL_OUTPUT_INVALID,
-    }:
-        disposition = FailureDisposition.PAUSE_RECOVERABLE
     else:
         disposition = FailureDisposition.FAIL_PERMANENT
     return FailureDecision(

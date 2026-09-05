@@ -66,11 +66,11 @@ def save_report(path, report):
     summary = {}
     for call in report["calls"]:
         key = call["phase"] + "/" + call["kind"]
-        row = summary.setdefault(key, {"calls": 0, "input_tokens": 0, "output_tokens": 0, "unreported_calls": 0, "duration_ms": 0})
+        row = summary.setdefault(key, {"calls": 0, "input_tokens": 0, "generation_tokens": 0, "unreported_calls": 0, "duration_ms": 0})
         row["calls"] += 1
-        for field in ("input_tokens", "output_tokens", "duration_ms"):
+        for field in ("input_tokens", "generation_tokens", "duration_ms"):
             row[field] += call.get(field) or 0
-        row["unreported_calls"] += call["input_tokens"] is None or call["kind"] == "chat" and call["output_tokens"] is None
+        row["unreported_calls"] += call["input_tokens"] is None or call["kind"] == "chat" and call["generation_tokens"] is None
     report["usage_by_phase"] = summary
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -147,7 +147,7 @@ class Transport:
         self.chars += chars
         self.reserved += cap
         entry = {"kind": kind, "case": self.case, "phase": self.phase, "input_chars": chars,
-                 "reserved_output_tokens": cap, "input_tokens": None, "output_tokens": None, "outcome": "unknown"}
+                 "reserved_output_tokens": cap, "input_tokens": None, "generation_tokens": None, "outcome": "unknown"}
         self.calls.append(entry)  # Admission stays charged even after a transport error.
         self.checkpoint()
         cfg = self.config[kind]
@@ -177,7 +177,7 @@ class Transport:
                 raise EvaluationError("transport_timeout")
             value = task.result()
             usage = value.get("usage") or {}
-            for target, source in (("input_tokens", "prompt_tokens"), ("output_tokens", "completion_tokens")):
+            for target, source in (("input_tokens", "prompt_tokens"), ("generation_tokens", "completion_tokens")):
                 count = usage.get(source)
                 if count is not None and (type(count) is not int or count < 0):
                     raise EvaluationError("invalid_provider_usage")
@@ -211,10 +211,10 @@ class Transport:
                 raise ValueError()
             usage = raw.get("usage") or {}
             tokens = None if usage.get("prompt_tokens") is None or usage.get("completion_tokens") is None else ModelTokenUsage(usage["prompt_tokens"], usage["completion_tokens"])
-            if tokens is not None and tokens.output_tokens > cap:
+            if tokens is not None and tokens.generation_tokens > cap:
                 raise ValueError()
             return ModelCompletion(message=AgentMessage(role="assistant", content=message["content"]),
-                model=self.config["chat"]["model"], finish_reason="stop", applied_output_limit=cap, usage=tokens)
+                model=self.config["chat"]["model"], finish_reason="stop", applied_generation_limit=cap, usage=tokens)
         except (ValueError, KeyError, TypeError):
             raise EvaluationError("invalid_chat_response") from None
 

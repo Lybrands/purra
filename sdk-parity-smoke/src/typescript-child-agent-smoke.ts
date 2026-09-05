@@ -1,6 +1,7 @@
 import {
   Agent,
   InMemoryAgentAdapters,
+  type ModelCapabilitySnapshot,
   type ModelGateway,
   type ToolDefinition,
 } from "purra";
@@ -17,7 +18,17 @@ const toolCalls: Array<{
 let rootModelCalls = 0;
 let childModelCalls = 0;
 
+const capabilities: ModelCapabilitySnapshot = {
+  schemaVersion: 2, profileId: "sdk-parity-tree", providerProtocol: "custom",
+  contextWindowTokens: 16_000, maxGenerationTokens: 512, thinkingTokenAccounting: "unknown",
+  protocol: { reasoningControl: "selectable", reasoningReplay: "ignored", toolCalling: "supported",
+    requiredToolChoice: "supported", parallelToolCalls: "supported", streaming: "unavailable",
+    cancellation: "supported", assistantContentWithToolCalls: "optional", jsonSchemaLevel: "unknown",
+    streamFinishSemantics: "normalized", usageSemantics: "normalized" },
+};
+
 const model: ModelGateway = {
+  capabilities,
   async invoke(request) {
     const child = request.messages.some((message) => message.content === childInstruction);
     const serializedMessages = JSON.stringify(request.messages);
@@ -51,11 +62,13 @@ const model: ModelGateway = {
             }],
           },
           finishReason: "tool_calls",
+          appliedGenerationLimit: request.outputBudget.maxGenerationTokens,
         };
       }
       return {
         message: { role: "assistant", content: "child evidence ready" },
         finishReason: "stop",
+        appliedGenerationLimit: request.outputBudget.maxGenerationTokens,
       };
     }
 
@@ -68,8 +81,8 @@ const model: ModelGateway = {
             id: "delegate-child",
             name: "delegateToAgents",
             arguments: {
-              delegations: [{
-                agentName: "evidence-reader",
+              children: [{
+                name: "evidence-reader",
                 title: "Evidence reader",
                 instruction: childInstruction,
                 objective: "Read and report the child status.",
@@ -78,6 +91,7 @@ const model: ModelGateway = {
           }],
         },
         finishReason: "tool_calls",
+        appliedGenerationLimit: request.outputBudget.maxGenerationTokens,
       };
     }
     if (!serializedMessages.includes("child evidence ready")) {
@@ -89,6 +103,7 @@ const model: ModelGateway = {
         content: "Parent received: child evidence ready.",
       },
       finishReason: "stop",
+      appliedGenerationLimit: request.outputBudget.maxGenerationTokens,
     };
   },
 };
@@ -125,7 +140,7 @@ const handle = await new Agent({
   messages: [{ role: "user", content: parentSecret }],
   enabledTools: ["delegateToAgents"],
 }, {
-  budgets: { maxRunOutputTokens: null },
+  budgets: { maxRunGenerationTokens: null },
 });
 const result = await handle.result;
 const descendants = await adapters.runTree.listDescendants(handle.runId);

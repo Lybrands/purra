@@ -1,6 +1,71 @@
 import asyncio
+import sqlite3
 import pytest
 from purra_sqlite import SqliteAgentAdapters
+
+
+@pytest.mark.asyncio
+async def test_reads_use_committed_snapshot_without_writer_lock_or_serialization(tmp_path, monkeypatch):
+    from purra.contracts import RunCreateParams
+    from purra.events import AgentEvent
+    import purra_sqlite
+
+    path = tmp_path / "readers.db"
+    storage = SqliteAgentAdapters(path, scope="reader", busy_timeout=0.05)
+    writer = sqlite3.connect(path, isolation_level=None)
+    try:
+        run_id = (await storage.runs.begin(
+            RunCreateParams(None, "read", None), AgentEvent("run.started"),
+        )).run_id
+        expected = await storage.runs.get(run_id)
+
+        def reject_serialization(value):
+            raise AssertionError("read queries must not serialize storage")
+
+        monkeypatch.setattr(purra_sqlite, "dumps", reject_serialization)
+        writer.execute("BEGIN IMMEDIATE")
+        writer.execute("DELETE FROM purra_state WHERE scope='reader'")
+        assert await storage.runs.get(run_id) == expected
+        assert await storage.outputs.list_events(run_id, after_sequence=0) == ()
+        assert await storage.outputs.list_root_events(run_id, after_root_sequence=0) == ()
+        assert await storage.list_running() == (run_id,)
+        assert (await storage.leases.get(run_id)).status == expected.status
+        writer.execute("COMMIT")
+        assert await storage.list_running() == ()
+        assert await storage.leases.get(run_id) is None
+        assert writer.execute("SELECT count(*) FROM purra_state").fetchone()[0] == 0
+    finally:
+        if writer.in_transaction:
+            writer.rollback()
+        writer.close()
+        storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("version", [1, 2])
+async def test_breaking_storage_version_rejects_pre_generation_budget_state(
+    tmp_path, version,
+):
+    path = tmp_path / "legacy.db"
+    with sqlite3.connect(path) as database:
+        database.execute(
+            "CREATE TABLE purra_state (scope TEXT NOT NULL, sdk TEXT NOT NULL, "
+            "version INTEGER NOT NULL, body TEXT NOT NULL, "
+            "PRIMARY KEY(scope,sdk))"
+        )
+        database.execute(
+            "INSERT INTO purra_state VALUES (?, 'python', ?, ?)",
+            ("legacy", version, "[]"),
+        )
+    storage = SqliteAgentAdapters(path, scope="legacy")
+    try:
+        with pytest.raises(ValueError, match="unsupported SQLite storage version"):
+            async with storage.transaction():
+                pass
+        with pytest.raises(ValueError, match="unsupported SQLite storage version"):
+            await storage.outputs.list_events("missing", after_sequence=0)
+    finally:
+        storage.close()
 
 @pytest.mark.asyncio
 async def test_transactions_rollback_and_scope_isolation(tmp_path):
@@ -64,4 +129,3 @@ async def test_unknown_tool_effect_is_not_replayed_after_restart(tmp_path):
         assert (await storage.idempotency.execute_once(run_id, call, uncertain)).content == "committed"
         assert attempts == 1
     finally: storage.close()
-

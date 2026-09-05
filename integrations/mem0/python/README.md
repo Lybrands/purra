@@ -99,7 +99,7 @@ providers = MemoryProviders(
         max_embedding_calls=64,
         max_input_chars=100_000,
         max_output_tokens=8192,
-        max_call_output_tokens=2048,
+        result_capacity_target_tokens=2048,
     ),
     complete=run_model(model_tasks, model_request),
     embed=embed,

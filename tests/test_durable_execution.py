@@ -358,6 +358,47 @@ async def test_durable_checkpoint_atomically_revises_root_plan_before_evidence()
 
 
 @pytest.mark.asyncio
+async def test_failed_long_task_fails_root_with_the_original_error_code():
+    controller, repository, sink = await _started()
+
+    class _Dispatcher:
+        async def dispatch(self, *args, **kwargs):
+            del args, kwargs
+            return LongTaskDispatchReceipt(
+                task_id="task-output-truncated",
+                message="Dispatched",
+                admission=_admission(),
+            )
+
+        async def execute(self, task_id, *, observer, **kwargs):
+            del observer, kwargs
+            return LongTaskExecutionResult(
+                task_id=task_id,
+                status=LongTaskExecutionStatus.FAILED,
+                error="model_output_truncated",
+            )
+
+    yielded = [
+        event
+        async for event in complete_admitted_task(
+            controller=controller,
+            request=_request(),
+            plan=_plan(),
+            admission=_admission(),
+            dispatcher=_Dispatcher(),
+            sink=sink,
+            signal=None,
+        )
+    ]
+
+    assert controller.status is RunStatus.FAILED
+    assert repository.status is RunStatus.FAILED
+    assert repository.error == "model_output_truncated"
+    assert yielded[-1].type == CoreEventType.RUN_FAILED
+    assert yielded[-1].payload["error"] == "model_output_truncated"
+
+
+@pytest.mark.asyncio
 async def test_continuation_executes_existing_receipt_without_redispatch():
     controller, repository, sink = await _started()
 

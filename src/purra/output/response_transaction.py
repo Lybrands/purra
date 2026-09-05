@@ -12,11 +12,13 @@ from purra.contracts import (
     AgentRunResult,
     MessageRole,
     ModelRequest,
+    ModelFinishReason,
     ModelStreamChunk,
     RunStatus,
     ToolChoiceMode,
 )
-from purra.errors import ContractViolationError
+from purra.errors import ContractViolationError, ModelGatewayError
+from purra.model_protocol import InvocationOutputBudget, classify_model_termination
 from purra.model_invocation import (
     AgentModelCall,
     ManagedInvocationStream,
@@ -117,6 +119,7 @@ class AgentResponseTransaction:
         *,
         request: ModelRequest,
         context: ModelInvocationContext,
+        output_budget: InvocationOutputBudget | None = None,
         signal: CancellationSignal | None = None,
     ) -> AgentRunResult:
         self._require_mode(ResponseTransactionMode.DIRECT_LIVE)
@@ -126,6 +129,7 @@ class AgentResponseTransaction:
             context=context,
             intent=AgentOutputIntent.FINAL_PUBLIC,
             commit_mode=OutputCommitMode.LIVE,
+            output_budget=output_budget,
             signal=signal,
         )
         return AgentRunResult(
@@ -142,6 +146,7 @@ class AgentResponseTransaction:
         *,
         request: ModelRequest,
         context: ModelInvocationContext,
+        output_budget: InvocationOutputBudget | None = None,
         signal: CancellationSignal | None = None,
     ) -> AgentRunResult:
         self._require_mode(ResponseTransactionMode.VALIDATED_RESULT)
@@ -156,6 +161,7 @@ class AgentResponseTransaction:
                 context=context,
                 intent=AgentOutputIntent.STRUCTURED_PRIVATE,
                 commit_mode=OutputCommitMode.GATED,
+                output_budget=output_budget,
                 signal=signal,
             )
             try:
@@ -205,6 +211,7 @@ class AgentResponseTransaction:
         *,
         request: ModelRequest,
         context: ModelInvocationContext,
+        output_budget: InvocationOutputBudget | None = None,
         signal: CancellationSignal | None = None,
     ) -> str:
         self._require_mode(ResponseTransactionMode.VALIDATED_RESULT)
@@ -231,6 +238,7 @@ class AgentResponseTransaction:
                     context=context,
                     intent=AgentOutputIntent.FINAL_PUBLIC,
                     commit_mode=OutputCommitMode.LIVE,
+                    output_budget=output_budget,
                     signal=signal,
                 )
             except Exception as caught:
@@ -289,6 +297,7 @@ class AgentResponseTransaction:
         context: ModelInvocationContext,
         intent: AgentOutputIntent,
         commit_mode: OutputCommitMode,
+        output_budget: InvocationOutputBudget | None,
         signal: CancellationSignal | None,
     ) -> str:
         stream = await self._models.stream(
@@ -300,6 +309,7 @@ class AgentResponseTransaction:
                 requires_full_text_validation=(
                     intent is AgentOutputIntent.STRUCTURED_PRIVATE
                 ),
+                output_budget=output_budget,
                 tools=(),
                 tool_choice=ToolChoiceMode.NONE,
             ),
@@ -308,6 +318,7 @@ class AgentResponseTransaction:
         )
         chunks = stream.chunks
         content: list[str] = []
+        finish_reason: ModelFinishReason | None = None
         async with aclosing(chunks):
             async for chunk in chunks:
                 if not isinstance(chunk, ModelStreamChunk):
@@ -320,6 +331,24 @@ class AgentResponseTransaction:
                     )
                 if chunk.content_delta:
                     content.append(chunk.content_delta)
+                if chunk.finish_reason is not None:
+                    finish_reason = chunk.finish_reason
+        if finish_reason is None:
+            raise ModelGatewayError(
+                "response model stream ended without a finish reason",
+                code="upstream_stream_interrupted",
+                retryable=True,
+            )
+        termination = classify_model_termination(
+            finish_reason,
+            tool_call_count=0,
+        )
+        if termination.incomplete:
+            raise ModelGatewayError(
+                "response model output is incomplete",
+                code=termination.error_code or "model_output_truncated",
+                retryable=False,
+            )
         return "".join(content)
 
     def _require_mode(self, expected: ResponseTransactionMode) -> None:

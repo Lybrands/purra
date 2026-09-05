@@ -7,6 +7,7 @@ from typing import Any
 
 from purra.agent_tree import ChildAgentSpec, SpawnAgentsCommand
 from purra.agent_tree_execution import RunCommandService
+from purra.agent_tree_policy import AgentTreePolicy
 from purra.contracts import (
     ExecutionState,
     ToolCall,
@@ -17,8 +18,6 @@ from purra.contracts import (
     ToolRiskLevel,
     ToolSchema,
 )
-from purra.delegation.policy import DelegationPolicy
-from purra.delegation.tool import _validated_items
 from purra.errors import ContractViolationError
 from purra.json_values import thaw_json_mapping
 from purra.ports import CancellationSignal, ToolRegistration
@@ -26,7 +25,7 @@ from purra.ports import CancellationSignal, ToolRegistration
 
 def build_agent_tree_tool_registration(
     commands: RunCommandService,
-    policy: DelegationPolicy,
+    policy: AgentTreePolicy,
     *,
     child_allowed_tools: tuple[str, ...] = (),
     lease_owner_id: str | None = None,
@@ -34,8 +33,8 @@ def build_agent_tree_tool_registration(
 ) -> ToolRegistration:
     if not isinstance(commands, RunCommandService):
         raise TypeError("Agent tree tool requires RunCommandService")
-    if not isinstance(policy, DelegationPolicy):
-        raise TypeError("Agent tree tool requires DelegationPolicy")
+    if not isinstance(policy, AgentTreePolicy):
+        raise TypeError("Agent tree tool requires AgentTreePolicy")
 
     async def unavailable(
         state: ExecutionState,
@@ -54,10 +53,10 @@ def build_agent_tree_tool_registration(
         run_id = str(state.run_id or "").strip()
         if not run_id:
             raise ContractViolationError("Agent tree tool requires a bound Run")
-        items = _validated_items(arguments, policy)
+        items = policy.validate_children(arguments.get("children"))
         child_grant = await commands.compile_child_grant(
             run_id,
-            can_spawn_agents=policy.allows_recursive_delegation,
+            can_spawn_agents=policy.allow_recursive_agents,
             allowed_tools=child_allowed_tools,
         )
         receipt = await commands.spawn_agents(SpawnAgentsCommand(
@@ -67,7 +66,7 @@ def build_agent_tree_tool_registration(
             lease_epoch=lease_epoch,
             children=tuple(
                 ChildAgentSpec(
-                    name=item["agentName"],
+                    name=item["name"],
                     title=item["title"],
                     instruction=item["instruction"],
                     objective=item["objective"],
@@ -100,7 +99,7 @@ def build_agent_tree_tool_registration(
                 separators=(",", ":"),
             ),
             error_code=(
-                "required_delegation_failed"
+                "required_child_run_failed"
                 if aggregate.state == "blocked"
                 else None
             ),
@@ -115,30 +114,46 @@ def build_agent_tree_tool_registration(
                 "en-US": "Create and invoke child Agents",
             },
             description=(
-                f"Create 1-{policy.max_agents_per_call} bounded child Agents, "
+                f"Create 1-{policy.max_children_per_call} bounded child Agents, "
                 "run them independently, wait for completion, and return "
                 "attributed results."
             ),
             parameters={
                 "type": "object",
                 "properties": {
-                    "delegations": {
+                    "children": {
                         "type": "array",
                         "minItems": 1,
-                        "maxItems": policy.max_agents_per_call,
+                        "maxItems": policy.max_children_per_call,
                         "items": {
                             "type": "object",
                             "properties": {
-                                "agentName": {"type": "string", "minLength": 1},
-                                "title": {"type": "string", "minLength": 1},
-                                "instruction": {"type": "string", "minLength": 1},
-                                "objective": {"type": "string", "minLength": 1},
+                                "name": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": policy.max_agent_name_chars,
+                                },
+                                "title": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": policy.max_title_chars,
+                                },
+                                "instruction": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": policy.max_instruction_chars,
+                                },
+                                "objective": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": policy.max_objective_chars,
+                                },
                                 "input": {"type": "object"},
                                 "required": {"type": "boolean"},
                                 "priority": {"type": "integer"},
                             },
                             "required": [
-                                "agentName",
+                                "name",
                                 "title",
                                 "instruction",
                                 "objective",
@@ -147,7 +162,7 @@ def build_agent_tree_tool_registration(
                         },
                     },
                 },
-                "required": ["delegations"],
+                "required": ["children"],
                 "additionalProperties": False,
             },
         ),

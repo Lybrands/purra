@@ -41,40 +41,25 @@ class ExecutionProfile:
 
     def snapshot_mapping(
         self,
-        binding_resolver: ComponentBindingResolver | None = None,
+        binding_resolver: ComponentBindingResolver,
     ) -> dict[str, Any]:
         """Return the deterministic orchestration surface owned by the host."""
 
-        bind = binding_resolver or _legacy_component_binding
         return {
             "planningEnabled": self.planning_enabled,
-            "planner": bind("planner", self.planner),
-            "planningPolicy": bind("planningPolicy", self.planning_policy),
+            "planner": binding_resolver("planner", self.planner),
+            "planningPolicy": binding_resolver(
+                "planningPolicy", self.planning_policy
+            ),
             "contextStrategy": self.context_strategy.value,
-            "taskAdmission": bind(
+            "taskAdmission": binding_resolver(
                 "taskAdmissionEvaluator",
                 self.task_admission_evaluator,
             ),
-            "longTaskDispatcher": bind(
+            "longTaskDispatcher": binding_resolver(
                 "longTaskDispatcher",
                 self.long_task_dispatcher,
             ),
         }
-
-
-def _component_type(value: object | None) -> str | None:
-    if value is None:
-        return None
-    kind = type(value)
-    return f"{kind.__module__}.{kind.__qualname__}"
-
-
-def _legacy_component_binding(
-    role: str,
-    value: object | None,
-) -> Mapping[str, Any]:
-    del role
-    return {"type": _component_type(value)} if value is not None else {"kind": "none"}
-
 
 __all__ = ["ExecutionProfile"]

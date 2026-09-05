@@ -38,7 +38,6 @@ export type OutputEventKind =
   | "tool.completed"
   | "plan.updated"
   | "task_admission.decided"
-  | "delegation.status"
   | "long_task.dispatched"
   | "long_task.progress"
   | "long_task.checkpoint"

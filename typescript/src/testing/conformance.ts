@@ -1,11 +1,10 @@
 import { prepareArtifactAppend } from "../artifacts/contracts.js";
 import type { ArtifactClaimRepository, ArtifactRepository } from "../artifacts/types.js";
-import type { DelegationRepository } from "../delegation/types.js";
 import { claimFromUnit } from "../durable/repository.js";
 import type { LongTaskRepository } from "../durable/types.js";
 import type { JsonValue, ModelGateway, ModelRequest } from "../model/types.js";
 import { invokeModel } from "../model/stream.js";
-import { copyCapabilitySnapshot } from "../model/validation.js";
+import { copyCapabilitySnapshot, resolveInvocationOutputBudget } from "../model/validation.js";
 import type { OutputEvent, OutputPublisher } from "../output/types.js";
 import { AgentError } from "../shared/errors.js";
 import { ToolCatalog } from "../tools/catalog.js";
@@ -15,15 +14,18 @@ export async function assertModelGatewayConforms(input: {
   readonly gateway: ModelGateway;
   readonly request?: ModelRequest;
 }): Promise<void> {
-  const capabilities = input.gateway.capabilities === undefined
-    ? undefined
-    : copyCapabilitySnapshot(input.gateway.capabilities);
-  if (capabilities?.protocol.streaming === "supported" && typeof input.gateway.stream !== "function") {
+  if (input.gateway.capabilities === undefined) {
+    nonconforming("model_gateway_nonconforming", "Model capabilities are required");
+  }
+  const capabilities = copyCapabilitySnapshot(input.gateway.capabilities);
+  if (capabilities.protocol.streaming === "supported" && typeof input.gateway.stream !== "function") {
     nonconforming("model_gateway_nonconforming", "Model capabilities claim an unavailable stream interface");
   }
   const request = input.request ?? Object.freeze({
     messages: Object.freeze([{ role: "user" as const, content: "conformance probe" }]),
     tools: Object.freeze([]),
+    capabilitySnapshot: capabilities,
+    outputBudget: resolveInvocationOutputBudget(capabilities),
   });
   const turn = await invokeModel(input.gateway, request, undefined, false);
   if (turn.finishReason !== "stop" || (turn.message.toolCalls?.length ?? 0) !== 0) {
@@ -93,44 +95,6 @@ export async function assertOutputPublisherConforms(publisher: OutputPublisher):
   );
 }
 
-export async function assertDelegationRepositoryConforms(
-  repository: DelegationRepository,
-): Promise<void> {
-  const suffix = uniqueId();
-  const command = Object.freeze({
-    runId: `conformance-run-${suffix}`,
-    batchId: `conformance-batch-${suffix}`,
-    idempotencyKey: `conformance-key-${suffix}`,
-    delegations: Object.freeze([{
-      agentName: "reader",
-      title: "Conformance reader",
-      instruction: "Inspect the fixture.",
-      objective: "Return a content-free status.",
-    }]),
-  });
-  const first = await repository.createBatch(command);
-  const replay = await repository.createBatch(command);
-  const row = first.delegations[0];
-  if (row === undefined || first.replayed || !replay.replayed || replay.delegations[0]?.id !== row.id) {
-    nonconforming("delegation_repository_nonconforming", "Delegation batch replay was not idempotent");
-  }
-  await requireRejected(
-    repository.start(row.id, `${command.runId}-other`, command.batchId),
-    "delegation_repository_nonconforming",
-    "Delegation escaped its Root Run scope",
-  );
-  if ((await repository.start(row.id, command.runId, command.batchId))?.status !== "running") {
-    nonconforming("delegation_repository_nonconforming", "Delegation did not enter running state");
-  }
-  if (!await repository.complete(row.id, command.runId, command.batchId, { status: "ok" })) {
-    nonconforming("delegation_repository_nonconforming", "Delegation did not complete");
-  }
-  const aggregate = await repository.aggregateBatch(command.runId, command.batchId);
-  if (aggregate.state !== "ready" || aggregate.counts.done !== 1) {
-    nonconforming("delegation_repository_nonconforming", "Delegation aggregation was inconsistent");
-  }
-}
-
 export async function assertLongTaskRepositoryConforms(repository: LongTaskRepository): Promise<void> {
   const suffix = uniqueId();
   const taskId = `conformance-task-${suffix}`;
@@ -150,7 +114,7 @@ export async function assertLongTaskRepositoryConforms(repository: LongTaskRepos
     budgets: Object.freeze({
       maxInvocationAttempts: 1,
       maxInputTokens: null,
-      maxRunOutputTokens: null,
+      maxRunGenerationTokens: null,
       maxReasoningTokens: null,
     }),
   });

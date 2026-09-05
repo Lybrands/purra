@@ -1,6 +1,7 @@
 import { AgentCanceledError, AgentError } from "../shared/errors.js";
 import type {
   Message,
+  ModelFinishReason,
   ModelGateway,
   ModelRequest,
   ModelStream,
@@ -48,6 +49,15 @@ const DEFAULT_STREAM_LIMITS: ModelStreamLimits = Object.freeze({
   maxToolArgumentChars: 1_000_000,
 });
 
+const FAILURE_USAGE = new WeakMap<object, ModelTokenUsage>();
+
+/** Provider usage validated before a terminal model failure was raised. */
+export function modelFailureUsage(error: unknown): ModelTokenUsage | undefined {
+  return error !== null && (typeof error === "object" || typeof error === "function")
+    ? FAILURE_USAGE.get(error)
+    : undefined;
+}
+
 export function constrainModelInvocationTimeout(
   limits: ModelStreamLimits | undefined,
   maximumMs: number,
@@ -86,7 +96,12 @@ export async function invokeModel(
         gateway.invoke(request, stop.signal),
         stop.signal,
       ));
-      requireAppliedOutputLimit(request, turn.appliedOutputLimit, turn.usage);
+      requireAppliedGenerationLimit(request, turn.appliedGenerationLimit, turn.usage);
+      throwForIncompleteFinishWithUsage(
+        turn.finishReason,
+        turn.message.toolCalls?.length ?? 0,
+        turn.usage,
+      );
       throwIfCanceled(stop.signal);
       return turn;
     }
@@ -103,12 +118,17 @@ export async function invokeModel(
       stop.signal,
     );
     throwIfCanceled(stop.signal);
-    const appliedOutputLimit = stream.appliedOutputLimit === undefined
-      ? undefined
-      : stream.appliedOutputLimit === null
-      ? null
-      : positiveInteger(stream.appliedOutputLimit, "applied output limit");
-    requireAppliedOutputLimit(request, appliedOutputLimit);
+    if (Object.prototype.hasOwnProperty.call(stream, "appliedOutputLimit")) {
+      throw new AgentError(
+        "model_gateway_contract_violation",
+        "Legacy applied output limits are unsupported",
+      );
+    }
+    const appliedGenerationLimit = positiveInteger(
+      stream.appliedGenerationLimit,
+      "applied generation limit",
+    );
+    requireAppliedGenerationLimit(request, appliedGenerationLimit);
     streamConsumed = true;
     return await consumeModelStream(
       stream,
@@ -116,7 +136,7 @@ export async function invokeModel(
       onChunk,
       limits,
       request,
-      appliedOutputLimit,
+      appliedGenerationLimit,
       started,
       (value) => { timings = value; },
     );
@@ -147,7 +167,7 @@ async function consumeModelStream(
   onChunk: ((chunk: ModelStreamChunk) => Promise<void> | void) | undefined,
   limits: ModelStreamLimits,
   request: ModelRequest,
-  appliedOutputLimit: number | null | undefined,
+  appliedGenerationLimit: number,
   started: number,
   onDiagnostics: (metrics: Readonly<Record<string, number | string | null>>) => void,
 ): Promise<ModelTurn> {
@@ -179,6 +199,9 @@ async function consumeModelStream(
         continue;
       }
       const chunk = validateModelStreamChunk(step.value);
+      if (chunk.usage !== undefined) {
+        requireAppliedGenerationLimit(request, appliedGenerationLimit, chunk.usage);
+      }
       const meaningful = isMeaningfulChunk(chunk);
       if (meaningful) liveness.acceptSemanticProgress(chunk);
       try {
@@ -224,7 +247,7 @@ async function consumeModelStream(
       "Model stream ended without a finish reason",
     );
   }
-  throwForIncompleteFinish(finishReason, calls.size);
+  throwForIncompleteFinishWithUsage(finishReason, calls.size, usage);
   const toolCalls = buildToolCalls(calls, malformed);
   const contentText = content.join("");
   const reasoningText = reasoning.join("");
@@ -238,36 +261,91 @@ async function consumeModelStream(
   const turn = validateModelTurn({
     message,
     finishReason,
-    ...(appliedOutputLimit === undefined ? {} : { appliedOutputLimit }),
+    appliedGenerationLimit,
     ...(usage === undefined ? {} : { usage }),
   });
-  requireAppliedOutputLimit(request, appliedOutputLimit, turn.usage);
+  requireAppliedGenerationLimit(request, appliedGenerationLimit, turn.usage);
   return turn;
 }
 
-function requireAppliedOutputLimit(
+function throwForIncompleteFinishWithUsage(
+  finishReason: ModelFinishReason,
+  toolCallCount: number,
+  usage: ModelTokenUsage | undefined,
+): void {
+  try {
+    throwForIncompleteFinish(finishReason, toolCallCount);
+  } catch (error) {
+    if (
+      usage !== undefined
+      && error !== null
+      && (typeof error === "object" || typeof error === "function")
+    ) {
+      FAILURE_USAGE.set(error, usage);
+    }
+    throw error;
+  }
+}
+
+function requireAppliedGenerationLimit(
   request: ModelRequest,
-  appliedOutputLimit: number | null | undefined,
+  appliedGenerationLimit: number | null | undefined,
   usage?: ModelTokenUsage,
 ): void {
-  const expected = request.outputLimit?.maxTokens;
-  if (expected === undefined && appliedOutputLimit === undefined) return;
-  if (appliedOutputLimit !== expected) {
-    throw new AgentError(
+  const expected = request.outputBudget?.maxGenerationTokens;
+  if (
+    !(expected === undefined && appliedGenerationLimit === undefined)
+    && appliedGenerationLimit !== expected
+  ) {
+    throwContractViolation(
       "model_gateway_contract_violation",
-      `Model gateway applied output limit ${String(appliedOutputLimit)} instead of ${String(expected)}`,
+      `Model gateway applied generation limit ${String(appliedGenerationLimit)} instead of ${String(expected)}`,
+      usage,
     );
   }
   if (
     expected !== undefined
-    && usage?.outputTokens !== undefined
-    && usage.outputTokens > expected
+    && usage?.generationTokens !== undefined
+    && usage.generationTokens > expected
   ) {
-    throw new AgentError(
+    throwContractViolation(
       "model_gateway_contract_violation",
-      "Model gateway reported output usage above the applied invocation limit",
+      "Model gateway reported generation usage above the applied invocation limit",
+      usage,
     );
   }
+  if (
+    request.capabilitySnapshot?.reasoningUsageDetail === "required"
+    && usage !== undefined
+    && usage.reasoningTokens === undefined
+  ) {
+    throwContractViolation(
+      "model_gateway_contract_violation",
+      "Model gateway omitted required reasoning-token usage detail",
+      usage,
+    );
+  }
+  if (
+    request.capabilitySnapshot?.thinkingTokenAccounting === "included"
+    && usage?.reasoningTokens !== undefined
+    && usage.reasoningTokens > (usage.generationTokens ?? 0)
+  ) {
+    throwContractViolation(
+      "model_gateway_contract_violation",
+      "Model gateway reported included reasoning usage above total generation usage",
+      usage,
+    );
+  }
+}
+
+function throwContractViolation(
+  code: string,
+  message: string,
+  usage: ModelTokenUsage | undefined,
+): never {
+  const error = new AgentError(code, message);
+  if (usage !== undefined) FAILURE_USAGE.set(error, usage);
+  throw error;
 }
 
 function positiveInteger(value: unknown, label: string): number {

@@ -1,5 +1,4 @@
 import { InMemoryArtifactStore } from "../artifacts/repository.js";
-import { InMemoryDelegationRepository } from "../delegation/repository.js";
 import { InMemoryLongTaskRepository } from "../durable/repository.js";
 import { InMemoryOutputPublisher } from "../output/publisher.js";
 import { InMemoryRunRepository } from "../run/store.js";
@@ -10,7 +9,6 @@ export class InMemoryAgentAdapters {
   public readonly runTree: InMemoryRunTreeRepository;
   public readonly runs: InMemoryRunRepository;
   public readonly outputs = new InMemoryOutputPublisher();
-  public readonly delegations = new InMemoryDelegationRepository();
   public readonly longTasks = new InMemoryLongTaskRepository();
   public readonly artifacts = new InMemoryArtifactStore();
 

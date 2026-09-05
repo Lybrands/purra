@@ -6,6 +6,7 @@ import test from "node:test";
 import {
   Agent,
   AgentError,
+  createRecoverySnapshot,
   DurableExecutorRegistry,
   HmacRecoveryAuthenticator,
   InMemoryLongTaskRepository,
@@ -15,6 +16,7 @@ import {
   OrphanRecoveryCoordinator,
   validateContinuation,
 } from "purra";
+import { testGateway } from "./support/model-gateway.mjs";
 
 const SECRET = "phase-six-recovery-secret-has-at-least-32-bytes";
 const durableFixture = JSON.parse(readFileSync(
@@ -23,12 +25,12 @@ const durableFixture = JSON.parse(readFileSync(
 ));
 
 const RUN_OPTIONS = Object.freeze({
-  budgets: Object.freeze({ maxRunOutputTokens: null }),
+  budgets: Object.freeze({ maxRunGenerationTokens: null }),
 });
 
 test("shared Durable classifications and exact lease boundary stay aligned", () => {
-  assert.equal(durableFixture.protocolVersion, 4);
-  assert.equal(durableFixture.agentPresetSnapshotVersion, 4);
+  assert.equal(durableFixture.protocolVersion, 5);
+  assert.equal(durableFixture.agentPresetSnapshotVersion, 5);
   assert.deepEqual(durableFixture.stableErrorCodes, {
     activityDeadline: "model_activity_deadline_exceeded",
     progressDeadline: "model_progress_deadline_exceeded",
@@ -43,13 +45,20 @@ test("shared Durable classifications and exact lease boundary stay aligned", () 
     const { usage, limits } = row;
     const missing = usage.unreportedUsageAttempts > 0 && [
       limits.maxInputTokens,
-      limits.maxRunOutputTokens,
+      limits.maxRunGenerationTokens,
       limits.maxReasoningTokens,
     ].some((value) => value !== null);
-    const actual = missing ? "provider_usage_unreported" : [
+    const missingReasoning = usage.invocationCount > 0
+      && usage.reasoningTokens === null
+      && limits.maxReasoningTokens !== null;
+    const actual = missing
+      ? "provider_usage_unreported"
+      : missingReasoning
+      ? "reasoning_tokens_unreported"
+      : [
       ["model_attempts", usage.invocationCount, limits.maxInvocationAttempts],
       ["input_tokens", usage.inputTokens, limits.maxInputTokens],
-      ["output_tokens", usage.outputTokens, limits.maxRunOutputTokens],
+      ["generation_tokens", usage.generationTokens, limits.maxRunGenerationTokens],
       ["reasoning_tokens", usage.reasoningTokens, limits.maxReasoningTokens],
     ].find(([, used, maximum]) => (
       maximum !== null && (used > maximum || (row.inclusive && used >= maximum))
@@ -75,14 +84,14 @@ test("shared Durable classifications and exact lease boundary stay aligned", () 
 
 test("shared Runtime and output batch defaults stay aligned", async () => {
   const agent = new Agent({
-    model: {
+    model: testGateway({
       async invoke() { throw new Error("stream should be used"); },
       async *stream() {
         yield { contentDelta: "a" };
         await new Promise((resolve) => setTimeout(resolve, 75));
         yield { contentDelta: "b", finishReason: "stop" };
       },
-    },
+    }),
   });
   const handle = await agent.submit(
     { messages: [{ role: "user", content: "defaults" }] },
@@ -143,7 +152,7 @@ test("repository fences an expired same-worker claim and settles replay once", a
   await repository.markUnitRunning(second);
   await repository.appendCheckpoint(second, { progress: 1 });
   await repository.appendCheckpoint(second, { progress: 2 });
-  await repository.recordUsage(second, { inputTokens: 3, outputTokens: 2 });
+  await repository.recordUsage(second, { inputTokens: 3, generationTokens: 2, reasoningTokens: 0 });
   const completed = await repository.completeUnit(
     second,
     { outputRef: "artifact://one" },
@@ -180,14 +189,14 @@ test("Long Task budgets fail before the next claim and preserve unreported usage
     budgets: {
       maxInvocationAttempts: 1,
       maxInputTokens: null,
-      maxRunOutputTokens: null,
+      maxRunGenerationTokens: null,
       maxReasoningTokens: null,
     },
   });
   await repository.start("task-budget");
   const first = claimFromUnit(await repository.claimReadyUnit("task-budget", "worker", 60_000));
   await repository.markUnitRunning(first);
-  await repository.recordUsage(first, { inputTokens: 1, outputTokens: 1 });
+  await repository.recordUsage(first, { inputTokens: 1, generationTokens: 1 });
   await repository.completeUnit(first, { outputRef: "result:1" }, "budget-settlement");
   assert.equal(await repository.claimReadyUnit("task-budget", "worker", 60_000), undefined);
   assert.equal((await repository.load("task-budget")).status, "failed");
@@ -200,7 +209,7 @@ test("Long Task budgets fail before the next claim and preserve unreported usage
     budgets: {
       maxInvocationAttempts: null,
       maxInputTokens: 10,
-      maxRunOutputTokens: null,
+      maxRunGenerationTokens: null,
       maxReasoningTokens: null,
     },
   });
@@ -241,7 +250,7 @@ test("recipe dispatcher resumes a DAG without replaying completed units and retr
             throw { code: "temporary", retryable: true };
           }
           await context.checkpoint({ unit: context.unit.id });
-          await context.recordUsage({ inputTokens: 1, outputTokens: 1 });
+          await context.recordUsage({ inputTokens: 1, generationTokens: 1, reasoningTokens: 0 });
           return { outputRef: `artifact://${context.unit.id}` };
         },
       },
@@ -508,6 +517,31 @@ test("authenticated continuation skips planning and rejects incompatible authori
   });
   const initial = await (await agent.submit(plannedUser("start"), RUN_OPTIONS)).result;
   const snapshot = initial.durable.recoverySnapshot;
+  await rejectsCode(createRecoverySnapshot({
+    run: {
+      runId: "reasoning-unknown",
+      status: "running",
+      version: 1,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      deadlineAt: null,
+      budgets: runBudgets(),
+      usage: {
+        modelAttempts: 1,
+        unreportedUsageAttempts: 0,
+        inputTokens: 1,
+        generationTokens: 1,
+        reasoningTokens: 0,
+        unreportedReasoningAttempts: 1,
+        outputBytes: 0,
+        outputEvents: 0,
+      },
+      preset: snapshot.preset,
+    },
+    plan: snapshot.plan,
+    receipt: snapshot.receipt,
+    authenticator: new HmacRecoveryAuthenticator(SECRET),
+  }), "runtime_budget_exceeded");
   const resumed = await (await agent.submit(
     { messages: [user("continue")] },
     { durableContinuation: { snapshot, command: "resume" } },
@@ -577,7 +611,7 @@ function durableAgent({
   presetRevision = "1",
 }) {
   return new Agent({
-    model: { invoke: model },
+    model: testGateway({ invoke: model }),
     preset: { id: "durable-test", revision: presetRevision },
     planning: {
       binding: { id: "fixture-planner", revision: "1" },
@@ -716,7 +750,7 @@ function runBudgets() {
   return {
     maxModelAttempts: 10,
     maxInputTokens: 1_000,
-    maxRunOutputTokens: 1_000,
+    maxRunGenerationTokens: 1_000,
     maxReasoningTokens: 1_000,
     maxOutputBytes: 100_000,
     maxOutputEvents: 1_000,
@@ -727,7 +761,7 @@ function taskBudgets() {
   return {
     maxInvocationAttempts: 10,
     maxInputTokens: 1_000,
-    maxRunOutputTokens: 1_000,
+    maxRunGenerationTokens: 1_000,
     maxReasoningTokens: 1_000,
   };
 }

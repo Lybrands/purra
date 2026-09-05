@@ -77,7 +77,7 @@ function usage(u: AnthropicMessage["usage"] | undefined): ModelTokenUsage | unde
   if (u?.input_tokens == null || u.output_tokens == null) return undefined;
   const cached = u.cache_read_input_tokens ?? 0;
   const inputs = u.input_tokens + cached + (u.cache_creation_input_tokens ?? 0);
-  return { inputTokens: inputs, outputTokens: u.output_tokens, totalTokens: inputs + u.output_tokens, cachedInputTokens: cached };
+  return { inputTokens: inputs, generationTokens: u.output_tokens, totalTokens: inputs + u.output_tokens, cachedInputTokens: cached };
 }
 function finish(reason: AnthropicMessage["stop_reason"]): ModelTurn["finishReason"] {
   if (reason === "end_turn" || reason === "stop_sequence") return "stop";
@@ -119,11 +119,11 @@ export class AnthropicMessagesGateway implements ModelGateway {
     this.#client = (options.client ?? new Anthropic()).withOptions({ maxRetries: 0, timeout: options.timeoutMs ?? 60000 });
   }
   #request(request: ModelRequest): MessageCreateParamsNonStreaming {
-    if (!request.outputLimit) throw new TypeError("Anthropic gateway requires a resolved output limit");
+    if (!request.outputBudget) throw new TypeError("Anthropic gateway requires a resolved generation budget");
     const o = this.#options;
-    if (o.thinking?.type === "enabled" && (!Number.isInteger(o.thinking.budget_tokens) || o.thinking.budget_tokens < 1024 || o.thinking.budget_tokens >= request.outputLimit.maxTokens)) throw new TypeError("Thinking budget must be at least 1024 and below the output limit");
+    if (o.thinking?.type === "enabled" && (!Number.isInteger(o.thinking.budget_tokens) || o.thinking.budget_tokens < 1024 || o.thinking.budget_tokens >= request.outputBudget.maxGenerationTokens)) throw new TypeError("Thinking budget must be at least 1024 and below the generation budget");
     const rows = input(request.messages, o.model);
-    return { model: o.model, messages: rows.messages, max_tokens: request.outputLimit.maxTokens,
+    return { model: o.model, messages: rows.messages, max_tokens: request.outputBudget.maxGenerationTokens,
       ...(rows.system.length ? { system: rows.system } : {}),
       ...(o.thinking === undefined ? {} : { thinking: o.thinking }),
       ...(o.outputConfig === undefined ? {} : { output_config: o.outputConfig }),
@@ -143,7 +143,7 @@ export class AnthropicMessagesGateway implements ModelGateway {
       const response = await this.#client.messages.create(params, { signal });
       const tokenUsage = usage(response.usage);
       return { message: { role: "assistant", ...projection(response.content), providerData: attributes(response.content, params.model) },
-        finishReason: finish(response.stop_reason), appliedOutputLimit: request.outputLimit!.maxTokens,
+        finishReason: finish(response.stop_reason), appliedGenerationLimit: request.outputBudget!.maxGenerationTokens,
         ...(tokenUsage === undefined ? {} : { usage: tokenUsage }) };
     } catch (error) { return failed(error, signal); }
   }
@@ -198,6 +198,6 @@ export class AnthropicMessagesGateway implements ModelGateway {
       } catch (error) { failed(error, signal); }
       finally { stream?.abort(); }
     }
-    return { appliedOutputLimit: request.outputLimit!.maxTokens, activitySupport: "working", [Symbol.asyncIterator]: chunks };
+    return { appliedGenerationLimit: request.outputBudget!.maxGenerationTokens, activitySupport: "working", [Symbol.asyncIterator]: chunks };
   }
 }

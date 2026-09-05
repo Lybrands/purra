@@ -43,7 +43,7 @@ def _request() -> AgentRunRequest:
             capability_snapshot=replace(
                 generic_capability_snapshot(),
                 profile_id="test:model",
-                max_call_output_tokens=1_024,
+                max_generation_tokens=1_024,
             ),
         ),
         domain_context=DomainContext(namespace="test"),

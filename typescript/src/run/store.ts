@@ -82,6 +82,73 @@ interface StoredRun {
   }>;
 }
 
+interface DeferredOutputJournal {
+  readonly counts: ReadonlyMap<string, number>;
+  readonly readRun: (runId: string) => readonly OutputEvent[];
+  readonly readRoot: () => readonly OutputEvent[];
+  readonly findSource: (sourceKey: string) => OutputEvent | undefined;
+}
+
+interface DeferredHistory {
+  readonly journal: DeferredOutputJournal;
+  readonly count: number;
+  readonly rootCount: number;
+  loadedRun?: readonly OutputEvent[];
+  loadedRoot?: readonly OutputEvent[];
+}
+
+// Storage callbacks are transaction-local and never part of an encoded snapshot.
+const deferredHistories = new WeakMap<StoredRun, DeferredHistory>();
+
+function eventCount(run: StoredRun, root = false): number {
+  const history = deferredHistories.get(run);
+  return root ? (history?.rootCount ?? 0) + run.rootEvents.length
+    : (history?.count ?? 0) + run.events.length;
+}
+
+function historyEvents(run: StoredRun, root = false): readonly OutputEvent[] {
+  const history = deferredHistories.get(run);
+  const pending = root ? run.rootEvents : run.events;
+  if (history === undefined) return pending;
+  let saved = root ? history.loadedRoot : history.loadedRun;
+  if (saved === undefined) {
+    saved = root ? history.journal.readRoot() : history.journal.readRun(run.runId);
+    if (saved.length !== (root ? history.rootCount : history.count)) throw new TypeError("incomplete output journal");
+    const counts = new Map<string, number>();
+    for (const [index, event] of saved.entries()) {
+      const count = (counts.get(event.runId) ?? 0) + 1;
+      counts.set(event.runId, count);
+      if (event.rootRunId !== run.rootRunId || (!root && event.runId !== run.runId)
+        || event.sequence !== count || (root && event.rootSequence !== index + 1)) {
+        throw new TypeError("invalid output journal sequence");
+      }
+    }
+    if (root && [...history.journal.counts].some(([id, count]) => count !== (counts.get(id) ?? 0))) {
+      throw new TypeError("incomplete output journal");
+    }
+    if (root) history.loadedRoot = saved; else history.loadedRun = saved;
+  }
+  return [...saved, ...pending];
+}
+
+function sourceEvent(run: StoredRun, key: string, root = true): OutputEvent | undefined {
+  const cache = root ? run.rootBySourceKey : run.bySourceKey;
+  const cached = cache.get(key);
+  if (cached !== undefined) return cached;
+  const history = deferredHistories.get(run);
+  const event = history?.journal.findSource(key);
+  if (event === undefined) return undefined;
+  if (event.sourceKey !== key || event.rootRunId !== run.rootRunId
+    || !Number.isSafeInteger(event.sequence) || event.sequence < 1
+    || event.sequence > (history!.journal.counts.get(event.runId) ?? 0)
+    || !Number.isSafeInteger(event.rootSequence) || event.rootSequence < 1 || event.rootSequence > history!.rootCount) {
+    throw new TypeError("invalid output journal identity");
+  }
+  if (!root && event.runId !== run.runId) return undefined;
+  cache.set(key, event);
+  return event;
+}
+
 const METERED_KINDS = new Set([
   "planning.progress",
   "model.delta",
@@ -95,20 +162,104 @@ export class InMemoryRunRepository implements RunRepository {
   readonly #runs = new Map<string, StoredRun>();
   readonly #rootEvents = new Map<string, OutputEvent[]>();
   readonly #rootEventsBySourceKey = new Map<string, Map<string, OutputEvent>>();
+  readonly #unloadedRoots = new Set<string>();
+  #journalCounts = new Map<string, number>();
   readonly #leaseValidator: (
     runId: string,
     claim: { readonly leaseOwnerId?: string; readonly leaseEpoch?: number },
   ) => void;
 
   /** Opaque version-pinned storage data, never a public output projection. */
-  public exportState(): string { return encodeStorageState({ runs: this.#runs, rootEvents: this.#rootEvents, rootEventsBySourceKey: this.#rootEventsBySourceKey }); }
-  public importState(text: string): void {
+  public exportState(): string {
+    if (this.#unloadedRoots.size) throw new TypeError("cannot export unloaded output journals");
+    if ([...this.#runs.values()].some((run) => deferredHistories.has(run))) {
+      const checkpoint = this.exportJournalState();
+      const restored = new InMemoryRunRepository();
+      const events = checkpoint.journals.flatMap((journal) => journal.events)
+        .sort((a, b) => a.rootRunId.localeCompare(b.rootRunId) || a.rootSequence - b.rootSequence);
+      restored.importState(checkpoint.state, events);
+      return restored.exportState();
+    }
+    return encodeStorageState({ runs: this.#runs, rootEvents: this.#rootEvents, rootEventsBySourceKey: this.#rootEventsBySourceKey });
+  }
+  /** Execution state without the canonical journal, for transactional row storage. */
+  public exportJournalState(options: { readonly incremental?: boolean } = {}): {
+    readonly state: string;
+    readonly journals: readonly { readonly runId: string; readonly rootRunId: string; readonly afterSequence: number; readonly events: readonly OutputEvent[] }[];
+  } {
+    const runs = new Map([...this.#runs].map(([id, run]) => [id, {
+      ...run, events: [], bySourceKey: new Map(), rootEvents: [], rootBySourceKey: new Map(),
+    }]));
+    return {
+      state: encodeStorageState({ runs, rootEvents: new Map(), rootEventsBySourceKey: new Map(), journalCounts: new Map([...this.#runs].map(([id, run]) => [id, this.#unloadedRoots.has(run.rootRunId) ? this.#journalCounts.get(id)! : eventCount(run)])) }),
+      journals: Object.freeze([...this.#runs.values()].filter((run) => !this.#unloadedRoots.has(run.rootRunId)).map((run) => Object.freeze({
+        runId: run.runId, rootRunId: run.rootRunId,
+        afterSequence: options.incremental ? deferredHistories.get(run)?.count ?? 0 : 0,
+        events: Object.freeze([...(options.incremental ? run.events : historyEvents(run))]),
+      }))),
+    };
+  }
+
+  public importState(text: string, outputEvents?: readonly OutputEvent[], options: { readonly rootRunId?: string; readonly deferredJournal?: DeferredOutputJournal } = {}): void {
     const shape = { runs: this.#runs, rootEvents: this.#rootEvents, rootEventsBySourceKey: this.#rootEventsBySourceKey };
-    const saved = decodeStorageState(text) as typeof shape;
+    const saved = decodeStorageState(text) as typeof shape & { journalCounts?: Map<string, number> };
+    const deferred = options.deferredJournal;
+    if (deferred !== undefined && (options.rootRunId === undefined || outputEvents !== undefined || saved.journalCounts === undefined)) {
+      throw new TypeError("deferred journal requires a detached Root checkpoint");
+    }
+    if (saved.journalCounts !== undefined && outputEvents === undefined && deferred === undefined) {
+      throw new TypeError("output journal is required for this checkpoint");
+    }
+    if (options.rootRunId !== undefined && ((outputEvents === undefined && deferred === undefined) || ![...saved.runs.values()].some((run) => run.rootRunId === options.rootRunId))) {
+      throw new TypeError("Root journal selection requires an existing Root and detached events");
+    }
+    this.#unloadedRoots.clear();
+    this.#journalCounts = saved.journalCounts ?? new Map();
+    for (const run of saved.runs.values()) {
+      if (options.rootRunId !== undefined && run.rootRunId !== options.rootRunId) this.#unloadedRoots.add(run.rootRunId);
+    }
     this.#runs.clear(); for (const [key, value] of saved.runs) this.#runs.set(key, value);
     this.#rootEvents.clear(); for (const [key, value] of saved.rootEvents) this.#rootEvents.set(key, value);
     this.#rootEventsBySourceKey.clear(); for (const [key, value] of saved.rootEventsBySourceKey) this.#rootEventsBySourceKey.set(key, value);
+    if (outputEvents !== undefined || deferred !== undefined) {
+      for (const run of this.#runs.values()) {
+        if (run.events.length || run.bySourceKey.size) throw new TypeError("checkpoint contains an embedded journal");
+        this.#rootEvents.set(run.rootRunId, []);
+        this.#rootEventsBySourceKey.set(run.rootRunId, new Map());
+      }
+      for (const event of outputEvents ?? []) {
+        const run = this.#require(event.runId);
+        const root = this.#rootEvents.get(event.rootRunId)!;
+        if (run.rootRunId !== event.rootRunId || event.sequence !== run.events.length + 1 || event.rootSequence !== root.length + 1) {
+          throw new TypeError("invalid output journal sequence");
+        }
+        run.events.push(event); run.bySourceKey.set(event.sourceKey, event);
+        root.push(event); this.#rootEventsBySourceKey.get(event.rootRunId)!.set(event.sourceKey, event);
+      }
+      if (saved.journalCounts?.size !== this.#runs.size || [...this.#runs].some(([id, run]) => {
+        const count = saved.journalCounts?.get(id);
+        return count === undefined || !Number.isSafeInteger(count) || count < 0
+          || (!this.#unloadedRoots.has(run.rootRunId) && count !== (deferred?.counts.get(id) ?? run.events.length));
+      })) {
+        throw new TypeError("incomplete output journal");
+      }
+    }
     for (const [id, run] of this.#runs) this.#runs.set(id, { ...run, rootEvents: this.#rootEvents.get(run.rootRunId)!, rootBySourceKey: this.#rootEventsBySourceKey.get(run.rootRunId)! });
+    if (deferred !== undefined) {
+      const counts = new Map(deferred.counts);
+      const rootCount = [...counts.values()].reduce((sum, count) => sum + count, 0);
+      if (!Number.isSafeInteger(rootCount) || [...counts.keys()].some((id) => this.#runs.get(id)?.rootRunId !== options.rootRunId)
+        || [...this.#runs.values()].some((run) => run.rootRunId === options.rootRunId && !counts.has(run.runId))) {
+        throw new TypeError("invalid output journal scope");
+      }
+      const journal: DeferredOutputJournal = {
+        counts, readRun: (id) => deferred.readRun(id),
+        readRoot: () => deferred.readRoot(), findSource: (key) => deferred.findSource(key),
+      };
+      for (const run of this.#runs.values()) if (run.rootRunId === options.rootRunId) {
+        deferredHistories.set(run, { journal, count: counts.get(run.runId)!, rootCount });
+      }
+    }
   }
 
   public constructor(options: {
@@ -179,8 +330,9 @@ export class InMemoryRunRepository implements RunRepository {
         modelAttempts: 0,
         unreportedUsageAttempts: 0,
         inputTokens: 0,
-        outputTokens: 0,
+        generationTokens: 0,
         reasoningTokens: 0,
+        unreportedReasoningAttempts: 0,
         outputBytes: 0,
         outputEvents: 0,
       },
@@ -203,6 +355,10 @@ export class InMemoryRunRepository implements RunRepository {
       invocationSettlements: new Map(),
     };
     this.#runs.set(runId, stored);
+    const rootHistory = rootRunId === runId ? undefined : deferredHistories.get(this.#require(rootRunId));
+    if (rootHistory !== undefined) {
+      deferredHistories.set(stored, { ...rootHistory, count: 0, loadedRun: [] });
+    }
     const event = append(stored, runId, {
       sourceKey: `run:${runId}:started`,
       kind: "run.started",
@@ -220,6 +376,9 @@ export class InMemoryRunRepository implements RunRepository {
   ) {
     const run = this.#active(runId, claim);
     const root = this.#root(run);
+    if (input.schemaVersion !== 2) {
+      throw new AgentError("model_invocation_contract_invalid", "Unsupported model invocation receipt schema");
+    }
     if (input.runId !== runId || (input.outputProtocol !== undefined && input.outputProtocol !== PLANNING_STREAM_SCHEMA)
       || (input.planningScope !== undefined && (input.outputProtocol !== PLANNING_STREAM_SCHEMA
         || input.planningScope.runId !== runId || !Number.isSafeInteger(input.planningScope.revision) || input.planningScope.revision < 0))) {
@@ -234,7 +393,7 @@ export class InMemoryRunRepository implements RunRepository {
       return Object.freeze({
         snapshot: run.snapshot,
         receipt: existing,
-        event: run.bySourceKey.get(`invocation:${existing.invocationId}:started`)!,
+        event: sourceEvent(run, `invocation:${existing.invocationId}:started`, false)!,
       });
     }
     requireBudgetForNextInvocation(root);
@@ -269,7 +428,7 @@ export class InMemoryRunRepository implements RunRepository {
     claim: RunLeaseClaim = {},
   ): Promise<OutputEvent> {
     const run = this.#active(runId, claim);
-    const existing = run.rootBySourceKey.get(draft.sourceKey);
+    const existing = sourceEvent(run, draft.sourceKey);
     if (existing !== undefined) {
       requireSameEvent(existing, draft, runId);
       return existing;
@@ -289,7 +448,7 @@ export class InMemoryRunRepository implements RunRepository {
       throw new AgentError("output_batch_conflict", "Output batch source keys must be unique");
     }
     const pending = copied.filter((draft) => {
-      const existing = run.rootBySourceKey.get(draft.sourceKey);
+      const existing = sourceEvent(run, draft.sourceKey);
       if (existing !== undefined) requireSameEvent(existing, draft, runId);
       return existing === undefined;
     });
@@ -297,7 +456,7 @@ export class InMemoryRunRepository implements RunRepository {
     for (const draft of pending) validatePlanningProjection(run, draft);
     checkRelatedBudget(root, pending);
     return Object.freeze(copied.map((draft) => (
-      run.rootBySourceKey.get(draft.sourceKey) ?? append(run, runId, draft, true, root)
+      sourceEvent(run, draft.sourceKey) ?? append(run, runId, draft, true, root)
     )));
   }
 
@@ -390,8 +549,8 @@ export class InMemoryRunRepository implements RunRepository {
         status,
         ...(usage === undefined ? { usageReported: false } : {
           inputTokens: usage.inputTokens,
-          outputTokens: usage.outputTokens ?? 0,
-          reasoningTokens: usage.reasoningOutputTokens ?? 0,
+          generationTokens: usage.generationTokens ?? 0,
+          reasoningTokens: usage.reasoningTokens ?? null,
         }),
         ...(errorCode === undefined ? {} : { errorCode }),
       },
@@ -442,7 +601,7 @@ export class InMemoryRunRepository implements RunRepository {
       run.openInvocations.delete(invocationId);
       // Cancellation can commit before the consuming task's catch runs. Charge
       // its last persisted Provider usage once, rather than losing known tokens.
-      const observed = [...run.events].reverse().find((event) => event.kind === "model.usage"
+      const observed = [...historyEvents(run)].reverse().find((event) => event.kind === "model.usage"
         && event.payload.invocationId === invocationId);
       const usage = observed?.payload.usage as ModelTokenUsage | undefined;
       applyInvocationUsage(run, usage);
@@ -456,9 +615,9 @@ export class InMemoryRunRepository implements RunRepository {
           ...(usage === undefined ? {} : { usage: copyJsonValue(usage), usageSource: "last_observed" }) },
       }, false));
     }
-    for (const started of run.events.filter((event) => event.kind === "operation.started")) {
+    for (const started of historyEvents(run).filter((event) => event.kind === "operation.started")) {
       const operationId = String(started.payload.operationId);
-      if (run.events.some((event) => event.kind === "operation.finished" && event.payload.operationId === operationId)) continue;
+      if (historyEvents(run).some((event) => event.kind === "operation.finished" && event.payload.operationId === operationId)) continue;
       events.push(append(run, runId, { sourceKey: `operation:${operationId}:operation.finished`,
         kind: "operation.finished", channel: "lifecycle", visibility: started.visibility,
         payload: { type: "operation.finished", operationId, runId,
@@ -527,7 +686,7 @@ export class InMemoryRunRepository implements RunRepository {
       throw new TypeError("afterSequence must be a non-negative integer");
     }
     if (!Number.isSafeInteger(limit) || limit < 1) throw new TypeError("limit must be positive");
-    return Object.freeze(run.events.filter((event) => event.sequence > afterSequence).slice(0, limit));
+    return Object.freeze(historyEvents(run).filter((event) => event.sequence > afterSequence).slice(0, limit));
   }
 
   public async listRootEvents(
@@ -544,7 +703,7 @@ export class InMemoryRunRepository implements RunRepository {
     }
     if (!Number.isSafeInteger(limit) || limit < 1) throw new TypeError("limit must be positive");
     return Object.freeze(
-      root.rootEvents.filter((event) => event.rootSequence > afterRootSequence).slice(0, limit),
+      historyEvents(root, true).filter((event) => event.rootSequence > afterRootSequence).slice(0, limit),
     );
   }
 
@@ -563,6 +722,7 @@ export class InMemoryRunRepository implements RunRepository {
   #require(runId: string): StoredRun {
     const run = this.#runs.get(runId);
     if (run === undefined) throw new AgentError("run_not_found", "Run does not exist");
+    if (this.#unloadedRoots.has(run.rootRunId)) throw new AgentError("run_scope_not_loaded", "Root journal is not loaded");
     return run;
   }
 
@@ -580,7 +740,7 @@ export async function assertRunRepositoryConforms(repository: RunRepository): Pr
   const begun = await repository.begin({
     requestedRunId: "conformance-run-1",
     preset: {
-      schemaVersion: 4,
+      schemaVersion: 5,
       presetId: "conformance",
       presetRevision: "1",
       promptFingerprint: "prompt",
@@ -597,12 +757,16 @@ export async function assertRunRepositoryConforms(repository: RunRepository): Pr
         maxReasoningChars: 1_000_000,
         maxToolArgumentChars: 1_000_000,
       },
+      agentTree: {
+        protocolVersion: 1,
+        enabled: false,
+      },
     },
     deadlineAt: null,
     budgets: {
       maxModelAttempts: 1,
       maxInputTokens: null,
-      maxRunOutputTokens: null,
+      maxRunGenerationTokens: null,
       maxReasoningTokens: null,
       maxOutputBytes: 1_000,
       maxOutputEvents: 10,
@@ -712,13 +876,16 @@ function append(
   meter: boolean,
   root: StoredRun = run,
 ): OutputEvent {
-  const existing = run.rootBySourceKey.get(rawDraft.sourceKey);
+  const existing = sourceEvent(run, rawDraft.sourceKey);
   if (existing !== undefined) {
     requireSameEvent(existing, rawDraft, runId);
     return existing;
   }
   const draft = copyDraft(rawDraft);
   validatePlanningProjection(run, draft);
+  if (!Number.isSafeInteger(eventCount(run) + 1) || !Number.isSafeInteger(eventCount(run, true) + 1)) {
+    throw new TypeError("output journal sequence exceeds safe integer range");
+  }
   if (meter) applyBudget(run, root, draft);
   const event: OutputEvent = Object.freeze({
     ...draft,
@@ -727,8 +894,8 @@ function append(
     rootRunId: run.rootRunId,
     agentId: run.agentId,
     parentRunId: run.parentRunId,
-    sequence: run.events.length + 1,
-    rootSequence: run.rootEvents.length + 1,
+    sequence: eventCount(run) + 1,
+    rootSequence: eventCount(run, true) + 1,
     occurredAt: new Date().toISOString(),
   });
   run.events.push(event);
@@ -744,7 +911,7 @@ function append(
 }
 
 function requirePlanningOperation(run: StoredRun, operationId: string): void {
-  const events = run.events.filter((event) => event.payload.operationId === operationId
+  const events = historyEvents(run).filter((event) => event.payload.operationId === operationId
     && (event.kind === "operation.started" || event.kind === "operation.finished"));
   if (events.at(-1)?.kind !== "operation.started" || events.at(-1)?.payload.kind !== "planning") {
     throw new AgentError("planning_scope_conflict", "Planning operation is not active");
@@ -769,13 +936,13 @@ function validatePlanningProjection(run: StoredRun, draft: OutputEventDraft): vo
       : undefined;
     const text = draft.payload.text;
     const completion = typeof invocationId === "string"
-      ? run.events.find((event) => (
+      ? historyEvents(run).find((event) => (
           event.sourceKey === `invocation:${invocationId}:completion`
           && event.kind === "model.completed"
         ))
       : undefined;
     const streamedText = typeof invocationId === "string"
-      ? run.events.filter((event) => (
+      ? historyEvents(run).filter((event) => (
           event.kind === "provider.delta_batch"
           && event.visibility === "private"
           && event.payload.invocationId === invocationId
@@ -814,7 +981,7 @@ function validatePlanningProjection(run: StoredRun, draft: OutputEventDraft): vo
       ? run.invocationReceipts.get(invocationId)
       : undefined;
     const sourceText = typeof invocationId === "string" && Number.isSafeInteger(chunkIndex)
-      ? run.events.filter((event) => (
+      ? historyEvents(run).filter((event) => (
           event.kind === "provider.delta_batch"
           && event.visibility === "private"
           && event.payload.invocationId === invocationId
@@ -871,7 +1038,7 @@ function validatePlanningProjection(run: StoredRun, draft: OutputEventDraft): vo
   requirePlanningOperation(run, scope.operationId);
   // ponytail: bounded replay (1 MiB, 16 projections), shared with Python. Index
   // source spans only if profiling shows persistence needs that complexity.
-  const text = run.events.filter((event) => event.kind === "provider.delta_batch"
+  const text = historyEvents(run).filter((event) => event.kind === "provider.delta_batch"
     && event.payload.invocationId === invocationId).flatMap((event) => (
       event.payload.entries as unknown as readonly { kind: string; payload: { delta?: string } }[]
     )).filter((entry) => entry.kind === "provider.content_delta").map((entry) => entry.payload.delta ?? "").join("");
@@ -945,13 +1112,17 @@ function tokenBudgetKind(run: StoredRun, inclusive: boolean): string | undefined
     usage.unreportedUsageAttempts > 0
     && (
       budgets.maxInputTokens !== null
-      || budgets.maxRunOutputTokens !== null
+      || budgets.maxRunGenerationTokens !== null
       || budgets.maxReasoningTokens !== null
     )
   ) return "provider_usage_unreported";
+  if (
+    usage.unreportedReasoningAttempts > 0
+    && budgets.maxReasoningTokens !== null
+  ) return "reasoning_tokens_unreported";
   const rows = [
     ["input_tokens", usage.inputTokens, budgets.maxInputTokens],
-    ["output_tokens", usage.outputTokens, budgets.maxRunOutputTokens],
+    ["generation_tokens", usage.generationTokens, budgets.maxRunGenerationTokens],
     ["reasoning_tokens", usage.reasoningTokens, budgets.maxReasoningTokens],
   ] as const;
   return rows.find(([, used, maximum]) => (
@@ -993,8 +1164,10 @@ function applyInvocationUsage(run: StoredRun, usage: ModelTokenUsage | undefined
     ? { unreportedUsageAttempts: run.snapshot.usage.unreportedUsageAttempts + 1 }
     : {
         inputTokens: run.snapshot.usage.inputTokens + usage.inputTokens,
-        outputTokens: run.snapshot.usage.outputTokens + (usage.outputTokens ?? 0),
-        reasoningTokens: run.snapshot.usage.reasoningTokens + (usage.reasoningOutputTokens ?? 0),
+        generationTokens: run.snapshot.usage.generationTokens + (usage.generationTokens ?? 0),
+        reasoningTokens: run.snapshot.usage.reasoningTokens + (usage.reasoningTokens ?? 0),
+        unreportedReasoningAttempts: run.snapshot.usage.unreportedReasoningAttempts
+          + (usage.reasoningTokens === undefined ? 1 : 0),
       });
 }
 
@@ -1034,9 +1207,9 @@ export function normalizeRunBudgets(value: RunBudgets): RunBudgets {
   return Object.freeze({
     maxModelAttempts: nullablePositiveBudget(record.maxModelAttempts, "maxModelAttempts"),
     maxInputTokens: nullablePositiveBudget(record.maxInputTokens, "maxInputTokens"),
-    maxRunOutputTokens: nullablePositiveBudget(
-      record.maxRunOutputTokens,
-      "maxRunOutputTokens",
+    maxRunGenerationTokens: nullablePositiveBudget(
+      record.maxRunGenerationTokens,
+      "maxRunGenerationTokens",
     ),
     maxReasoningTokens: nullablePositiveBudget(record.maxReasoningTokens, "maxReasoningTokens"),
     maxOutputBytes: nullablePositiveBudget(record.maxOutputBytes, "maxOutputBytes"),

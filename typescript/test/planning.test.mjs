@@ -8,6 +8,7 @@ import {
   compileWorkPlan,
 } from "purra";
 import { resolvePlanningActivation } from "../dist/planning/activation.js";
+import { testGateway } from "./support/model-gateway.mjs";
 
 const planningFixture = JSON.parse(readFileSync(
   new URL("../../conformance/fixtures/planning_protocol.json", import.meta.url),
@@ -19,14 +20,14 @@ const activationFixture = JSON.parse(readFileSync(
 ));
 
 const RUN_OPTIONS = Object.freeze({
-  budgets: Object.freeze({ maxRunOutputTokens: null }),
+  budgets: Object.freeze({ maxRunGenerationTokens: null }),
 });
 
 test("Reactive Agent never invokes an unrelated Planner", async () => {
   let plannerCalls = 0;
   const planner = { createPlan() { plannerCalls += 1; throw new Error("must not run"); } };
   const agent = new Agent({
-    model: { async invoke() { return finalTurn("reactive"); } },
+    model: testGateway({ async invoke() { return finalTurn("reactive"); } }),
     planning: { planner },
   });
 
@@ -60,7 +61,7 @@ test("Reactive execution bypasses staged planning context even when a Planner is
 });
 
 test("explicit Planned execution fails closed when no Planner is configured", async () => {
-  const agent = new Agent({ model: { async invoke() { throw new Error("must not run"); } } });
+  const agent = new Agent({ model: testGateway({ async invoke() { throw new Error("must not run"); } }) });
   await rejectsCode(agent.invoke(planned("run")), "planning_unavailable");
   await assert.rejects(
     agent.invoke({ messages: [user("run")], planningMode: "automatic" }),
@@ -104,13 +105,13 @@ test("Auto direct answer advertises private control without invoking Planner twi
   let plannerCalls = 0;
   const seenTools = [];
   const agent = new Agent({
-    model: {
+    model: testGateway({
       async invoke(request) {
         modelCalls += 1;
         seenTools.push(request.tools.map((tool) => tool.name));
         return finalTurn("direct");
       },
-    },
+    }),
     planning: {
       planner: {
         createPlan() {
@@ -133,14 +134,14 @@ test("Auto request_plan promotes into the existing governed Planner before effec
   const seenTools = [];
   const publicIntent = "I will inspect the scope before planning the remaining work.";
   const agent = new Agent({
-    model: {
+    model: testGateway({
       async invoke(request) {
         seenTools.push(request.tools.map((tool) => tool.name));
         if (seenTools.length === 1) return callsTurn("request_plan", undefined, publicIntent);
         if (request.messages.at(-1).role === "tool") return finalTurn("planned result");
         return callsTurn("weather_runtime");
       },
-    },
+    }),
     tools: [plannedReadTool("weather_runtime", "weather_lookup", () => {
       toolCalls += 1;
       return { content: { condition: "sunny" }, effectState: "not_started" };
@@ -181,14 +182,14 @@ test("Auto stream emits Provider-authored intent before Planner activation", asy
   const events = [];
   let modelCalls = 0;
   const agent = new Agent({
-    model: {
+    model: testGateway({
       async invoke() {
         modelCalls += 1;
         return modelCalls === 1
           ? callsTurn("request_plan", undefined, "I need a plan for the remaining work.")
           : finalTurn("done");
       },
-    },
+    }),
     planning: {
       planner: {
         createPlan() {
@@ -220,13 +221,13 @@ test("planning-required tool triggers Auto planning and fails closed in Reactive
     planningRequirement: "required",
   };
   const auto = new Agent({
-    model: {
+    model: testGateway({
       async invoke(request) {
         autoModelCalls += 1;
         if (request.messages.at(-1).role === "tool") return finalTurn("done");
         return callsTurn("publish");
       },
-    },
+    }),
     tools: [required],
     planning: {
       planner: {
@@ -245,7 +246,7 @@ test("planning-required tool triggers Auto planning and fails closed in Reactive
 
   let reactiveToolCalls = 0;
   const reactive = new Agent({
-    model: { async invoke() { return callsTurn("publish"); } },
+    model: testGateway({ async invoke() { return callsTurn("publish"); } }),
     tools: [{
       ...required,
       run() {
@@ -267,7 +268,7 @@ test("Auto plans remaining work before a required tool effect", async () => {
   const executed = [];
   let modelCalls = 0;
   const agent = new Agent({
-    model: {
+    model: testGateway({
       async invoke(request) {
         modelCalls += 1;
         if (modelCalls === 1) {
@@ -287,7 +288,7 @@ test("Auto plans remaining work before a required tool effect", async () => {
         if (modelCalls === 3) return callsTurn("publish");
         return finalTurn("done");
       },
-    },
+    }),
     tools: [
       readTool("lookup", () => {
         executed.push("lookup");
@@ -324,7 +325,7 @@ test("Auto model can request a private plan for remaining work", async () => {
   let plannerCalls = 0;
   const executed = [];
   const agent = new Agent({
-    model: {
+    model: testGateway({
       async invoke(request) {
         modelCalls += 1;
         if (modelCalls === 1) return callsTurn("lookup");
@@ -337,7 +338,7 @@ test("Auto model can request a private plan for remaining work", async () => {
         }
         return finalTurn("done");
       },
-    },
+    }),
     tools: [readTool("lookup", () => {
       executed.push("lookup");
       return { content: { ok: true }, effectState: "not_started" };
@@ -371,7 +372,7 @@ test("Auto control is private, strict, and bounded", async () => {
   let toolCalls = 0;
   let plannerCalls = 0;
   const mixed = new Agent({
-    model: { async invoke() { return callsTurnMany(["request_plan", "lookup"]); } },
+    model: testGateway({ async invoke() { return callsTurnMany(["request_plan", "lookup"]); } }),
     tools: [readTool("lookup", () => {
       toolCalls += 1;
       return { content: null, effectState: "not_started" };
@@ -384,7 +385,7 @@ test("Auto control is private, strict, and bounded", async () => {
 
   const exhausted = new Agent({
     maxRounds: 1,
-    model: { async invoke() { return callsTurn("request_plan"); } },
+    model: testGateway({ async invoke() { return callsTurn("request_plan"); } }),
     planning: { planner: { createPlan() { plannerCalls += 1; return { workPlan: weatherPlan() }; } } },
   });
   await rejectsCode(
@@ -398,13 +399,13 @@ test("Auto without Planner performs one direct call and hides unavailable contro
   let calls = 0;
   const seenTools = [];
   const agent = new Agent({
-    model: {
+    model: testGateway({
       async invoke(request) {
         calls += 1;
         seenTools.push(request.tools.map((tool) => tool.name));
         return finalTurn("direct");
       },
-    },
+    }),
   });
   assert.equal((await agent.invoke({ messages: [user("simple")] })).output, "direct");
   assert.equal(calls, 1);
@@ -444,14 +445,14 @@ test("Planned Agent compiles public capability into current private runtime auth
     },
   };
   const agent = new Agent({
-    model: {
+    model: testGateway({
       async invoke(request) {
         modelTools.push(request.tools.map((tool) => tool.name));
         planPrompt ??= request.messages.find((message) => message.attributes?.workPlan)?.content;
         if (request.messages.at(-1).role === "tool") return finalTurn("sunny");
         return callsTurn("weather_runtime");
       },
-    },
+    }),
     tools: [plannedReadTool("weather_runtime", "weather_lookup", () => {
       toolCalls += 1;
       return { content: { condition: "sunny" }, effectState: "not_started" };
@@ -479,7 +480,7 @@ test("invalid and private-tool plans fail before Provider or tool execution", as
   let modelCalls = 0;
   let toolCalls = 0;
   const agent = new Agent({
-    model: { async invoke() { modelCalls += 1; return finalTurn("no"); } },
+    model: testGateway({ async invoke() { modelCalls += 1; return finalTurn("no"); } }),
     tools: [plannedReadTool("private_runtime", "public_capability", () => {
       toolCalls += 1;
       return { content: null, effectState: "not_started" };
@@ -513,13 +514,13 @@ test("normal tool progress does not trigger replanning and future tools stay hid
     },
   };
   const agent = new Agent({
-    model: {
+    model: testGateway({
       async invoke(request) {
         seen.push(request.tools.map((tool) => tool.name));
         const name = request.tools[0]?.name;
         return name === undefined ? finalTurn("done") : callsTurn(name);
       },
-    },
+    }),
     tools: [readTool("first"), readTool("second")],
     planning: { planner },
   });
@@ -547,13 +548,13 @@ test("explicit tool disposition permits one bounded replan without bypassing aut
     },
   };
   const agent = new Agent({
-    model: {
+    model: testGateway({
       async invoke(request) {
         seen.push(request.tools.map((tool) => tool.name));
         const name = request.tools[0]?.name;
         return name === undefined ? finalTurn("done") : callsTurn(name);
       },
-    },
+    }),
     tools: [
       readTool("lookup", () => ({
         content: { changed: true },
@@ -575,11 +576,11 @@ test("explicit tool disposition permits one bounded replan without bypassing aut
 test("replanning cannot bypass tool approval", async () => {
   let protectedCalls = 0;
   const agent = new Agent({
-    model: {
+    model: testGateway({
       async invoke(request) {
         return callsTurn(request.tools[0].name);
       },
-    },
+    }),
     tools: [
       readTool("lookup", () => ({
         content: null,
@@ -613,9 +614,9 @@ test("replanning cannot bypass tool approval", async () => {
 
 test("a revised plan cannot replace completed history", async () => {
   const agent = new Agent({
-    model: {
+    model: testGateway({
       async invoke(request) { return callsTurn(request.tools[0].name); },
-    },
+    }),
     tools: [
       readTool("lookup", () => ({
         content: null,
@@ -689,12 +690,12 @@ test("staged task context is selected only after a valid TaskSpec", async () => 
 test("response validators withhold and repair one bounded candidate", async () => {
   let modelCalls = 0;
   const agent = new Agent({
-    model: {
+    model: testGateway({
       async invoke() {
         modelCalls += 1;
         return finalTurn(modelCalls === 1 ? "bad" : "accepted");
       },
-    },
+    }),
     responseValidation: {
       validators: [{
         validate({ content }) {
@@ -719,7 +720,7 @@ test("Planned recovery corrects one missing and one unauthorized tool call befor
   let currentCalls = 0;
   let futureCalls = 0;
   const agent = new Agent({
-    model: {
+    model: testGateway({
       async invoke() {
         modelCalls += 1;
         if (modelCalls === 1) return finalTurn("omitted");
@@ -727,7 +728,7 @@ test("Planned recovery corrects one missing and one unauthorized tool call befor
         if (modelCalls === 3) return callsTurn("current");
         return finalTurn("done");
       },
-    },
+    }),
     tools: [
       readTool("current", () => {
         currentCalls += 1;
@@ -753,13 +754,13 @@ test("a failed Planned read step consumes recovery authority before replanning",
   let revisions = 0;
   const seenTools = [];
   const agent = new Agent({
-    model: {
+    model: testGateway({
       async invoke(request) {
         seenTools.push(request.tools.map((tool) => tool.name));
         const selected = request.tools[0]?.name;
         return selected === undefined ? finalTurn("done") : callsTurn(selected);
       },
-    },
+    }),
     tools: [
       readTool("primary", () => ({
         content: null,
@@ -896,7 +897,7 @@ function finalTurn(content, request) {
     finishReason: "stop",
     ...(request === undefined
       ? {}
-      : { appliedOutputLimit: request.outputLimit?.maxTokens }),
+      : { appliedGenerationLimit: request.outputBudget?.maxGenerationTokens }),
   };
 }
 
@@ -910,7 +911,7 @@ function callsTurn(name, request, content = "") {
     finishReason: "tool_calls",
     ...(request === undefined
       ? {}
-      : { appliedOutputLimit: request.outputLimit?.maxTokens }),
+      : { appliedGenerationLimit: request.outputBudget?.maxGenerationTokens }),
   };
 }
 
@@ -935,11 +936,11 @@ function objectSchema() {
 
 function capabilities() {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     profileId: "planning-test",
     providerProtocol: "fixture",
     contextWindowTokens: 8_000,
-    maxCallOutputTokens: 1_000,
+    maxGenerationTokens: 1_000,
     thinkingTokenAccounting: "included",
     protocol: {
       reasoningControl: "unavailable",

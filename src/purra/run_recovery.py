@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
-from purra.contracts import AgentDelegation, ExecutionPlan, RunId, RunStatus
+from purra.contracts import ExecutionPlan, RunId, RunStatus
 from purra.events import AgentEvent
 from purra.json_values import freeze_json_mapping
 from purra.normalization import optional_positive_int, required_text
@@ -22,7 +22,6 @@ class RunRecoverySnapshot:
     deadline_at_ms: int | None = None
     agent_preset_snapshot: Mapping[str, Any] = field(default_factory=dict)
     events: tuple[AgentEvent, ...] = ()
-    delegations: tuple[AgentDelegation, ...] = ()
     next_cursor: int = 0
     has_more: bool = False
 
@@ -53,16 +52,7 @@ class RunRecoverySnapshot:
         events = tuple(self.events)
         if any(not isinstance(event, AgentEvent) for event in events):
             raise TypeError("run recovery snapshot events must be AgentEvent values")
-        delegations = tuple(self.delegations)
-        if any(
-            not isinstance(delegation, AgentDelegation)
-            for delegation in delegations
-        ):
-            raise TypeError(
-                "run recovery snapshot delegations must be AgentDelegation values"
-            )
         object.__setattr__(self, "events", events)
-        object.__setattr__(self, "delegations", delegations)
         object.__setattr__(self, "next_cursor", max(0, int(self.next_cursor)))
         object.__setattr__(self, "has_more", bool(self.has_more))
 

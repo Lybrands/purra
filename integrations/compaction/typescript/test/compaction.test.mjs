@@ -8,7 +8,10 @@ const request = { messages, previousSummary: null, compressionRequired: true, av
 test("semantic summary preserves instructions and latest turn; private reasoning is excluded", async () => {
   let calls = 0;
   const hook = new SemanticCompaction({ async complete(input, options) {
-    calls++; assert.equal(options.maxCallOutputTokens, 256); assert.ok(!JSON.stringify(input).includes("private-secret"));
+    calls++; assert.equal(options.resultCapacityTargetTokens, 256);
+    assert.equal(options.resultCapacitySource, "workflow_policy");
+    assert.equal(options.maxGenerationTokens, undefined);
+    assert.ok(!JSON.stringify(input).includes("private-secret"));
     return { turn: { message: { role: "assistant", content: JSON.stringify(summary) }, finishReason: "stop" } };
   } }, { maxSummaryTokens: 256, keepRecentMessages: 1 });
   const result = await hook.compress(request);

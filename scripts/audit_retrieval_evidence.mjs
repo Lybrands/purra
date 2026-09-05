@@ -8,7 +8,7 @@ import {
   estimateMessagesTokens, prepareContext,
 } from "../typescript/dist/index.js";
 
-const OPTIONS = { budgets: { maxRunOutputTokens: null }, deadlineAt: null };
+const OPTIONS = { budgets: { maxRunGenerationTokens: null }, deadlineAt: null };
 const CHILD = {
   name: "evidence-worker", title: "Evidence worker",
   instruction: "Inspect audit evidence.", objective: "Retrieve and report.",
@@ -20,8 +20,8 @@ const HIT = {
   metadata: { evidenceId: "retrieval:audit-source:audit-hit:3" },
 };
 const CAPABILITIES = {
-  schemaVersion: 1, profileId: "audit:model", providerProtocol: "custom",
-  contextWindowTokens: 16_000, maxCallOutputTokens: 512,
+  schemaVersion: 2, profileId: "audit:model", providerProtocol: "custom",
+  contextWindowTokens: 16_000, maxGenerationTokens: 512,
   thinkingTokenAccounting: "unknown",
   protocol: {
     reasoningControl: "selectable", reasoningReplay: "ignored",
@@ -72,7 +72,7 @@ function turn(request, content, toolCalls) {
   return {
     message: { role: "assistant", content, ...(toolCalls === undefined ? {} : { toolCalls }) },
     finishReason: toolCalls === undefined ? "stop" : "tool_calls",
-    appliedOutputLimit: request.outputLimit.maxTokens,
+    appliedGenerationLimit: request.outputBudget.maxGenerationTokens,
   };
 }
 
@@ -86,8 +86,8 @@ export async function captureAutomaticCheckpoint(options = {}) {
     if (request.messages.some((message) => message.role === "tool")) return turn(request, "done");
     return turn(request, "", isChild
       ? [{ id: "audit-search", name: "searchKnowledge", arguments: { query: "evidence" } }]
-      : [{ id: "audit-delegate", name: "delegateToAgents", arguments: { delegations: [{
-        agentName: CHILD.name, title: CHILD.title, instruction: CHILD.instruction, objective: CHILD.objective,
+      : [{ id: "audit-child", name: "delegateToAgents", arguments: { children: [{
+        name: CHILD.name, title: CHILD.title, instruction: CHILD.instruction, objective: CHILD.objective,
       }] } }]);
   }, options);
   const handle = await agent.submit({ messages: [{ role: "user", content: "Audit retrieval." }] }, OPTIONS);

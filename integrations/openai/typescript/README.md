@@ -42,7 +42,7 @@ with those options. Select parameters supported by the chosen model.
 
 ## Behavior
 
-Core resolves the output limit; the gateway applies it to the selected API.
+Core resolves the total-generation limit; the gateway applies it to the selected API.
 SDK retries are disabled so Core controls retry and budget accounting.
 Server-side response storage is disabled.
 

@@ -2,13 +2,19 @@
 
 from purra.model_protocol.capabilities import (
     AssistantContentWithToolCalls,
+    ContinuationKind,
+    ContinuationSafety,
     FeatureSupport,
+    LengthReasonDetail,
     ModelCapabilitySnapshot,
     ModelOutputCapabilities,
     ModelProtocolCapabilities,
     ReasoningControl,
+    ReasoningLimitKind,
     ReasoningReplayPolicy,
+    ReasoningUsageDetail,
     ThinkingTokenAccounting,
+    VisibleOutputReservation,
     generic_capability_snapshot,
 )
 from purra.model_protocol.requirements import (
@@ -17,9 +23,12 @@ from purra.model_protocol.requirements import (
     preflight_capabilities,
 )
 from purra.model_protocol.output_limits import (
-    InvocationOutputLimit,
-    InvocationOutputLimitSource,
-    resolve_invocation_output_limit,
+    GenerationBudgetSource,
+    InvocationOutputBudget,
+    ResultCapacitySource,
+    constrain_output_budget_to_context,
+    require_output_budget_matches_request,
+    resolve_invocation_output_budget,
 )
 
 from purra.model_protocol.termination import (
@@ -30,23 +39,32 @@ from purra.model_protocol.termination import (
 
 __all__ = [
     "AssistantContentWithToolCalls",
+    "ContinuationKind",
+    "ContinuationSafety",
     "FeatureRequirement",
     "FeatureSupport",
-    "InvocationOutputLimit",
-    "InvocationOutputLimitSource",
+    "GenerationBudgetSource",
+    "InvocationOutputBudget",
     "InvocationTermination",
+    "LengthReasonDetail",
     "ModelCapabilitySnapshot",
     "ModelOutputCapabilities",
     "ModelProtocolCapabilities",
     "ModelTermination",
     "ReasoningControl",
+    "ReasoningLimitKind",
     "ReasoningReplayPolicy",
+    "ReasoningUsageDetail",
+    "ResultCapacitySource",
     "TaskCapabilityRequirements",
     "ThinkingTokenAccounting",
+    "VisibleOutputReservation",
     "classify_model_termination",
+    "constrain_output_budget_to_context",
     "generic_capability_snapshot",
     "preflight_capabilities",
-    "resolve_invocation_output_limit",
+    "require_output_budget_matches_request",
+    "resolve_invocation_output_budget",
 ]
 
 from purra.model_protocol.diagnostics import ModelTransportDiagnostics

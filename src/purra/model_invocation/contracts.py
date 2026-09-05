@@ -18,10 +18,16 @@ from purra.contracts import (
 from purra.json_values import freeze_json_mapping
 from purra.json_values import thaw_json_mapping
 from purra.model_protocol import (
-    InvocationOutputLimit,
-    resolve_invocation_output_limit,
+    InvocationOutputBudget,
+    require_output_budget_matches_request,
+    resolve_invocation_output_budget,
 )
-from purra.normalization import optional_positive_int, optional_text, required_text
+from purra.normalization import (
+    optional_non_negative_int,
+    optional_positive_int,
+    optional_text,
+    required_text,
+)
 from purra.planning_stream import PlanningScope, PLANNING_STREAM_SCHEMA
 from purra.output.contracts import AgentOutputIntent, OutputCommitMode
 
@@ -37,6 +43,9 @@ class ModelInvocationContext:
     planning_scope: PlanningScope | None = None
     planning_attempt: int = 0
     tool_argument_limits: Mapping[str, int] = field(default_factory=dict)
+    context_window_tokens: int | None = None
+    safety_reserve_tokens: int | None = None
+    runtime_reserve_tokens: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "run_id", required_text(self.run_id, "run id"))
@@ -75,6 +84,23 @@ class ModelInvocationContext:
         if any(limit <= 0 for limit in limits.values()):
             raise ValueError("tool argument limits must be positive")
         object.__setattr__(self, "tool_argument_limits", freeze_json_mapping(limits))
+        object.__setattr__(
+            self,
+            "context_window_tokens",
+            optional_positive_int(
+                self.context_window_tokens,
+                "model invocation context window tokens",
+            ),
+        )
+        for name in ("safety_reserve_tokens", "runtime_reserve_tokens"):
+            object.__setattr__(
+                self,
+                name,
+                optional_non_negative_int(
+                    getattr(self, name),
+                    f"model invocation {name.replace('_', ' ')}",
+                ),
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,7 +111,7 @@ class AgentModelCall:
     output_protocol: str | None = None
     requires_full_text_validation: bool = False
     reasoning_mode: ReasoningMode = ReasoningMode.DEFAULT
-    output_limit: InvocationOutputLimit | None = None
+    output_budget: InvocationOutputBudget | None = None
     tools: tuple[ToolSchema, ...] = ()
     tool_choice: ToolChoiceMode = ToolChoiceMode.NONE
 
@@ -112,12 +138,17 @@ class AgentModelCall:
             raise ValueError("private output intent cannot be live")
         if not isinstance(self.requires_full_text_validation, bool):
             raise TypeError("full-text validation flag must be a boolean")
-        limit = self.output_limit or resolve_invocation_output_limit(
+        budget = self.output_budget or resolve_invocation_output_budget(
             self.request.capability_snapshot,
-            self.request.options.get("max_tokens"),
+            max_generation_tokens=self.request.max_generation_tokens,
         )
-        if not isinstance(limit, InvocationOutputLimit):
-            raise TypeError("agent model call requires an InvocationOutputLimit")
+        if not isinstance(budget, InvocationOutputBudget):
+            raise TypeError("agent model call requires an InvocationOutputBudget")
+        require_output_budget_matches_request(
+            budget,
+            self.request.capability_snapshot,
+            self.request.max_generation_tokens,
+        )
         tools = tuple(self.tools)
         tool_choice = ToolChoiceMode(self.tool_choice)
         if not tools and tool_choice is ToolChoiceMode.REQUIRED:
@@ -125,7 +156,7 @@ class AgentModelCall:
         object.__setattr__(self, "output_intent", intent)
         object.__setattr__(self, "commit_mode", commit_mode)
         object.__setattr__(self, "reasoning_mode", ReasoningMode(self.reasoning_mode))
-        object.__setattr__(self, "output_limit", limit)
+        object.__setattr__(self, "output_budget", budget)
         object.__setattr__(self, "tools", tools)
         object.__setattr__(self, "tool_choice", tool_choice)
 
@@ -139,7 +170,7 @@ class ModelInvocationReceipt:
     model: str
     output_intent: AgentOutputIntent
     commit_mode: OutputCommitMode
-    output_limit: InvocationOutputLimit
+    output_budget: InvocationOutputBudget
     input_fingerprint: str
     tool_schema_fingerprint: str
     output_protocol: str | None = None
@@ -171,8 +202,8 @@ class ModelInvocationReceipt:
             AgentOutputIntent(self.output_intent),
         )
         object.__setattr__(self, "commit_mode", OutputCommitMode(self.commit_mode))
-        if not isinstance(self.output_limit, InvocationOutputLimit):
-            raise TypeError("invocation receipt requires an output limit")
+        if not isinstance(self.output_budget, InvocationOutputBudget):
+            raise TypeError("invocation receipt requires an output budget")
         object.__setattr__(
             self,
             "input_fingerprint",
@@ -201,6 +232,7 @@ class ModelInvocationReceipt:
 
     def to_mapping(self) -> dict[str, object]:
         return {
+            "schemaVersion": 2,
             "invocationId": self.invocation_id,
             "outputStreamId": self.output_stream_id,
             "runId": self.run_id,
@@ -208,7 +240,7 @@ class ModelInvocationReceipt:
             "model": self.model,
             "outputIntent": self.output_intent.value,
             "commitMode": self.commit_mode.value,
-            "outputLimit": self.output_limit.to_mapping(),
+            "outputBudget": self.output_budget.to_mapping(),
             "inputFingerprint": self.input_fingerprint,
             "toolSchemaFingerprint": self.tool_schema_fingerprint,
             "budgetKey": self.budget_key or self.invocation_id,

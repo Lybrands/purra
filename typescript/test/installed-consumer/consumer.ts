@@ -2,15 +2,14 @@ import {
   Agent,
   AgentCapabilityGrant,
   AgentTreeRunSupervisor,
+  AgentTreePolicy,
   AgentOperationController,
   ArtifactAccessController,
   ArtifactLifecycle,
   DurableExecutorRegistry,
-  DelegationPolicy,
   evaluateAgentRun,
   InMemoryAgentAdapters,
   InMemoryRunTreeRepository,
-  InMemoryDelegationRepository,
   InMemoryLongTaskRepository,
   InMemoryArtifactStore,
   ModelResponseJudge,
@@ -28,13 +27,13 @@ import {
   type ContextCompressionHook,
   type LongTaskDispatchReceipt,
   type ModelGateway,
+  type ModelCapabilitySnapshot,
   type PreparedContextSnapshot,
   type ModelStreamActivity,
   type ModelStreamActivityKind,
   type ModelStreamActivitySupport,
   type ModelStreamItem,
   type ModelStreamLimits,
-  type DelegationRepository,
   type OutputEvent,
   type PlanningMode,
   type ToolPlanningRequirement,
@@ -108,8 +107,9 @@ const typedOperations = new AgentOperationController({
 const typedModelTasks = new ModelTaskRunner({
   model: {
     capabilities: capabilities(),
-    async invoke() {
-      return { message: { role: "assistant", content: "typed" }, finishReason: "stop" };
+    async invoke(request) {
+      return { message: { role: "assistant", content: "typed" }, finishReason: "stop",
+        appliedGenerationLimit: request.outputBudget.maxGenerationTokens };
     },
   },
   runId: "typed-managed-run",
@@ -133,21 +133,26 @@ const model: ModelGateway = {
   async invoke() {
     throw new Error("stream should be used");
   },
-  async *stream() {
-    round += 1;
-    if (round === 1) {
-      yield {
-        toolCallDeltas: [{
-          index: 0,
-          id: "call-1",
-          name: "lookup",
-          argumentsFragment: "{\"key\":\"installed\"}",
-        }],
-        finishReason: "tool_calls",
-      };
-      return;
-    }
-    yield { contentDelta: "installed", finishReason: "stop" };
+  stream(request) {
+    return {
+      appliedGenerationLimit: request.outputBudget.maxGenerationTokens,
+      async *[Symbol.asyncIterator]() {
+        round += 1;
+        if (round === 1) {
+          yield {
+            toolCallDeltas: [{
+              index: 0,
+              id: "call-1",
+              name: "lookup",
+              argumentsFragment: "{\"key\":\"installed\"}",
+            }],
+            finishReason: "tool_calls" as const,
+          };
+          return;
+        }
+        yield { contentDelta: "installed", finishReason: "stop" as const };
+      },
+    };
   },
 };
 
@@ -220,7 +225,7 @@ const handle: RunHandle = await new Agent({
   messages: [{ role: "user", content: "hello" }],
   planningMode: "planned",
 }, {
-  budgets: { maxRunOutputTokens: null },
+  budgets: { maxRunGenerationTokens: null },
 });
 const result = await handle.result;
 result.output satisfies JsonValue;
@@ -277,7 +282,7 @@ const durableReceipt: LongTaskDispatchReceipt = await durableDispatcher.dispatch
   budgets: {
     maxModelAttempts: 2,
     maxInputTokens: 100,
-    maxRunOutputTokens: 100,
+    maxRunGenerationTokens: 100,
     maxReasoningTokens: 100,
     maxOutputBytes: 1_000,
     maxOutputEvents: 100,
@@ -343,20 +348,10 @@ if (finalizedArtifact.status !== "finalized") {
   throw new Error(`unexpected artifact status: ${finalizedArtifact.status}`);
 }
 
-const delegationRepository: DelegationRepository = new InMemoryDelegationRepository();
-new DelegationPolicy({ maxAgentsPerCall: 1, maxParallel: 1 }).snapshot().contextMode satisfies "isolated";
-const delegationBatch = await delegationRepository.createBatch({
-  runId: "typed-root-run",
-  batchId: "typed-delegation-batch",
-  idempotencyKey: "typed-delegation-call",
-  delegations: [{
-    agentName: "typed",
-    title: "Typed delegate",
-    instruction: "Verify the installed TypeScript contracts.",
-    objective: "compile delegation",
-  }],
-});
-delegationBatch.delegations[0]!.contextMode satisfies "isolated";
+new AgentTreePolicy({
+  maxChildrenPerCall: 1,
+  maxParallelRuns: 1,
+}).snapshot().allowsRecursiveAgents satisfies boolean;
 
 const treeRepository = new InMemoryRunTreeRepository();
 let treeCommands: RunCommandService;
@@ -445,13 +440,13 @@ if ((await treeRepository.listDescendants(treeRoot.runId)).length !== 4) {
   throw new Error("installed Agent tree did not recurse and continue");
 }
 
-function capabilities() {
+function capabilities(): ModelCapabilitySnapshot {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     profileId: "installed",
     providerProtocol: "custom",
     contextWindowTokens: 16_000,
-    maxCallOutputTokens: 512,
+    maxGenerationTokens: 512,
     thinkingTokenAccounting: "unknown" as const,
     protocol: {
       reasoningControl: "selectable" as const,

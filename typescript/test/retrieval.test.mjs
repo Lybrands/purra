@@ -12,6 +12,7 @@ import {
 } from "purra";
 import * as publicApi from "purra";
 import { ToolCatalog } from "../dist/tools/catalog.js";
+import { testGateway } from "./support/model-gateway.mjs";
 
 const fixture = JSON.parse(readFileSync(
   new URL("../../conformance/fixtures/retrieval.json", import.meta.url),
@@ -33,7 +34,7 @@ test("RetrieverTool exposes one stable read-only ToolDefinition", () => {
   assert.equal("createRetrieverTool" in publicApi, false);
 
   assert.doesNotThrow(() => new Agent({
-    model: completion("done"),
+    model: testGateway(completion("done")),
     tools: [tool.definition],
   }));
 });
@@ -118,7 +119,7 @@ test("RetrieverTool persists versioned evidence and blocks a stale follow-up mod
   let modelCalls = 0;
   const validations = [];
   const agent = new Agent({
-    model: {
+    model: testGateway({
       async invoke() {
         modelCalls += 1;
         return modelCalls === 1
@@ -129,7 +130,7 @@ test("RetrieverTool persists versioned evidence and blocks a stale follow-up mod
             }])
           : finalTurn("unsafe");
       },
-    },
+    }),
     tools: [tool.definition],
     evidenceValidator: {
       validateEvidence(receipts) {
@@ -184,11 +185,11 @@ test("the model cannot provide host-owned retrieval fields", async () => {
   ];
   for (const [index, argumentsValue] of invalidArguments.entries()) {
     const agent = new Agent({
-      model: calls([{
+      model: testGateway(calls([{
         id: `forbidden-${index}`,
         name: tool.definition.name,
         arguments: argumentsValue,
-      }]),
+      }])),
       tools: [tool.definition],
     });
     await rejectsCode(agent.invoke(runInput()), "invalid_tool_arguments_schema");
@@ -224,14 +225,14 @@ test("unknown retrieval failures use the existing Tool boundary", async () => {
     async retrieve() { throw new Error("secret-token-/private/path"); },
   });
   const agent = new Agent({
-    model: {
+    model: testGateway({
       async invoke(request) {
         requests.push(request);
         return requests.length === 1
           ? callsTurn([{ id: "one", name: tool.definition.name, arguments: { query: "canon" } }])
           : finalTurn("recovered");
       },
-    },
+    }),
     tools: [tool.definition],
   });
 
@@ -351,12 +352,12 @@ test("canceled retrieval discards late results without another model call", { ti
     },
   });
   const agent = new Agent({
-    model: {
+    model: testGateway({
       async invoke() {
         modelCalls += 1;
         return callsTurn([{ id: "cancel-call", name: tool.definition.name, arguments: { query: "canon" } }]);
       },
-    },
+    }),
     tools: [tool.definition],
   });
   const running = agent.invoke({ ...runInput(), signal: controller.signal });
@@ -390,14 +391,14 @@ test("model observations preserve source identity without promoting retrieved in
   const requests = [];
   const tool = retrieverTool({ async retrieve() { return fixture.successCase.hits; } });
   const agent = new Agent({
-    model: {
+    model: testGateway({
       async invoke(request) {
         requests.push(request);
         return requests.length === 1
           ? callsTurn([{ id: "evidence-call", name: tool.definition.name, arguments: { query: "canon" } }])
           : finalTurn("done");
       },
-    },
+    }),
     tools: [tool.definition],
   });
   await agent.invoke(runInput());

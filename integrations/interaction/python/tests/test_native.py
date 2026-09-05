@@ -17,10 +17,14 @@ class Gateway:
         answered = any('Answers to requested' in m.content for m in messages)
         async def chunks():
             if answered:
-                yield ModelStreamChunk(content_delta="Finished with the answer", finish_reason="stop", usage=ModelTokenUsage(input_tokens=5, output_tokens=7))
+                yield ModelStreamChunk(content_delta="Finished with the answer", finish_reason="stop", usage=ModelTokenUsage(input_tokens=5, generation_tokens=7))
             else:
-                yield ModelStreamChunk(tool_call_deltas=(ToolCallDelta(index=0, id="ask-1", name="request_user_input", arguments_fragment='{"questions":[{"id":"length","prompt":"篇幅？","choices":["短","长"],"allowFreeform":false}]}'),), finish_reason="tool_calls", usage=ModelTokenUsage(input_tokens=10, output_tokens=20))
-        return ModelStream(chunks=chunks(), model="fixture", applied_output_limit=invocation.output_limit.max_tokens)
+                yield ModelStreamChunk(tool_call_deltas=(ToolCallDelta(index=0, id="ask-1", name="request_user_input", arguments_fragment='{"questions":[{"id":"length","prompt":"篇幅？","choices":["短","长"],"allowFreeform":false}]}'),), finish_reason="tool_calls", usage=ModelTokenUsage(input_tokens=10, generation_tokens=20))
+        return ModelStream(
+            chunks=chunks(),
+            model="fixture",
+            applied_generation_limit=invocation.output_budget.max_generation_tokens,
+        )
 
 
 def compose(path, *, max_attempts=64):
@@ -30,9 +34,9 @@ def compose(path, *, max_attempts=64):
     core = AgentCore(model_gateway=gateway, run_repository=storage.runs,
         output_repository=storage.outputs, output_publisher=storage.publisher, execution_lease_store=storage.leases,
         preset=AgentPreset(id="sqlite", revision="1", tool_catalog=InMemoryToolCatalog((interaction.registration,)),
-                           runtime_limits=RuntimeLimits(max_run_output_tokens=100, max_model_invocation_attempts=max_attempts)))
+                           runtime_limits=RuntimeLimits(max_run_generation_tokens=100, max_model_invocation_attempts=max_attempts)))
     request = AgentRunRequest(messages=(AgentMessage("user", "Write"),),
-        model=ModelRequest("fixture", "fixture", replace(generic_capability_snapshot(), max_call_output_tokens=32)),
+        model=ModelRequest("fixture", "fixture", replace(generic_capability_snapshot(), max_generation_tokens=32)),
         domain_context=DomainContext("fixture"), context_window=65536, tools_enabled=True, planning_mode="reactive")
     return storage, interaction, gateway, core, request
 
@@ -65,7 +69,7 @@ async def test_question_restart_answer_resume_preserves_budget_and_output(tmp_pa
         async with storage.transaction() as adapters:
             run = adapters.runs._state.runs[run_id]
             assert len(run.model_attempt_ids) == 3
-            assert sum(u.output_tokens for u in run.model_usage_by_invocation.values() if u) == 34
+            assert sum(u.generation_tokens for u in run.model_usage_by_invocation.values() if u) == 34
         events = await storage.outputs.list_events(run_id, after_sequence=0)
         assert events[:len(before)] == before
         assert sum(e.payload.get("type") == "input.required" for e in events) == 1
@@ -120,5 +124,4 @@ async def test_concurrent_resume_has_one_execution_owner(tmp_path):
         assert (await resumed.wait()).status.value == "done"
     finally:
         release.set(); await core.close(); storage.close()
-
 

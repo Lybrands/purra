@@ -139,9 +139,9 @@ export class Transport {
       const { message, finish_reason: finishReason } = raw.choices[0];
       if (finishReason !== "stop" || message.tool_calls?.length || message.role !== "assistant" || typeof message.content !== "string") throw Error();
       const usage = raw.usage?.prompt_tokens == null || raw.usage?.completion_tokens == null ? undefined
-        : { inputTokens: raw.usage.prompt_tokens, outputTokens: raw.usage.completion_tokens };
-      if (usage && usage.outputTokens > cap) throw Error();
-      return { message: { role: "assistant", content: message.content }, finishReason, appliedOutputLimit: cap, ...(usage ? { usage } : {}) };
+        : { inputTokens: raw.usage.prompt_tokens, generationTokens: raw.usage.completion_tokens };
+      if (usage && usage.generationTokens > cap) throw Error();
+      return { message: { role: "assistant", content: message.content }, finishReason, appliedGenerationLimit: cap, ...(usage ? { usage } : {}) };
     } catch { throw new EvaluationError("invalid_chat_response"); }
   }
   async embed(texts, signal) {
@@ -162,7 +162,7 @@ export async function evaluateCase(test, fixture, root, transport, index) {
   const checks = {}, ledgers = [];
   let decisions = [], relevant = new Set();
   const dims = transport.config.embedding.dimensions;
-  const providers = { budget: { key: "trial", maxLlmCalls: 4, maxEmbeddingCalls: 20, maxInputChars: 150_000, maxOutputTokens: 8192, maxCallOutputTokens: 2048 },
+  const providers = { budget: { key: "trial", maxLlmCalls: 4, maxEmbeddingCalls: 20, maxInputChars: 150_000, maxOutputTokens: 8192, resultCapacityTargetTokens: 2048 },
     complete: transport.complete.bind(transport), embed: transport.embed.bind(transport) };
   mkdirSync(root);
   async function openMemory(other = false) {

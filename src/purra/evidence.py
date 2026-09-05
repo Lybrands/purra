@@ -132,10 +132,10 @@ class RunEvidenceStore:
     def get(self, evidence_id: str) -> EvidenceRecord | None:
         return self._records.get(str(evidence_id or "").strip())
 
-    def resolve_delegation(self, tool_call_id: str, content: str) -> None:
+    def resolve_child_runs(self, tool_call_id: str, content: str) -> None:
         record = self._records[f"tool:{tool_call_id}"]
         if record.tool_name != "delegateToAgents":
-            raise ValueError("Only a delegation receipt can be resolved")
+            raise ValueError("Only a Child Run receipt can be resolved")
         tokens = estimate_text_tokens(content)
         self._records[record.evidence_id] = replace(record, content=content, token_estimate=tokens)
         receipt = self._tool_result_receipts[tool_call_id]

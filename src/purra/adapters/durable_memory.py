@@ -829,6 +829,7 @@ class InMemoryLongTaskRepository:
                 return None
             now = self._clock_ms()
             normalized_expired = False
+            failed_required_unit_id: str | None = None
             for unit_id, unit in tuple(state.units.items()):
                 if (
                     unit.status in {
@@ -840,13 +841,18 @@ class InMemoryLongTaskRepository:
                 ):
                     state.units[unit_id] = replace(
                         unit,
-                        status=LongTaskUnitStatus.BLOCKED,
+                        status=LongTaskUnitStatus.FAILED,
                         worker_id=None,
                         lease_expires_at_ms=None,
                         error_code="lease_expired_attempts_exhausted",
                     )
                     normalized_expired = True
+                    if unit.required and failed_required_unit_id is None:
+                        failed_required_unit_id = unit_id
             if normalized_expired:
+                if failed_required_unit_id is not None:
+                    self._fail_task(state, failed_required_unit_id)
+                    return None
                 self._touch(state)
             active = sum(
                 unit.status in {
@@ -1045,7 +1051,6 @@ class InMemoryLongTaskRepository:
                 FailureDisposition.RETRY_ATTEMPT: LongTaskUnitStatus.WAITING_RETRY,
                 FailureDisposition.RESUME_CHECKPOINT: LongTaskUnitStatus.WAITING_RETRY,
                 FailureDisposition.SPLIT_PART: LongTaskUnitStatus.NEEDS_SPLIT,
-                FailureDisposition.PAUSE_RECOVERABLE: LongTaskUnitStatus.BLOCKED,
                 FailureDisposition.CANCEL: LongTaskUnitStatus.CANCELED,
                 FailureDisposition.FAIL_PERMANENT: LongTaskUnitStatus.FAILED,
             }
@@ -1310,7 +1315,25 @@ class InMemoryLongTaskRepository:
             ):
                 self._set_status(state, LongTaskStatus.COMPLETED)
             elif not self._has_runnable_work(state):
-                self._set_status(state, LongTaskStatus.PAUSED)
+                stranded = next(
+                    (
+                        unit
+                        for unit in required
+                        if unit.status is not LongTaskUnitStatus.COMPLETED
+                    ),
+                    None,
+                )
+                if stranded is not None:
+                    state.units[stranded.id] = replace(
+                        stranded,
+                        status=LongTaskUnitStatus.FAILED,
+                        worker_id=None,
+                        lease_expires_at_ms=None,
+                        error_code=(
+                            stranded.error_code or "long_task_no_runnable_work"
+                        ),
+                    )
+                    self._fail_task(state, stranded.id)
             return state.record
 
     async def recover_after_restart(
@@ -1447,7 +1470,7 @@ class InMemoryLongTaskRepository:
                 value.unreported_usage_attempts for value in values
             ),
             input_tokens=sum(value.input_tokens for value in values),
-            output_tokens=sum(value.output_tokens for value in values),
+            generation_tokens=sum(value.generation_tokens for value in values),
             reasoning_tokens=(
                 None
                 if any(value.reasoning_tokens is None for value in values)
@@ -1653,7 +1676,7 @@ class InMemoryLongTaskRepository:
             limit is not None
             for limit in (
                 limits.max_input_tokens,
-                limits.max_run_output_tokens,
+                limits.max_run_generation_tokens,
                 limits.max_reasoning_tokens,
             )
         ):
@@ -1664,9 +1687,9 @@ class InMemoryLongTaskRepository:
             ("model_attempts", usage.invocation_count, limits.max_invocation_attempts),
             ("input_tokens", usage.input_tokens, limits.max_input_tokens),
             (
-                "output_tokens",
-                usage.output_tokens,
-                limits.max_run_output_tokens,
+                "generation_tokens",
+                usage.generation_tokens,
+                limits.max_run_generation_tokens,
             ),
             ("reasoning_tokens", usage.reasoning_tokens, limits.max_reasoning_tokens),
         ):

@@ -43,7 +43,11 @@ def dumps(value):
 
 
 def loads(text):
-    registry = _types()
+    return next(load_many((text,)))
+
+
+def load_many(texts):
+    registry = None
     def decode(row):
         kind = row[0]
         if kind == "value": return row[1]
@@ -53,4 +57,7 @@ def loads(text):
         if kind == "map": return {decode(k): decode(v) for k, v in row[1]}
         constructors = {"list": list, "tuple": tuple, "set": set, "frozenset": frozenset}
         return constructors[kind](decode(v) for v in row[1])
-    return decode(json.loads(text))
+    for text in texts:
+        if registry is None:
+            registry = _types()
+        yield decode(json.loads(text))

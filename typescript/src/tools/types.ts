@@ -23,7 +23,6 @@ export interface ToolContext {
   readonly parentRunId?: string;
   readonly leaseOwnerId?: string;
   readonly leaseEpoch?: number;
-  readonly enabledTools?: readonly string[];
 }
 
 export interface ToolHandlerResult {

@@ -1,6 +1,6 @@
 {
-  "protocolVersion": 4,
-  "agentPresetSnapshotVersion": 4,
+  "protocolVersion": 5,
+  "agentPresetSnapshotVersion": 5,
   "runtimeDefaults": {
     "providerActivityIdleTimeoutMs": 30000,
     "providerProgressIdleTimeoutMs": 60000,
@@ -30,13 +30,13 @@
         "invocationCount": 2,
         "unreportedUsageAttempts": 0,
         "inputTokens": 0,
-        "outputTokens": 0,
+        "generationTokens": 0,
         "reasoningTokens": 0
       },
       "limits": {
         "maxInvocationAttempts": 2,
         "maxInputTokens": null,
-        "maxRunOutputTokens": null,
+        "maxRunGenerationTokens": null,
         "maxReasoningTokens": null
       },
       "inclusive": true,
@@ -48,17 +48,35 @@
         "invocationCount": 1,
         "unreportedUsageAttempts": 0,
         "inputTokens": 6,
-        "outputTokens": 1,
+        "generationTokens": 1,
         "reasoningTokens": 0
       },
       "limits": {
         "maxInvocationAttempts": null,
         "maxInputTokens": 5,
-        "maxRunOutputTokens": null,
+        "maxRunGenerationTokens": null,
         "maxReasoningTokens": null
       },
       "inclusive": false,
       "budgetKind": "input_tokens"
+    },
+    {
+      "name": "authoritative generation usage may cross its maximum",
+      "usage": {
+        "invocationCount": 1,
+        "unreportedUsageAttempts": 0,
+        "inputTokens": 1,
+        "generationTokens": 6,
+        "reasoningTokens": 0
+      },
+      "limits": {
+        "maxInvocationAttempts": null,
+        "maxInputTokens": null,
+        "maxRunGenerationTokens": 5,
+        "maxReasoningTokens": null
+      },
+      "inclusive": false,
+      "budgetKind": "generation_tokens"
     },
     {
       "name": "missing usage cannot prove a finite token budget",
@@ -66,13 +84,13 @@
         "invocationCount": 1,
         "unreportedUsageAttempts": 1,
         "inputTokens": 0,
-        "outputTokens": 0,
+        "generationTokens": 0,
         "reasoningTokens": 0
       },
       "limits": {
         "maxInvocationAttempts": null,
         "maxInputTokens": 5,
-        "maxRunOutputTokens": null,
+        "maxRunGenerationTokens": null,
         "maxReasoningTokens": null
       },
       "inclusive": false,

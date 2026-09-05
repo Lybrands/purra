@@ -10,7 +10,7 @@ const operation = memory.add("A fact", { source: { id: "source", revision: "1" }
 void [tool, context, operation];
 
 declare const runner: ModelTaskRunner;
-const budget: MemoryBudget = { key: "run-1", maxLlmCalls: 2, maxEmbeddingCalls: 8, maxInputChars: 10_000, maxOutputTokens: 512, maxCallOutputTokens: 256 };
+const budget: MemoryBudget = { key: "run-1", maxLlmCalls: 2, maxEmbeddingCalls: 8, maxInputChars: 10_000, maxOutputTokens: 512, resultCapacityTargetTokens: 256 };
 const managedClient = await createManagedClient({ embeddingDims: 2, config: {
   vectorStore: { provider: "memory", config: { dimension: 2, dbPath: "/host/vectors.db" } }, historyDbPath: "/host/history.db",
 } });

@@ -11,7 +11,7 @@
 | `tool_security.json`、`retrieval.json` | 工具 Schema、检索结果与访问边界 |
 | `planning_protocol.json`、`planning_activation.json`、`planning_stream.json` | 计划、激活模式与公开进度流 |
 | `durable_protocol.json`、`recovery_protocol.json` | 持久执行与恢复 |
-| `agent_tree_protocol.json`、`delegation_protocol.json` | Agent 身份、委派与共享预算 |
+| `agent_tree_protocol.json` | Agent 身份、Child Run 与共享预算 |
 | `artifact_protocol.json`、`observability_protocol.json` | 产物、事件与诊断 |
 
 ## 运行

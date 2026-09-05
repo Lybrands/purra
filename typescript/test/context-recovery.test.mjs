@@ -130,9 +130,9 @@ test("recovery recomputes its input budget using the rebound model and output re
   const captured = await captureAutomaticCheckpoint({ compression: false });
   const recovered = await replayCheckpoint(captured, {
     compression: false,
-    capabilities: { ...captured.capabilities, maxCallOutputTokens: 8_000 },
+    capabilities: { ...captured.capabilities, maxGenerationTokens: 8_000 },
   });
-  assert.equal(recovered.report.errorCode, "fixed_reserves_exceed_window");
+  assert.equal(recovered.report.errorCode, "minimum_context_demand_exceeds_pool");
   assert.equal(recovered.report.modelCalls, 0);
   assert.equal(recovered.report.contextProviderCalls, 0);
 });

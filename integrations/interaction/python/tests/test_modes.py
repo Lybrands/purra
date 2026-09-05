@@ -2,10 +2,16 @@ import asyncio
 import json
 from dataclasses import replace
 import pytest
-from purra.api import AgentCore, UserInputRequired
+from purra.api import (
+    AgentComponentBinding,
+    AgentCore,
+    AgentPreset,
+    ExecutionProfile,
+    UserInputRequired,
+)
 from purra.contracts import (AgentMessage, AgentRunRequest, DomainContext, ModelRequest, ModelStream,
     ModelStreamChunk, ToolCallDelta, ModelTokenUsage, RuntimeLimits, PlanningResult, WorkPlan, WorkStep)
-from purra.delegation import DelegationPolicy
+from purra.agent_tree_policy import AgentTreePolicy
 from purra.model_protocol import generic_capability_snapshot
 from purra.tools import InMemoryToolCatalog
 from purra_sqlite import SqliteAgentAdapters
@@ -33,9 +39,13 @@ class Gateway:
         async def chunks():
             if isinstance(result, tuple):
                 name, args = result
-                yield ModelStreamChunk(tool_call_deltas=(ToolCallDelta(index=0, id=f"call-{sum(len(m.tool_calls) for m in messages) + 1}", name=name, arguments_fragment=json.dumps(args)),), finish_reason="tool_calls", usage=ModelTokenUsage(input_tokens=2, output_tokens=2))
-            else: yield ModelStreamChunk(content_delta=result, finish_reason="stop", usage=ModelTokenUsage(input_tokens=2, output_tokens=2))
-        return ModelStream(chunks=chunks(), model="fixture", applied_output_limit=invocation.output_limit.max_tokens)
+                yield ModelStreamChunk(tool_call_deltas=(ToolCallDelta(index=0, id=f"call-{sum(len(m.tool_calls) for m in messages) + 1}", name=name, arguments_fragment=json.dumps(args)),), finish_reason="tool_calls", usage=ModelTokenUsage(input_tokens=2, generation_tokens=2))
+            else: yield ModelStreamChunk(content_delta=result, finish_reason="stop", usage=ModelTokenUsage(input_tokens=2, generation_tokens=2))
+        return ModelStream(
+            chunks=chunks(),
+            model="fixture",
+            applied_generation_limit=invocation.output_budget.max_generation_tokens,
+        )
 
 def answered(messages): return any(isinstance(m.content, str) and "Answers to requested" in m.content for m in messages)
 
@@ -48,13 +58,27 @@ def compose(path, script, planner=None, tree=False, replan=False):
             return replace(await original(*args, **kwargs), planning_disposition="replan")
         interaction.registration = replace(interaction.registration, handler=question)
     gateway = Gateway(script)
+    profile = ExecutionProfile(planner=planner)
+    bindings = (
+        {"planner": AgentComponentBinding("interaction.planner", "1")}
+        if planner is not None
+        else {}
+    )
     core = AgentCore(model_gateway=gateway, run_repository=storage.runs, output_repository=storage.outputs,
         output_publisher=storage.publisher, execution_lease_store=storage.leases,
-        tool_catalog=InMemoryToolCatalog((interaction.registration,)), planner=planner,
-        runtime_limits=RuntimeLimits(max_run_output_tokens=1000),
         run_tree_repository=storage.run_tree if tree else None,
-        delegation_policy=DelegationPolicy(allow_recursive_delegation=True) if tree else None)
-    request = AgentRunRequest(messages=(AgentMessage("user", "Root task"),), model=ModelRequest("fixture", "fixture", replace(generic_capability_snapshot(), max_call_output_tokens=32)),
+        preset=AgentPreset(
+            id="interaction-modes",
+            revision="1",
+            tool_catalog=InMemoryToolCatalog((interaction.registration,)),
+            runtime_limits=RuntimeLimits(max_run_generation_tokens=1000),
+            execution_profile=profile,
+            component_bindings=bindings,
+            agent_tree_policy=(
+                AgentTreePolicy(allow_recursive_agents=True) if tree else None
+            ),
+        ))
+    request = AgentRunRequest(messages=(AgentMessage("user", "Root task"),), model=ModelRequest("fixture", "fixture", replace(generic_capability_snapshot(), max_generation_tokens=32)),
         domain_context=DomainContext("fixture"), context_window=65536, tools_enabled=True)
     return storage, interaction, gateway, core, request
 
@@ -96,7 +120,7 @@ def tree_script(messages, count):
     if instruction in {"root", "middle"}:
         if not delegated:
             names = ["middle", "sibling"] if instruction == "root" else ["leaf"]
-            return "delegateToAgents", {"delegations": [{"agentName": name, "title": name, "instruction": name, "objective": name} for name in names]}
+            return "delegateToAgents", {"children": [{"name": name, "title": name, "instruction": name, "objective": name} for name in names]}
         for m in messages:
             if m.role.value == "tool" and '"pendingRunIds"' in m.content: assert not json.loads(m.content)["pendingRunIds"]
         return "Tree finished"

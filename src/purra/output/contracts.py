@@ -59,7 +59,6 @@ class OutputChannel(StrEnum):
     LIFECYCLE = "lifecycle"
     ERROR = "error"
     DIAGNOSTIC = "diagnostic"
-    DELEGATION = "delegation"
 
 
 class OutputVisibility(StrEnum):
@@ -87,7 +86,6 @@ class OutputEventKind(StrEnum):
     RUN_VALIDATED_RESULT = "run.validated_result"
     TOOL = "tool.event"
     DOMAIN_EFFECT = "domain.effect"
-    DELEGATION = "delegation.event"
     RUNTIME = "runtime.event"
 
 
@@ -578,56 +576,6 @@ class RuntimeOutputEvent:
         )
         object.__setattr__(self, "payload", freeze_json_mapping(self.payload))
         object.__setattr__(self, "turn_id", optional_text(self.turn_id))
-        _require_aware(self.occurred_at, "occurred_at")
-
-
-@dataclass(frozen=True, slots=True)
-class DelegationOutputEvent:
-    event_id: str
-    run_id: RunId
-    batch_id: str
-    delegation_id: str
-    status: str
-    agent_name: str
-    agent_title: str | None
-    objective: str
-    error_code: str | None
-    occurred_at: datetime
-
-    def __post_init__(self) -> None:
-        for attribute, label in (
-            ("event_id", "delegation output event id"),
-            ("run_id", "delegation Root Run id"),
-            ("batch_id", "delegation batch id"),
-            ("delegation_id", "delegation id"),
-            ("agent_name", "delegation agent name"),
-            ("objective", "delegation objective"),
-        ):
-            object.__setattr__(
-                self,
-                attribute,
-                required_text(getattr(self, attribute), label),
-            )
-        status = required_text(self.status, "delegation status")
-        if status not in {
-            "queued",
-            "running",
-            "done",
-            "failed",
-            "canceled",
-        }:
-            raise ValueError("invalid delegation output status")
-        object.__setattr__(self, "status", status)
-        object.__setattr__(
-            self,
-            "agent_title",
-            optional_text(self.agent_title),
-        )
-        object.__setattr__(
-            self,
-            "error_code",
-            optional_text(self.error_code),
-        )
         _require_aware(self.occurred_at, "occurred_at")
 
 

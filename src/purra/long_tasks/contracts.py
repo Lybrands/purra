@@ -88,15 +88,15 @@ class LongTaskUsage:
     invocation_count: int = 0
     unreported_usage_attempts: int = 0
     input_tokens: int = 0
-    output_tokens: int = 0
-    reasoning_tokens: int | None = 0
+    generation_tokens: int = 0
+    reasoning_tokens: int | None = None
 
     def __post_init__(self) -> None:
         for name in (
             "invocation_count",
             "unreported_usage_attempts",
             "input_tokens",
-            "output_tokens",
+            "generation_tokens",
         ):
             object.__setattr__(
                 self,
@@ -122,7 +122,7 @@ class LongTaskUsage:
             "invocationCount": self.invocation_count,
             "unreportedUsageAttempts": self.unreported_usage_attempts,
             "inputTokens": self.input_tokens,
-            "outputTokens": self.output_tokens,
+            "generationTokens": self.generation_tokens,
             "reasoningTokens": self.reasoning_tokens,
         }
 
@@ -133,14 +133,14 @@ class LongTaskBudgetLimits:
 
     max_invocation_attempts: int | None = None
     max_input_tokens: int | None = None
-    max_run_output_tokens: int | None = None
+    max_run_generation_tokens: int | None = None
     max_reasoning_tokens: int | None = None
 
     def __post_init__(self) -> None:
         for name in (
             "max_invocation_attempts",
             "max_input_tokens",
-            "max_run_output_tokens",
+            "max_run_generation_tokens",
             "max_reasoning_tokens",
         ):
             object.__setattr__(
@@ -156,8 +156,8 @@ class LongTaskBudgetLimits:
         return {
             "maxInvocationAttempts": self.max_invocation_attempts,
             "maxInputTokens": self.max_input_tokens,
-            "maxRunOutputTokens": (
-                self.max_run_output_tokens
+            "maxRunGenerationTokens": (
+                self.max_run_generation_tokens
             ),
             "maxReasoningTokens": self.max_reasoning_tokens,
         }

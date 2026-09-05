@@ -11,7 +11,6 @@ import type {
 import { AgentCanceledError, AgentError } from "../shared/errors.js";
 import { stableFingerprint } from "../shared/fingerprint.js";
 import type { ToolExecutionEvent } from "../tools/types.js";
-import type { DelegationLifecycleEvent } from "../delegation/types.js";
 import { normalizeRunSnapshot, type RunRepository } from "./store.js";
 import type {
   AgentExecutionCheckpoint,
@@ -236,13 +235,13 @@ export class RunSession {
       toolFingerprint,
       evidenceFingerprint,
       capabilityProfileId: input.capabilityProfileId,
-      outputLimit: input.outputLimit,
+      outputBudget: input.outputBudget,
       ...(input.outputProtocol === undefined ? {} : { outputProtocol: input.outputProtocol }),
       ...(input.planningScope === undefined ? {} : { planningScope: input.planningScope }),
       ...(input.planningAttempt === undefined ? {} : { planningAttempt: input.planningAttempt }),
     }));
     const opened = await this.#repository.openInvocation(this.#runId, {
-      schemaVersion: 1,
+      schemaVersion: 2,
       runId: this.#runId,
       invocationId,
       messageFingerprint,
@@ -251,7 +250,7 @@ export class RunSession {
       evidenceFingerprint,
       contextEvidence: Object.freeze(input.evidence.map((receipt) => Object.freeze({ ...receipt }))),
       capabilityProfileId: input.capabilityProfileId,
-      outputLimit: input.outputLimit,
+      outputBudget: input.outputBudget,
       ...(input.outputProtocol === undefined ? {} : { outputProtocol: input.outputProtocol }),
       ...(input.planningScope === undefined ? {} : { planningScope: input.planningScope }),
       ...(input.planningAttempt === undefined ? {} : { planningAttempt: input.planningAttempt }),
@@ -344,9 +343,9 @@ export class RunSession {
         ...(turn.message.reasoning === undefined ? {} : { reasoning: turn.message.reasoning }),
         ...(turn.message.toolCalls === undefined ? {} : { toolCalls: turn.message.toolCalls }),
         finishReason: turn.finishReason,
-        ...(turn.appliedOutputLimit === undefined
+        ...(turn.appliedGenerationLimit === undefined
           ? {}
-          : { appliedOutputLimit: turn.appliedOutputLimit }),
+          : { appliedGenerationLimit: turn.appliedGenerationLimit }),
         ...(turn.usage === undefined ? {} : { usage: turn.usage }),
       }) as Readonly<Record<string, JsonValue>>,
     });
@@ -503,40 +502,6 @@ export class RunSession {
       channel: "tool",
       visibility: this.#outwardVisibility,
       payload: copyJsonValue(event) as Readonly<Record<string, JsonValue>>,
-    });
-  }
-
-  public async publishDelegatedTool(
-    delegationId: string,
-    event: ToolExecutionEvent,
-    round: number,
-  ): Promise<void> {
-    await this.#persist({
-      sourceKey: `delegation:${delegationId}:tool:${round}:${event.toolCallId}:${event.type}`,
-      kind: event.type === "tool_started" ? "tool.started" : "tool.completed",
-      channel: "tool",
-      visibility: this.#outwardVisibility,
-      payload: copyJsonValue({ ...event, delegationId }) as Readonly<Record<string, JsonValue>>,
-    });
-  }
-
-  public async publishDelegation(event: DelegationLifecycleEvent): Promise<void> {
-    if (event.runId !== this.#runId) {
-      throw new AgentError("delegation_scope_violation", "Delegation event belongs to another Root Run");
-    }
-    await this.#persist({
-      sourceKey: `delegation:${event.batchId}:${event.delegationId}:${event.status}`,
-      kind: "delegation.status",
-      channel: "lifecycle",
-      visibility: this.#outwardVisibility,
-      payload: copyJsonValue({
-        batchId: event.batchId,
-        delegationId: event.delegationId,
-        agentName: event.agentName,
-        agentTitle: event.agentTitle,
-        status: event.status,
-        ...(event.errorCode === undefined ? {} : { errorCode: event.errorCode }),
-      }) as Readonly<Record<string, JsonValue>>,
     });
   }
 

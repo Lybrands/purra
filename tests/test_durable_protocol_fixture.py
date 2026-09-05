@@ -20,9 +20,9 @@ FIXTURE = json.loads(
 
 
 def test_shared_durable_protocol_fixture() -> None:
-    assert FIXTURE["protocolVersion"] == 4
-    assert FIXTURE["agentPresetSnapshotVersion"] == 4
-    limits = RuntimeLimits(max_run_output_tokens=None)
+    assert FIXTURE["protocolVersion"] == 5
+    assert FIXTURE["agentPresetSnapshotVersion"] == 5
+    limits = RuntimeLimits(max_run_generation_tokens=None)
     assert {
         "providerActivityIdleTimeoutMs": limits.provider_activity_idle_timeout_ms,
         "providerProgressIdleTimeoutMs": limits.provider_progress_idle_timeout_ms,
@@ -53,7 +53,7 @@ def test_shared_durable_protocol_fixture() -> None:
             limits[name] is not None
             for name in (
                 "maxInputTokens",
-                "maxRunOutputTokens",
+                "maxRunGenerationTokens",
                 "maxReasoningTokens",
             )
         ):
@@ -65,9 +65,9 @@ def test_shared_durable_protocol_fixture() -> None:
                     ("model_attempts", usage["invocationCount"], limits["maxInvocationAttempts"]),
                     ("input_tokens", usage["inputTokens"], limits["maxInputTokens"]),
                     (
-                        "output_tokens",
-                        usage["outputTokens"],
-                        limits["maxRunOutputTokens"],
+                        "generation_tokens",
+                        usage["generationTokens"],
+                        limits["maxRunGenerationTokens"],
                     ),
                     ("reasoning_tokens", usage["reasoningTokens"], limits["maxReasoningTokens"]),
                 )

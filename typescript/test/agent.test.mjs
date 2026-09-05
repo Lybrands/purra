@@ -2,11 +2,12 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { Agent, AgentCanceledError, AgentError } from "purra";
+import { testGateway } from "./support/model-gateway.mjs";
 
 test("Agent completes one validated model/tool loop", async () => {
   const requests = [];
   const agent = new Agent({
-    model: {
+    model: testGateway({
       async invoke(request) {
         requests.push(request);
         if (request.tools.length === 0) {
@@ -30,7 +31,7 @@ test("Agent completes one validated model/tool loop", async () => {
           finishReason: "stop",
         };
       },
-    },
+    }),
     tools: [readTool("weather",
       (input) => {
         assert.deepEqual(input, { city: "Hangzhou" });
@@ -71,7 +72,7 @@ test("Agent completes one validated model/tool loop", async () => {
 test("Agent rejects an invalid tool batch before any handler runs", async () => {
   let executions = 0;
   const agent = new Agent({
-    model: {
+    model: testGateway({
       async invoke() {
         return {
           message: {
@@ -85,7 +86,7 @@ test("Agent rejects an invalid tool batch before any handler runs", async () => 
           finishReason: "tool_calls",
         };
       },
-    },
+    }),
     tools: [readTool("known", () => {
       executions += 1;
       return { content: null, effectState: "not_started" };
@@ -103,7 +104,7 @@ test("Agent stops before calling the model when already canceled", async () => {
   const controller = new AbortController();
   controller.abort();
   const agent = new Agent({
-    model: { invoke() { throw new Error("must not run"); } },
+    model: testGateway({ invoke() { throw new Error("must not run"); } }),
   });
 
   await assert.rejects(
@@ -114,14 +115,14 @@ test("Agent stops before calling the model when already canceled", async () => {
 
 test("Agent rejects an empty tool-call turn", async () => {
   const agent = new Agent({
-    model: {
+    model: testGateway({
       async invoke() {
         return {
           message: { role: "assistant", content: "" },
           finishReason: "tool_calls",
         };
       },
-    },
+    }),
   });
 
   await assert.rejects(
@@ -132,14 +133,14 @@ test("Agent rejects an empty tool-call turn", async () => {
 
 test("Agent converts malformed Provider messages into a coded boundary error", async () => {
   const agent = new Agent({
-    model: {
+    model: testGateway({
       async invoke() {
         return {
           message: { role: "tool", content: "invalid", toolCallId: "call-1" },
           finishReason: "stop",
         };
       },
-    },
+    }),
   });
 
   await assert.rejects(
@@ -162,11 +163,11 @@ test("Agent rejects incomplete model turns with stable error codes", async () =>
     ["other", "unsupported_model_finish_reason"],
   ]) {
     const agent = new Agent({
-      model: {
+      model: testGateway({
         async invoke() {
           return { message: { role: "assistant", content: "partial" }, finishReason };
         },
-      },
+      }),
     });
 
     await assert.rejects(
@@ -179,7 +180,7 @@ test("Agent rejects incomplete model turns with stable error codes", async () =>
 test("Agent never executes a truncated tool call", async () => {
   let executions = 0;
   const agent = new Agent({
-    model: {
+    model: testGateway({
       async invoke() {
         return {
           message: {
@@ -190,7 +191,7 @@ test("Agent never executes a truncated tool call", async () => {
           finishReason: "length",
         };
       },
-    },
+    }),
     tools: [readTool("known", () => {
       executions += 1;
       return { content: null, effectState: "not_started" };

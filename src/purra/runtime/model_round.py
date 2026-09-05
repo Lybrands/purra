@@ -266,7 +266,7 @@ def build_agent_model_call(
         commit_mode=commit_mode,
         requires_full_text_validation=requires_full_text_validation,
         reasoning_mode=invocation.reasoning_mode,
-        output_limit=invocation.output_limit,
+        output_budget=invocation.output_budget,
         tools=invocation.tools,
         tool_choice=invocation.tool_choice,
     )
@@ -281,7 +281,7 @@ def truncation_trace_details(
     finish_reason: ModelFinishReason,
     error_code: str,
     emitted_delta_count: int,
-    output_limit: Any | None,
+    output_budget: Any | None,
 ) -> dict[str, Any]:
     return {
         "round": round_number,
@@ -300,8 +300,8 @@ def truncation_trace_details(
             and accumulator.reasoning.strip()
         ),
         "emittedDeltaCount": emitted_delta_count,
-        "outputLimit": (
-            output_limit.to_mapping() if output_limit is not None else None
+        "outputBudget": (
+            output_budget.to_mapping() if output_budget is not None else None
         ),
     }
 
@@ -326,9 +326,9 @@ def model_request_fingerprint(
         ],
         "toolChoice": invocation.tool_choice.value,
         "reasoningMode": invocation.reasoning_mode.value,
-        "outputLimit": (
-            invocation.output_limit.to_mapping()
-            if invocation.output_limit is not None
+        "outputBudget": (
+            invocation.output_budget.to_mapping()
+            if invocation.output_budget is not None
             else None
         ),
     }

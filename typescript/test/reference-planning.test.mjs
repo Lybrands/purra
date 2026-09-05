@@ -22,7 +22,7 @@ class Agent extends CoreAgent {
         if (isPlannerRequest(request)) {
           try { content = JSON.stringify({ v: 1, type: "plan", plan: JSON.parse(content) }) + "\n"; } catch {}
         }
-        return { appliedOutputLimit: request.outputLimit?.maxTokens,
+        return { appliedGenerationLimit: request.outputBudget?.maxGenerationTokens,
           async *[Symbol.asyncIterator]() {
             yield { contentDelta: content,
               ...(turn.message.toolCalls === undefined ? {} : { toolCallDeltas: turn.message.toolCalls.map((call, index) => ({
@@ -36,7 +36,7 @@ class Agent extends CoreAgent {
 }
 
 const RUN_OPTIONS = Object.freeze({
-  budgets: Object.freeze({ maxRunOutputTokens: null }),
+  budgets: Object.freeze({ maxRunGenerationTokens: null }),
 });
 
 test("WorkPlan has no default total-step limit but honors an explicit host limit", () => {
@@ -93,6 +93,27 @@ test("model Planner requests the smallest non-redundant semantic plan", async ()
 
   assert.equal((await agent.invoke(plannedInput("answer"))).output, "done");
   assert.match(instruction, /smallest non-redundant set/u);
+  assert.match(instruction, /at least 3 distinct user-visible semantic steps/u);
+});
+
+test("model Planner repairs an initial plan with fewer than three semantic steps", async () => {
+  let calls = 0;
+  const planner = new ModelWorkPlanner({ async plan(messages, options) {
+    calls += 1;
+    const steps = calls === 1
+      ? twoStepPlan().steps
+      : threeStepPlan().steps;
+    options.validatePlan({ workPlan: { title: "Plan", steps } });
+    return { turn: finalTurn(JSON.stringify({ workPlan: { title: "Plan", steps } })) };
+  } });
+
+  const result = await planner.createPlan(
+    { messages: [{ role: "user", content: "plan" }] },
+    { availableTools: [], constraints: {}, planningContext: [] },
+  );
+
+  assert.equal(calls, 2);
+  assert.equal(result.workPlan.steps.length, 4);
 });
 
 test("model Planner repairs invalid JSON inside the submitted Run before executing the plan", async () => {
@@ -107,7 +128,7 @@ test("model Planner repairs invalid JSON inside the submitted Run before executi
         if (isPlannerRequest(request)) {
           plannerCalls += 1;
           return acknowledged(request, finalTurn(plannerCalls === 1 ? "not json" : JSON.stringify({
-            workPlan: toolPlan("lookup", "lookup-step"),
+            workPlan: initialToolPlan("lookup", "lookup-step"),
           })));
         }
         mainCalls += 1;
@@ -126,7 +147,7 @@ test("model Planner repairs invalid JSON inside the submitted Run before executi
         plannerRunId = modelTasks.runId;
         return new ModelWorkPlanner(modelTasks, {
           maxRepairAttempts: 1,
-          maxCallOutputTokens: 256,
+          resultCapacityTargetTokens: 256,
         });
       },
     },
@@ -264,7 +285,11 @@ test("model Planner revisions cannot bypass current tool authority", async () =>
           const name = plannerCalls === 1 ? "lookup" : "summarize";
           return acknowledged(
             request,
-            finalTurn(JSON.stringify({ workPlan: toolPlan(name, `${name}-step`) })),
+            finalTurn(JSON.stringify({
+              workPlan: plannerCalls === 1
+                ? initialToolPlan(name, `${name}-step`)
+                : toolPlan(name, `${name}-step`),
+            })),
           );
         }
         const name = request.tools[0]?.name;
@@ -309,7 +334,9 @@ test("model Planner revisions receive bounded retrieval evidence without changin
           plannerCalls++;
           if (plannerCalls === 2) revision = request;
           return acknowledged(request, finalTurn(JSON.stringify({
-            workPlan: plannerCalls === 1 ? toolPlan("lookup", "lookup-step") : directPlan(),
+            workPlan: plannerCalls === 1
+              ? initialToolPlan("lookup", "lookup-step")
+              : directPlan(),
           })));
         }
         if (request.tools.length === 0) return acknowledged(request, finalTurn("done"));
@@ -358,11 +385,12 @@ test("model Planner forwards its independent output and attempt budgets", async 
     received = options;
     options.validatePlan({ workPlan: directPlan() });
     return { turn: finalTurn(JSON.stringify({ workPlan: directPlan() })) };
-  } }, { maxCallOutputTokens: 256, attemptTimeoutMs: 2_000 });
+  } }, { resultCapacityTargetTokens: 256, attemptTimeoutMs: 2_000 });
   await planner.createPlan({ messages: [{ role: "user", content: "plan" }] }, {
     availableTools: [], constraints: {}, planningContext: [],
   });
-  assert.equal(received.maxCallOutputTokens, 256);
+  assert.equal(received.resultCapacityTargetTokens, 256);
+  assert.equal(received.resultCapacitySource, "workflow_policy");
   assert.equal(received.attemptTimeoutMs, 2_000);
   assert.throws(
     () => new ModelWorkPlanner({ plan() {} }, { attemptTimeoutMs: 0 }),
@@ -493,10 +521,44 @@ function toolPlan(name, id) {
   };
 }
 
+function initialToolPlan(name, id) {
+  return {
+    ...toolPlan(name, id),
+    steps: [
+      ...toolPlan(name, id).steps,
+      { id: "analyze", title: "Analyze", type: "analyze", executor: "model", dependsOn: [id] },
+      { id: "review", title: "Review", type: "review", executor: "model", dependsOn: ["analyze"] },
+      { id: "respond", title: "Respond", type: "review", executor: "model", dependsOn: ["review"] },
+    ],
+  };
+}
+
 function directPlan() {
   return {
     title: "Direct response",
     steps: [{ id: "respond", title: "Respond", type: "review", executor: "model" }],
+  };
+}
+
+function twoStepPlan() {
+  return {
+    title: "Short plan",
+    steps: [
+      { id: "analyze", title: "Analyze", type: "analyze", executor: "model" },
+      { id: "review", title: "Review", type: "review", executor: "model" },
+      { id: "respond", title: "Respond", type: "review", executor: "model" },
+    ],
+  };
+}
+
+function threeStepPlan() {
+  return {
+    title: "Plan",
+    steps: [
+      ...twoStepPlan().steps.slice(0, -1),
+      { id: "deliver", title: "Deliver", type: "write", executor: "model" },
+      twoStepPlan().steps.at(-1),
+    ],
   };
 }
 
@@ -526,16 +588,16 @@ function finalTurn(content) {
 }
 
 function acknowledged(request, turn) {
-  return { ...turn, appliedOutputLimit: request.outputLimit?.maxTokens };
+  return { ...turn, appliedGenerationLimit: request.outputBudget?.maxGenerationTokens };
 }
 
 function capabilities() {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     profileId: "reference-planning-fixture",
     providerProtocol: "custom",
     contextWindowTokens: 16_000,
-    maxCallOutputTokens: 512,
+    maxGenerationTokens: 512,
     thinkingTokenAccounting: "unknown",
     protocol: {
       reasoningControl: "selectable",

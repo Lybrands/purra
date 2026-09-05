@@ -106,13 +106,11 @@ def test_activity_snapshot_normalizes_subsets_and_quiescence():
         requested_run_ids=(" run-1 ", "run-1"),
         requested_task_ids=(" task-1 ",),
         active_run_ids=("run-1",),
-        active_delegation_run_ids=(" run-1 ",),
         active_task_ids=("task-1",),
         draining_cancellation_run_ids=(),
     )
 
     assert snapshot.requested_run_ids == ("run-1",)
-    assert snapshot.active_delegation_run_ids == ("run-1",)
     assert not snapshot.quiescent
     assert RunActivitySnapshot(requested_run_ids=("run-1",)).quiescent
 
@@ -128,7 +126,6 @@ def test_cancellation_receipt_normalizes_and_enforces_invariants():
         status="running",
         cancellation_epoch="2",
         newly_requested=1,
-        delegations_canceled="3",
         draining=1,
     )
 
@@ -136,7 +133,6 @@ def test_cancellation_receipt_normalizes_and_enforces_invariants():
     assert receipt.status is RunStatus.RUNNING
     assert receipt.cancellation_epoch == 2
     assert receipt.newly_requested is True
-    assert receipt.delegations_canceled == 3
     assert receipt.draining is True
 
 
@@ -178,7 +174,6 @@ def test_cancellation_receipt_preserves_a_competing_terminal_outcome():
             "tombstoned": True,
         },
         {"status": "running", "cancellation_epoch": -1, "draining": True},
-        {"status": "canceled", "cancellation_epoch": 1, "delegations_canceled": -1},
     ),
 )
 def test_cancellation_receipt_rejects_invalid_invariants(kwargs):

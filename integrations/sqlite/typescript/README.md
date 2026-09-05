@@ -30,7 +30,7 @@ const agent = new Agent({
 ```
 
 Select `scope` from the application's authenticated user/project binding.
-The bundle also exposes `runTree`, `delegations`, `artifacts`, and `longTasks`.
+The bundle also exposes `runTree`, `artifacts`, and `longTasks`.
 
 ## Recovery
 
@@ -46,9 +46,76 @@ happened. For persisted questions and answers, use
 
 ## Storage and shutdown
 
-Each scope is stored as one transactional snapshot. Loading and serialization
-cost grow with its history, so this adapter suits bounded local workloads.
+Canonical output events are appended as rows with Run and Root sequence indexes.
+Event additions and the execution snapshot commit in one transaction.
+`runs.listEvents()`, `runs.listRootEvents()` and subscription polling neither load
+the execution snapshot nor acquire a writer lock. `runs.get()` remains read-only.
+Tool receipts and lease renewal/release skip Run state and journal hydration;
+Agent tree, Artifact and Long Task operations restore only their own repository.
+Writes targeting an existing Run validate sequence counts in SQL, use indexed
+source-key lookups and buffer only new events. Core planning, public-progress
+and terminal-settlement rules read original Run evidence on demand. Persisted
+counts and pending events jointly determine Run and Root sequences; sibling
+budgets remain shared. Run reads restore the complete Root journal. Unloaded Roots reject access;
+their checkpoints and event counts are preserved. Lease acquisition, public
+`transaction()` and operations such as creating a Run still validate the full
+scope. Execution snapshots retain checkpoints and receipts and
+are still loaded and saved at scope granularity. This adapter therefore
+still suits bounded local workloads.
+Storage v3 rejects v1/v2 data without automatic migration; existing databases
+cannot be resumed directly.
 Python and TypeScript execution snapshots are not interchangeable.
+The source-key index is local to each Root (Python keys are scope-wide).
+Opening existing v3 data creates the index using SQLite `json_extract`.
+Sequence checks scan a covering index for the selected Root and match each child
+by Run id, without fetching event body rows. Root headers have a covering index
+as well. Existing v3 databases build these indexes on opening, consuming time and
+disk space; inserts maintain the extra indexes. Metadata remains scope-sized;
+writes are not constant-cost. Event bodies are validated when read. Lease
+acquisition and public transactions retain full journal hydration.
+
+After building Core and this package, run the empty-poll and tail-pagination
+benchmark from the repository root:
+
+```sh
+node integrations/sqlite/typescript/scripts/benchmark-reads.mjs
+```
+
+This temporary-database benchmark reports warm median read latency, not
+concurrent throughput or real-model end-to-end performance.
+
+Measure tool receipt writes, including claim and result-commit transactions:
+
+```sh
+node integrations/sqlite/typescript/scripts/benchmark-writes.mjs
+```
+
+The tool callback is local and has no external side effect; this excludes real
+business-tool and model latency.
+
+Measure active Run event writes beside a growing unrelated Root:
+
+```sh
+node integrations/sqlite/typescript/scripts/benchmark-run-writes.mjs
+```
+
+This measures isolation from other Roots, not scaling within a single growing Root.
+
+Measure appends, invocation registration and checkpoint commits within the same
+growing Root (two warmups and ten measured writes per operation):
+
+```sh
+node integrations/sqlite/typescript/scripts/benchmark-execution-writes.mjs
+```
+
+History consists of private diagnostic events. Results exclude planning evidence
+replay, concurrent throughput and real Provider latency. Unlike Python's
+reservation and checkpoint APIs, TypeScript emits an output event for each of
+these operations, so compare each SDK against its own baseline.
+Add `--profile` to report journal preparation, Run state import/export and the
+remaining transaction time. The remainder includes outer snapshot handling,
+other repositories and SQL writes. Phase medians are calculated independently
+and need not sum to the total median.
 
 The application owns database access, backups, and retention. Checkpoints contain
 private model data. Wait for active executions to settle before `storage.close()`.

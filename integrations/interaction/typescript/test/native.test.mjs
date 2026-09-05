@@ -3,9 +3,10 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { Agent, UserInputRequired, assertRunRepositoryConforms, assertArtifactRepositoryConforms, assertLongTaskRepositoryConforms, assertDelegationRepositoryConforms } from "purra";
+import { Agent, UserInputRequired, assertRunRepositoryConforms, assertArtifactRepositoryConforms, assertLongTaskRepositoryConforms } from "purra";
 import { SqliteAgentAdapters } from "purra-sqlite";
 import { SqliteClarification } from "../dist/index.js";
+import { TEST_MODEL_CAPABILITIES } from "./model-capabilities.mjs";
 
 function compose(path, beforeAnswered = async () => {}) {
   const storage = new SqliteAgentAdapters(path, { scope: "owner/project" });
@@ -13,12 +14,12 @@ function compose(path, beforeAnswered = async () => {}) {
   const calls = [];
   const agent = new Agent({ runRepository: storage.runs, outputPublisher: storage.publisher,
     preset: { id: "sqlite", revision: "1" }, tools: [interaction.tool], checkpointHandler: interaction.checkpointHandler,
-    model: { async invoke(request) {
+    model: { capabilities: TEST_MODEL_CAPABILITIES, async invoke(request) {
       calls.push(request);
       const answered = request.messages.some(m => typeof m.content === "string" && m.content.includes("Answers to requested"));
       if (answered) await beforeAnswered();
-      return answered ? { message: { role: "assistant", content: "Finished with the answer" }, finishReason: "stop", usage: { inputTokens: 5, outputTokens: 7 } }
-        : { message: { role: "assistant", content: "", toolCalls: [{ id: "ask-1", name: "request_user_input", arguments: { questions: [{ id: "length", prompt: "篇幅？", choices: ["短", "长"], allowFreeform: false }] } }] }, finishReason: "tool_calls", usage: { inputTokens: 10, outputTokens: 20 } };
+      return answered ? { message: { role: "assistant", content: "Finished with the answer" }, finishReason: "stop", appliedGenerationLimit: request.outputBudget.maxGenerationTokens, usage: { inputTokens: 5, generationTokens: 7 } }
+        : { message: { role: "assistant", content: "", toolCalls: [{ id: "ask-1", name: "request_user_input", arguments: { questions: [{ id: "length", prompt: "篇幅？", choices: ["短", "长"], allowFreeform: false }] } }] }, finishReason: "tool_calls", appliedGenerationLimit: request.outputBudget.maxGenerationTokens, usage: { inputTokens: 10, generationTokens: 20 } };
     } },
   });
   return { storage, interaction, calls, agent };
@@ -29,7 +30,7 @@ test("question restart answer resume retains Run id, budget and canonical output
   const path = join(dir, "agent.db");
   let host = compose(path);
   try {
-    const handle = await host.agent.submit({ messages: [{ role: "user", content: "Write" }], planningMode: "reactive" }, { budgets: { maxRunOutputTokens: 100 } });
+    const handle = await host.agent.submit({ messages: [{ role: "user", content: "Write" }], planningMode: "reactive" }, { budgets: { maxRunGenerationTokens: 100 } });
     let requestId;
     await assert.rejects(handle.result, error => { assert(error instanceof UserInputRequired); requestId = error.requestId; return true; });
     const before = await host.storage.runs.listEvents(handle.runId, 0);
@@ -44,7 +45,7 @@ test("question restart answer resume retains Run id, budget and canonical output
     assert.equal((await resumed.result).output, "Finished with the answer");
     const saved = await resumed.snapshot();
     assert.equal(saved.usage.modelAttempts, 3);
-    assert.equal(saved.usage.outputTokens, 34);
+    assert.equal(saved.usage.generationTokens, 34);
     const events = await host.storage.runs.listEvents(handle.runId, 0);
     assert.deepEqual(events.slice(0, before.length), before);
     assert.equal(events.filter(e => e.kind === "input.required").length, 1);
@@ -57,7 +58,7 @@ test("persistent cancellation and cumulative attempt limits", async () => {
     for (const cancel of [false, true]) {
       const host = compose(join(dir, `${cancel}.db`));
       try {
-        const handle = await host.agent.submit({ messages: [{ role: "user", content: "Write" }], planningMode: "reactive" }, { budgets: { maxRunOutputTokens: 100, maxModelAttempts: 1 } });
+        const handle = await host.agent.submit({ messages: [{ role: "user", content: "Write" }], planningMode: "reactive" }, { budgets: { maxRunGenerationTokens: 100, maxModelAttempts: 1 } });
         let id;
         await assert.rejects(handle.result, error => { id = error.requestId; return error instanceof UserInputRequired; });
         if (cancel) {
@@ -83,7 +84,7 @@ test("concurrent resume cannot borrow another execution's lease", async () => {
   const barrier = new Promise(resolve => { release = resolve; });
   const host = compose(join(dir, "agent.db"), async () => { enter(); await barrier; });
   try {
-    const initial = await host.agent.submit({ messages: [{ role: "user", content: "Write" }], planningMode: "reactive" }, { budgets: { maxRunOutputTokens: 100 } });
+    const initial = await host.agent.submit({ messages: [{ role: "user", content: "Write" }], planningMode: "reactive" }, { budgets: { maxRunGenerationTokens: 100 } });
     let id;
     await assert.rejects(initial.result, error => { id = error.requestId; return error instanceof UserInputRequired; });
     await host.interaction.answer(id, { revision: 1, key: "a", answers: { length: "短" } });

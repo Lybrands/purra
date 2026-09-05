@@ -14,7 +14,7 @@ npm install purra
 ## 运行 Agent
 
 将配置好的模型网关传入 `ask`。[OpenAI 和 Anthropic 适配包](../integrations/README.zh-CN.md)
-提供各自原生 API 的网关。自定义网关需要声明模型能力，并确认每次请求实际应用的输出上限。
+提供各自原生 API 的网关。自定义网关需要声明模型能力，并确认每次请求实际应用的精确总生成上限。
 
 ```ts
 import { Agent, type ModelGateway } from "purra";
@@ -24,7 +24,7 @@ async function ask(model: ModelGateway) {
   const run = await agent.submit({
     messages: [{ role: "user", content: "Hello" }],
   }, {
-    budgets: { maxRunOutputTokens: 8192 },
+    budgets: { maxRunGenerationTokens: 8192 },
   });
 
   for await (const event of run.events()) {
@@ -75,8 +75,13 @@ Planner 要求网关支持流式输出。订阅 Run 事件可接收公开的 `pl
 
 ## 预算与持久化
 
-`maxCallOutputTokens` 限制单次模型调用的输出，`maxRunOutputTokens` 限制 Run 累计输出，
-后者必须显式设置；`null` 表示不设有限 Token 上限。有限预算要求模型服务报告实际用量。
+`RunRequest.maxGenerationTokens` 是用户对单次 Provider 调用全部生成 Token 的上限；当模型把
+推理计入 generation 时，其中也包括推理 Token。`maxRunGenerationTokens` 限制 Run 累计生成量，
+并且必须显式设置；`null` 表示不设有限 Token 上限。有限预算要求模型服务报告实际用量。
+
+`NewRunOptions.resultCapacityTargetTokens` 是正式结果内容的可选工作流容量目标，不会降低
+Provider 的生成额度；只有选定上下文窗口的物理容量可以收紧该额度。模型未报告推理用量时，
+Core 会保留“未知”状态，而不会把它记成 0。
 
 内置仓储使用内存。需要持久化时，配置 [SQLite 适配器](../integrations/sqlite/typescript/README.zh-CN.md)
 或实现仓储接口。恢复使用已提交的检查点，并要求还原原有模型与工具配置。

@@ -7,7 +7,7 @@ import { AnthropicMessagesGateway } from '../dist/index.js';
 const fixture = JSON.parse(readFileSync(new URL('../../fixtures/message.json', import.meta.url), 'utf8'));
 const request = { messages:[{role:'system',content:'system'},{role:'developer',content:'developer'},{role:'user',content:'check'},{role:'developer',content:'runtime instruction'}],
   tools:[{name:'lookup',description:'lookup',inputSchema:{type:'object',properties:{query:{type:'string'}}}},{name:'ready',description:'ready',inputSchema:{type:'object'}}],
-  outputLimit:{maxTokens:4096,source:'user_override',profileMaxTokens:8192} };
+  outputBudget:{maxGenerationTokens:4096,generationSource:'user',profileMaxGenerationTokens:8192,requestedUserMaxGenerationTokens:4096,resultCapacityTargetTokens:null,resultCapacitySource:null,nonResultHeadroomTokens:null} };
 function gateway(fetch, options={}) { return new AnthropicMessagesGateway({ model:'fixture-model',capabilities:{},client:new Anthropic({apiKey:'fixture-not-a-key',fetch,maxRetries:5}),...options }); }
 function sse(events) { return events.map(e=>`event: ${e.type}\ndata: ${JSON.stringify(e)}\n\n`).join(''); }
 function streamResponse(events) { return new Response(sse(events),{headers:{'content-type':'text/event-stream'}}); }
@@ -21,7 +21,7 @@ test('official SDK preserves signed thinking, parallel tools and cache usage thr
   },{thinking:{type:'adaptive'}});
   const result=await model.invoke(request);
   assert.equal(result.finishReason,'tool_calls');assert.equal(result.message.content,'先查资料。');assert.equal(result.message.reasoning,undefined);
-  assert.deepEqual(result.usage,{inputTokens:20,outputTokens:20,totalTokens:40,cachedInputTokens:7});
+  assert.deepEqual(result.usage,{inputTokens:20,generationTokens:20,totalTokens:40,cachedInputTokens:7});
   const chunks=[];for await(const chunk of await model.stream(request)) chunks.push(chunk);
   assert.equal(JSON.stringify(chunks.slice(0,-1)).includes('private-thought'),false);
   assert.equal(JSON.stringify(chunks.slice(0,-1)).includes('opaque-signature'),false);
@@ -95,9 +95,9 @@ test('Core executes the tool round and removes private thinking from public mess
       ]);
     }
     return streamResponse(fixture.events.filter(e=>e.index!==4));
-  },{capabilities:{schemaVersion:1,profileId:'fixture',providerProtocol:'anthropic',contextWindowTokens:65536,maxCallOutputTokens:8192,thinkingTokenAccounting:'included',protocol:{reasoningControl:'selectable',reasoningReplay:'ignored',toolCalling:'supported',requiredToolChoice:'unavailable',parallelToolCalls:'supported',streaming:'supported',cancellation:'supported',assistantContentWithToolCalls:'optional',jsonSchemaLevel:'unknown',streamFinishSemantics:'normalized',usageSemantics:'normalized'}}});
+  },{capabilities:{schemaVersion:2,profileId:'fixture',providerProtocol:'anthropic',contextWindowTokens:65536,maxGenerationTokens:8192,thinkingTokenAccounting:'included',protocol:{reasoningControl:'selectable',reasoningReplay:'ignored',toolCalling:'supported',requiredToolChoice:'unavailable',parallelToolCalls:'supported',streaming:'supported',cancellation:'supported',assistantContentWithToolCalls:'optional',jsonSchemaLevel:'unknown',streamFinishSemantics:'normalized',usageSemantics:'normalized'}}});
   const agent=new Agent({model,tools:[{name:'lookup',description:'lookup',inputSchema:{type:'object',properties:{query:{type:'string'}},required:['query']},policy:{mode:'read',title:'lookup'},run:()=>({content:'found',effectState:'not_started'})}]});
-  const result=await agent.invoke({messages:[{role:'user',content:'lookup'}],maxCallOutputTokens:4096});
+  const result=await agent.invoke({messages:[{role:'user',content:'lookup'}],maxGenerationTokens:4096});
   assert.equal(result.output,'Found it.');
   assert.ok(requests[1].messages.some(m=>m.content.some(b=>b.signature==='opaque-signature')));
   for(const secret of ['private-thought','opaque-signature','opaque-redacted'])assert.equal(JSON.stringify(result.messages).includes(secret),false);

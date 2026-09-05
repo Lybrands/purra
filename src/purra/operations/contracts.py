@@ -23,7 +23,6 @@ class OperationKind(StrEnum):
     TOOL = "tool"
     VALIDATION = "validation"
     CONTEXT_COMPACTION = "context_compaction"
-    DELEGATION = "delegation"
 
 
 class OperationStatus(StrEnum):

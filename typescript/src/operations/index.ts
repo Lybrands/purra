@@ -2,7 +2,7 @@ import type { JsonValue } from "../model/types.js";
 import { copyJsonValue } from "../model/validation.js";
 import { AgentError } from "../shared/errors.js";
 
-export type OperationKind = "planning" | "model" | "tool" | "validation" | "context_compaction" | "delegation";
+export type OperationKind = "planning" | "model" | "tool" | "validation" | "context_compaction";
 export type OperationStatus = "running" | "succeeded" | "failed" | "canceled";
 
 export interface OperationDisplay {
@@ -65,7 +65,7 @@ interface RunningOperation {
 }
 
 const KINDS = new Set<OperationKind>([
-  "planning", "model", "tool", "validation", "context_compaction", "delegation",
+  "planning", "model", "tool", "validation", "context_compaction",
 ]);
 const LIFECYCLE_DISPLAY_FIELDS = new Set([
   "operationid", "status", "startedat", "finishedat", "durationms", "errorcode",

@@ -40,9 +40,11 @@ export type {
 export type { ModelStreamLimits } from "./model/stream.js";
 export type {
   AssistantContentWithToolCalls,
+  ContinuationKind,
+  ContinuationSafety,
   FeatureSupport,
-  InvocationOutputLimit,
-  InvocationOutputLimitSource,
+  GenerationBudgetSource,
+  InvocationOutputBudget,
   JsonValue,
   Message,
   MessageRole,
@@ -59,13 +61,23 @@ export type {
   ModelStreamItem,
   ModelTokenUsage,
   ModelTurn,
+  LengthReasonDetail,
   ReasoningControl,
+  ReasoningLimitKind,
   ReasoningReplayPolicy,
+  ReasoningUsageDetail,
+  ResultCapacitySource,
   ThinkingTokenAccounting,
   ToolCall,
   ToolCallDelta,
   ToolSpec,
+  VisibleOutputReservation,
 } from "./model/types.js";
+export {
+  constrainOutputBudgetToContext,
+  resolveInvocationOutputBudget,
+} from "./model/validation.js";
+export type { InvocationOutputBudgetOptions } from "./model/validation.js";
 export { ModelTaskRunner } from "./extensions/model-tasks.js";
 export type {
   ModelTaskCompletion,
@@ -110,31 +122,12 @@ export type {
   RecoveryReason,
   RecoveryRequest,
 } from "./recovery/index.js";
-export { DelegationCoordinator } from "./delegation/coordinator.js";
-export { DynamicDelegatedAgentExecutor } from "./delegation/executor.js";
-export { DelegationPolicy } from "./delegation/policy.js";
-export { InMemoryDelegationRepository } from "./delegation/repository.js";
-export { buildDelegationTool } from "./delegation/tool.js";
+export { AgentTreePolicy } from "./agent-tree-policy.js";
 export type {
-  AgentDelegation,
-  DelegatedAgentExecutor,
-  DelegatedAgentOutcome,
-  DelegatedAgentRequest,
-  DelegatedAgentResult,
-  DelegationAggregation,
-  DelegationBatchCommand,
-  DelegationBatchReceipt,
-  DelegationContextMode,
-  DelegationDefinition,
-  DelegationEventSink,
-  DelegationLifecycleEvent,
-  DelegationOptions,
-  DelegationPolicyOptions,
-  DelegationPolicySnapshot,
-  DelegationRepository,
-  DelegationStatus,
-  DynamicDelegatedAgentExecutorOptions,
-} from "./delegation/types.js";
+  AgentTreePolicyOptions,
+  AgentTreePolicySnapshot,
+  ChildAgentDefinition,
+} from "./agent-tree-policy.js";
 export {
   buildCanonicalRunObservation,
   evaluateAgentRun,
@@ -239,6 +232,7 @@ export {
   estimateMessagesTokens,
   estimateTextTokens,
   estimateToolSchemaTokens,
+  maxGenerationTokensForContext,
   trimMessagesByTurn,
 } from "./context/budget.js";
 export type {
@@ -394,8 +388,6 @@ export type {
   AgentExecutionCheckpoint,
   AgentPreset,
   AgentPresetSnapshot,
-  AgentPresetSnapshotV4,
-  AgentPresetSnapshotV5,
   AgentRuntimeLimitSnapshot,
   InvocationReceiptInput,
   InvocationSettlement,
@@ -439,7 +431,6 @@ export type {
 export { InMemoryAgentAdapters } from "./testing/adapters.js";
 export {
   assertArtifactRepositoryConforms,
-  assertDelegationRepositoryConforms,
   assertLongTaskRepositoryConforms,
   assertModelGatewayConforms,
   assertOutputPublisherConforms,

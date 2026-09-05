@@ -12,8 +12,15 @@ export type FeatureSupport = "supported" | "unavailable" | "unknown";
 export type ReasoningControl = "selectable" | "always_enabled" | "unavailable";
 export type ReasoningReplayPolicy = "required" | "forbidden" | "ignored";
 export type ThinkingTokenAccounting = "included" | "separate" | "unknown";
+export type ReasoningUsageDetail = "required" | "optional" | "unavailable";
+export type ReasoningLimitKind = "none" | "soft" | "hard";
+export type VisibleOutputReservation = "supported" | "unavailable" | "unknown";
+export type LengthReasonDetail = "request_cap" | "context_cap" | "conflated";
+export type ContinuationKind = "none" | "prefix_beta" | "opaque_state" | "signed_replay";
+export type ContinuationSafety = "text" | "structured" | "tool_call";
 export type AssistantContentWithToolCalls = "required" | "optional" | "forbidden";
-export type InvocationOutputLimitSource = "user_override" | "model_profile" | "workflow_policy";
+export type GenerationBudgetSource = "user" | "model_profile" | "context_capacity";
+export type ResultCapacitySource = "user" | "workflow_policy";
 
 export interface ToolCall {
   readonly id: string;
@@ -34,10 +41,10 @@ export interface Message {
 
 export interface ModelTokenUsage {
   readonly inputTokens: number;
-  readonly outputTokens?: number;
+  readonly generationTokens: number;
   readonly totalTokens?: number;
   readonly cachedInputTokens?: number;
-  readonly reasoningOutputTokens?: number;
+  readonly reasoningTokens?: number;
 }
 
 export interface ToolCallDelta {
@@ -78,16 +85,16 @@ export type ModelStreamItem = ModelStreamChunk | ModelStreamActivity;
 
 export interface ModelStream extends AsyncIterable<ModelStreamItem> {
   readonly transportDiagnostics?: ModelTransportDiagnostics;
-  /** Exact request output limit actually applied by the Provider host. */
-  readonly appliedOutputLimit?: number | null;
+  /** Exact total-generation limit actually applied by the Provider host. */
+  readonly appliedGenerationLimit: number;
   readonly activitySupport?: ModelStreamActivitySupport;
 }
 
 export interface ModelTurn {
   readonly message: Message;
   readonly finishReason: ModelFinishReason;
-  /** Exact request output limit actually applied by the Provider host. */
-  readonly appliedOutputLimit?: number | null;
+  /** Exact total-generation limit actually applied by the Provider host. */
+  readonly appliedGenerationLimit: number;
   readonly usage?: ModelTokenUsage;
 }
 
@@ -114,32 +121,45 @@ export interface ModelProtocolCapabilities {
 }
 
 export interface ModelCapabilitySnapshot {
-  readonly schemaVersion: number;
+  readonly schemaVersion: 2;
   readonly profileId: string;
   readonly providerProtocol: string;
   readonly contextWindowTokens: number;
-  readonly maxCallOutputTokens: number | null;
+  readonly maxGenerationTokens: number | null;
   readonly thinkingTokenAccounting: ThinkingTokenAccounting;
+  readonly reasoningUsageDetail?: ReasoningUsageDetail;
+  readonly reasoningLimitKind?: ReasoningLimitKind;
+  readonly visibleOutputReservation?: VisibleOutputReservation;
+  readonly lengthReasonDetail?: LengthReasonDetail;
+  readonly continuationKind?: ContinuationKind;
+  readonly continuationSafeFor?: readonly ContinuationSafety[];
   readonly protocol: ModelProtocolCapabilities;
   readonly actionable?: boolean;
   readonly source?: string;
 }
 
-export interface InvocationOutputLimit {
-  readonly maxTokens: number;
-  readonly source: InvocationOutputLimitSource;
-  readonly profileMaxTokens: number;
+export interface InvocationOutputBudget {
+  /** Provider allowance for all generated tokens, including reasoning. */
+  readonly maxGenerationTokens: number;
+  readonly generationSource: GenerationBudgetSource;
+  readonly profileMaxGenerationTokens: number;
+  /** Original user ceiling, preserved when context capacity clips the effective value. */
+  readonly requestedUserMaxGenerationTokens: number | null;
+  /** Sizing/diagnostic target, not a Provider guarantee or actual minimum. */
+  readonly resultCapacityTargetTokens: number | null;
+  readonly resultCapacitySource: ResultCapacitySource | null;
+  readonly nonResultHeadroomTokens: number | null;
 }
 
 export interface ModelRequest {
   readonly messages: readonly Message[];
   readonly tools: readonly ToolSpec[];
-  readonly capabilitySnapshot?: ModelCapabilitySnapshot;
-  readonly outputLimit?: InvocationOutputLimit;
+  readonly capabilitySnapshot: ModelCapabilitySnapshot;
+  readonly outputBudget: InvocationOutputBudget;
 }
 
 export interface ModelGateway {
-  readonly capabilities?: ModelCapabilitySnapshot;
+  readonly capabilities: ModelCapabilitySnapshot;
   invoke(request: ModelRequest, signal?: AbortSignal): Promise<ModelTurn>;
   stream?(
     request: ModelRequest,

@@ -9,9 +9,10 @@ import {
   RecoveryLedger,
   RecoveryPolicy,
 } from "purra";
+import { testGateway } from "./support/model-gateway.mjs";
 
 const RUN_OPTIONS = Object.freeze({
-  budgets: Object.freeze({ maxRunOutputTokens: null }),
+  budgets: Object.freeze({ maxRunGenerationTokens: null }),
 });
 
 const fixture = JSON.parse(readFileSync(
@@ -40,14 +41,14 @@ test("submitted Run persists recovery approval before the retried Provider attem
   let attempts = 0;
   const agent = new Agent({
     runRepository: repository,
-    model: {
+    model: testGateway({
       async invoke() { throw new Error("stream should be used"); },
       async *stream() {
         attempts += 1;
         if (attempts === 1) return;
         yield { contentDelta: "done", finishReason: "stop" };
       },
-    },
+    }),
   });
 
   const handle = await agent.submit(
@@ -87,14 +88,14 @@ test("invalid tool input is corrected once before any handler runs", async () =>
   let modelCalls = 0;
   let toolCalls = 0;
   const agent = new Agent({
-    model: {
+    model: testGateway({
       async invoke() {
         modelCalls += 1;
         if (modelCalls === 1) return toolTurn({ value: "wrong" });
         if (modelCalls === 2) return toolTurn({ value: 1 });
         return finalTurn("done");
       },
-    },
+    }),
     tools: [{
       name: "read",
       description: "Read",
@@ -121,12 +122,12 @@ test("disabled recovery fails without a second model attempt", async () => {
   let modelCalls = 0;
   const agent = new Agent({
     recovery: new RecoveryPolicy({}),
-    model: {
+    model: testGateway({
       async invoke() {
         modelCalls += 1;
         return finalTurn("");
       },
-    },
+    }),
   });
 
   await assert.rejects(

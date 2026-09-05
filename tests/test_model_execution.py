@@ -34,7 +34,7 @@ def _call() -> AgentModelTask:
             capability_snapshot=replace(
                 generic_capability_snapshot(),
                 profile_id="test:model",
-                max_call_output_tokens=200,
+                max_generation_tokens=200,
             ),
         ),
     )
@@ -43,6 +43,7 @@ def _call() -> AgentModelTask:
 def _model_tasks(
     gateway,
     reasoning_mode: ReasoningMode = ReasoningMode.DISABLED,
+    request: ModelRequest | None = None,
 ) -> AgentModelTaskRunner:
     return AgentModelTaskRunner(
         AgentModelInvocationManager(gateway),
@@ -50,6 +51,7 @@ def _model_tasks(
             run_id="model-task-test-run",
             requested_reasoning_mode=reasoning_mode,
         ),
+        request or _call().request,
     )
 
 
@@ -64,7 +66,7 @@ class _Gateway:
         return ModelCompletion(
             message=AgentMessage(role="assistant", content="done"),
             model="model",
-            applied_output_limit=invocation.output_limit.max_tokens,
+            applied_generation_limit=invocation.output_budget.max_generation_tokens,
             finish_reason=self.finish_reason,
         )
 
@@ -79,7 +81,7 @@ class _Gateway:
         return ModelStream(
             chunks=chunks(),
             model="model",
-            applied_output_limit=invocation.output_limit.max_tokens,
+            applied_generation_limit=invocation.output_budget.max_generation_tokens,
         )
 
 
@@ -102,7 +104,7 @@ class _ScriptedStreamGateway(_Gateway):
         return ModelStream(
             chunks=chunks(),
             model="model",
-            applied_output_limit=invocation.output_limit.max_tokens,
+            applied_generation_limit=invocation.output_budget.max_generation_tokens,
         )
 
 
@@ -116,14 +118,14 @@ class _AcceptingJudgePolicy:
         return ResponseValidationResult()
 
 
-def test_complete_resolves_the_exact_provider_output_limit():
+def test_complete_resolves_the_exact_provider_generation_limit():
     async def run():
         gateway = _Gateway()
         result = await _model_tasks(gateway).complete((), _call())
         assert result.completion.message.content == "done"
-        assert result.output_limit.max_tokens == 200
-        assert gateway.invocations[0].output_limit == result.output_limit
-        assert gateway.invocations[0].max_call_output_tokens == 200
+        assert result.output_budget.max_generation_tokens == 200
+        assert gateway.invocations[0].output_budget == result.output_budget
+        assert gateway.invocations[0].max_generation_tokens == 200
 
     asyncio.run(run())
 
@@ -132,6 +134,22 @@ def test_model_task_runner_exposes_the_core_owned_run_id():
     model_tasks = _model_tasks(_Gateway())
 
     assert model_tasks.run_id == "model-task-test-run"
+
+
+def test_model_task_cannot_replace_or_expand_the_root_model_request():
+    async def run():
+        gateway = _Gateway()
+        root = replace(_call().request, max_generation_tokens=100)
+        runner = _model_tasks(gateway, request=root)
+        expanded = replace(root, max_generation_tokens=200)
+
+        with pytest.raises(ModelGatewayError) as captured:
+            await runner.complete((), AgentModelTask(request=expanded))
+
+        assert captured.value.code == "model_request_identity_conflict"
+        assert gateway.invocations == []
+
+    asyncio.run(run())
 
 
 def test_response_judge_inherits_reasoning_and_preserves_model_options():
@@ -150,7 +168,11 @@ def test_response_judge_inherits_reasoning_and_preserves_model_options():
         )
         request = replace(request, options={"temperature": 0.7, "top_p": 0.9})
         judge = AgentModelResponseJudge(
-            model_tasks=_model_tasks(gateway, ReasoningMode.ENABLED),
+            model_tasks=_model_tasks(
+                gateway,
+                ReasoningMode.ENABLED,
+                request,
+            ),
             model_request=request,
             policy=_AcceptingJudgePolicy(),
         )

@@ -15,7 +15,7 @@ from test_providers import managed, budget, complete
 from test_memory import setup
 
 FIXTURE = json.loads((Path(__file__).resolve().parents[2] / "fixtures/review.json").read_text())
-LIMITS = budget(max_llm_calls=8, max_embedding_calls=32, max_output_tokens=4096, max_call_output_tokens=512)
+LIMITS = budget(max_llm_calls=8, max_embedding_calls=32, max_output_tokens=4096, result_capacity_target_tokens=512)
 
 
 def classifier(kinds, calls, raw=None):

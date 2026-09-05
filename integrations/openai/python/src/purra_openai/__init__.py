@@ -47,10 +47,12 @@ def _usage(response):
     usage = response.usage
     if usage is None:
         return None
-    return ModelTokenUsage(input_tokens=usage.input_tokens, output_tokens=usage.output_tokens,
+    input_details = getattr(usage, "input_tokens_details", None)
+    output_details = getattr(usage, "output_tokens_details", None)
+    return ModelTokenUsage(input_tokens=usage.input_tokens, generation_tokens=usage.output_tokens,
                            total_tokens=usage.total_tokens,
-                           cached_input_tokens=usage.input_tokens_details.cached_tokens,
-                           reasoning_output_tokens=usage.output_tokens_details.reasoning_tokens)
+                           cached_input_tokens=(getattr(input_details, "cached_tokens", 0) or 0),
+                           reasoning_tokens=getattr(output_details, "reasoning_tokens", None))
 
 
 def _finish(response):
@@ -93,18 +95,20 @@ class OpenAIResponsesGateway:
     def _request(self, messages, invocation):
         if invocation.request.provider != "openai":
             raise ValueError("OpenAI gateway requires provider='openai'")
-        cap = invocation.max_call_output_tokens
+        cap = invocation.max_generation_tokens
         if cap is None:
-            raise ValueError("OpenAI gateway requires a resolved output limit")
+            raise ValueError("OpenAI gateway requires a resolved generation allowance")
         options = thaw_json_mapping(invocation.request.options)
-        unknown = set(options) - {"max_tokens", "temperature", "top_p", "reasoning_effort"}
+        unknown = set(options) - {"temperature", "top_p", "reasoning_effort"}
         if unknown:
             raise ValueError("unsupported OpenAI model options: " + ", ".join(sorted(unknown)))
         effort = options.get("reasoning_effort")
+        if invocation.reasoning_mode.value == "disabled" and effort not in (None, "none"):
+            raise ValueError("reasoning effort conflicts with disabled reasoning")
         if invocation.reasoning_mode.value == "disabled":
             effort = "none"
-        elif invocation.reasoning_mode.value == "enabled" and effort in (None, "none"):
-            effort = "medium"
+        elif invocation.reasoning_mode.value == "enabled" and effort == "none":
+            raise ValueError("reasoning effort conflicts with enabled reasoning")
         return dict(model=invocation.request.model, input=_input(messages),
                     tools=[{"type": "function", "name": t.name, "description": t.description,
                             "parameters": thaw_json_mapping(t.parameters), "strict": False} for t in invocation.tools],
@@ -125,7 +129,7 @@ class OpenAIResponsesGateway:
                                           for i in response.output if i.type == "function_call"),
                          provider_data=_attributes(response)),
             model=response.model, finish_reason=_finish(response), usage=_usage(response),
-            applied_output_limit=params["max_output_tokens"],
+            applied_generation_limit=params["max_output_tokens"],
         )
 
     async def stream(self, messages, invocation, signal=None):
@@ -168,7 +172,7 @@ class OpenAIResponsesGateway:
                 if stream is not None:
                     await stream.close()
 
-        return ModelStream(chunks(), invocation.request.model, applied_output_limit=params["max_output_tokens"],
+        return ModelStream(chunks(), invocation.request.model, applied_generation_limit=params["max_output_tokens"],
                            activity_support=ModelStreamActivitySupport.WORKING)
 
     async def close(self):

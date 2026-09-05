@@ -44,7 +44,7 @@ class Journal:
             CREATE TABLE IF NOT EXISTS purra_mem0_calls (
                 scope TEXT NOT NULL, id TEXT NOT NULL, budget TEXT NOT NULL, operation TEXT,
                 kind TEXT NOT NULL, state TEXT NOT NULL, input_chars INTEGER NOT NULL,
-                reserved_output INTEGER NOT NULL, input_tokens INTEGER, output_tokens INTEGER,
+                reserved_output INTEGER NOT NULL, input_tokens INTEGER, generation_tokens INTEGER,
                 PRIMARY KEY(scope,id));
             CREATE INDEX IF NOT EXISTS purra_mem0_calls_budget ON purra_mem0_calls(scope,budget);
             CREATE INDEX IF NOT EXISTS purra_mem0_calls_operation ON purra_mem0_calls(scope,operation);
@@ -114,8 +114,8 @@ class Journal:
                 COALESCE(SUM(input_chars),0) AS input_chars,
                 COALESCE(SUM(reserved_output),0) AS reserved_output_tokens,
                 COALESCE(SUM(input_tokens),0) AS reported_input_tokens,
-                COALESCE(SUM(output_tokens),0) AS reported_output_tokens,
-                COALESCE(SUM(input_tokens IS NULL OR output_tokens IS NULL),0) AS unreported_calls,
+                COALESCE(SUM(generation_tokens),0) AS reported_output_tokens,
+                COALESCE(SUM(input_tokens IS NULL OR generation_tokens IS NULL),0) AS unreported_calls,
                 COALESCE(SUM(state='started'),0) AS unsettled_calls
                 FROM purra_mem0_calls WHERE scope=? AND {column}=?""", (self.scope, value)).fetchone()
             return dict(row)
@@ -138,10 +138,10 @@ class Journal:
                             (self.scope, call_id, budget, operation, kind, input_chars, reserved_output))
             return call_id
 
-    def settle(self, call_id, state, input_tokens=None, output_tokens=None):
+    def settle(self, call_id, state, input_tokens=None, generation_tokens=None):
         with self.lock:
-            self.db.execute("UPDATE purra_mem0_calls SET state=?,input_tokens=?,output_tokens=? WHERE scope=? AND id=?",
-                            (state, input_tokens, output_tokens, self.scope, call_id))
+            self.db.execute("UPDATE purra_mem0_calls SET state=?,input_tokens=?,generation_tokens=? WHERE scope=? AND id=?",
+                            (state, input_tokens, generation_tokens, self.scope, call_id))
 
     def provider_error(self, key, code):
         with self.transaction():

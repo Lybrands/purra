@@ -16,10 +16,10 @@ AUTO_PLANNING_TOOL_SCHEMA = ToolSchema(
     name=AUTO_PLANNING_TOOL_NAME,
     description=(
         "Request a governed execution plan before any business tool runs. "
-        "Use only when the task needs multiple dependent actions or must be "
-        "validated for authority, budget, approval, or durable execution. "
-        "Do not use for direct answers, one-step work, or ordinary read-only "
-        "tool use."
+        "Use only when the task needs at least three distinct user-visible "
+        "semantic steps or must be validated for authority, budget, approval, "
+        "or durable execution. Do not use for direct answers, work with fewer "
+        "than three real steps, or ordinary read-only tool use."
     ),
     parameters={
         "type": "object",
