@@ -126,9 +126,13 @@ class StorageSession:
             state.output_events.setdefault(event.run_id, []).append(event)
             state.root_output_events.setdefault(event.root_run_id, []).append(event)
             state.events_by_source_key[event.source_event_key] = event
-        if any(len(state.output_events.get(run_id, ())) != sequence
-               for run_id, sequence in state.sequences.items()
+        if any(len(state.output_events.get(run_id, ())) != state.sequences.get(run_id, 0)
+               for run_id in state.runs
                if root_run_id is None or self.root_for_run(run_id) == root_run_id):
+            raise ValueError("incomplete output journal")
+        roots = {self.root_for_run(run_id) for run_id in state.runs} if root_run_id is None else {root_run_id}
+        if any(len(state.root_output_events.get(root, ())) != state.root_sequences.get(root, 0)
+               for root in roots):
             raise ValueError("incomplete output journal")
 
     def defer_output_events(self, root_run_id, counts, *, load_run, load_root, find_source):
