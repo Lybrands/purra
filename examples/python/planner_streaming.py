@@ -40,8 +40,10 @@ class FixtureGateway:
                 await self.release_plan.wait()
                 yield ModelStreamChunk(content_delta=json.dumps({
                     "v": 1, "type": "plan", "plan": {
-                        "needsTodos": True, "title": "Answer", "todos": [
-                            {"id": "answer", "title": "Answer", "type": "review", "executor": "model"}
+                        "needsTodos": True, "title": "Compare options", "todos": [
+                            {"id": "analyze", "title": "Analyze requirements", "type": "analyze", "executor": "model"},
+                            {"id": "compare", "title": "Compare options", "type": "analyze", "executor": "model", "dependsOn": ["analyze"]},
+                            {"id": "recommend", "title": "Recommend an option", "type": "review", "executor": "model", "dependsOn": ["compare"]},
                         ]
                     }
                 }) + "\n")
@@ -61,7 +63,7 @@ async def exercise() -> None:
                      output_repository=storage.outputs, output_publisher=storage.publisher,
                      runtime_limits=RuntimeLimits(max_run_generation_tokens=None))
     request = AgentRunRequest(
-        messages=(AgentMessage(role="user", content="Give a concise answer."),),
+        messages=(AgentMessage(role="user", content="Analyze my requirements, compare the options, and recommend one."),),
         model=ModelRequest(provider="fixture", model="fixture",
             capability_snapshot=replace(generic_capability_snapshot(), profile_id="example:planner",
                                         max_generation_tokens=512)),
@@ -81,7 +83,7 @@ async def exercise() -> None:
         assert (await handle.wait()).status.value == "done"
         assert live == [event async for event in handle.subscribe()]  # Same IDs/sequence on replay.
         snapshots = await storage.runs.get(handle.run_id)
-        assert snapshots.steps[0].id == "answer"  # Complete, validated plan only.
+        assert snapshots.steps[0].id == "analyze"  # Complete, validated plan only.
 
         gateway.release_plan.clear()
         canceled = await core.submit(request)

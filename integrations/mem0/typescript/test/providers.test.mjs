@@ -353,14 +353,16 @@ for (const event of ["withdraw", "tamper", "cancel", "timeout"]) test(`${event} 
     if (messages[0].content.startsWith("Review a pending memory")) { started.resolve(); await release.promise; }
     return regular(messages, cap, signal);
   };
-  const memory = create({ providers: { budget: reviewBudget, complete: model }, timeoutMs: event === "timeout" ? 200 : 3000 });
+  const memory = create({ providers: { budget: reviewBudget, complete: model }, timeoutMs: 30_000 });
   const { candidate, old } = await seedReview(memory);
+  if (event === "timeout") t.mock.timers.enable({ apis: ["setTimeout"] });
   const task = memory.review(candidate, { key: "slow", signal: cancel.signal }), rejected = assert.rejects(task);
   try {
     await started.promise;
     if (event === "withdraw") await create({ providers: { budget: reviewBudget } }).revokeSource("old-0", { key: "withdraw" });
     else if (event === "tamper") client.sdk.rows.get(old[0].id).memory = "changed outside adapter";
     else if (event === "cancel") cancel.abort();
+    else if (event === "timeout") t.mock.timers.tick(30_000);
     if (event !== "timeout" && event !== "cancel") release.resolve();
     await rejected;
   } finally { release.resolve(); await memory.drain(); }

@@ -1,4 +1,4 @@
-name: Publish Python package
+name: Publish Python packages
 
 on:
   release:
@@ -15,6 +15,24 @@ permissions: {}
 jobs:
   build:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package: purra
+            path: .
+          - package: purra-openai
+            path: integrations/openai/python
+          - package: purra-anthropic
+            path: integrations/anthropic/python
+          - package: purra-compaction
+            path: integrations/compaction/python
+          - package: purra-interaction
+            path: integrations/interaction/python
+          - package: purra-sqlite
+            path: integrations/sqlite/python
+          - package: purra-mem0
+            path: integrations/mem0/python
     permissions:
       contents: read
     env:
@@ -28,29 +46,36 @@ jobs:
           python-version: "3.11"
       - run: python scripts/check_release_version.py "$RELEASE_TAG"
       - run: python -m pip install build
-      - run: python -m build --sdist --wheel
+      - run: python -m build --sdist --wheel --outdir dist "$PACKAGE_PATH"
+        env:
+          PACKAGE_PATH: ${{ matrix.path }}
       - name: Verify installed wheel
+        if: matrix.package == 'purra'
         run: |
           python -m venv "$RUNNER_TEMP/purra-smoke"
           "$RUNNER_TEMP/purra-smoke/bin/python" -m pip install --no-deps dist/*.whl
           "$RUNNER_TEMP/purra-smoke/bin/python" tests/installed_distribution_smoke.py
       - uses: actions/upload-artifact@v7
         with:
-          name: python-package-distributions
+          name: python-package-distributions-${{ matrix.package }}
           path: dist/
           if-no-files-found: error
 
   publish:
     needs: build
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        package: [purra, purra-openai, purra-anthropic, purra-compaction, purra-interaction, purra-sqlite, purra-mem0]
     environment:
       name: pypi
-      url: https://pypi.org/p/purra
+      url: https://pypi.org/p/${{ matrix.package }}
     permissions:
       id-token: write
     steps:
       - uses: actions/download-artifact@v8
         with:
-          name: python-package-distributions
+          name: python-package-distributions-${{ matrix.package }}
           path: dist/
       - uses: pypa/gh-action-pypi-publish@release/v1
