@@ -1860,20 +1860,7 @@ export class Agent {
     }
     const planning = new PlannedExecutionCoordinator({
       runId,
-      ...((authority?.operations ?? this.#operations) === undefined ? {} : { operations: authority?.operations ?? this.#operations! }),
-      ...(authority === undefined ? {} : {
-        publishPlan: (plan, revision) => authority.publishPlan(plan, revision),
-        countAttempts: (operationId) => authority.countPlanningAttempts(operationId),
-      }),
-      ...(authority === undefined || this.#durable === undefined ? {} : {
-        admit: async (plan) => {
-          const decision = copyAdmissionDecision(await awaitWithSignal(Promise.resolve(this.#durable!.admission.evaluate({
-            messages: publicMessages(input.messages), plan, signal: authority.signal,
-          })), authority.signal), plan);
-          await authority.publishAdmission(decision);
-          return decision;
-        },
-      }),
+      ...this.#planningAuthority(authority, input.messages),
       options: planningOptions,
       request: resumeCheckpoint?.planning?.request ?? Object.freeze({
         messages: copyMessages(input.messages),
@@ -1953,26 +1940,7 @@ export class Agent {
       : undefined;
     const planning = new PlannedExecutionCoordinator({
       runId: input.runId,
-      ...((input.authority?.operations ?? this.#operations) === undefined
-        ? {}
-        : { operations: input.authority?.operations ?? this.#operations! }),
-      ...(input.authority === undefined ? {} : {
-        publishPlan: (plan, revision) => input.authority!.publishPlan(plan, revision),
-        countAttempts: (operationId) => input.authority!.countPlanningAttempts(operationId),
-      }),
-      ...(input.authority === undefined || this.#durable === undefined ? {} : {
-        admit: async (plan) => {
-          const decision = copyAdmissionDecision(await awaitWithSignal(Promise.resolve(
-            this.#durable!.admission.evaluate({
-              messages: publicMessages(input.messages),
-              plan,
-              signal: input.authority!.signal,
-            }),
-          ), input.authority!.signal), plan);
-          await input.authority!.publishAdmission(decision);
-          return decision;
-        },
-      }),
+      ...this.#planningAuthority(input.authority, input.messages),
       options: input.planningOptions,
       request: Object.freeze({
         messages: copyMessages(input.messages),
@@ -2013,6 +1981,29 @@ export class Agent {
     });
   }
 
+  #planningAuthority(
+    authority: RunSession | undefined,
+    messages: readonly Message[],
+  ): Pick<ConstructorParameters<typeof PlannedExecutionCoordinator>[0], "operations" | "publishPlan" | "countAttempts" | "admit"> {
+    const operations = authority?.operations ?? this.#operations;
+    return {
+      ...(operations === undefined ? {} : { operations }),
+      ...(authority === undefined ? {} : {
+        publishPlan: (plan, revision) => authority.publishPlan(plan, revision),
+        countAttempts: (operationId) => authority.countPlanningAttempts(operationId),
+      }),
+      ...(authority === undefined || this.#durable === undefined ? {} : {
+        admit: async (plan) => {
+          const decision = copyAdmissionDecision(await awaitWithSignal(Promise.resolve(
+            this.#durable!.admission.evaluate({ messages: publicMessages(messages), plan, signal: authority.signal }),
+          ), authority.signal), plan);
+          await authority.publishAdmission(decision);
+          return decision;
+        },
+      }),
+    };
+  }
+
   #restoreContext(
     input: AgentRunInput,
     metadata: Readonly<Record<string, JsonValue>>,
@@ -2029,7 +2020,7 @@ export class Agent {
     const options = projectionOptions.compressionFactory === undefined
       ? projectionOptions
       : resolveContextFactories(projectionOptions, modelTasks!);
-    return restoreContext(options, this.#contextPreparationInput(input, metadata), checkpoint.context);
+    return restoreContext(options, this.#contextPreparationInput(input, metadata, options), checkpoint.context);
   }
 
   async #prepareContext(
@@ -2038,41 +2029,7 @@ export class Agent {
     metadata: Readonly<Record<string, JsonValue>>,
   ): Promise<PreparedContext | undefined> {
     if (contextOptions === undefined) return undefined;
-    if (
-      this.#capabilities === undefined
-      || this.#capabilities.maxGenerationTokens === null
-    ) {
-      throw new AgentError(
-        "context_model_capabilities_required",
-        "Context budgeting requires model window and generation-limit capabilities",
-      );
-    }
-    const tools = this.#tools.specsFor(input.enabledTools);
-    const outputBudget = resolveInvocationOutputBudget(
-      this.#capabilities,
-      input.maxGenerationTokens === undefined
-        ? {}
-        : { maxGenerationTokens: input.maxGenerationTokens, generationSource: "user" },
-    )!;
-    const constrainedOutputBudget = constrainOutputBudgetToContext(
-      outputBudget,
-      maxGenerationTokensForContext({
-        windowTokens: this.#capabilities.contextWindowTokens,
-        tools,
-        ...(contextOptions.reserves === undefined ? {} : { reserves: contextOptions.reserves }),
-      }),
-    );
-    return prepareContext(contextOptions, {
-      request: {
-        messages: input.messages,
-        ...(input.enabledTools === undefined ? {} : { enabledTools: input.enabledTools }),
-        ...(Object.keys(metadata).length === 0 ? {} : { metadata }),
-      },
-      tools,
-      windowTokens: this.#capabilities.contextWindowTokens,
-      outputReserveTokens: constrainedOutputBudget.maxGenerationTokens,
-      ...(input.signal === undefined ? {} : { signal: input.signal }),
-    });
+    return prepareContext(contextOptions, this.#contextPreparationInput(input, metadata, contextOptions));
   }
 
   async #prepareStagedContext(
@@ -2080,7 +2037,7 @@ export class Agent {
     input: AgentRunInput,
     metadata: Readonly<Record<string, JsonValue>>,
   ): Promise<StagedContextPreparation> {
-    const preparation = this.#contextPreparationInput(input, metadata);
+    const preparation = this.#contextPreparationInput(input, metadata, contextOptions);
     return prepareStagedContext(contextOptions, preparation);
   }
 
@@ -2134,6 +2091,7 @@ export class Agent {
   #contextPreparationInput(
     input: AgentRunInput,
     metadata: Readonly<Record<string, JsonValue>>,
+    contextOptions: ContextOptions,
   ): Parameters<typeof prepareContext>[1] {
     if (
       this.#capabilities === undefined
@@ -2156,7 +2114,7 @@ export class Agent {
       maxGenerationTokensForContext({
         windowTokens: this.#capabilities.contextWindowTokens,
         tools,
-        ...(this.#context?.reserves === undefined ? {} : { reserves: this.#context.reserves }),
+        ...(contextOptions.reserves === undefined ? {} : { reserves: contextOptions.reserves }),
       }),
     );
     return Object.freeze({

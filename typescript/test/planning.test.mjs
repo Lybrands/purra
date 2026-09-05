@@ -970,3 +970,33 @@ async function rejectsCode(promise, code) {
     (error) => error instanceof AgentError && error.code === code,
   );
 }
+
+for (const mode of ["reactive", "planned", "auto"]) test(`${mode} preparation preserves reserves and provider ceiling`, async () => {
+  const observed = [];
+  const requests = [];
+  let plannerCalls = 0;
+  const capture = (name, budget) => { observed.push([name, budget]); return { blocks: [] }; };
+  const agent = new Agent({
+    model: { capabilities: capabilities(), async invoke(request) {
+      requests.push(request);
+      return mode === "auto" && requests.length === 1 ? callsTurn("request_plan", request) : finalTurn("answer", request);
+    } },
+    context: { strategy: "staged", reserves: { safetyTokens: 101, runtimeTokens: 103, minimumMessageTokens: 107 },
+      provider: {
+        buildContext(_request, budget) { return capture("single", budget); },
+        buildPlanningContext(_request, budget) { return capture("planning", budget); },
+        buildTaskContext(_request, budget) { return capture("task", budget); },
+      },
+    },
+    planning: { planner: { createPlan() { plannerCalls++; return { workPlan: {
+      title: "Answer", taskSpec: { goal: "Answer" }, steps: [{ id: "respond", title: "Answer", type: "review", executor: "model" }],
+    } }; } } },
+  });
+  assert.equal((await agent.invoke({ messages: [user("answer")], planningMode: mode, maxGenerationTokens: 512 })).output, "answer");
+  assert.deepEqual(observed.map(([name]) => name), mode === "reactive" ? ["single"] : mode === "planned" ? ["planning", "task"] : ["single", "planning", "task"]);
+  for (const [, budget] of observed) assert.deepEqual([budget.windowTokens, budget.outputReserveTokens, budget.safetyReserveTokens, budget.runtimeReserveTokens, budget.minimumMessageTokens], [8000,512,101,103,107]);
+  assert.equal(plannerCalls, mode === "reactive" ? 0 : 1);
+  assert.equal(requests.length, mode === "auto" ? 2 : 1);
+  assert.ok(requests.every(request => request.outputBudget.maxGenerationTokens === 512));
+  assert.deepEqual(requests.at(-1).tools, []);
+});

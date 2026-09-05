@@ -809,3 +809,23 @@ async function rejectsCode(promise, code) {
     (error) => error instanceof AgentError && error.code === code,
   );
 }
+
+test("Auto promotion preserves admission and keeps private control out of its input", async () => {
+  const calls = [];
+  let admitted;
+  const agent = durableAgent({
+    model(request) {
+      calls.push(request);
+      assert.equal(calls.length, 1);
+      return { message: { role: "assistant", content: "", toolCalls: [{id:"plan",name:"request_plan",arguments:{}}] }, finishReason:"tool_calls" };
+    },
+    planner: () => workPlan(),
+    admission(request) { admitted=request; return {mode:"reject",reasonCode:"denied",message:"not allowed"}; },
+    dispatcher: { async dispatch() { assert.fail("rejected admission cannot dispatch"); }, async execute() { assert.fail("rejected admission cannot execute"); } },
+  });
+  const result=await (await agent.submit({messages:[user("plan remaining")],planningMode:"auto"}, RUN_OPTIONS)).result;
+  assert.equal(result.output,"not allowed");
+  assert.equal(calls.length,1);
+  assert.ok(admitted.messages.some(message => message.role === "user" && message.content === "plan remaining"));
+  assert.deepEqual(admitted.messages, [user("plan remaining")]);
+});

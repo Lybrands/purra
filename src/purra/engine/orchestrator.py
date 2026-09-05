@@ -1145,6 +1145,18 @@ class AgentCore:
             for registration in registrations
         )
 
+    def _execution_registrations(
+        self, request: AgentRunRequest, options: AgentCoreRunOptions,
+    ) -> tuple[tuple[ToolRegistration, ...], frozenset[str]]:
+        registrations, enabled_names = _effective_registrations(
+            self._tool_catalog, self._registrations, request,
+            model_supports_tools=options.model_supports_tools,
+        )
+        registrations, enabled_names = self._restrict_agent_capabilities(
+            request, options.agent_capability_grant, registrations, enabled_names,
+        )
+        return self._bind_agent_tree_lease(registrations, options), enabled_names
+
     async def _execute_run(
         self,
         request: AgentRunRequest,
@@ -1257,19 +1269,7 @@ class AgentCore:
                     ),
                     signal,
                 )
-                registrations, enabled_names = _effective_registrations(
-                    self._tool_catalog,
-                    self._registrations,
-                    request,
-                    model_supports_tools=options.model_supports_tools,
-                )
-                registrations, enabled_names = self._restrict_agent_capabilities(
-                    request,
-                    options.agent_capability_grant,
-                    registrations,
-                    enabled_names,
-                )
-                registrations = self._bind_agent_tree_lease(registrations, options)
+                registrations, enabled_names = self._execution_registrations(request, options)
                 display_locale = str(
                     request.metadata.get("locale") or "zh-CN"
                 )
@@ -1285,25 +1285,8 @@ class AgentCore:
                     if auto_planning_available
                     else ()
                 )
-                reserved_output_reserve = _context_planning_reserve_tokens(
-                    output_budget,
-                    window_tokens=_selected_context_window_tokens(request, options),
-                    tools=reserved_schemas,
-                    safety_reserve_tokens=options.safety_reserve_tokens,
-                    runtime_reserve_tokens=options.runtime_reserve_tokens,
-                    minimum_message_tokens=options.minimum_message_tokens,
-                )
-                reserved_budget = allocate_context_budget(
-                    window_tokens=_selected_context_window_tokens(
-                        request,
-                        options,
-                    ),
-                    output_reserve_tokens=reserved_output_reserve,
-                    tools=reserved_schemas,
-                    claims=context_claims,
-                    safety_reserve_tokens=options.safety_reserve_tokens,
-                    runtime_reserve_tokens=options.runtime_reserve_tokens,
-                    minimum_message_tokens=options.minimum_message_tokens,
+                reserved_budget = _execution_context_budget(
+                    request, options, output_budget, reserved_schemas, context_claims,
                 )
                 if (
                     planning_required
@@ -2163,19 +2146,7 @@ class AgentCore:
         checkpoint = options.agent_execution_checkpoint
         if checkpoint is None:  # pragma: no cover - caller invariant
             raise ContractViolationError("Run resume requires a checkpoint")
-        registrations, enabled_names = _effective_registrations(
-            self._tool_catalog,
-            self._registrations,
-            request,
-            model_supports_tools=options.model_supports_tools,
-        )
-        registrations, enabled_names = self._restrict_agent_capabilities(
-            request,
-            options.agent_capability_grant,
-            registrations,
-            enabled_names,
-        )
-        registrations = self._bind_agent_tree_lease(registrations, options)
+        registrations, enabled_names = self._execution_registrations(request, options)
         display_locale = str(request.metadata.get("locale") or "zh-CN")
         plan = controller.snapshot.execution_plan if checkpoint.execution_profile == "planned" else None
         if checkpoint.execution_profile == "planned" and plan is None:
@@ -2194,7 +2165,7 @@ class AgentCore:
             )
             planning_hook.restore_checkpoint_state(checkpoint.planning_state)
             selected_names = runtime_tool_names_for_planning_names(
-                registrations, enabled_names, effective_planning_tool_names(planning_hook._capabilities),
+                registrations, enabled_names, planning_hook.planning_tool_names,
             )
         elif plan is not None:
             selected_names = _planned_tool_names(plan) & enabled_names
@@ -2204,34 +2175,8 @@ class AgentCore:
             for registration in registrations
             if registration.schema.name in selected_names
         ) + (AUTO_PLANNING_TOOL_SCHEMAS if planning_available else ())
-        physical_generation_capacity = max_generation_tokens_for_context(
-            window_tokens=_selected_context_window_tokens(
-                request,
-                options,
-            ),
-            tools=schemas,
-            safety_reserve_tokens=options.safety_reserve_tokens,
-            runtime_reserve_tokens=options.runtime_reserve_tokens,
-            minimum_message_tokens=options.minimum_message_tokens,
-        )
-        constrain_output_budget_to_context(
-            output_budget,
-            max_generation_tokens=physical_generation_capacity,
-        )
-        budget = allocate_context_budget(
-            window_tokens=_selected_context_window_tokens(
-                request,
-                options,
-            ),
-            output_reserve_tokens=_context_result_reserve_tokens(
-                output_budget,
-                physical_generation_capacity=physical_generation_capacity,
-            ),
-            tools=schemas,
-            claims=(),
-            safety_reserve_tokens=options.safety_reserve_tokens,
-            runtime_reserve_tokens=options.runtime_reserve_tokens,
-            minimum_message_tokens=options.minimum_message_tokens,
+        budget = _execution_context_budget(
+            request, options, output_budget, schemas, (),
         )
         prepared_request = replace(
             request,
@@ -2408,34 +2353,8 @@ class AgentCore:
             context_claims,
             task_context_claims,
         )
-        physical_generation_capacity = max_generation_tokens_for_context(
-            window_tokens=_selected_context_window_tokens(
-                request,
-                options,
-            ),
-            tools=schemas,
-            safety_reserve_tokens=options.safety_reserve_tokens,
-            runtime_reserve_tokens=options.runtime_reserve_tokens,
-            minimum_message_tokens=options.minimum_message_tokens,
-        )
-        constrain_output_budget_to_context(
-            output_budget,
-            max_generation_tokens=physical_generation_capacity,
-        )
-        budget = allocate_context_budget(
-            window_tokens=_selected_context_window_tokens(
-                request,
-                options,
-            ),
-            output_reserve_tokens=_context_result_reserve_tokens(
-                output_budget,
-                physical_generation_capacity=physical_generation_capacity,
-            ),
-            tools=schemas,
-            claims=effective_context_claims,
-            safety_reserve_tokens=options.safety_reserve_tokens,
-            runtime_reserve_tokens=options.runtime_reserve_tokens,
-            minimum_message_tokens=options.minimum_message_tokens,
+        budget = _execution_context_budget(
+            request, options, output_budget, schemas, effective_context_claims,
         )
         context_mode = "single_pass" if planned else "reactive"
         if context_capability.staged_provider is not None and planned:
@@ -3319,29 +3238,33 @@ def _context_result_reserve_tokens(
     return min(desired, output_budget.max_generation_tokens, physical)
 
 
-def _context_planning_reserve_tokens(
+def _execution_context_budget(
+    request: AgentRunRequest,
+    options: AgentCoreRunOptions,
     output_budget,
-    *,
-    window_tokens: int,
-    tools=(),
-    safety_reserve_tokens: int | None = None,
-    runtime_reserve_tokens: int | None = None,
-    minimum_message_tokens: int | None = None,
-) -> int:
+    schemas,
+    claims: Sequence[ContextBudgetClaim],
+) -> ContextBudget:
+    window_tokens = _selected_context_window_tokens(request, options)
     physical = max_generation_tokens_for_context(
         window_tokens=window_tokens,
-        tools=tools,
-        safety_reserve_tokens=safety_reserve_tokens,
-        runtime_reserve_tokens=runtime_reserve_tokens,
-        minimum_message_tokens=minimum_message_tokens,
+        tools=schemas,
+        safety_reserve_tokens=options.safety_reserve_tokens,
+        runtime_reserve_tokens=options.runtime_reserve_tokens,
+        minimum_message_tokens=options.minimum_message_tokens,
     )
-    constrain_output_budget_to_context(
-        output_budget,
-        max_generation_tokens=physical,
+    constrain_output_budget_to_context(output_budget, max_generation_tokens=physical)
+    output_reserve = _context_result_reserve_tokens(
+        output_budget, physical_generation_capacity=physical,
     )
-    return _context_result_reserve_tokens(
-        output_budget,
-        physical_generation_capacity=physical,
+    return allocate_context_budget(
+        window_tokens=window_tokens,
+        output_reserve_tokens=output_reserve,
+        tools=schemas,
+        claims=claims,
+        safety_reserve_tokens=options.safety_reserve_tokens,
+        runtime_reserve_tokens=options.runtime_reserve_tokens,
+        minimum_message_tokens=options.minimum_message_tokens,
     )
 
 

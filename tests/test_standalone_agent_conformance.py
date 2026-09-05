@@ -1235,3 +1235,48 @@ async def test_durable_dispatch_contract_error_commits_failed_run():
         "status": "failed",
         "error": "runtime_limits_invalid",
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", (PlanningMode.REACTIVE, PlanningMode.PLANNED, PlanningMode.AUTO))
+async def test_execution_entries_keep_context_reserves_and_provider_limits(mode):
+    class BudgetContext(_Context):
+        def __init__(self):
+            super().__init__()
+            self.observed = []
+
+        async def build_context(self, request, budget, signal=None):
+            self.observed.append(("single", budget))
+            return await super().build_context(request, budget, signal)
+
+        async def build_planning_context(self, request, budget, signal=None):
+            self.observed.append(("planning", budget))
+            return await super().build_planning_context(request, budget, signal)
+
+        async def build_task_context(self, request, budget, task, signal=None):
+            self.observed.append(("task", budget))
+            return await super().build_task_context(request, budget, task, signal)
+
+    context = BudgetContext()
+    gateway = _ScriptedToolGateway(("request_plan", None)) if mode is PlanningMode.AUTO else _Gateway("answer")
+    planner = _Planner()
+    core = _core(gateway=gateway, context=context, profile=ExecutionProfile(
+        planner=planner, planning_policy=_AlwaysPlan(), context_strategy=ContextStrategy.STAGED,
+    ))
+    try:
+        result = await (await core.submit(replace(_request(), planning_mode=mode, tools_enabled=True),
+            options=AgentCoreRunOptions(result_capacity_target_tokens=128, safety_reserve_tokens=101,
+                runtime_reserve_tokens=103, minimum_message_tokens=107))).wait()
+        assert result.status is RunStatus.DONE
+        expected = {PlanningMode.REACTIVE: ["single"], PlanningMode.PLANNED: ["planning", "task"],
+                    PlanningMode.AUTO: ["single", "planning", "task"]}[mode]
+        assert [name for name, _ in context.observed] == expected
+        for _, budget in context.observed:
+            assert (budget.window_tokens, budget.output_reserve_tokens, budget.safety_reserve_tokens,
+                    budget.runtime_reserve_tokens, budget.minimum_message_tokens) == (8192, 128, 101, 103, 107)
+        assert planner.calls == (0 if mode is PlanningMode.REACTIVE else 1)
+        assert len(gateway.invocations) == (2 if mode is PlanningMode.AUTO else 1)
+        assert all(invocation.output_budget.max_generation_tokens == 512 for invocation in gateway.invocations)
+        assert gateway.invocations[-1].tools == ()
+    finally:
+        await core.close()

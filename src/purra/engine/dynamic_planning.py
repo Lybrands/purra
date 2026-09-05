@@ -34,7 +34,7 @@ from purra.plan_compiler import (
     compile_work_plan,
     project_completed_steps_for_planning,
 )
-from purra.planner import build_execution_message
+from purra.planner import build_execution_message, effective_planning_tool_names
 from purra.ports import CancellationSignal, DynamicWorkPlanner, ToolRegistration
 from purra.run_controller import AgentRunController
 from purra.run_state import RunStateMachine
@@ -72,6 +72,11 @@ class DynamicPlanningOrchestrator:
         self._turn_id = str(turn_id or "").strip() or None
         self._reasoning_mode = ReasoningMode(reasoning_mode)
         self._revision = 0
+
+    @property
+    def planning_tool_names(self) -> frozenset[str]:
+        """Planner-visible names after restored exclusions and satisfied context."""
+        return effective_planning_tool_names(self._capabilities)
 
     def checkpoint_state(self):
         capabilities = self._capabilities
