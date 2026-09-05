@@ -13,11 +13,7 @@
 python -m pip install . ./integrations/mem0/python
 ```
 
-需要受控的 LLM/Embedding 回调时安装附加依赖：
-
-```sh
-python -m pip install . './integrations/mem0/python[managed]'
-```
+原生受控模型和向量回调已包含在本包内，无需安装 LangChain。
 
 导入 Mem0 前，设置 `MEM0_TELEMETRY=false`，并将 `MEM0_DIR` 指向应用管理的数据目录。
 显式配置 LLM、embedder、`vector_store` 和 `history_db_path`。
@@ -131,3 +127,8 @@ async def capture(messages, source, operation_key):
 
 关闭前调用 `await memory.drain()` 和 `memory.close()`，再关闭 SDK 与模型服务资源。
 分页、来源撤回、证据校验和不确定写入的处理见[记忆生命周期指南](../README.zh-CN.md)。
+
+
+## 原生受控适配
+
+`create_managed_client` 把 PurrA 的原生模型和向量适配器注入包内、版本固定的 Mem0 私有模块，沿用现有预算、取消与结果校验。向量维度必须一致，受控路径拒绝 LangChain 向量库。不修改宿主安装的官方 SDK，也不启动代理服务。来源、许可证与修改说明见[第三方声明](THIRD_PARTY_NOTICES.md)。直接传入的原始 SDK 客户端仍由宿主管理，不自动获得受控回调的计费。

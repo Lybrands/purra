@@ -1,8 +1,10 @@
-"""Real mem0ai 2.0.19 + local Qdrant/SQLite; deterministic provider substitutes.
+"""Private mem0ai 2.0.19 extension + local Qdrant/SQLite; deterministic provider substitutes.
 
 Run in an isolated environment with purra-mem0 installed. No real provider,
 credentials, network server or quality benchmark is involved.
 """
+
+import deny_langchain  # Installs the test-only LangChain import tripwire.
 
 import asyncio
 import json
@@ -206,7 +208,7 @@ async def check(root):
         transport.test = case
         result = await evaluate_case(case, fixture, root / case["id"], transport, index)
         assert result["passed"], {"case": case["id"], "checks": result["checks"]}
-    print(json.dumps({"sdk": "mem0ai==2.0.19", "checks": "CRUD/inference/restart/idempotency/managed-budget/swallowed-denial/source-withdrawal/correction/evidence/atomic-resolution/semantic-review/evaluation-harness", "provider": "deterministic fixture via supported LangChain config", "calls": calls, "offline_evaluation_cases": len(fixture["cases"])}))
+    print(json.dumps({"sdk": "purra-mem0 private extension of mem0ai==2.0.19", "checks": "CRUD/inference/restart/idempotency/managed-budget/swallowed-denial/source-withdrawal/correction/evidence/atomic-resolution/semantic-review/evaluation-harness", "provider": "deterministic fixture via native PurrA adapters", "calls": calls, "offline_evaluation_cases": len(fixture["cases"])}))
 
 
 if __name__ == "__main__":

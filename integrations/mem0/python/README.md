@@ -13,11 +13,7 @@ From the repository root:
 python -m pip install . ./integrations/mem0/python
 ```
 
-For managed LLM/Embedding callbacks, install the extra:
-
-```sh
-python -m pip install . './integrations/mem0/python[managed]'
-```
+Managed callbacks use the native PurrA adapters included in this package; no LangChain installation is required.
 
 Before importing Mem0, set `MEM0_TELEMETRY=false` and an application-owned
 `MEM0_DIR`. Explicitly configure the LLM, embedder, `vector_store`, and
@@ -139,3 +135,8 @@ key, or `None` to leave the candidate pending.
 Before shutdown, call `await memory.drain()` and `memory.close()`, then close SDK
 and provider resources. For paging, withdrawal, evidence validation, and uncertain
 writes, see the [memory lifecycle guide](../README.md).
+
+
+## Native managed providers
+
+`create_managed_client` inject native LLM and Embedding adapters into a version-pinned, package-private Mem0 module. Calls retain the existing PurrA budget, cancellation and result validation. Explicit vector dimensions must agree; the managed path rejects LangChain vector stores. It neither patches the installed SDK nor starts a proxy server. See [third-party notices](THIRD_PARTY_NOTICES.md). Raw SDK clients remain host-owned and do not acquire managed accounting automatically.

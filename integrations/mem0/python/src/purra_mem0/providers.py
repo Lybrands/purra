@@ -1,4 +1,4 @@
-"""Optional, bounded SDK providers. No SDK or LangChain import at module load."""
+"""Optional, bounded SDK providers. No SDK import at module load."""
 
 from __future__ import annotations
 
@@ -230,7 +230,7 @@ class ManagedMem0Client:
 
 
 def create_managed_client(*, config: Mapping, embedding_dims: int):
-    """Construct OSS Mem0 through its supported LangChain instance configuration.
+    """Construct the package-private Mem0 extension with native PurrA providers.
 
     Only storage/history/custom extraction instructions are accepted. Rerankers,
     graph memory and alternate provider configuration cannot bypass admission.
@@ -242,31 +242,21 @@ def create_managed_client(*, config: Mapping, embedding_dims: int):
         raise ValueError("managed config accepts only vector_store, history_db_path, custom_instructions")
     if not config.get("vector_store") or not config.get("history_db_path"):
         raise ValueError("explicit vector_store and history_db_path are required")
-    from langchain_core.embeddings import Embeddings
-    from langchain_core.language_models.chat_models import BaseChatModel
-    from langchain_core.messages import AIMessage
-    from langchain_core.outputs import ChatGeneration, ChatResult
-    from mem0 import Memory
-
-    class Chat(BaseChatModel):
-        @property
-        def _llm_type(self):
-            return "purra-memory"
-
-        def _generate(self, messages, stop=None, run_manager=None, **kwargs):
-            roles = {"human": "user", "ai": "assistant", "system": "system"}
-            converted = tuple(AgentMessage(role=roles[m.type], content=m.content) for m in messages)
-            return ChatResult(generations=[ChatGeneration(message=AIMessage(content=_execution().invoke("llm", converted)))])
-
-    class Embed(Embeddings):
-        def embed_documents(self, texts):
-            return _execution().invoke("embedding", tuple(texts))
-
-        def embed_query(self, text):
-            return self.embed_documents([text])[0]
-
-    sdk = Memory.from_config({**config,
-        "llm": {"provider": "langchain", "config": {"model": Chat(cache=False)}},
-        "embedder": {"provider": "langchain", "config": {"model": Embed(), "embedding_dims": embedding_dims}},
-    })
+    vector = config["vector_store"]
+    if not isinstance(vector, Mapping) or str(vector.get("provider", "")).lower() == "langchain" or not isinstance(vector.get("config"), Mapping):
+        raise ValueError("explicit native vector_store configuration is required")
+    values = dict(vector["config"])
+    for name in ("embedding_model_dims", "dimension"):
+        if name in values and (type(values[name]) is not int or values[name] != embedding_dims):
+            raise ValueError("vector store dimension must match embedding_dims")
+    if vector.get("provider") == "qdrant":
+        values["embedding_model_dims"] = embedding_dims
+    from importlib.metadata import version
+    if version("mem0ai") != "2.0.19":
+        raise RuntimeError("purra-mem0 requires mem0ai 2.0.19")
+    from mem0.configs.base import MemoryConfig
+    from ._vendor.memory import Memory
+    from .direct_providers import DirectLlm, DirectEmbedder
+    settings = MemoryConfig(**{**config, "vector_store": {**vector, "config": values}})
+    sdk = Memory(settings, llm=DirectLlm(), embedder=DirectEmbedder())
     return ManagedMem0Client(sdk, embedding_dims)

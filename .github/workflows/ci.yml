@@ -67,11 +67,23 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
-      - run: python -m pip install . "./integrations/mem0/python[test,managed]" build
+      - run: python -m pip install . "./integrations/mem0/python[test]" build
       - run: python -m pytest
         working-directory: integrations/mem0/python
+      - name: Verify the pinned SDK transformation
+        run: python integrations/mem0/python/scripts/sync_sdk.py "$(python -c 'import importlib.util; from pathlib import Path; print(Path(importlib.util.find_spec("mem0").origin).parent / "memory/main.py")')" --check
       - run: python integrations/mem0/python/scripts/check_sdk.py
-      - run: python -m build --wheel integrations/mem0/python
+      - run: python integrations/mem0/python/scripts/check_native_sdk.py
+      - name: Verify installed native Memory wheels
+        run: |
+          python -m build --wheel --outdir "$RUNNER_TEMP/mem0-wheels"
+          python -m build --wheel --outdir "$RUNNER_TEMP/mem0-wheels" integrations/mem0/python
+          python -m venv "$RUNNER_TEMP/mem0-consumer"
+          "$RUNNER_TEMP/mem0-consumer/bin/python" -m pip install "$RUNNER_TEMP"/mem0-wheels/*.whl
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/mem0-consumer/bin/python" -c 'from importlib.metadata import distributions; assert not any("langchain" in d.metadata["Name"].lower() or d.metadata["Name"].lower() == "langsmith" for d in distributions())'
+          "$RUNNER_TEMP/mem0-consumer/bin/python" "$GITHUB_WORKSPACE/integrations/mem0/python/scripts/check_sdk.py"
+          "$RUNNER_TEMP/mem0-consumer/bin/python" "$GITHUB_WORKSPACE/integrations/mem0/python/scripts/check_native_sdk.py"
 
   mem0-typescript:
     runs-on: ubuntu-latest
@@ -89,6 +101,21 @@ jobs:
         working-directory: typescript
       - run: npm ci && npm run check && npm run test:sdk && npm pack --dry-run
         working-directory: integrations/mem0/typescript
+      - name: Verify installed native Memory tarballs and public types
+        run: |
+          mkdir -p "$RUNNER_TEMP/mem0-node/consumer/scripts"
+          (cd typescript && npm pack --pack-destination "$RUNNER_TEMP/mem0-node")
+          (cd integrations/mem0/typescript && npm pack --pack-destination "$RUNNER_TEMP/mem0-node")
+          cp integrations/mem0/typescript/scripts/*.mjs "$RUNNER_TEMP/mem0-node/consumer/scripts/"
+          cp integrations/mem0/typescript/test/{consumer.ts,tsconfig.json} "$RUNNER_TEMP/mem0-node/consumer/"
+          cp -R integrations/mem0/fixtures "$RUNNER_TEMP/mem0-node/fixtures"
+          cd "$RUNNER_TEMP/mem0-node/consumer"
+          echo '{"private":true,"type":"module"}' > package.json
+          npm install --omit=dev --omit=optional ../*.tgz
+          node --input-type=module -e 'import {createRequire} from "node:module"; const require=createRequire(import.meta.url); for(const name of ["@langchain/core","langchain","langsmith","mem0ai"]) { try { require.resolve(name); throw new Error("unexpected dependency: " + name); } catch(e) { if(e.code !== "MODULE_NOT_FOUND") throw e; } }'
+          node --experimental-loader ./scripts/deny-langchain.mjs scripts/check-sdk.mjs
+          node --experimental-loader ./scripts/deny-langchain.mjs scripts/check-native-sdk.mjs
+          "$GITHUB_WORKSPACE/typescript/node_modules/.bin/tsc" -p tsconfig.json
 
   optional-components:
     runs-on: ubuntu-latest

@@ -1,4 +1,4 @@
-/** Published SDK + SQLite, deterministic providers. This is not a quality eval. */
+/** Private SDK extension + SQLite, deterministic providers. This is not a quality eval. */
 import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -155,5 +155,5 @@ try {
     const result = await evaluateCase(test, fixture, join(root, test.id), transport, index);
     assert.ok(result.passed, JSON.stringify({ case: test.id, checks: result.checks }));
   }
-  console.log(JSON.stringify({ sdk: "mem0ai@3.1.7", checks: "CRUD/inference/restart/idempotency/managed-budget/swallowed-denial/source-withdrawal/correction/evidence/atomic-resolution/semantic-review/evaluation-harness", provider: "deterministic fixture via supported LangChain config", calls, offline_evaluation_cases: fixture.cases.length }));
+  console.log(JSON.stringify({ sdk: "purra-mem0 private extension of mem0ai@3.1.7", checks: "CRUD/inference/restart/idempotency/managed-budget/swallowed-denial/source-withdrawal/correction/evidence/atomic-resolution/semantic-review/evaluation-harness", provider: "deterministic fixture via native PurrA adapters", calls, offline_evaluation_cases: fixture.cases.length }));
 } finally { rmSync(root, { recursive: true, force: true }); }

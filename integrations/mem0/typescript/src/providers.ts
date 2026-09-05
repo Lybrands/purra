@@ -58,11 +58,6 @@ export function currentExecution(journal?: Journal): ProviderExecution | undefin
   const value = current.getStore();
   return journal === undefined || value?.journal === journal ? value : undefined;
 }
-function execution(): ProviderExecution {
-  const value = currentExecution();
-  if (!value) throw new MemoryError("memory_provider_unbound");
-  return value;
-}
 
 export class ProviderExecution {
   readonly controller = new AbortController();
@@ -189,21 +184,14 @@ export async function createManagedClient(options: { config: ManagedMem0Config; 
   if (!Number.isSafeInteger(embeddingDims) || embeddingDims < 1 || embeddingDims > 65_536) throw new TypeError("invalid embeddingDims");
   if (!config || Object.keys(config).some(k => !["vectorStore", "historyDbPath", "customInstructions"].includes(k))) throw new TypeError("managed config accepts only storage/history/instructions");
   if (!config.vectorStore || typeof config.historyDbPath !== "string" || !config.historyDbPath.trim()) throw new TypeError("explicit vectorStore and historyDbPath are required");
-  const { Memory } = await import("mem0ai/oss");
+  if (config.vectorStore.provider.toLowerCase() === "langchain") throw new TypeError("native vector store required");
+  const dimension = config.vectorStore.config.dimension;
+  if (dimension !== undefined && dimension !== embeddingDims) throw new TypeError("vector store dimension must match embeddingDims");
+  const { Memory } = await import("./sdk-memory.js");
+  const { DirectLlm, DirectEmbedder } = await import("./direct-providers.js");
   const sdk = new Memory({ ...config,
-    llm: { provider: "langchain", config: { model: { async invoke(messages: { type?: string; getType?: () => string; content: unknown }[]) {
-      const roles = { human: "user", ai: "assistant", system: "system" } as const;
-      const converted = messages.map(message => {
-        const role = roles[(message.type ?? message.getType?.()) as keyof typeof roles];
-        if (!role || typeof message.content !== "string") throw new MemoryError("memory_provider_contract");
-        return { role, content: message.content };
-      });
-      return { content: await execution().invoke("llm", converted) };
-    } } } },
-    embedder: { provider: "langchain", config: { embeddingDims, model: {
-      async embedQuery(text: string) { return (await execution().invoke("embedding", [text]))[0]!; },
-      async embedDocuments(texts: string[]) { return execution().invoke("embedding", texts); },
-    } } },
-  } as ConstructorParameters<typeof Memory>[0]);
+    vectorStore: { ...config.vectorStore, config: { ...config.vectorStore.config, dimension: embeddingDims } },
+  }, { llm: new DirectLlm(), embedder: new DirectEmbedder() });
+  await sdk.ready();
   return new ManagedMem0Client(sdk, embeddingDims);
 }

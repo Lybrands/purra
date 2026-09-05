@@ -1,0 +1,12 @@
+{
+  "python": {
+    "version": "2.0.19",
+    "sha256": "5b1b75e2f00aca7bd368a6e9cd5905145d60fd05a0e36d6b1ef3e2f1b4f28ca1",
+    "file": "mem0/memory/main.py"
+  },
+  "typescript": {
+    "version": "3.1.7",
+    "sha256": "6abcee750e0bf1649cd269b95ab5aa83ef0f6c3cde7b3165356bf6737dc5247a",
+    "file": "dist/oss/index.mjs"
+  }
+}
