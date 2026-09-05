@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.5.0 — Unreleased
+## 0.5.0 — 2026-09-06
 
 - Preserve transport-activity events in the opt-in Provider timing sampler
   without treating them as content or progress. Add SQLite multiprocess,
@@ -110,7 +110,7 @@
   source mismatches, cross-Run output and late terminal writes. Providers without
   this capability emit no native Agent progress.
 
-### Optional Mem0 integration (local, unpublished)
+### Optional Mem0 integration
 
 - Add bounded administration filters and pagination, host metadata and reasons,
   explicit record selection/context assembly, and versioned relations between
