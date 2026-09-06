@@ -1,18 +1,23 @@
 # Changelog
 
-## Unreleased — 1.0.0 development
+## 1.0.0 — Unreleased candidate
 
 - Add versioned strict object output contracts, shared JSON identity, and Run-bound
   structured model tasks with local/native-required modes and explicit bounded repairs.
   OpenAI Responses/Chat and Anthropic mappings use conservative schema dialects;
   selected live model support must be verified separately.
+- Keep Core free of runtime dependencies; version all seven optional packages with Core.
 - Add optional host-owned MCP read-only tools with bounded discovery, immutable
   catalog identity, schema/result validation, and fail-closed catalog changes.
+  Recognize an explicit root JSON Schema 2020-12 declaration while preserving snapshot identity.
 - Add explicit bounded concurrency for wholly safe read batches; preserve ordered
   results, actual event timing, cancellation and per-dispatch authorization.
 - Add actual integration-check coverage reports and read-only recovery inspection.
   Unknown usage, permissions and effects remain unknown; diagnosis grants no
   execution authority. Include public examples and external package consumers.
+
+Candidate support and upgrade boundaries: [English](conformance/release-1.0.md) ·
+[简体中文](conformance/release-1.0.zh-CN.md). This entry does not indicate publication.
 
 ## 0.5.0 — 2026-09-06
 

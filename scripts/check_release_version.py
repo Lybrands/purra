@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import tomllib
 from pathlib import Path
@@ -33,9 +34,27 @@ def main() -> int:
             f"purra-{integration} lock root": integration_lock["packages"][""]["version"],
             f"purra-{integration} PurrA peer": integration_package["peerDependencies"]["purra"],
         })
-        if f"purra=={expected}" not in integration_python["project"]["dependencies"]:
+        project = integration_python["project"]
+        if f"purra=={expected}" not in project["dependencies"]:
             print(f"purra-{integration} Python dependency must match the release", file=sys.stderr)
             return 1
+        dependencies = [*project["dependencies"],
+                        *(dependency for group in project.get("optional-dependencies", {}).values() for dependency in group)]
+        for dependency in dependencies:
+            if re.match(r"^purra(?:-[a-z0-9-]+)?(?:\[|[<=>!~;\s]|$)", dependency):
+                if not re.fullmatch(r"purra(?:-[a-z0-9-]+)?==" + re.escape(expected), dependency):
+                    print(f"purra-{integration} Python dependency {dependency!r} must match the release", file=sys.stderr)
+                    return 1
+        for name, requirement in integration_package.get("peerDependencies", {}).items():
+            if name == "purra" or name.startswith("purra-"):
+                versions[f"purra-{integration} {name} peer"] = requirement
+        for path, entry in integration_lock["packages"].items():
+            name = entry.get("name", "")
+            if name == "purra" or name.startswith("purra-"):
+                versions[f"purra-{integration} lock package {path!r}"] = entry.get("version")
+            for name, requirement in entry.get("peerDependencies", {}).items():
+                if name == "purra" or name.startswith("purra-"):
+                    versions[f"purra-{integration} lock peer {path!r} {name}"] = requirement
     mismatches = {name: version for name, version in versions.items() if version != expected}
     if mismatches:
         print(f"release version mismatch: {versions}", file=sys.stderr)

@@ -6,6 +6,14 @@ PurrA is an Agent runtime for Python and TypeScript. It coordinates model calls,
 tool execution, planning, context, and recoverable Runs inside your application.
 The application supplies its models, tools, data sources, and access rules.
 
+
+## 1.0.0 candidate status
+
+This checkout contains an unreleased 1.0.0 candidate. Install the exact local
+artifacts from its candidate manifest; registry commands do not identify this candidate.
+See the [candidate support and upgrade guide](conformance/release-1.0.md)
+for structured tasks, read-only MCP, safe read concurrency, inspection, and 1.x compatibility.
+
 ## Install
 
 Python 3.11+:

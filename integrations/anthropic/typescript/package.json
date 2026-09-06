@@ -1,6 +1,6 @@
 {
   "name": "purra-anthropic",
-  "version": "0.5.0",
+  "version": "1.0.0",
   "type": "module",
   "license": "MIT",
   "description": "Official Anthropic Messages SDK adapter for PurrA",
@@ -20,7 +20,7 @@
     "@anthropic-ai/sdk": "0.123.0"
   },
   "peerDependencies": {
-    "purra": "0.5.0"
+    "purra": "1.0.0"
   },
   "devDependencies": {
     "purra": "file:../../../typescript",

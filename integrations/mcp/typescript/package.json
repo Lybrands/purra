@@ -1,6 +1,6 @@
 {
   "name": "purra-mcp",
-  "version": "0.5.0",
+  "version": "1.0.0",
   "type": "module",
   "license": "MIT",
   "description": "Host-owned, read-only MCP tools for PurrA",
@@ -19,7 +19,7 @@
     "@modelcontextprotocol/sdk": "1.30.0"
   },
   "peerDependencies": {
-    "purra": "0.5.0"
+    "purra": "1.0.0"
   },
   "devDependencies": {
     "purra": "file:../../../typescript",
