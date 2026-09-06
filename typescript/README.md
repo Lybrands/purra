@@ -5,6 +5,14 @@ English | [简体中文](README.zh-CN.md)
 An ESM Agent runtime for Node.js 22+. Applications provide a `ModelGateway` and
 compose tools, context, planning, and persistence through the public `purra` exports.
 
+
+## 1.0.0 candidate status
+
+This checkout contains an unreleased 1.0.0 candidate. Install the exact local
+artifacts from its candidate manifest; registry commands do not identify this candidate.
+See the [candidate support and upgrade guide](../conformance/release-1.0.md)
+for structured tasks, read-only MCP, safe read concurrency, inspection, and 1.x compatibility.
+
 ## Install
 
 ```sh
