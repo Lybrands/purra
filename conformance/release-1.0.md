@@ -31,10 +31,10 @@ acceptance are separate evidence categories.
 
 | Path | Evidence | Remaining boundary |
 | --- | --- | --- |
-| DeepSeek `deepseek-v4-flash`, Responses, `native_required` | Python/TypeScript actual schema requests, local revalidation, Run-bound receipts, usage settlement and persisted replay passed | Compatible service; not OpenAI service certification or proof of every schema constraint |
+| DeepSeek `deepseek-v4-flash`, Responses, `native_required` | Python/TypeScript actual schema requests, local revalidation, Run-bound receipts, usage settlement and persisted replay passed | Verified Responses protocol/service/model combination; not proof of other combinations or every schema constraint |
 | DeepSeek Chat, `local` and one format repair | Both runtimes passed; controlled input caused a real schema mismatch followed by a new, settled repair invocation | Host-specific wire mapping required; not a natural-task repair-rate benchmark |
-| OpenAI Responses/Chat native schema | Both SDK request/response and failure fixtures passed | Original OpenAI service/model validation pending |
-| Anthropic Messages native schema | Both SDK request/response and failure fixtures passed | Original Anthropic service/model validation pending |
+| OpenAI Chat Completions protocol, native schema | Both SDK request/response and failure fixtures passed | Live `response_format.json_schema` validation on a compatible service/model remains pending; local Chat validation does not cover this capability |
+| Anthropic Messages protocol, native schema | Both SDK request/response and failure fixtures passed | Live `output_config.format` validation on a compatible service/model remains pending |
 | Microsoft Learn MCP `microsoft_docs_fetch` | Actual read-only text calls and bounded concurrency passed in both runtimes | Only the selected, scoped tool; not arbitrary Microsoft MCP tools |
 | Cloudflare documentation MCP `search_cloudflare_documentation` | Actual structured JSON, output-schema validation and bounded concurrency passed in both runtimes | Only the selected, scoped public documentation tool |
 | MCP cancellation, disconnect and catalog changes | Both runtimes passed separate-process HTTP server termination, catalog notifications, stale in-flight result rejection and queued-call blocking; host cancellation also checked against Cloudflare | Controlled faults, not third-party production outages; disconnect detection may wait for the RPC timeout; Python transport-context failures require host handling |
@@ -43,7 +43,19 @@ acceptance are separate evidence categories.
 `native_required` requires explicit model capability and adapter dialect support.
 It fails before a call when unsupported; it does not silently fall back to local
 validation. Compatible endpoint names alone do not establish model support.
-Original-provider checks remain open for final support sign-off.
+Acceptance is defined by protocol entry point, capability, and the actual
+service/model combination, not by the model vendor. OpenAI Responses, OpenAI
+Chat Completions, and Anthropic Messages are distinct protocol paths. A
+compatible third-party service can provide live evidence for the capabilities
+it implements; models or credentials from OpenAI or Anthropic are not a
+mandatory release gate. `native_required` means service-side schema constraints,
+not a first-party model. The DeepSeek Responses checks above satisfy live
+verification for that selected path. Chat and Messages native-schema checks
+remain pending and require a compatible service/model that implements the
+respective schema fields. Basic chat compatibility or a successful response
+alone does not establish schema constraints, tool, stream, termination, or usage
+semantics; record only the capabilities exercised. Unverified combinations stay
+unverified; this correction adds no new passing results or support claims.
 
 MCP accepts only its documented schema subset. A root `$schema` may explicitly
 select `https://json-schema.org/draft/2020-12/schema`; the declaration stays in

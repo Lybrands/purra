@@ -16,16 +16,18 @@ Python 和 TypeScript 均提供 Run 绑定的完整对象结构化任务、显�
 
 | 路径 | 已有证据 | 保留边界 |
 | --- | --- | --- |
-| DeepSeek `deepseek-v4-flash` Responses，`native_required` | 双端实际 Schema 请求、本地复验、Run 回执、用量结算与持久重放通过 | 兼容服务证据，不替代 OpenAI 原厂或所有 Schema 约束验证 |
+| DeepSeek `deepseek-v4-flash` Responses，`native_required` | 双端实际 Schema 请求、本地复验、Run 回执、用量结算与持久重放通过 | 已验证的 Responses 协议／服务／模型组合，不代表其他组合或所有 Schema 约束 |
 | DeepSeek Chat，`local` 与一次格式修复 | 双端通过；受控输入使真实模型先返回 Schema 不匹配，再发起新的修复调用并结算 | 需要宿主字段映射，不代表自然业务的修复成功率 |
-| OpenAI Responses／Chat 原生 Schema | 双端 SDK 请求、响应和故障测试通过 | 原厂服务与具体模型待验证 |
-| Anthropic Messages 原生 Schema | 双端 SDK 请求、响应和故障测试通过 | 原厂服务与具体模型待验证 |
+| OpenAI Chat Completions 协议，原生 Schema | 双端 SDK 请求、响应和故障测试通过 | 兼容服务／模型的 `response_format.json_schema` 真实验证待完成；local Chat 验证不覆盖这项能力 |
+| Anthropic Messages 协议，原生 Schema | 双端 SDK 请求、响应和故障测试通过 | 兼容服务／模型的 `output_config.format` 真实验证待完成 |
 | Microsoft Learn MCP `microsoft_docs_fetch` | 双端真实文本读取与有界并行通过 | 仅选定并限定范围的工具，不代表其全部工具 |
 | Cloudflare 文档 MCP `search_cloudflare_documentation` | 双端真实结构化 JSON、输出 Schema 复验与有界并行通过 | 仅选定的公共文档工具 |
 | MCP 取消、断连、目录变化 | 双端独立进程 HTTP 服务退出、目录通知、在途旧结果丢弃及排队调用阻止通过；另有 Cloudflare 宿主取消验证 | 受控故障，不代表第三方生产故障；断连检测可能等待 RPC 超时，Python 传输上下文异常需宿主处理 |
 | 下游应用 | 公共示例、独立安装消费者及接入契约已具备 | 实际业务验收由目标项目独立执行 |
 
-`native_required` 同时要求明确的模型能力和适配器方言支持。不支持时调用前失败，不静默降级为本地模式。兼容接口名称本身不证明模型能力；原厂验证仍是最终支持确认的开放项。
+`native_required` 同时要求明确的模型能力和适配器方言支持。不支持时调用前失败，不静默降级为本地模式。兼容接口名称本身不证明模型能力。
+
+验收按“协议入口＋具体能力＋实际服务／模型组合”记录，不按模型厂商品牌设置门槛。OpenAI Responses、OpenAI Chat Completions、Anthropic Messages 是三个独立协议入口；兼容第三方服务可以为其实际支持的能力提供真实证据，不强制使用 OpenAI／Anthropic 自家的模型或凭据。`native_required` 指服务端原生 Schema 约束，不指原厂模型。上表 DeepSeek Responses 已满足该选定路径的真实验证；Chat 和 Messages 的原生 Schema 仍待兼容服务／模型实测。基础聊天兼容或一次成功响应不证明 Schema 约束、工具、流式、终止和用量语义全部兼容，只记录实际覆盖的能力。未验证组合仍标未验证；本次口径纠正没有新增通过结果或扩大支持声明。
 
 MCP 仅支持明确声明的 Schema 子集。根部可声明确切的 `https://json-schema.org/draft/2020-12/schema`；声明保留在目录身份中并计入限额。其他方言、嵌套声明、引用、`default` 和厂商关键字仍拒绝，不承诺完整 JSON Schema 支持。远端只读注解不授予访问或并发权限。参见 [Python](../integrations/mcp/python/README.md)／[TypeScript](../integrations/mcp/typescript/README.md) MCP 契约。
 
