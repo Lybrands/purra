@@ -106,6 +106,15 @@ async function contract(schema: Readonly<Record<string, JsonValue>>, limits: Mcp
     limits: { schemaBytes: limits.maxSchemaBytes, outputBytes: limits.maxResultBytes } }); }
   catch { return fail("mcp_schema_unsupported"); }
 }
+async function remoteContract(schema: Readonly<Record<string, JsonValue>>, limits: McpToolLimits) {
+  // Keep the recognized MCP root dialect in snapshot identity, outside the constraint profile.
+  if (size(schema) > limits.maxSchemaBytes) fail("mcp_schema_unsupported");
+  const declared = Object.hasOwn(schema, "$schema");
+  if (declared && schema.$schema !== "https://json-schema.org/draft/2020-12/schema") fail("mcp_schema_unsupported");
+  const compiled = await contract(Object.fromEntries(Object.entries(schema).filter(([key]) => key !== "$schema")), limits);
+  const snapshot = declared ? Object.freeze({ ...compiled.schema, $schema: schema.$schema! }) : compiled.schema;
+  return { compiled, snapshot };
+}
 function resultValue(raw: CallToolResult, output: StructuredOutputContract | undefined, envelope: StructuredOutputContract, limits: McpToolLimits): Readonly<Record<string, JsonValue>> {
   if (raw.isError) fail("mcp_tool_error");
   if (raw.content.length > limits.maxContentBlocks || size(raw) > limits.maxResultBytes) fail("mcp_result_too_large");
@@ -169,10 +178,11 @@ export async function discoverMcpTools(client: Client, serverId: string, binding
       const description = tool.description ?? "";
       if (encoder.encode(description).length > limits.maxDescriptionBytes) fail("mcp_catalog_limit_exceeded");
       if (tool.execution?.taskSupport === "required") fail("mcp_tool_unsupported");
-      const input = await contract(tool.inputSchema as Readonly<Record<string, JsonValue>>, limits);
-      const output = tool.outputSchema === undefined ? undefined : await contract(tool.outputSchema as Readonly<Record<string, JsonValue>>, limits);
+      const inputContract = await remoteContract(tool.inputSchema as Readonly<Record<string, JsonValue>>, limits);
+      const outputContract = tool.outputSchema === undefined ? undefined : await remoteContract(tool.outputSchema as Readonly<Record<string, JsonValue>>, limits);
+      const input = inputContract.compiled, output = outputContract?.compiled;
       const entry: McpToolEntry = Object.freeze({ remoteName: tool.name, localName: binding.localName, description,
-        inputSchema: input.schema, outputSchema: output?.schema ?? null,
+        inputSchema: inputContract.snapshot, outputSchema: outputContract?.snapshot ?? null,
         policy: Object.freeze({ mode: "read", title: binding.policy.title, riskLevel: "read" }), concurrencySafe: binding.concurrencySafe ?? false });
       found.set(tool.name, { entry, binding, input, output });
     }

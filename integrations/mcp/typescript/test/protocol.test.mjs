@@ -214,3 +214,27 @@ for (const row of fixture.schemaCases) test(`selected schema metadata: ${row.id}
   await assert.rejects(discover(f), errorCode(row.errorCode));
   assert.deepEqual(f.calls, []);
 });
+
+test('declared dialect keeps snapshot identity and argument validation', async t => {
+  const f = await connect(t,{pages:[{tools:[fixture.declaredDialectTool]}]});
+  const catalog = await discover(f);
+  for (const key of ['inputSchema','outputSchema']) assert.equal(catalog.snapshot.entries[0][key].$schema,fixture.declaredDialectTool[key].$schema);
+  assert.equal(Object.hasOwn(catalog.registrations[0].argumentContract.schema,'$schema'),false);
+  assert.equal((await run(catalog,{q:'too long'})).errorCode,'mcp_invalid_arguments');
+  assert.equal(f.calls.length,0);
+  const result = await run(catalog);
+  assert.equal(result.errorCode,undefined);assert.deepEqual(result.content.structured,{count:1});assert.equal(f.calls.length,1);
+  const baseline = await discover(await connect(t));
+  assert.notEqual(catalog.snapshot.revisionDigest,baseline.snapshot.revisionDigest);
+});
+
+test('declared output dialect still rejects wrong result', async t => {
+  const f = await connect(t,{pages:[{tools:[fixture.declaredDialectTool]}],result:{content:[],structuredContent:{count:'wrong'}}});
+  assert.equal((await run(await discover(f))).errorCode,'mcp_result_invalid');assert.equal(f.calls.length,1);
+});
+
+test('schema byte limit includes dialect declaration', async t => {
+  const f = await connect(t,{pages:[{tools:[{name:'remote.search',inputSchema:{type:'object',$schema:'https://json-schema.org/draft/2020-12/schema'}}]}]});
+  await assert.rejects(discover(f,{limits:{maxSchemaBytes:60}}),errorCode('mcp_schema_unsupported'));
+  assert.equal(f.calls.length,0);
+});

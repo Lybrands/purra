@@ -113,3 +113,13 @@ keywords. For example, `default` and `x-fastmcp-wrap-result` are outside
 fields to make a remote tool appear supported. Select compatible tools explicitly;
 unselected unsupported tools do not widen the catalog. A working MCP handshake
 alone does not establish tool compatibility.
+
+MCP input/output schemas may declare the root `$schema` as exactly
+`https://json-schema.org/draft/2020-12/schema`. The adapter recognizes this
+MCP dialect declaration, retains it in the immutable snapshot and revision
+digest, and compiles the remaining constraints with `purra.output-schema/v1`.
+The full remote schema, including the declaration, counts against the schema
+byte limit. Other dialect URIs, nested declarations, references, and unknown
+keywords remain unsupported; no schema document is fetched. This does not add
+`$schema` to the Core structured-output profile or promise full JSON Schema
+2020-12 support. See the [MCP schema rules](https://modelcontextprotocol.io/specification/2025-11-25/server/tools).

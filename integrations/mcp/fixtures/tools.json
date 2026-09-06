@@ -46,7 +46,7 @@
     {
       "id": "valid",
       "arguments": {
-        "q": "猫"
+        "q": "\u732b"
       },
       "result": {
         "content": [
@@ -64,7 +64,7 @@
     {
       "id": "unicode_integer",
       "arguments": {
-        "q": "😀",
+        "q": "\ud83d\ude00",
         "n": 1.0
       },
       "result": {
@@ -329,6 +329,244 @@
         }
       },
       "errorCode": "mcp_schema_unsupported"
+    },
+    {
+      "id": "other-input-dialect",
+      "tool": {
+        "name": "remote.search",
+        "description": "Search documents",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "q": {
+              "type": "string",
+              "maxLength": 1
+            },
+            "n": {
+              "type": "integer"
+            },
+            "tags": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "q"
+          ],
+          "additionalProperties": false,
+          "$schema": "http://json-schema.org/draft-07/schema#"
+        },
+        "outputSchema": {
+          "type": "object",
+          "properties": {
+            "count": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "count"
+          ],
+          "additionalProperties": false,
+          "$schema": "https://json-schema.org/draft/2020-12/schema"
+        },
+        "annotations": {
+          "readOnlyHint": false,
+          "destructiveHint": true
+        }
+      },
+      "errorCode": "mcp_schema_unsupported"
+    },
+    {
+      "id": "other-output-dialect",
+      "tool": {
+        "name": "remote.search",
+        "description": "Search documents",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "q": {
+              "type": "string",
+              "maxLength": 1
+            },
+            "n": {
+              "type": "integer"
+            },
+            "tags": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "q"
+          ],
+          "additionalProperties": false,
+          "$schema": "https://json-schema.org/draft/2020-12/schema"
+        },
+        "outputSchema": {
+          "type": "object",
+          "properties": {
+            "count": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "count"
+          ],
+          "additionalProperties": false,
+          "$schema": "https://example.invalid/schema"
+        },
+        "annotations": {
+          "readOnlyHint": false,
+          "destructiveHint": true
+        }
+      },
+      "errorCode": "mcp_schema_unsupported"
+    },
+    {
+      "id": "nested-dialect",
+      "tool": {
+        "name": "remote.search",
+        "description": "Search documents",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "q": {
+              "type": "string",
+              "maxLength": 1,
+              "$schema": "https://json-schema.org/draft/2020-12/schema"
+            },
+            "n": {
+              "type": "integer"
+            },
+            "tags": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "q"
+          ],
+          "additionalProperties": false,
+          "$schema": "https://json-schema.org/draft/2020-12/schema"
+        },
+        "outputSchema": {
+          "type": "object",
+          "properties": {
+            "count": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "count"
+          ],
+          "additionalProperties": false,
+          "$schema": "https://json-schema.org/draft/2020-12/schema"
+        },
+        "annotations": {
+          "readOnlyHint": false,
+          "destructiveHint": true
+        }
+      },
+      "errorCode": "mcp_schema_unsupported"
+    },
+    {
+      "id": "reference-with-recognized-dialect",
+      "tool": {
+        "name": "remote.search",
+        "description": "Search documents",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "q": {
+              "type": "string",
+              "maxLength": 1
+            },
+            "n": {
+              "type": "integer"
+            },
+            "tags": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "q"
+          ],
+          "additionalProperties": false,
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "$ref": "https://example.invalid/private"
+        },
+        "outputSchema": {
+          "type": "object",
+          "properties": {
+            "count": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "count"
+          ],
+          "additionalProperties": false,
+          "$schema": "https://json-schema.org/draft/2020-12/schema"
+        },
+        "annotations": {
+          "readOnlyHint": false,
+          "destructiveHint": true
+        }
+      },
+      "errorCode": "mcp_schema_unsupported"
     }
-  ]
+  ],
+  "declaredDialectTool": {
+    "name": "remote.search",
+    "description": "Search documents",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "q": {
+          "type": "string",
+          "maxLength": 1
+        },
+        "n": {
+          "type": "integer"
+        },
+        "tags": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "q"
+      ],
+      "additionalProperties": false,
+      "$schema": "https://json-schema.org/draft/2020-12/schema"
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "count": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "count"
+      ],
+      "additionalProperties": false,
+      "$schema": "https://json-schema.org/draft/2020-12/schema"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true
+    }
+  }
 }

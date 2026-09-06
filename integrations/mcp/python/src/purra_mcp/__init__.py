@@ -151,6 +151,23 @@ def _contract(schema, limits):
         _fail("mcp_schema_unsupported")
 
 
+def _remote_contract(schema, limits):
+    # MCP's root dialect declaration selects the validated subset; it is not a constraint.
+    try:
+        if _bytes(schema) > limits.max_schema_bytes:
+            _fail("mcp_schema_unsupported")
+        declared = "$schema" in schema
+        if declared and schema["$schema"] != "https://json-schema.org/draft/2020-12/schema":
+            _fail("mcp_schema_unsupported")
+        contract = _contract({key: value for key, value in schema.items() if key != "$schema"}, limits)
+        snapshot = thaw_json_mapping(contract.schema)
+        if declared:
+            snapshot["$schema"] = schema["$schema"]
+        return contract, snapshot
+    except (TypeError, ValueError, OverflowError, RecursionError):
+        _fail("mcp_schema_unsupported")
+
+
 async def _request(client, request, result_type, limits, signal):
     raise_if_stopped(signal)
     try:
@@ -277,11 +294,11 @@ async def discover_mcp_tools(client: ClientSession, server_id: str,
                 _fail("mcp_catalog_limit_exceeded")
             if tool.execution is not None and tool.execution.taskSupport == "required":
                 _fail("mcp_tool_unsupported")
-            contract = _contract(tool.inputSchema, limits)
-            output = _contract(tool.outputSchema, limits) if tool.outputSchema is not None else None
+            contract, input_schema = _remote_contract(tool.inputSchema, limits)
+            output, output_schema = _remote_contract(tool.outputSchema, limits) if tool.outputSchema is not None else (None, None)
             entry = {"remoteName": tool.name, "localName": binding.local_name,
-                "description": description, "inputSchema": thaw_json_mapping(contract.schema),
-                "outputSchema": thaw_json_mapping(output.schema) if output is not None else None,
+                "description": description, "inputSchema": input_schema,
+                "outputSchema": output_schema,
                 "policy": {"mode": "read", "title": binding.policy.title, "riskLevel": "read"},
                 "concurrencySafe": binding.concurrency_safe}
             found[tool.name] = (entry, binding, contract, output)

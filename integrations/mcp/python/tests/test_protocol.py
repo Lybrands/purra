@@ -310,3 +310,40 @@ async def test_selected_schema_metadata_is_not_silently_discarded(row):
             await discover(client, monitor)
         assert caught.value.code == row['errorCode']
         assert fixture.calls == []
+
+
+@pytest.mark.asyncio
+async def test_declared_dialect_keeps_snapshot_identity_and_argument_validation():
+    fixture = ProtocolServer(pages=[{'tools':[FIXTURE['declaredDialectTool']]}])
+    async with fixture.connect() as (client, monitor):
+        catalog = await discover(client, monitor)
+        for key in ('inputSchema','outputSchema'):
+            assert catalog.snapshot.entries[0][key]['$schema'] == FIXTURE['declaredDialectTool'][key]['$schema']
+        assert '$schema' not in catalog.registrations[0].argument_contract.schema
+        denied = await catalog.registrations[0].handler(ExecutionState(), {'q':'too long'})
+        assert denied.error_code == 'mcp_invalid_arguments'
+        assert not fixture.calls
+        result = await catalog.registrations[0].handler(ExecutionState(), {'q':'a'})
+        assert result.error_code is None
+        assert json.loads(result.content)['structured'] == {'count':1}
+        assert len(fixture.calls) == 1
+    async with ProtocolServer().connect() as (client, monitor):
+        assert (await discover(client, monitor)).snapshot.revision_digest != catalog.snapshot.revision_digest
+
+
+@pytest.mark.asyncio
+async def test_declared_output_dialect_still_rejects_wrong_result():
+    fixture = ProtocolServer(pages=[{'tools':[FIXTURE['declaredDialectTool']]}], result={'content':[],'structuredContent':{'count':'wrong'}})
+    async with fixture.connect() as (client, monitor):
+        result = await (await discover(client,monitor)).registrations[0].handler(ExecutionState(), {'q':'a'})
+        assert result.error_code == 'mcp_result_invalid'
+        assert len(fixture.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_schema_byte_limit_includes_dialect_declaration():
+    tool = {'name':'remote.search','inputSchema':{'type':'object','$schema':'https://json-schema.org/draft/2020-12/schema'}}
+    async with ProtocolServer(pages=[{'tools':[tool]}]).connect() as (client, monitor):
+        with pytest.raises(McpAdapterError) as caught:
+            await discover(client,monitor,limits=McpToolLimits(max_schema_bytes=60))
+        assert caught.value.code == 'mcp_schema_unsupported'
