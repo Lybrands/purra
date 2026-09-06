@@ -37,7 +37,7 @@ acceptance are separate evidence categories.
 | Anthropic Messages native schema | Both SDK request/response and failure fixtures passed | Original Anthropic service/model validation pending |
 | Microsoft Learn MCP `microsoft_docs_fetch` | Actual read-only text calls and bounded concurrency passed in both runtimes | Only the selected, scoped tool; not arbitrary Microsoft MCP tools |
 | Cloudflare documentation MCP `search_cloudflare_documentation` | Actual structured JSON, output-schema validation and bounded concurrency passed in both runtimes | Only the selected, scoped public documentation tool |
-| MCP cancellation, disconnect and catalog changes | Local official-SDK protocol fault tests passed | Controlled remote-origin fault verification pending |
+| MCP cancellation, disconnect and catalog changes | Both runtimes passed separate-process HTTP server termination, catalog notifications, stale in-flight result rejection and queued-call blocking; host cancellation also checked against Cloudflare | Controlled faults, not third-party production outages; disconnect detection may wait for the RPC timeout; Python transport-context failures require host handling |
 | Downstream applications | Public examples, package consumers and integration contracts available | Actual application/business acceptance belongs to the consuming project |
 
 `native_required` requires explicit model capability and adapter dialect support.

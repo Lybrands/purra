@@ -119,3 +119,10 @@ byte limit. Other dialect URIs, nested declarations, references, and unknown
 keywords remain unsupported; no schema document is fetched. This does not add
 `$schema` to the Core structured-output profile or promise full JSON Schema
 2020-12 support. See the [MCP schema rules](https://modelcontextprotocol.io/specification/2025-11-25/server/tools).
+
+HTTP connection failures (including `fetch` transport `TypeError`) return
+`mcp_transport_error`; SDK response validation failures remain
+`mcp_result_invalid`. A lost response stream may remain pending until the
+configured request timeout. The host must close the monitor when discarding a
+failed session, then initialize a new session and explicitly rediscover tools
+before resuming work. Transport recovery never authorizes new tools.

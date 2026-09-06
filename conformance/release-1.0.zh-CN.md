@@ -22,7 +22,7 @@ Python 和 TypeScript 均提供 Run 绑定的完整对象结构化任务、显�
 | Anthropic Messages 原生 Schema | 双端 SDK 请求、响应和故障测试通过 | 原厂服务与具体模型待验证 |
 | Microsoft Learn MCP `microsoft_docs_fetch` | 双端真实文本读取与有界并行通过 | 仅选定并限定范围的工具，不代表其全部工具 |
 | Cloudflare 文档 MCP `search_cloudflare_documentation` | 双端真实结构化 JSON、输出 Schema 复验与有界并行通过 | 仅选定的公共文档工具 |
-| MCP 取消、断连、目录变化 | 本地官方 SDK 协议故障测试通过 | 受控的远端来源故障尚未验证 |
+| MCP 取消、断连、目录变化 | 双端独立进程 HTTP 服务退出、目录通知、在途旧结果丢弃及排队调用阻止通过；另有 Cloudflare 宿主取消验证 | 受控故障，不代表第三方生产故障；断连检测可能等待 RPC 超时，Python 传输上下文异常需宿主处理 |
 | 下游应用 | 公共示例、独立安装消费者及接入契约已具备 | 实际业务验收由目标项目独立执行 |
 
 `native_required` 同时要求明确的模型能力和适配器方言支持。不支持时调用前失败，不静默降级为本地模式。兼容接口名称本身不证明模型能力；原厂验证仍是最终支持确认的开放项。

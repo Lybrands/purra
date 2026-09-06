@@ -19,22 +19,24 @@ from purra_mcp import McpCatalogMonitor, McpToolBinding, discover_mcp_tools
 
 monitor = McpCatalogMonitor()
 # read_stream/write_stream come from the application's chosen SDK transport.
-async with ClientSession(read_stream, write_stream,
-                         message_handler=monitor.on_message) as client:
-    initialized = await client.initialize()
-    monitor.accept_protocol_version(initialized.protocolVersion)
-    catalog = await discover_mcp_tools(client, "documents", {
-        "remote.search": McpToolBinding(
-            local_name="search_documents",
-            policy=ToolPolicy(mode="read", title="Search documents"),
-            scope_validator=authorize_document_scope,
-            concurrency_safe=False,
-        ),
-    }, monitor=monitor)
-    # Pass catalog.registrations to Core's InMemoryToolCatalog while this
-    # session remains open. authorize_document_scope(state, args, signal)
-    # returns None to allow or a non-empty denial string.
-monitor.close()
+try:
+    async with ClientSession(read_stream, write_stream,
+                             message_handler=monitor.on_message) as client:
+        initialized = await client.initialize()
+        monitor.accept_protocol_version(initialized.protocolVersion)
+        catalog = await discover_mcp_tools(client, "documents", {
+            "remote.search": McpToolBinding(
+                local_name="search_documents",
+                policy=ToolPolicy(mode="read", title="Search documents"),
+                scope_validator=authorize_document_scope,
+                concurrency_safe=False,
+            ),
+        }, monitor=monitor)
+        # Pass catalog.registrations to Core's InMemoryToolCatalog while this
+        # session remains open. authorize_document_scope(state, args, signal)
+        # returns None to allow or a non-empty denial string.
+finally:
+    monitor.close()
 ```
 
 If the host already has a message handler, compose it with `monitor.on_message`.
@@ -86,6 +88,16 @@ envelope plus `error_code`: `mcp_invalid_arguments`, `mcp_scope_denied`,
 Core admission may reject the whole batch before the handler, using Core's
 argument/scope error codes. Remote error messages are not returned to the model.
 There are no adapter retries, implicit rediscovery, or hidden model calls.
+
+The host must also handle failures around the transport context manager. In the
+pinned Python Streamable HTTP SDK, a connection failure in a background HTTP
+task can exit the entire session with an `ExceptionGroup`, interrupting the
+awaiting tool call. This is a host session failure, not a returned adapter tool
+error. Close the monitor in `finally`, discard the failed session and create a
+new initialized session and catalog before resuming work. Do not expose raw
+transport exceptions to the model. A lost response stream may instead remain
+pending until the configured request timeout; disconnect detection is not
+guaranteed to be immediate.
 
 Cancellation stops local waiting and discards late results. The pinned Python
 SDK removes the pending local request but does not send a cancellation
