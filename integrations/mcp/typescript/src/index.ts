@@ -96,7 +96,7 @@ async function request<T>(operation: () => Promise<T>, signal?: AbortSignal): Pr
       if (error.code === ErrorCode.ConnectionClosed) fail("mcp_transport_error");
       fail("mcp_protocol_error");
     }
-    if (error instanceof TypeError || error !== null && typeof error === "object" && "name" in error
+    if (error !== null && typeof error === "object" && "name" in error
       && (error.name === "ZodError" || error.name === "$ZodError")) fail("mcp_result_invalid");
     fail("mcp_transport_error");
   }

@@ -49,10 +49,37 @@ async function connect(t, options = {}) {
   await server.connect(st);
   await client.connect(ct);
   t.after(async () => { state.gate?.resolve(); await client.close(); await server.close(); });
-  return { ...state, state, client, monitor, server };
+  return { ...state, state, client, monitor, server, transport: ct };
 }
 const discover = (f, extra = {}) => discoverMcpTools(f.client,'fixture',{'remote.search':binding},{monitor:f.monitor,...extra});
 const run = (catalog, args = {q:'a'}, context = {}) => catalog.registrations[0].run(args,{toolCallId:'call',toolName:'search',...context});
+
+for (const phase of ['discovery', 'call']) test(`transport TypeError during ${phase} is sanitized as a transport failure`, async t => {
+  const f = await connect(t);
+  const catalog = phase === 'call' ? await discover(f) : undefined;
+  const send = f.transport.send.bind(f.transport);
+  let attempts = 0;
+  f.transport.send = (message, ...rest) => {
+    if (message.method === (phase === 'call' ? 'tools/call' : 'tools/list')) {
+      attempts++;
+      throw new TypeError('fetch failed: private endpoint', { cause: new Error('ECONNREFUSED') });
+    }
+    return send(message, ...rest);
+  };
+  if (catalog) {
+    const result = await run(catalog);
+    assert.equal(result.errorCode, 'mcp_transport_error');
+    assert.deepEqual(result.content, { text: [], structured: null });
+  } else await assert.rejects(discover(f), error => {
+    assert.equal(error.code, 'mcp_transport_error');
+    assert.equal(error.message.includes('private endpoint'), false);
+    return true;
+  });
+  assert.equal(attempts, 1);
+  assert.equal(f.calls.length, 0);
+  assert.equal(f.lists.length, phase === 'call' ? 1 : 0);
+  await f.client.ping();
+});
 
 for (const row of fixture.cases) test(`shared boundary: ${row.id}`, async t => {
   const f = await connect(t, {result:row.result,malformed:row.malformed});
