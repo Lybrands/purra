@@ -819,7 +819,7 @@ function generationCapabilities(maxGenerationTokens) {
 
 function invocationInput(runId, index) {
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     runId,
     invocationId: `invocation-${index}`,
     messageFingerprint: `message-${index}`,

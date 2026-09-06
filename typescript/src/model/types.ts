@@ -152,6 +152,7 @@ export interface InvocationOutputBudget {
 }
 
 export interface ModelRequest {
+  readonly outputContract?: import("../structured.js").StructuredOutputContract;
   readonly messages: readonly Message[];
   readonly tools: readonly ToolSpec[];
   readonly capabilitySnapshot: ModelCapabilitySnapshot;
@@ -159,6 +160,8 @@ export interface ModelRequest {
 }
 
 export interface ModelGateway {
+  /** Pure preflight; returns the adapter's versioned native dialect, never performs I/O. */
+  validateOutputContract?(request: ModelRequest): string | undefined;
   readonly capabilities: ModelCapabilitySnapshot;
   invoke(request: ModelRequest, signal?: AbortSignal): Promise<ModelTurn>;
   stream?(

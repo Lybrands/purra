@@ -40,6 +40,8 @@ export interface ToolPlanningMetadata {
 }
 
 export interface ToolDefinition {
+  readonly argumentContract?: import("../structured.js").StructuredOutputContract;
+  readonly concurrencySafe?: boolean;
   readonly name: string;
   readonly description: string;
   readonly displayNames?: Readonly<Record<string, string>>;
@@ -77,6 +79,7 @@ export interface ToolIdempotencyGateway {
 }
 
 export interface ToolExecutionLimits {
+  readonly maxConcurrency?: number;
   readonly maxCallsPerBatch?: number;
   readonly maxResultChars?: number;
   readonly approvalSummaryChars?: number;

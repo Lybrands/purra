@@ -1,3 +1,4 @@
+import { StructuredOutputContract, StructuredOutputError } from "../structured.js";
 import { AgentOperationController } from "../operations/index.js";
 import { estimateMessagesTokens, maxGenerationTokensForContext } from "../context/budget.js";
 import type {
@@ -75,6 +76,7 @@ export interface ModelTaskRunnerOptions {
   readonly operations?: AgentOperationController;
   readonly authority?: ModelTaskInvocationAuthority;
   readonly runtimeLimits?: ModelStreamLimits;
+  readonly signal?: AbortSignal;
   readonly maxGenerationTokens?: number;
   readonly evidenceValidator?: ModelInputEvidenceValidator;
 }
@@ -110,8 +112,44 @@ export interface ModelTaskTextResult {
   readonly outputBudget: InvocationOutputBudget;
 }
 
+export interface StructuredInvocationRef {
+  readonly usageState: "reported" | "unknown";
+  readonly invocationId: string;
+  readonly outputBudget: InvocationOutputBudget;
+  readonly usage?: ModelTokenUsage;
+  readonly dispatched: boolean;
+  readonly settled: boolean;
+  readonly errorCode?: string;
+}
+export interface StructuredModelTaskReceipt {
+  readonly runId: string;
+  readonly outputContract: Readonly<Record<string, JsonValue>>;
+  readonly invocationRefs: readonly StructuredInvocationRef[];
+  readonly attempts: number;
+  readonly outputBudget: InvocationOutputBudget;
+  readonly usage?: ModelTokenUsage;
+  readonly usageState: "reported" | "unknown";
+  readonly persistence: "bound" | "none";
+  readonly rootBudget: "bound" | "not_bound";
+  readonly validation: "passed";
+}
+export interface StructuredModelTaskResult {
+  readonly value: Readonly<Record<string, JsonValue>>;
+  readonly receipt: StructuredModelTaskReceipt;
+}
+export interface StructuredModelTaskOptions extends ModelTaskOptions {
+  readonly output: StructuredOutputContract;
+  readonly repairAttempts?: number;
+}
+interface StructuredInvocation {
+  readonly task: NonNullable<InvocationReceiptInput["structuredTask"]>;
+  readonly identity: Readonly<Record<string, JsonValue>>;
+  readonly onAttempt: (ref: StructuredInvocationRef) => void;
+}
+
 export class ModelTaskRunner {
   readonly #model: ModelGateway;
+  readonly #signal: AbortSignal | undefined;
   readonly #runId: string;
   readonly #capabilities: ModelCapabilitySnapshot;
   readonly #recovery: RecoveryPolicy;
@@ -140,6 +178,7 @@ export class ModelTaskRunner {
       }
     }
     this.#model = options.model;
+    this.#signal = options.signal;
     if (Object.prototype.hasOwnProperty.call(options, "maxCallOutputTokens")) {
       throw new AgentError(
         "model_output_budget_invalid",
@@ -191,6 +230,68 @@ export class ModelTaskRunner {
     const request = this.#request(messages, options);
     const turn = await this.#invoke(request, options.signal, false);
     return Object.freeze({ turn, outputBudget: request.outputBudget });
+  }
+
+  public async completeStructured(messages: readonly Message[], options: StructuredModelTaskOptions): Promise<StructuredModelTaskResult> {
+    const output = options.output;
+    if (!(output instanceof StructuredOutputContract)) throw new StructuredOutputError("structured_output_schema_invalid", "schema");
+    const repairs = options.repairAttempts ?? 0;
+    if (!Number.isSafeInteger(repairs) || repairs < 0) throw new TypeError("repairAttempts must be a non-negative safe integer");
+    const signal = this.#signal === undefined ? options.signal : options.signal === undefined
+      ? this.#signal : AbortSignal.any([this.#signal, options.signal]);
+    const ledger = new RecoveryLedger(new RecoveryPolicy({ structured_output_invalid: repairs }));
+    const refs: StructuredInvocationRef[] = [];
+    const taskId = globalThis.crypto.randomUUID();
+    const original = copyMessages(messages);
+    let value: Readonly<Record<string, JsonValue>> | undefined;
+    while (true) {
+      try {
+        throwIfAborted(signal);
+        const feedback: readonly Message[] = refs.length === 0 ? [] : [{ role: "developer", content: "Produce a new complete JSON object satisfying the schema; the previous response failed format validation." }];
+        const formatted = [...original, ...feedback, { role: "developer" as const, content: output.instruction() }];
+        const budgetMessages: readonly Message[] = output.mode === "native_required"
+          ? [...formatted, { role: "developer", content: JSON.stringify(output.schema) }] : formatted;
+        const request = Object.freeze({ ...this.#request(formatted, options, budgetMessages), outputContract: output });
+        let dialect: string | undefined;
+        if (output.mode === "native_required" && (this.#capabilities.protocol.jsonSchemaLevel !== "json_schema" || this.#model.validateOutputContract === undefined)) {
+          throw new StructuredOutputError("structured_output_mode_unsupported", "mode");
+        }
+        dialect = this.#model.validateOutputContract?.(request);
+        if (output.mode === "native_required" && (typeof dialect !== "string" || !dialect.trim() || dialect.length > 128)) {
+          throw new StructuredOutputError("structured_output_mode_unsupported", "dialect");
+        }
+        if (output.mode === "native_required" && estimateMessagesTokens([...formatted,
+          { role: "developer", content: JSON.stringify(output.schema) }]) + request.outputBudget.maxGenerationTokens > this.#capabilities.contextWindowTokens) {
+          throw new AgentError("model_task_input_exceeds_budget", "Native schema exceeds model input budget");
+        }
+        const identity = Object.freeze({ ...output.identity(), ...(dialect === undefined ? {} : { nativeDialect: dialect }) });
+        await this.#invoke(request, signal, false, undefined, undefined, (turn) => {
+          if (turn.finishReason !== "stop") throw new AgentError("model_task_tool_call_unsupported", "Structured task requires normal termination");
+          value = output.parse(turn.message.content as string);
+        }, undefined, undefined, { identity, task: Object.freeze({ taskId, attempt: refs.length + 1, previousInvocationId: refs.at(-1)?.invocationId ?? null }), onAttempt: (ref) => refs.push(ref) });
+        const usage = sumStructuredUsage(refs);
+        return Object.freeze({ value: value!, receipt: Object.freeze({
+          runId: this.#runId, outputContract: identity, invocationRefs: Object.freeze([...refs]),
+          attempts: refs.length, outputBudget: request.outputBudget,
+          ...(usage === undefined ? {} : { usage }), usageState: usage === undefined ? "unknown" as const : "reported" as const,
+          persistence: this.#authority === undefined ? "none" as const : "bound" as const,
+          rootBudget: this.#authority === undefined ? "not_bound" as const : "bound" as const, validation: "passed" as const,
+        }) });
+      } catch (error) {
+        if (error instanceof Error) Object.defineProperty(error, "invocationRefs", { value: Object.freeze([...refs]), configurable: true });
+        const last = refs.at(-1);
+        if (!(error instanceof StructuredOutputError) || !["structured_output_invalid_json", "structured_output_schema_mismatch"].includes(error.code)
+          || last?.settled !== true || last.usage === undefined) throw error;
+        const decision = ledger.decide({ cause: "structured_output_invalid", action: "retry_model",
+          remainingModelRounds: repairs - refs.length + 1, cancellationRequested: signal?.aborted === true });
+        if (!decision.allowed) throw error;
+        try { await this.#authority?.publishRecoveryDecision(decision, refs.length); }
+        catch (error) {
+          if (error instanceof Error) Object.defineProperty(error, "invocationRefs", { value: Object.freeze([...refs]), configurable: true });
+          throw error;
+        }
+      }
+    }
   }
 
   public async plan(messages: readonly Message[], options: ModelTaskPlanOptions = {}): Promise<ModelTaskCompletion> {
@@ -319,6 +420,7 @@ export class ModelTaskRunner {
   #request(
     messages: readonly Message[],
     options: ModelTaskOptions,
+    budgetMessages?: readonly Message[],
   ): ManagedModelRequest {
     if (
       Object.prototype.hasOwnProperty.call(options, "maxGenerationTokens")
@@ -343,11 +445,14 @@ export class ModelTaskRunner {
             }),
       },
     );
+    const physicalMaximum = budgetMessages === undefined ? undefined
+      : this.#capabilities.contextWindowTokens - estimateMessagesTokens(budgetMessages);
+    if (physicalMaximum !== undefined && physicalMaximum <= 0) throw new AgentError("model_task_input_exceeds_budget", "Compiled structured input leaves no generation capacity");
     let outputBudget: InvocationOutputBudget;
     try {
       outputBudget = constrainOutputBudgetToContext(
         baseOutputBudget,
-        maxGenerationTokensForContext({
+        physicalMaximum ?? maxGenerationTokensForContext({
           windowTokens: this.#capabilities.contextWindowTokens,
           tools: [],
         }),
@@ -380,9 +485,10 @@ export class ModelTaskRunner {
     useStream: boolean,
     onChunk?: (chunk: ModelStreamChunk, receipt?: ModelInvocationReceipt) => Promise<void> | void,
     planning?: Pick<InvocationReceiptInput, "outputProtocol" | "planningScope" | "planningAttempt">,
-    validateTurn?: () => void,
+    validateTurn?: (turn: ModelTurn) => void,
     diagnostics?: Record<string, JsonValue>,
     invocationTimeoutMs?: number,
+    structured?: StructuredInvocation,
   ): Promise<ModelTurn> {
     const evidence = this.#contextEvidence;
     const receipt = await this.#authority?.openInvocation({
@@ -392,6 +498,7 @@ export class ModelTaskRunner {
       capabilityProfileId: this.#capabilities?.profileId ?? null,
       outputBudget: request.outputBudget,
       ...planning,
+      ...(structured === undefined ? {} : { outputContract: structured.identity, structuredTask: structured.task }),
     });
     let operation: OperationReceipt | undefined;
     let chunkIndex = 0;
@@ -399,6 +506,16 @@ export class ModelTaskRunner {
     let latestUsage: ModelTokenUsage | undefined;
     let settled = false;
     let diagnosticsRecorded = false;
+    let fullySettled = false;
+    let dispatched = false;
+    let validated = false;
+    const invocationId = receipt?.invocationId ?? globalThis.crypto.randomUUID();
+    const report = (error?: unknown) => structured?.onAttempt(Object.freeze({
+      invocationId, outputBudget: request.outputBudget, dispatched, settled: fullySettled,
+      usageState: latestUsage === undefined ? "unknown" : "reported",
+      ...(latestUsage === undefined ? {} : { usage: latestUsage }),
+      ...(error === undefined ? {} : { errorCode: errorCode(error) }),
+    }));
     try {
       await validateEvidence(this.#evidenceValidator, evidence, signal);
       operation = await this.#operations?.start("model", {
@@ -406,6 +523,8 @@ export class ModelTaskRunner {
         ...(receipt === undefined ? {} : { invocationId: receipt.invocationId }),
         ...(planning?.planningScope === undefined ? {} : { parentOperationId: planning.planningScope.operationId }),
       });
+      throwIfAborted(signal);
+      dispatched = true;
       turn = await invokeModel(
         this.#model,
         request,
@@ -429,7 +548,8 @@ export class ModelTaskRunner {
       );
       latestUsage = turn.usage ?? latestUsage;
       assertNoToolCalls(turn);
-      validateTurn?.();
+      validateTurn?.(turn);
+      validated = true;
       if (signal?.aborted === true) throw new AgentCanceledError();
       if (receipt !== undefined && !useStream) {
         await this.#authority!.persistCompletion(receipt, turn);
@@ -442,8 +562,11 @@ export class ModelTaskRunner {
         settled = true;
         await this.#authority!.settleInvocation(receipt, "completed", turn);
       }
+      if (operation !== undefined) await this.#operations!.succeed(operation.operationId);
+      fullySettled = true;
     } catch (error) {
       let failure = error;
+      latestUsage ??= modelFailureUsage(error);
       if (receipt !== undefined && !settled) {
         try {
           settled = true;
@@ -454,10 +577,14 @@ export class ModelTaskRunner {
             errorCode(error),
             latestUsage ?? modelFailureUsage(error),
           );
+          fullySettled = true;
         } catch (terminationError) {
-          if (planning !== undefined) failure = planningTerminationFailure(failure, terminationError);
+          fullySettled = false;
+          if (structured !== undefined) failure = new AgentError("model_task_settlement_failed", "Structured task settlement failed");
+          else if (planning !== undefined) failure = planningTerminationFailure(failure, terminationError);
         }
       }
+      if (receipt === undefined) fullySettled = true;
       if (operation !== undefined) {
         try {
           if (signal?.aborted === true || error instanceof AgentCanceledError) {
@@ -466,16 +593,20 @@ export class ModelTaskRunner {
             await this.#operations!.fail(operation.operationId, errorCode(error));
           }
         } catch (terminationError) {
-          if (planning !== undefined) failure = planningTerminationFailure(failure, terminationError);
+          fullySettled = false;
+          if (structured !== undefined) failure = new AgentError("model_task_settlement_failed", "Structured task settlement failed");
+          else if (planning !== undefined) failure = planningTerminationFailure(failure, terminationError);
         }
       }
       if (receipt !== undefined && diagnostics !== undefined && !diagnosticsRecorded) {
         try { await this.#authority!.recordModelDiagnostics?.(receipt, diagnostics); }
         catch { /* Keep the original invocation failure. */ }
       }
+      if (structured !== undefined && validated) fullySettled = false;
+      report(failure);
       throw failure;
     }
-    if (operation !== undefined) await this.#operations!.succeed(operation.operationId);
+    report();
     return turn;
   }
 }
@@ -558,4 +689,14 @@ function planningTerminationFailure(error: unknown, terminationError: unknown): 
 function requiredText(value: unknown, label: string): string {
   if (typeof value !== "string" || value.trim() === "") throw new TypeError(`${label} is required`);
   return value.trim();
+}
+
+function sumStructuredUsage(refs: readonly StructuredInvocationRef[]): ModelTokenUsage | undefined {
+  if (refs.some((ref) => ref.usage === undefined)) return undefined;
+  const usages = refs.map((ref) => ref.usage!);
+  const fields = ["inputTokens", "generationTokens", "totalTokens", "cachedInputTokens", "reasoningTokens"] as const;
+  return Object.freeze(Object.fromEntries(fields.flatMap((key) => {
+    const values = usages.map((usage) => usage[key]);
+    return values.some((value) => value === undefined) ? [] : [[key, values.reduce<number>((a, b) => a + b!, 0)]];
+  }))) as unknown as ModelTokenUsage;
 }

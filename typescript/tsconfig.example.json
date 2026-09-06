@@ -5,5 +5,11 @@
     "rootDir": ".",
     "outDir": ".example-dist"
   },
-  "include": ["examples/quickstart.ts", "examples/planner-streaming.ts"]
+  "include": [
+    "examples/quickstart.ts",
+    "examples/planner-streaming.ts",
+    "examples/parallel-tools.ts",
+    "examples/integration-check.ts",
+    "examples/structured-task.ts"
+  ]
 }

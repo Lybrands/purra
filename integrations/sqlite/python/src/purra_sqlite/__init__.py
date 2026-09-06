@@ -206,6 +206,33 @@ class SqliteAgentAdapters:
         async with self._transaction(read_only=True, with_journal=False) as adapters:
             return adapters.running_run_ids()
 
+    async def inspect_recovery(self, run_id, *, expected_preset=None):
+        """Observe one committed snapshot without claiming, reconciling or resuming.
+
+        expected_preset is a host-supplied *complete* effective preset snapshot.
+        Permissions and complete usage/effect coverage outside this adapter remain unknown.
+        """
+        from purra.observability.inspection import build_recovery_inspection
+        async with self._transaction(read_only=True, with_journal=False) as adapters:
+            saved = await adapters.runs.get(run_id)
+            info = adapters.get_run_info(run_id)
+            lease = adapters.leases.get(run_id)
+            now = int(time.time() * 1000)
+            configuration = "unknown"
+            if expected_preset and saved.agent_preset_snapshot:
+                configuration = "matched" if saved.agent_preset_snapshot == expected_preset else "mismatch"
+            return build_recovery_inspection({
+                "status": "running" if saved.status is RunStatus.RUNNING else "terminal",
+                "checkpoint": "present" if info.has_checkpoint else "missing",
+                "attemptsAfterCheckpoint": info.model_attempt_count - info.checkpoint_attempt_count if info.has_checkpoint else None,
+                "unknownToolReceipts": sum(key[0] == run_id for key in adapters.claims),
+                "receiptScope": "run",
+                "lease": "active" if lease and lease.owner_id and (lease.expires_at_ms or 0) > now else "inactive",
+                "configuration": configuration,
+                "cancellation": "requested" if saved.status is RunStatus.CANCELED or (lease and lease.cancellation_requested_at_ms is not None) else "clear",
+                "deadline": "expired" if saved.deadline_at_ms is not None and saved.deadline_at_ms <= now else "open",
+            })
+
     def close(self):
         if self._lock.locked(): raise RuntimeError("storage transaction is active")
         self._db.close()

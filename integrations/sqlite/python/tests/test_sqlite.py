@@ -29,6 +29,7 @@ async def test_reads_use_committed_snapshot_without_writer_lock_or_serialization
         assert await storage.outputs.list_events(run_id, after_sequence=0) == ()
         assert await storage.outputs.list_root_events(run_id, after_root_sequence=0) == ()
         assert await storage.list_running() == (run_id,)
+        assert (await storage.inspect_recovery(run_id))["observations"]["checkpoint"] == "missing"
         assert (await storage.leases.get(run_id)).status == expected.status
         writer.execute("COMMIT")
         assert await storage.list_running() == ()

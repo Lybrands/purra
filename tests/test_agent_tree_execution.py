@@ -180,19 +180,27 @@ async def test_executor_failure_settles_the_child_and_blocks_required_join():
 
 @pytest.mark.asyncio
 async def test_supervisor_renews_child_lease_while_executor_is_active():
+    now = [100]
+    renewed = asyncio.Event()
+
     class _CountingRepository(InMemoryRunTreeRepository):
         def __init__(self):
-            super().__init__()
+            super().__init__(clock_ms=lambda: now[0])
             self.renewals = 0
 
         async def renew_run_lease(self, *args, **kwargs):
+            # The second renewal crosses the original nine-millisecond lease.
+            now[0] += 6
+            result = await super().renew_run_lease(*args, **kwargs)
             self.renewals += 1
-            return await super().renew_run_lease(*args, **kwargs)
+            if self.renewals >= 2:
+                renewed.set()
+            return result
 
     class _SlowExecutor:
         async def execute(self, run, agent, checkpoint, signal=None):
             del agent, checkpoint, signal
-            await asyncio.sleep(0.03)
+            await asyncio.wait_for(renewed.wait(), timeout=2)
             return AgentTreeExecutionResult(
                 status=AgentTreeRunStatus.DONE,
                 result="done",

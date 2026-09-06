@@ -7,8 +7,11 @@ and classifies the terminal provider reason.
 
 from __future__ import annotations
 
+import asyncio
+
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from uuid import uuid4
 
 from purra.cancellation import await_with_cancellation, is_canceled
 from purra.contracts import (
@@ -33,6 +36,10 @@ from purra.model_protocol import (
     ResultCapacitySource,
     classify_model_termination,
     resolve_invocation_output_budget,
+)
+from purra.structured import StructuredOutputContract, StructuredOutputError
+from purra.structured_task import (
+    StructuredInvocationRef, StructuredModelTaskReceipt, StructuredModelTaskResult, total_usage,
 )
 from purra.output import AgentOutputIntent, OutputCommitMode
 from purra.ports import CancellationSignal, ResponseJudgePolicy
@@ -112,6 +119,8 @@ class AgentModelTaskRunner:
         manager: AgentModelInvocationManager,
         context: ModelInvocationContext,
         request: ModelRequest,
+        *,
+        signal: CancellationSignal | None = None,
     ) -> None:
         if not isinstance(manager, AgentModelInvocationManager):
             raise TypeError("model task runner requires PurrA's invocation manager")
@@ -122,6 +131,7 @@ class AgentModelTaskRunner:
         self._manager = manager
         self._context = context
         self._request = request
+        self._signal = signal
 
     @property
     def run_id(self) -> str:
@@ -152,6 +162,62 @@ class AgentModelTaskRunner:
             output_budget=managed.receipt.output_budget,
             call_parameters=managed.receipt.call_parameters,
         )
+
+    async def complete_structured(
+        self,
+        messages: Sequence[AgentMessage],
+        call: AgentModelTask,
+        *,
+        output: StructuredOutputContract,
+        signal: CancellationSignal | None = None,
+        repair_attempts: int = 0,
+    ) -> StructuredModelTaskResult:
+        signal = _TaskStopSignal(self._signal, signal)
+        self._require_root_request(call.request)
+        if not isinstance(output, StructuredOutputContract):
+            raise StructuredOutputError("An output contract is required", code="structured_output_schema_invalid")
+        if type(repair_attempts) is not int or not 0 <= repair_attempts <= 2**53 - 1:
+            raise ValueError("repair_attempts must be a non-negative safe integer")
+        ledger = RecoveryLedger(RecoveryPolicy({RecoveryCause.STRUCTURED_OUTPUT_INVALID: repair_attempts}))
+        task_id = f"structured-task-{uuid4().hex}"
+        original_messages = tuple(messages)
+        agent_call = replace(_agent_call(call, self._context.requested_reasoning_mode), output_contract=output)
+        refs: tuple[StructuredInvocationRef, ...] = ()
+        while True:
+            try:
+                attempt_call = replace(agent_call, structured_task={"taskId": task_id, "attempt": len(refs) + 1,
+                    "previousInvocationId": refs[-1].invocation_id if refs else None})
+                attempt_messages = original_messages if not refs else (*original_messages, AgentMessage(
+                    role=MessageRole.DEVELOPER, content="Produce a new complete JSON object satisfying the schema; the previous response failed format validation."))
+                managed = await self._manager.complete(attempt_messages, attempt_call, self._context, signal)
+            except BaseException as error:
+                ref = getattr(error, "structured_invocation_ref", None)
+                if isinstance(ref, StructuredInvocationRef):
+                    refs = (*refs, ref)
+                error.invocation_refs = refs
+                if not (isinstance(error, StructuredOutputError)
+                        and error.code in {"structured_output_invalid_json", "structured_output_schema_mismatch"}
+                        and ref is not None and ref.settled and ref.usage is not None):
+                    raise
+                decision = ledger.decide(RecoveryRequest(
+                    cause=RecoveryCause.STRUCTURED_OUTPUT_INVALID,
+                    action=RecoveryAction.RETRY_MODEL,
+                    remaining_model_rounds=repair_attempts - len(refs) + 1,
+                    cancellation_requested=is_canceled(signal),
+                ))
+                if not decision.allowed:
+                    raise
+                continue
+            refs = (*refs, StructuredInvocationRef(
+                managed.receipt.invocation_id, managed.receipt.output_budget,
+                managed.completion.usage, True, True,
+            ))
+            persistence, root_budget = self._manager.structured_binding
+            assert managed.structured_value is not None
+            return StructuredModelTaskResult(managed.structured_value, StructuredModelTaskReceipt(
+                self.run_id, managed.receipt.output_contract, refs, total_usage(refs),
+                persistence, root_budget,
+            ))
 
     async def stream(
         self,
@@ -392,3 +458,35 @@ __all__ = [
     "AgentModelTextResult",
     "AgentModelResponseJudge",
 ]
+
+
+class _TaskStopSignal:
+    """Keep the bound Run cancellation even when a host omits its call signal."""
+
+    def __init__(self, *signals):
+        self._signals = tuple(s for s in signals if s is not None)
+
+    def is_set(self):
+        return any(s.is_set() for s in self._signals)
+
+    @property
+    def reason_code(self):
+        return next((getattr(s, "reason_code", None) or "request_canceled" for s in self._signals if s.is_set()), None)
+
+    @property
+    def reason_details(self):
+        return next((getattr(s, "reason_details", {}) for s in self._signals if s.is_set()), {})
+
+    async def wait(self):
+        if self.is_set():
+            return True
+        waits = [asyncio.create_task(s.wait()) for s in self._signals]
+        if not waits:
+            waits = [asyncio.create_task(asyncio.Event().wait())]
+        try:
+            await asyncio.wait(waits, return_when=asyncio.FIRST_COMPLETED)
+            return True
+        finally:
+            for task in waits:
+                task.cancel()
+            await asyncio.gather(*waits, return_exceptions=True)

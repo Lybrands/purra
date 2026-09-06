@@ -38,3 +38,18 @@ npm --prefix typescript run check
 公开输出的预期结果中不得包含私有执行状态。各 SDK 的检查点格式和公开 API 名称可以不同。
 
 包安装与外部调用检查见 [SDK 冒烟检查](../sdk-parity-smoke/README.zh-CN.md)。
+
+
+## Object output, MCP and recovery inspection
+
+- [Structured output](structured-output.md): `structured_output.json`,
+  `structured_model_task.json`, and `native_output_schema.json`.
+- [Safe read concurrency](tool-concurrency.md): `tool_concurrency.json`.
+- [Integration checks and read-only diagnosis](integration-inspection.md):
+  `recovery_inspection.json`.
+- MCP protocol and selected-schema rejection vectors live in
+  `integrations/mcp/fixtures/tools.json` and run in both optional package suites.
+
+Protocol fixtures and SDK transport tests do not certify a live model or remote
+server. Record deterministic, installed-artifact, real-service and downstream
+results separately. See each contract for supported dialects and unknown states.

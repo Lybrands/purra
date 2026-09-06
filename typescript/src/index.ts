@@ -1,5 +1,10 @@
 export { Agent } from "./core/agent.js";
 export {
+  OUTPUT_SCHEMA_PROFILE, JSON_IDENTITY_PROFILE,
+  StructuredOutputContract, StructuredOutputError,
+} from "./structured.js";
+export type { StructuredOutputLimits, StructuredOutputOptions } from "./structured.js";
+export {
   AgentCapabilityGrant,
   InMemoryRunTreeRepository,
 } from "./agent-tree.js";
@@ -79,6 +84,7 @@ export {
 } from "./model/validation.js";
 export type { InvocationOutputBudgetOptions } from "./model/validation.js";
 export { ModelTaskRunner } from "./extensions/model-tasks.js";
+export type { StructuredInvocationRef, StructuredModelTaskReceipt, StructuredModelTaskResult, StructuredModelTaskOptions } from "./extensions/model-tasks.js";
 export type {
   ModelTaskCompletion,
   ModelTaskInvocationAuthority,
@@ -447,3 +453,9 @@ export { UserInputRequired } from "./interaction.js";
 
 export { StorageSession, STORAGE_STATE_SCHEMA, STORAGE_PORT_METHODS } from "./storage/session.js";
 export type { StorageStores, StoragePorts, StorageSelection, StorageJournalOptions } from "./storage/session.js";
+
+export { jsonIdentityDigest } from "./structured.js";
+export { buildRecoveryInspection, inspectRecovery } from "./observability/inspection.js";
+export type { RecoveryObservations, RecoveryInspection } from "./observability/inspection.js";
+export { checkIntegration } from "./testing/conformance.js";
+export type { IntegrationCheck, IntegrationCapability, EvidenceCategory } from "./testing/conformance.js";

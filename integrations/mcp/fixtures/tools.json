@@ -1,0 +1,334 @@
+{
+  "schemaVersion": 1,
+  "tool": {
+    "name": "remote.search",
+    "description": "Search documents",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "q": {
+          "type": "string",
+          "maxLength": 1
+        },
+        "n": {
+          "type": "integer"
+        },
+        "tags": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "q"
+      ],
+      "additionalProperties": false
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "count": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "count"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true
+    }
+  },
+  "cases": [
+    {
+      "id": "valid",
+      "arguments": {
+        "q": "猫"
+      },
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "found"
+          }
+        ],
+        "structuredContent": {
+          "count": 1
+        }
+      },
+      "errorCode": null
+    },
+    {
+      "id": "unicode_integer",
+      "arguments": {
+        "q": "😀",
+        "n": 1.0
+      },
+      "result": {
+        "content": [],
+        "structuredContent": {
+          "count": 0
+        }
+      },
+      "errorCode": null
+    },
+    {
+      "id": "no_coercion",
+      "arguments": {
+        "q": "a",
+        "tags": "[\"x\"]"
+      },
+      "result": {
+        "content": []
+      },
+      "errorCode": "mcp_invalid_arguments"
+    },
+    {
+      "id": "extra_argument",
+      "arguments": {
+        "q": "a",
+        "secret": true
+      },
+      "result": {
+        "content": []
+      },
+      "errorCode": "mcp_invalid_arguments"
+    },
+    {
+      "id": "missing_argument",
+      "arguments": {},
+      "result": {
+        "content": []
+      },
+      "errorCode": "mcp_invalid_arguments"
+    },
+    {
+      "id": "missing_structured",
+      "arguments": {
+        "q": "a"
+      },
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "{\"count\":1}"
+          }
+        ]
+      },
+      "errorCode": "mcp_result_invalid"
+    },
+    {
+      "id": "wrong_output",
+      "arguments": {
+        "q": "a"
+      },
+      "result": {
+        "content": [],
+        "structuredContent": {
+          "count": "1"
+        }
+      },
+      "errorCode": "mcp_result_invalid"
+    },
+    {
+      "id": "extra_output",
+      "arguments": {
+        "q": "a"
+      },
+      "result": {
+        "content": [],
+        "structuredContent": {
+          "count": 1,
+          "secret": "never echo"
+        }
+      },
+      "errorCode": "mcp_result_invalid"
+    },
+    {
+      "id": "tool_error",
+      "arguments": {
+        "q": "a"
+      },
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "private remote failure"
+          }
+        ],
+        "isError": true
+      },
+      "errorCode": "mcp_tool_error"
+    },
+    {
+      "id": "image",
+      "arguments": {
+        "q": "a"
+      },
+      "result": {
+        "content": [
+          {
+            "type": "image",
+            "data": "eA==",
+            "mimeType": "image/png"
+          }
+        ],
+        "structuredContent": {
+          "count": 1
+        }
+      },
+      "errorCode": "mcp_result_unsupported"
+    },
+    {
+      "id": "resource_link",
+      "arguments": {
+        "q": "a"
+      },
+      "result": {
+        "content": [
+          {
+            "type": "resource_link",
+            "name": "secret",
+            "uri": "https://example.invalid/private"
+          }
+        ],
+        "structuredContent": {
+          "count": 1
+        }
+      },
+      "errorCode": "mcp_result_unsupported"
+    },
+    {
+      "id": "result_size",
+      "arguments": {
+        "q": "a"
+      },
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+          }
+        ],
+        "structuredContent": {
+          "count": 1
+        }
+      },
+      "errorCode": "mcp_result_too_large",
+      "limits": {
+        "maxResultBytes": 256
+      }
+    },
+    {
+      "id": "content_count",
+      "arguments": {
+        "q": "a"
+      },
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "a"
+          },
+          {
+            "type": "text",
+            "text": "b"
+          }
+        ],
+        "structuredContent": {
+          "count": 1
+        }
+      },
+      "errorCode": "mcp_result_too_large",
+      "limits": {
+        "maxContentBlocks": 1
+      }
+    },
+    {
+      "id": "invalid_wire_content",
+      "arguments": {
+        "q": "a"
+      },
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": 3
+          }
+        ],
+        "structuredContent": {
+          "count": 1
+        }
+      },
+      "errorCode": "mcp_result_invalid",
+      "malformed": true
+    }
+  ],
+  "revisionDigest": "8cb096a7199b89dd4fcdcdae1f23b91b9d29ba0146efbbba79cd1a557e62349d",
+  "testModelCapabilities": {
+    "schemaVersion": 2,
+    "profileId": "mcp-local-fixture",
+    "providerProtocol": "custom",
+    "contextWindowTokens": 1000000,
+    "maxGenerationTokens": 65536,
+    "thinkingTokenAccounting": "unknown",
+    "protocol": {
+      "reasoningControl": "selectable",
+      "reasoningReplay": "ignored",
+      "toolCalling": "supported",
+      "requiredToolChoice": "supported",
+      "parallelToolCalls": "supported",
+      "streaming": "unknown",
+      "cancellation": "supported",
+      "publicProgress": "supported",
+      "assistantContentWithToolCalls": "optional",
+      "jsonSchemaLevel": "unknown",
+      "streamFinishSemantics": "normalized",
+      "usageSemantics": "normalized"
+    }
+  },
+  "schemaCases": [
+    {
+      "id": "unknown-default-annotation",
+      "tool": {
+        "name": "remote.search",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "string",
+              "default": null
+            }
+          }
+        }
+      },
+      "errorCode": "mcp_schema_unsupported"
+    },
+    {
+      "id": "unknown-vendor-output-annotation",
+      "tool": {
+        "name": "remote.search",
+        "inputSchema": {
+          "type": "object",
+          "properties": {}
+        },
+        "outputSchema": {
+          "type": "object",
+          "properties": {
+            "result": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "result"
+          ],
+          "x-fastmcp-wrap-result": true
+        }
+      },
+      "errorCode": "mcp_schema_unsupported"
+    }
+  ]
+}

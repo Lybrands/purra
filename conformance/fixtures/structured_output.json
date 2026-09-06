@@ -1,0 +1,919 @@
+{
+  "profile": "purra.output-schema/v1",
+  "cases": [
+    {
+      "name": "empty",
+      "schema": {
+        "type": "object"
+      },
+      "text": "{}",
+      "code": null,
+      "schemaDigest": "35d2b71e1c667ec7dde27eb339b795691b3d5f1582109fa87a51ce344dff98c0",
+      "contractDigest": "2ad666543996b1de6330a21191357c38604d23dd32992b2dd5cd9723d525af5f"
+    },
+    {
+      "name": "object",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "v": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "v"
+        ],
+        "additionalProperties": false
+      },
+      "text": "{\"v\":\"hello\"}",
+      "code": null,
+      "schemaDigest": "6b316711fee2405029d1338b2139d3faebde2b96a7d17452be9bc4b016676785",
+      "contractDigest": "8a567f65e3eb40d5c29ffebd1b01c454a9d6e3bbe4278eeb24c2bed1604cc046"
+    },
+    {
+      "name": "fenced",
+      "schema": {
+        "type": "object"
+      },
+      "text": "```json\n{}\n```",
+      "code": "structured_output_invalid_json",
+      "schemaDigest": "35d2b71e1c667ec7dde27eb339b795691b3d5f1582109fa87a51ce344dff98c0",
+      "contractDigest": "2ad666543996b1de6330a21191357c38604d23dd32992b2dd5cd9723d525af5f"
+    },
+    {
+      "name": "prefix",
+      "schema": {
+        "type": "object"
+      },
+      "text": "Result: {}",
+      "code": "structured_output_invalid_json",
+      "schemaDigest": "35d2b71e1c667ec7dde27eb339b795691b3d5f1582109fa87a51ce344dff98c0",
+      "contractDigest": "2ad666543996b1de6330a21191357c38604d23dd32992b2dd5cd9723d525af5f"
+    },
+    {
+      "name": "suffix",
+      "schema": {
+        "type": "object"
+      },
+      "text": "{} tail",
+      "code": "structured_output_invalid_json",
+      "schemaDigest": "35d2b71e1c667ec7dde27eb339b795691b3d5f1582109fa87a51ce344dff98c0",
+      "contractDigest": "2ad666543996b1de6330a21191357c38604d23dd32992b2dd5cd9723d525af5f"
+    },
+    {
+      "name": "two_documents",
+      "schema": {
+        "type": "object"
+      },
+      "text": "{}{}",
+      "code": "structured_output_invalid_json",
+      "schemaDigest": "35d2b71e1c667ec7dde27eb339b795691b3d5f1582109fa87a51ce344dff98c0",
+      "contractDigest": "2ad666543996b1de6330a21191357c38604d23dd32992b2dd5cd9723d525af5f"
+    },
+    {
+      "name": "duplicate",
+      "schema": {
+        "type": "object"
+      },
+      "text": "{\"a\":1,\"a\":2}",
+      "code": "structured_output_invalid_json",
+      "schemaDigest": "35d2b71e1c667ec7dde27eb339b795691b3d5f1582109fa87a51ce344dff98c0",
+      "contractDigest": "2ad666543996b1de6330a21191357c38604d23dd32992b2dd5cd9723d525af5f"
+    },
+    {
+      "name": "escaped_duplicate",
+      "schema": {
+        "type": "object"
+      },
+      "text": "{\"a\":1,\"\\u0061\":2}",
+      "code": "structured_output_invalid_json",
+      "schemaDigest": "35d2b71e1c667ec7dde27eb339b795691b3d5f1582109fa87a51ce344dff98c0",
+      "contractDigest": "2ad666543996b1de6330a21191357c38604d23dd32992b2dd5cd9723d525af5f"
+    },
+    {
+      "name": "nested_duplicate",
+      "schema": {
+        "type": "object"
+      },
+      "text": "{\"v\":{\"a\":1,\"a\":2}}",
+      "code": "structured_output_invalid_json",
+      "schemaDigest": "35d2b71e1c667ec7dde27eb339b795691b3d5f1582109fa87a51ce344dff98c0",
+      "contractDigest": "2ad666543996b1de6330a21191357c38604d23dd32992b2dd5cd9723d525af5f"
+    },
+    {
+      "name": "nan",
+      "schema": {
+        "type": "object"
+      },
+      "text": "{\"v\":NaN}",
+      "code": "structured_output_invalid_json",
+      "schemaDigest": "35d2b71e1c667ec7dde27eb339b795691b3d5f1582109fa87a51ce344dff98c0",
+      "contractDigest": "2ad666543996b1de6330a21191357c38604d23dd32992b2dd5cd9723d525af5f"
+    },
+    {
+      "name": "infinity",
+      "schema": {
+        "type": "object"
+      },
+      "text": "{\"v\":Infinity}",
+      "code": "structured_output_invalid_json",
+      "schemaDigest": "35d2b71e1c667ec7dde27eb339b795691b3d5f1582109fa87a51ce344dff98c0",
+      "contractDigest": "2ad666543996b1de6330a21191357c38604d23dd32992b2dd5cd9723d525af5f"
+    },
+    {
+      "name": "overflow",
+      "schema": {
+        "type": "object"
+      },
+      "text": "{\"v\":1e309}",
+      "code": "structured_output_invalid_json",
+      "schemaDigest": "35d2b71e1c667ec7dde27eb339b795691b3d5f1582109fa87a51ce344dff98c0",
+      "contractDigest": "2ad666543996b1de6330a21191357c38604d23dd32992b2dd5cd9723d525af5f"
+    },
+    {
+      "name": "unsafe_integer",
+      "schema": {
+        "type": "object"
+      },
+      "text": "{\"v\":9007199254740992}",
+      "code": "structured_output_invalid_json",
+      "schemaDigest": "35d2b71e1c667ec7dde27eb339b795691b3d5f1582109fa87a51ce344dff98c0",
+      "contractDigest": "2ad666543996b1de6330a21191357c38604d23dd32992b2dd5cd9723d525af5f"
+    },
+    {
+      "name": "unsafe_integral_float",
+      "schema": {
+        "type": "object"
+      },
+      "text": "{\"v\":9007199254740992.0}",
+      "code": "structured_output_invalid_json",
+      "schemaDigest": "35d2b71e1c667ec7dde27eb339b795691b3d5f1582109fa87a51ce344dff98c0",
+      "contractDigest": "2ad666543996b1de6330a21191357c38604d23dd32992b2dd5cd9723d525af5f"
+    },
+    {
+      "name": "negative_unsafe",
+      "schema": {
+        "type": "object"
+      },
+      "text": "{\"v\":-9007199254740992}",
+      "code": "structured_output_invalid_json",
+      "schemaDigest": "35d2b71e1c667ec7dde27eb339b795691b3d5f1582109fa87a51ce344dff98c0",
+      "contractDigest": "2ad666543996b1de6330a21191357c38604d23dd32992b2dd5cd9723d525af5f"
+    },
+    {
+      "name": "lone_surrogate",
+      "schema": {
+        "type": "object"
+      },
+      "text": "{\"v\":\"\\ud800\"}",
+      "code": "structured_output_invalid_json",
+      "schemaDigest": "35d2b71e1c667ec7dde27eb339b795691b3d5f1582109fa87a51ce344dff98c0",
+      "contractDigest": "2ad666543996b1de6330a21191357c38604d23dd32992b2dd5cd9723d525af5f"
+    },
+    {
+      "name": "trailing_comma",
+      "schema": {
+        "type": "object"
+      },
+      "text": "{\"v\":1,}",
+      "code": "structured_output_invalid_json",
+      "schemaDigest": "35d2b71e1c667ec7dde27eb339b795691b3d5f1582109fa87a51ce344dff98c0",
+      "contractDigest": "2ad666543996b1de6330a21191357c38604d23dd32992b2dd5cd9723d525af5f"
+    },
+    {
+      "name": "leading_zero",
+      "schema": {
+        "type": "object"
+      },
+      "text": "{\"v\":01}",
+      "code": "structured_output_invalid_json",
+      "schemaDigest": "35d2b71e1c667ec7dde27eb339b795691b3d5f1582109fa87a51ce344dff98c0",
+      "contractDigest": "2ad666543996b1de6330a21191357c38604d23dd32992b2dd5cd9723d525af5f"
+    },
+    {
+      "name": "bom",
+      "schema": {
+        "type": "object"
+      },
+      "text": "﻿{}",
+      "code": "structured_output_invalid_json",
+      "schemaDigest": "35d2b71e1c667ec7dde27eb339b795691b3d5f1582109fa87a51ce344dff98c0",
+      "contractDigest": "2ad666543996b1de6330a21191357c38604d23dd32992b2dd5cd9723d525af5f"
+    },
+    {
+      "name": "root_array",
+      "schema": {
+        "type": "object"
+      },
+      "text": "[]",
+      "code": "structured_output_schema_mismatch",
+      "schemaDigest": "35d2b71e1c667ec7dde27eb339b795691b3d5f1582109fa87a51ce344dff98c0",
+      "contractDigest": "2ad666543996b1de6330a21191357c38604d23dd32992b2dd5cd9723d525af5f"
+    },
+    {
+      "name": "root_null",
+      "schema": {
+        "type": "object"
+      },
+      "text": "null",
+      "code": "structured_output_schema_mismatch",
+      "schemaDigest": "35d2b71e1c667ec7dde27eb339b795691b3d5f1582109fa87a51ce344dff98c0",
+      "contractDigest": "2ad666543996b1de6330a21191357c38604d23dd32992b2dd5cd9723d525af5f"
+    },
+    {
+      "name": "root_string",
+      "schema": {
+        "type": "object"
+      },
+      "text": "\"hi\"",
+      "code": "structured_output_schema_mismatch",
+      "schemaDigest": "35d2b71e1c667ec7dde27eb339b795691b3d5f1582109fa87a51ce344dff98c0",
+      "contractDigest": "2ad666543996b1de6330a21191357c38604d23dd32992b2dd5cd9723d525af5f"
+    },
+    {
+      "name": "integer_decimal",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "v": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "v"
+        ],
+        "additionalProperties": false
+      },
+      "text": "{\"v\":1.0}",
+      "code": null,
+      "schemaDigest": "d887baf8bd4459a09aaa373155d94298a7863de11ee2ac8d0b2ad67d66091558",
+      "contractDigest": "169c5aa299607c337eb8f045d620e548f9eb581f647fa7e1301a85901e76b22a"
+    },
+    {
+      "name": "integer_exponent",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "v": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "v"
+        ],
+        "additionalProperties": false
+      },
+      "text": "{\"v\":1e0}",
+      "code": null,
+      "schemaDigest": "d887baf8bd4459a09aaa373155d94298a7863de11ee2ac8d0b2ad67d66091558",
+      "contractDigest": "169c5aa299607c337eb8f045d620e548f9eb581f647fa7e1301a85901e76b22a"
+    },
+    {
+      "name": "safe_max",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "v": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "v"
+        ],
+        "additionalProperties": false
+      },
+      "text": "{\"v\":9007199254740991}",
+      "code": null,
+      "schemaDigest": "d887baf8bd4459a09aaa373155d94298a7863de11ee2ac8d0b2ad67d66091558",
+      "contractDigest": "169c5aa299607c337eb8f045d620e548f9eb581f647fa7e1301a85901e76b22a"
+    },
+    {
+      "name": "bool_not_integer",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "v": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "v"
+        ],
+        "additionalProperties": false
+      },
+      "text": "{\"v\":true}",
+      "code": "structured_output_schema_mismatch",
+      "schemaDigest": "d887baf8bd4459a09aaa373155d94298a7863de11ee2ac8d0b2ad67d66091558",
+      "contractDigest": "169c5aa299607c337eb8f045d620e548f9eb581f647fa7e1301a85901e76b22a"
+    },
+    {
+      "name": "fraction_not_integer",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "v": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "v"
+        ],
+        "additionalProperties": false
+      },
+      "text": "{\"v\":1.5}",
+      "code": "structured_output_schema_mismatch",
+      "schemaDigest": "d887baf8bd4459a09aaa373155d94298a7863de11ee2ac8d0b2ad67d66091558",
+      "contractDigest": "169c5aa299607c337eb8f045d620e548f9eb581f647fa7e1301a85901e76b22a"
+    },
+    {
+      "name": "no_coercion",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "v": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "v"
+        ],
+        "additionalProperties": false
+      },
+      "text": "{\"v\":\"1\"}",
+      "code": "structured_output_schema_mismatch",
+      "schemaDigest": "d887baf8bd4459a09aaa373155d94298a7863de11ee2ac8d0b2ad67d66091558",
+      "contractDigest": "169c5aa299607c337eb8f045d620e548f9eb581f647fa7e1301a85901e76b22a"
+    },
+    {
+      "name": "unicode_point",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "v": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1
+          }
+        },
+        "required": [
+          "v"
+        ],
+        "additionalProperties": false
+      },
+      "text": "{\"v\":\"😀\"}",
+      "code": null,
+      "schemaDigest": "06b641851d71237ce8aa6c6ea9a5196065784fecbf35ff3064d85f16e8e143a6",
+      "contractDigest": "5449130e0b0ea118f74341c970d809e0c84fdfa51d07fc0c7b7a421ae345f72f"
+    },
+    {
+      "name": "unicode_short",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "v": {
+            "type": "string",
+            "minLength": 2
+          }
+        },
+        "required": [
+          "v"
+        ],
+        "additionalProperties": false
+      },
+      "text": "{\"v\":\"😀\"}",
+      "code": "structured_output_schema_mismatch",
+      "schemaDigest": "c05e90278418dcd19921b04252fbed9eb9352cfaaab1846ebd809f70fc53511a",
+      "contractDigest": "c32547f2c889d0381794fb71abc257908ba73984104bd4381772cb68fef2a02f"
+    },
+    {
+      "name": "surrogate_pair",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "v": {
+            "type": "string",
+            "maxLength": 1
+          }
+        },
+        "required": [
+          "v"
+        ],
+        "additionalProperties": false
+      },
+      "text": "{\"v\":\"\\ud83d\\ude00\"}",
+      "code": null,
+      "schemaDigest": "15982c3c9fa905fea075faee0911a939a8a51334ac8e2078f435e65416ecb003",
+      "contractDigest": "5157a6fe8bc883662caf335801c0432197bcd36bb8893dd085fa8d8dd4521cee"
+    },
+    {
+      "name": "nullable",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "v": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "v"
+        ],
+        "additionalProperties": false
+      },
+      "text": "{\"v\":null}",
+      "code": null,
+      "schemaDigest": "4fae34eadeb20c179a16f694e3ffe1d1a1cc6ddde8564e88c168777f97884b23",
+      "contractDigest": "259bb188e6c7ee20a933dec7a3c7ce50100ac81181aa68ce63f7577c41ee8619"
+    },
+    {
+      "name": "bool_enum",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "v": {
+            "enum": [
+              1
+            ]
+          }
+        },
+        "required": [
+          "v"
+        ],
+        "additionalProperties": false
+      },
+      "text": "{\"v\":true}",
+      "code": "structured_output_schema_mismatch",
+      "schemaDigest": "46335499c7c0a947ccdbcfdb2f259a0d465f4379a5a93ff0f4a7db9a75b2b7f9",
+      "contractDigest": "1620a6e663c1e2a4e0cd1c95770b8f8a7bc6c063e0a640ad5fa6175326ec5580"
+    },
+    {
+      "name": "structural_const",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "v": {
+            "const": {
+              "a": 1,
+              "b": 2
+            }
+          }
+        },
+        "required": [
+          "v"
+        ],
+        "additionalProperties": false
+      },
+      "text": "{\"v\":{\"b\":2,\"a\":1}}",
+      "code": null,
+      "schemaDigest": "9dbdca4b3e170dfe0a790e03b2be625cabe17c7f9dfb989328f774ef0d578632",
+      "contractDigest": "5cb0776ddc19c9919672a939cce2e91d8d8951d44781680d7dac4f67a8d2ba30"
+    },
+    {
+      "name": "unique_object",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "v": {
+            "type": "array",
+            "uniqueItems": true
+          }
+        },
+        "required": [
+          "v"
+        ],
+        "additionalProperties": false
+      },
+      "text": "{\"v\":[{\"a\":1,\"b\":2},{\"b\":2,\"a\":1}]}",
+      "code": "structured_output_schema_mismatch",
+      "schemaDigest": "c316d7d795a8532de84c2fc49548b458dd043b08fb9bfb15ce6bab3c66841c21",
+      "contractDigest": "35fab268568b823577b3e7bcdb3d77176acca427d175fb8502fcf24536e09864"
+    },
+    {
+      "name": "bool_number_unique",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "v": {
+            "type": "array",
+            "uniqueItems": true
+          }
+        },
+        "required": [
+          "v"
+        ],
+        "additionalProperties": false
+      },
+      "text": "{\"v\":[true,1]}",
+      "code": null,
+      "schemaDigest": "c316d7d795a8532de84c2fc49548b458dd043b08fb9bfb15ce6bab3c66841c21",
+      "contractDigest": "35fab268568b823577b3e7bcdb3d77176acca427d175fb8502fcf24536e09864"
+    },
+    {
+      "name": "same_numeric_unique",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "v": {
+            "type": "array",
+            "uniqueItems": true
+          }
+        },
+        "required": [
+          "v"
+        ],
+        "additionalProperties": false
+      },
+      "text": "{\"v\":[1,1.0]}",
+      "code": "structured_output_schema_mismatch",
+      "schemaDigest": "c316d7d795a8532de84c2fc49548b458dd043b08fb9bfb15ce6bab3c66841c21",
+      "contractDigest": "35fab268568b823577b3e7bcdb3d77176acca427d175fb8502fcf24536e09864"
+    },
+    {
+      "name": "oneof_ambiguous",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "v": {
+            "oneOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              }
+            ]
+          }
+        },
+        "required": [
+          "v"
+        ],
+        "additionalProperties": false
+      },
+      "text": "{\"v\":1}",
+      "code": "structured_output_schema_mismatch",
+      "schemaDigest": "025466ac899d90e65413e8ac8bb1a0bd6defb921592ff992d20a5993953723fd",
+      "contractDigest": "0f67d35eafbe050adfc3e8c3b63b1d0edbc62e6c8919e68d724073095e7cd6d2"
+    },
+    {
+      "name": "anyof",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "v": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "string"
+              }
+            ]
+          }
+        },
+        "required": [
+          "v"
+        ],
+        "additionalProperties": false
+      },
+      "text": "{\"v\":\"ok\"}",
+      "code": null,
+      "schemaDigest": "6688d17fabbab8c211a5bbc801af89c67169df8895615dd6a261fcf012448103",
+      "contractDigest": "51b5ed21168f7ad88dc36af737e4a4b2e8ffd8c2dfcdb698c07273ba28c724f2"
+    },
+    {
+      "name": "range",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "v": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1
+          }
+        },
+        "required": [
+          "v"
+        ],
+        "additionalProperties": false
+      },
+      "text": "{\"v\":2}",
+      "code": "structured_output_schema_mismatch",
+      "schemaDigest": "31ebedb9ffc585bf30f0a2962c7d4ef15ba4309976ea042fc66955c4f10daab9",
+      "contractDigest": "8a22d0a7ee90cea77af0056e1b47ecb7570a2423314c9c3c55639fae5421598f"
+    },
+    {
+      "name": "no_array_coercion",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "v": {
+            "type": "array",
+            "items": {
+              "type": "integer"
+            }
+          }
+        },
+        "required": [
+          "v"
+        ],
+        "additionalProperties": false
+      },
+      "text": "{\"v\":\"[1]\"}",
+      "code": "structured_output_schema_mismatch",
+      "schemaDigest": "888a9bbb072bb85dd1ade4cbe689b270d9a43e99acba83652fd1a222a0daac3e",
+      "contractDigest": "a9263a24e4c4f85d16239852b3b9f81b7fd6ded966e76a0625f6a7224c5f2ed4"
+    },
+    {
+      "name": "extra",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "v": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "v"
+        ],
+        "additionalProperties": false
+      },
+      "text": "{\"v\":\"ok\",\"secret-candidate\":123}",
+      "code": "structured_output_schema_mismatch",
+      "schemaDigest": "6b316711fee2405029d1338b2139d3faebde2b96a7d17452be9bc4b016676785",
+      "contractDigest": "8a567f65e3eb40d5c29ffebd1b01c454a9d6e3bbe4278eeb24c2bed1604cc046"
+    },
+    {
+      "name": "missing",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "v": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "v"
+        ],
+        "additionalProperties": false
+      },
+      "text": "{}",
+      "code": "structured_output_schema_mismatch",
+      "schemaDigest": "6b316711fee2405029d1338b2139d3faebde2b96a7d17452be9bc4b016676785",
+      "contractDigest": "8a567f65e3eb40d5c29ffebd1b01c454a9d6e3bbe4278eeb24c2bed1604cc046"
+    },
+    {
+      "name": "proto_property",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "__proto__": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "__proto__"
+        ],
+        "additionalProperties": false
+      },
+      "text": "{\"__proto__\":\"value\"}",
+      "code": null,
+      "schemaDigest": "9181e7957e9f55bf71157aa5a98f9dbb067219ddb15c38bab4ce7fb07bcf92d5",
+      "contractDigest": "6d3b08d1d6b3f418a054733d1062e32104beaa334e24cce4e27e246d4d284df5"
+    },
+    {
+      "name": "inherited_required",
+      "schema": {
+        "type": "object",
+        "required": [
+          "toString"
+        ]
+      },
+      "text": "{}",
+      "code": "structured_output_schema_mismatch",
+      "schemaDigest": "32ee1b474d6e42f88fd7283af5b8bf363e3b7480cda2942bcc44c5c810f9082c",
+      "contractDigest": "ef18dc4330a7fc73889f221aa042dc545674cf0f664034a67c4c23cfd0f0c65d"
+    },
+    {
+      "name": "inherited_extra",
+      "schema": {
+        "type": "object",
+        "additionalProperties": false
+      },
+      "text": "{\"toString\":123}",
+      "code": "structured_output_schema_mismatch",
+      "schemaDigest": "341ba6e8a9b2bd6a22f01bf5cdf9d660f4779970a8c30e7f4aed87f80ff28697",
+      "contractDigest": "6f1506fb6c7b05e59781d0415dd1f5fda5cad7df8a2a13844513783ef2ce132b"
+    },
+    {
+      "name": "root_missing",
+      "schema": {},
+      "text": "{}",
+      "code": "structured_output_schema_invalid"
+    },
+    {
+      "name": "unknown",
+      "schema": {
+        "type": "object",
+        "$ref": "#/x"
+      },
+      "text": "{}",
+      "code": "structured_output_schema_invalid"
+    },
+    {
+      "name": "required_null",
+      "schema": {
+        "type": "object",
+        "required": null
+      },
+      "text": "{}",
+      "code": "structured_output_schema_invalid"
+    },
+    {
+      "name": "type_invalid",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "v": {
+            "type": [
+              "string",
+              {}
+            ]
+          }
+        }
+      },
+      "text": "{}",
+      "code": "structured_output_schema_invalid"
+    },
+    {
+      "name": "required_object",
+      "schema": {
+        "type": "object",
+        "required": [
+          {}
+        ]
+      },
+      "text": "{}",
+      "code": "structured_output_schema_invalid"
+    },
+    {
+      "name": "items_bool",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "v": {
+            "items": true
+          }
+        }
+      },
+      "text": "{}",
+      "code": "structured_output_schema_invalid"
+    },
+    {
+      "name": "null_anyof",
+      "schema": {
+        "type": "object",
+        "anyOf": null
+      },
+      "text": "{}",
+      "code": "structured_output_schema_invalid"
+    },
+    {
+      "name": "null_enum",
+      "schema": {
+        "type": "object",
+        "enum": null
+      },
+      "text": "{}",
+      "code": "structured_output_schema_invalid"
+    },
+    {
+      "name": "range_reverse",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "v": {
+            "minItems": 2,
+            "maxItems": 1
+          }
+        }
+      },
+      "text": "{}",
+      "code": "structured_output_schema_invalid"
+    },
+    {
+      "name": "unknown_mode",
+      "schema": {
+        "type": "object"
+      },
+      "text": "{}",
+      "code": "structured_output_mode_unsupported",
+      "mode": "auto"
+    },
+    {
+      "name": "native_identity",
+      "schema": {
+        "type": "object"
+      },
+      "text": "{}",
+      "code": null,
+      "mode": "native_required",
+      "schemaDigest": "35d2b71e1c667ec7dde27eb339b795691b3d5f1582109fa87a51ce344dff98c0",
+      "contractDigest": "95fd7a28da0295d1979cb9903d0b0353c66c9bff484f2ceb9c77246d5cbd442b"
+    },
+    {
+      "name": "work_limit",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "v": {
+            "enum": [
+              1,
+              2,
+              3
+            ]
+          }
+        },
+        "required": [
+          "v"
+        ],
+        "additionalProperties": false
+      },
+      "text": "{\"v\":3}",
+      "code": "structured_output_validation_limit_exceeded",
+      "limits": {
+        "validationSteps": 1
+      }
+    },
+    {
+      "name": "node_limit",
+      "schema": {
+        "type": "object"
+      },
+      "text": "{\"a\":1,\"b\":2}",
+      "code": "structured_output_invalid_json",
+      "limits": {
+        "outputNodes": 3
+      }
+    },
+    {
+      "name": "depth_limit",
+      "schema": {
+        "type": "object"
+      },
+      "text": "{\"a\":{\"b\":1}}",
+      "code": "structured_output_invalid_json",
+      "limits": {
+        "outputDepth": 1
+      }
+    },
+    {
+      "name": "byte_limit",
+      "schema": {
+        "type": "object"
+      },
+      "text": "{\"a\":\"abcdef\"}",
+      "code": "structured_output_invalid_json",
+      "limits": {
+        "outputBytes": 10
+      }
+    },
+    {
+      "name": "identity_order_unicode_numbers",
+      "schema": {
+        "type": "object",
+        "const": {
+          "10": 1.25,
+          "2": -0.0,
+          "😀": 1e-07,
+          "": 1e-06
+        }
+      },
+      "text": "{\"2\":0,\"10\":1.25,\"😀\":1e-7,\"\":1e-6}",
+      "code": null,
+      "schemaDigest": "b2ce00bdc66ed307ba63a7f5d58cadf914ec364403a3c6de38451a75080f42df",
+      "contractDigest": "ffce2faaf36f028bc4cb0994e36ebc28e6273b47a4c91078bbe156596828c282"
+    }
+  ],
+  "keywords": [
+    "additionalProperties",
+    "anyOf",
+    "const",
+    "description",
+    "enum",
+    "items",
+    "maxItems",
+    "maxLength",
+    "maximum",
+    "minItems",
+    "minLength",
+    "minimum",
+    "oneOf",
+    "properties",
+    "required",
+    "title",
+    "type",
+    "uniqueItems"
+  ]
+}

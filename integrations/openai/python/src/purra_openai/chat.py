@@ -1,5 +1,7 @@
 """Official OpenAI Chat Completions transport."""
 
+from ._structured import validate as _validate_output
+
 import math
 
 from openai import APIError, APIStatusError, AsyncOpenAI
@@ -58,7 +60,16 @@ class OpenAIChatCompletionsGateway:
         self._owns_client = client is None
         self._client = (client or AsyncOpenAI()).with_options(max_retries=0, timeout=timeout_seconds)
 
+    def validate_output_contract(self, invocation):
+        return _validate_output(invocation)
+
     def _request(self, messages, invocation):
+        self.validate_output_contract(invocation)
+        wire = {}
+        if invocation.output_contract is not None and invocation.output_contract.mode == "native_required":
+            fmt = {"type": "json_schema", "name": "purra_output", "strict": True,
+                   "schema": thaw_json_mapping(invocation.output_contract.schema)}
+            wire = {"response_format": {"type": "json_schema", "json_schema": {k: v for k, v in fmt.items() if k != "type"}}}
         if invocation.request.provider != "openai":
             raise ValueError("OpenAI gateway requires provider='openai'")
         cap = invocation.max_generation_tokens
@@ -85,7 +96,7 @@ class OpenAIChatCompletionsGateway:
                 row["tool_calls"] = [{"id": call.id, "type": "function", "function": {
                     "name": call.name, "arguments": call.arguments_json}} for call in message.tool_calls]
             rows.append(row)
-        params = dict(model=invocation.request.model, messages=rows, max_completion_tokens=cap, store=False,
+        params = dict(**wire, model=invocation.request.model, messages=rows, max_completion_tokens=cap, store=False,
                       **{key: options[key] for key in ("temperature", "top_p") if key in options})
         if effort is not None:
             params["reasoning_effort"] = effort

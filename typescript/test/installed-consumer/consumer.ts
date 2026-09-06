@@ -474,3 +474,28 @@ const transport: ModelTransportDiagnostics = { requestSentAtMs: 1000, firstByteA
 PLANNING_STREAM_SCHEMA satisfies "purra.planning-stream/v1";
 new PlanningStreamParser().feed("") satisfies readonly PlanningProgress[];
 void [planningProgress, planOptions, transport];
+
+import { StructuredOutputContract } from "purra";
+const structuredOutput = await StructuredOutputContract.create({
+  schemaId: "installed", schemaVersion: "1",
+  schema: { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"], additionalProperties: false },
+});
+const structuredValue = structuredOutput.parse('{"ok":true}');
+if (structuredValue.ok !== true || !Object.isFrozen(structuredValue)) throw new Error("Installed output contract failed");
+
+import type { StructuredModelTaskResult, StructuredModelTaskOptions } from "purra";
+let structuredCalls = 0;
+const structuredRunner = new ModelTaskRunner({ runId: "installed", model: {
+  capabilities: capabilities(),
+  async invoke(request) {
+    structuredCalls++;
+    return { message: { role: "assistant", content: structuredCalls === 1 ? "invalid" : '{"ok":true}' },
+      finishReason: "stop", appliedGenerationLimit: request.outputBudget!.maxGenerationTokens,
+      usage: { inputTokens: 10, generationTokens: 5, totalTokens: 15 } };
+  },
+} });
+const structuredOptions: StructuredModelTaskOptions = { output: structuredOutput, repairAttempts: 1 };
+const structuredResult: StructuredModelTaskResult = await structuredRunner.completeStructured([], structuredOptions);
+if (structuredResult.value.ok !== true || structuredResult.receipt.attempts !== 2
+  || structuredResult.receipt.usage?.generationTokens !== 10 || structuredResult.receipt.persistence !== "none"
+  || structuredResult.receipt.rootBudget !== "not_bound") throw new Error("Installed structured task failed");

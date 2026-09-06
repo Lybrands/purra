@@ -15,7 +15,7 @@ async function params() {
   return { begin: { preset, budgets, deadlineAt: null, metadata: {} }, checkpoint: { ...executionCheckpoint, runId: "root" } };
 }
 const draft = (key) => ({ sourceKey: key, kind: "model.diagnostics", channel: "model", visibility: "private", payload: { text: key } });
-const invocation = (id = "invoke") => ({ schemaVersion: 2, runId: "root", invocationId: id,
+const invocation = (id = "invoke") => ({ schemaVersion: 3, runId: "root", invocationId: id,
   messageFingerprint: "messages", toolFingerprint: "tools", requestFingerprint: "request",
   evidenceFingerprint: "evidence", contextEvidence: [], capabilityProfileId: null, outputBudget: null });
 

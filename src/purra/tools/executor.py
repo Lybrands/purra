@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from types import MappingProxyType
 from typing import Any
+
+from purra.structured import StructuredOutputError
 
 from purra.cancellation import (
     OperationCanceled,
@@ -165,6 +167,16 @@ class CoreToolExecutor:
 
         normalized_calls: list[ParsedToolCall] = []
         for parsed in parsed_calls:
+            contract = self._registrations[parsed.call.name].argument_contract
+            if contract is not None:
+                try:
+                    arguments = contract.parse(parsed.call.arguments_json)
+                except StructuredOutputError as error:
+                    return _whole_batch_failure(request.calls, outcome=ToolBatchOutcome.FAILED,
+                        code="invalid_tool_arguments_schema", message="Tool arguments do not satisfy the declared object contract.",
+                        diagnostics={"stage": "schema_validation", "contractError": error.code})
+                normalized_calls.append(ParsedToolCall(parsed.call, arguments))
+                continue
             normalized, normalization_failure = normalize_tool_arguments_to_schema(
                 parsed,
                 self._registrations[parsed.call.name].schema.parameters,
@@ -185,6 +197,8 @@ class CoreToolExecutor:
         parsed_calls = tuple(normalized_calls)
 
         for parsed in parsed_calls:
+            if self._registrations[parsed.call.name].argument_contract is not None:
+                continue
             schema_failure = validate_tool_arguments_schema(
                 parsed,
                 self._registrations[parsed.call.name].schema.parameters,
@@ -198,13 +212,45 @@ class CoreToolExecutor:
                     diagnostics=schema_failure.diagnostics,
                 )
 
+        parallel = self._limits.max_concurrency > 1 and len(parsed_calls) > 1 and all(
+            self._registrations[item.call.name].policy.mode is ToolExecutionMode.READ
+            and self._registrations[item.call.name].concurrency_safe
+            for item in parsed_calls
+        )
+        if parallel:
+            # Admission is complete and ordered before any operation or handler starts.
+            for parsed in parsed_calls:
+                failure = await self._validate_scope(self._registrations[parsed.call.name], request, parsed, signal, preserve_control_errors=True)
+                if failure is not None:
+                    code, message, canceled = failure
+                    return _whole_batch_failure(request.calls,
+                        outcome=(ToolBatchOutcome.CANCELED if canceled else ToolBatchOutcome.REJECTED
+                            if code == "tool_scope_violation" else ToolBatchOutcome.FAILED),
+                        code=code, message=message)
+            return await self._execute_parallel(request, event_sink, signal, parsed_calls)
+        return await self._execute_calls(request, event_sink, signal, parsed_calls)
+
+    async def _execute_calls(
+        self, request: ToolBatchRequest, event_sink: EventSink,
+        signal: CancellationSignal | None, parsed_calls: Sequence[ParsedToolCall], *,
+        index_offset: int = 0, stop_scheduling: Callable[[], None] | None = None,
+        dispatch_allowed: Callable[[], bool] | None = None,
+    ) -> ToolBatchResult:
+        halt = stop_scheduling or (lambda: None)
+        can_start = dispatch_allowed or (lambda: True)
         results: list[ToolCallResult] = []
         outcomes: list[ToolBatchOutcome] = []
         cache_hits: list[bool] = []
 
-        for index, parsed in enumerate(parsed_calls):
+        for position, parsed in enumerate(parsed_calls):
+            index = index_offset + position
             registration = self._registrations[parsed.call.name]
+            if not can_start() and not _is_canceled(signal):
+                return await _failed_call_batch(request, event_sink, parsed, index, results, cache_hits,
+                    outcome=ToolBatchOutcome.FAILED, code="tool_batch_aborted",
+                    message="Tool was not dispatched after the batch gate closed.", effect_state=ToolEffectState.NOT_STARTED)
             if _is_canceled(signal):
+                halt()
                 return await self._canceled_result(
                     request,
                     event_sink,
@@ -224,8 +270,10 @@ class CoreToolExecutor:
                 request,
                 parsed,
                 signal,
+                preserve_control_errors=stop_scheduling is not None,
             )
             if scope_failure is not None:
+                halt()
                 code, message, canceled = scope_failure
                 outcome = (
                     ToolBatchOutcome.CANCELED
@@ -248,7 +296,7 @@ class CoreToolExecutor:
                     index,
                     results,
                     cache_hits,
-                    remaining=parsed_calls[index + 1:],
+                    remaining=parsed_calls[position + 1:],
                     outcome=outcome,
                     code=code,
                     message=message,
@@ -260,6 +308,7 @@ class CoreToolExecutor:
 
             # Defense in depth: authorization never comes from mutable state.
             if parsed.call.name not in request.allowed_tool_names:
+                halt()
                 await self._finish_tool_operation(
                     operation_id,
                     ToolBatchOutcome.REJECTED,
@@ -272,7 +321,7 @@ class CoreToolExecutor:
                     index,
                     results,
                     cache_hits,
-                    remaining=parsed_calls[index + 1:],
+                    remaining=parsed_calls[position + 1:],
                     outcome=ToolBatchOutcome.REJECTED,
                     code="tool_not_authorized",
                     message=(
@@ -281,6 +330,13 @@ class CoreToolExecutor:
                     ),
                     effect_state=ToolEffectState.NOT_STARTED,
                 )
+
+            if not can_start() or _is_canceled(signal):
+                outcome = ToolBatchOutcome.CANCELED if _is_canceled(signal) else ToolBatchOutcome.FAILED
+                await self._finish_tool_operation(operation_id, outcome, "tool_batch_aborted")
+                return await _failed_call_batch(request, event_sink, parsed, index, results, cache_hits,
+                    outcome=outcome, code="tool_batch_aborted",
+                    message="Tool was not dispatched after the batch gate closed.", effect_state=ToolEffectState.NOT_STARTED)
 
             policy = registration.policy
             failure_effect_state = (
@@ -331,7 +387,7 @@ class CoreToolExecutor:
                         await _append_unexecuted_results(
                             request,
                             event_sink,
-                            parsed_calls[index + 1:],
+                            parsed_calls[position + 1:],
                             start_index=index + 1,
                             results=results,
                             cache_hits=cache_hits,
@@ -386,6 +442,7 @@ class CoreToolExecutor:
                     ),
                 )
             except OperationCanceled:
+                halt()
                 await self._finish_tool_operation(
                     operation_id,
                     ToolBatchOutcome.CANCELED,
@@ -400,6 +457,7 @@ class CoreToolExecutor:
                     cache_hits,
                 )
             except asyncio.CancelledError:
+                halt()
                 await self._finish_tool_operation(
                     operation_id,
                     ToolBatchOutcome.CANCELED,
@@ -407,6 +465,9 @@ class CoreToolExecutor:
                 )
                 raise
             except Exception as error:
+                halt()
+                if stop_scheduling is not None and _is_control_failure(error):
+                    raise
                 await self._finish_tool_operation(
                     operation_id,
                     ToolBatchOutcome.FAILED,
@@ -419,7 +480,7 @@ class CoreToolExecutor:
                     index,
                     results,
                     cache_hits,
-                    remaining=parsed_calls[index + 1:],
+                    remaining=parsed_calls[position + 1:],
                     outcome=ToolBatchOutcome.FAILED,
                     code="tool_execution_failed",
                     message="Tool execution failed.",
@@ -429,6 +490,7 @@ class CoreToolExecutor:
                 )
 
             if not isinstance(handler_result, ToolHandlerResult):
+                halt()
                 await self._finish_tool_operation(
                     operation_id,
                     ToolBatchOutcome.FAILED,
@@ -441,7 +503,7 @@ class CoreToolExecutor:
                     index,
                     results,
                     cache_hits,
-                    remaining=parsed_calls[index + 1:],
+                    remaining=parsed_calls[position + 1:],
                     outcome=ToolBatchOutcome.FAILED,
                     code="invalid_tool_result",
                     message="Tool handler returned an invalid result.",
@@ -484,6 +546,7 @@ class CoreToolExecutor:
             results.append(result)
 
             if handler_error:
+                halt()
                 await _emit_completed(
                     event_sink,
                     request,
@@ -495,7 +558,7 @@ class CoreToolExecutor:
                 await _append_unexecuted_results(
                     request,
                     event_sink,
-                    parsed_calls[index + 1:],
+                    parsed_calls[position + 1:],
                     start_index=index + 1,
                     results=results,
                     cache_hits=cache_hits,
@@ -546,6 +609,70 @@ class CoreToolExecutor:
             aggregate_outcomes(outcomes),
             cache_hits,
         )
+
+    async def _execute_parallel(
+        self, request: ToolBatchRequest, event_sink: EventSink,
+        signal: CancellationSignal | None, parsed_calls: Sequence[ParsedToolCall],
+    ) -> ToolBatchResult:
+        next_index = 0
+        scheduling = True
+        completed: dict[int, ToolBatchResult] = {}
+        event_lock = asyncio.Lock()
+
+        def stop():
+            nonlocal scheduling
+            scheduling = False
+
+        class OrderedSink:
+            async def emit(self, event):
+                async with event_lock:
+                    await event_sink.emit(event)
+
+        sink = OrderedSink()
+
+        async def worker():
+            nonlocal next_index
+            try:
+                while scheduling and not _is_canceled(signal) and next_index < len(parsed_calls):
+                    index = next_index
+                    next_index += 1
+                    result = await self._execute_calls(request, sink, signal, (parsed_calls[index],),
+                        index_offset=index, stop_scheduling=stop, dispatch_allowed=lambda: scheduling)
+                    completed[index] = result
+                    if result.outcome not in {ToolBatchOutcome.COMPLETED, ToolBatchOutcome.PROGRESSED}:
+                        stop()
+            except BaseException:
+                stop()
+                raise
+
+        workers = [asyncio.create_task(worker()) for _ in range(min(self._limits.max_concurrency, len(parsed_calls)))]
+        try:
+            await asyncio.gather(*workers)
+        except BaseException:
+            stop()
+            for task in workers:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
+            raise
+
+        results, cache_hits, outcomes = [], [], []
+        for index, parsed in enumerate(parsed_calls):
+            batch = completed.get(index)
+            if batch is None:
+                result = _failure_result(parsed.call, "tool_batch_aborted", "Tool was not dispatched after the batch gate closed.")
+                await _emit_completed(sink, request, index, result, ToolBatchOutcome.CANCELED if _is_canceled(signal) else ToolBatchOutcome.FAILED)
+                results.append(result)
+                cache_hits.append(False)
+            else:
+                results.extend(batch.results)
+                cache_hits.extend(batch.cache_hits)
+                outcomes.append(batch.outcome)
+        if _is_canceled(signal):
+            outcomes.append(ToolBatchOutcome.CANCELED)
+        return _batch_result(results, aggregate_outcomes(outcomes), cache_hits,
+            error=next((result.error for result in results if result.error), None),
+            effect_state=ToolEffectState.NOT_STARTED)
 
     async def _start_tool_operation(
         self,
@@ -613,6 +740,7 @@ class CoreToolExecutor:
         request: ToolBatchRequest,
         parsed: ParsedToolCall,
         signal: CancellationSignal | None,
+        *, preserve_control_errors: bool = False,
     ) -> tuple[str, str, bool] | None:
         if registration.scope_validator is None:
             return None
@@ -625,7 +753,9 @@ class CoreToolExecutor:
             return "tool_execution_canceled", "Tool execution was canceled.", True
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as error:
+            if preserve_control_errors and _is_control_failure(error):
+                raise
             return (
                 "tool_scope_validation_failed",
                 "Tool scope validation failed.",
@@ -939,3 +1069,7 @@ def _approval_message(status: ApprovalStatus) -> str:
     if status is ApprovalStatus.TIMED_OUT:
         return "The approval request timed out."
     return "Approval is unavailable."
+
+
+def _is_control_failure(error: BaseException) -> bool:
+    return getattr(error, "code", None) in {"agent_run_lease_lost", "run_lease_conflict", "output_persistence_failed", "output_publish_failed"}

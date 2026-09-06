@@ -20,6 +20,7 @@ from purra.cancellation import (
 from purra.contracts import (
     AgentMessage,
     ModelCompletion,
+    MessageRole,
     ModelFinishReason,
     ModelInvocation,
     ModelStreamActivity,
@@ -31,6 +32,8 @@ from purra.contracts import (
     RuntimeLimits,
 )
 from purra.errors import ContractViolationError, InvalidPlannerOutputError, ModelGatewayError
+from purra.structured import StructuredOutputError
+from purra.structured_task import StructuredInvocationRef
 from purra.context_budget import max_generation_tokens_for_actual_input
 from purra.evidence import context_evidence_receipts
 from purra.model_invocation.evidence import (
@@ -175,6 +178,11 @@ class AgentModelInvocationManager:
             )
         self._evidence_validator = evidence_validator
 
+    @property
+    def structured_binding(self) -> tuple[str, str]:
+        return ("none" if isinstance(self._output, _NullOutputObserver) else "bound",
+                "not_bound" if self._budget_repository is None else "bound")
+
     async def stream(
         self,
         messages: Sequence[AgentMessage],
@@ -187,6 +195,8 @@ class AgentModelInvocationManager:
         _diagnostics: dict | None = None,
     ) -> ManagedInvocationStream:
         self._validate_call(call, context, public_stream_allowed=True)
+        if call.output_contract is not None:
+            raise StructuredOutputError("Structured tasks require complete output", code="structured_output_mode_unsupported")
         call = self._fit_call_to_context(messages, call, context)
         invocation = _invocation(call)
         receipt, spec = self._receipt_and_spec(messages, call, context, invocation)
@@ -415,12 +425,26 @@ class AgentModelInvocationManager:
         on_attempt: Callable[[Mapping[str, object]], Awaitable[None]] | None = None,
     ) -> ManagedInvocationCompletion:
         self._validate_call(call, context, public_stream_allowed=False)
+        output = call.output_contract
+        dialect = None
+        if output is not None:
+            messages = (*messages, AgentMessage(role=MessageRole.DEVELOPER, content=output.instruction()))
+            checker = getattr(self._gateway, "validate_output_contract", None)
+            if output.mode == "native_required" and (call.request.protocol_capabilities.json_schema_level != "json_schema" or not callable(checker)):
+                raise StructuredOutputError("Native output mode is unsupported", code="structured_output_mode_unsupported")
+            if callable(checker):
+                dialect = checker(_invocation(call))
+            if output.mode == "native_required" and (not isinstance(dialect, str) or not dialect.strip() or len(dialect) > 128):
+                raise StructuredOutputError("Native output dialect is unsupported", code="structured_output_mode_unsupported")
         call = self._fit_call_to_context(messages, call, context)
         invocation = _invocation(call)
         receipt, spec = self._receipt_and_spec(messages, call, context, invocation)
         if on_attempt is not None:
             await on_attempt(receipt.call_parameters[0])
-        operation_id = await self._start_operation(receipt)
+        if output is not None and dialect is not None:
+            receipt = replace(receipt, output_contract={**output.identity(), "nativeDialect": dialect},
+                input_fingerprint=_fingerprint({"inputFingerprint": receipt.input_fingerprint, "nativeDialect": dialect}))
+        operation_id = None
         invocation_signal = self._invocation_signal(context, signal)
         stream_opened = False
         output_settled = False
@@ -429,12 +453,18 @@ class AgentModelInvocationManager:
         attempt_settled = False
         meter = self._stream_meter(context)
         usage = None
+        dispatched = False
+        fully_settled = False
+        structured_value = None
         try:
+            operation_id = await self._start_operation(receipt)
             await self._validate_evidence(receipt, invocation_signal)
             await self._reserve_attempt(receipt)
             attempt_reserved = True
             await self._output.open_model_stream(receipt, spec)
             stream_opened = True
+            raise_if_stopped(invocation_signal)
+            dispatched = True
             completion = await await_with_cancellation(
                 self._gateway.complete(messages, invocation, invocation_signal),
                 invocation_signal,
@@ -475,6 +505,10 @@ class AgentModelInvocationManager:
                     code="unexpected_model_tool_calls",
                     retryable=False,
                 )
+            if output is not None:
+                if reason is not ModelFinishReason.STOP:
+                    raise ModelGatewayError("Structured task requires normal termination", code="unexpected_model_tool_calls")
+                structured_value = output.parse(completion.message.content)
             attempt_settled = True
             await self._settle_attempt(receipt, completion.usage)
             completion_chunk = _completion_chunk(completion)
@@ -494,24 +528,36 @@ class AgentModelInvocationManager:
             return ManagedInvocationCompletion(
                 completion=completion,
                 receipt=receipt,
+                structured_value=structured_value,
             )
         except BaseException as error:
             selected_error = error
             try:
                 if attempt_reserved and not attempt_settled:
                     attempt_settled = True
-                    try:
-                        await self._settle_attempt(receipt, usage)
-                    except BaseException as budget_error:
-                        selected_error = budget_error
+                    await self._settle_attempt(receipt, usage)
+                fully_settled = stream_opened and attempt_reserved
+            except BaseException as budget_error:
+                fully_settled = False
+                selected_error = budget_error
+            try:
                 if stream_opened and not output_settled:
-                    await self._output.abort_model_stream(
-                        receipt.output_stream_id,
-                        _error_code(selected_error),
-                    )
-            finally:
+                    await self._output.abort_model_stream(receipt.output_stream_id, _error_code(selected_error))
                 if not operation_settled:
                     await self._fail_operation(operation_id, selected_error)
+            except BaseException as persistence_error:
+                fully_settled = False
+                selected_error = persistence_error
+            # An exception raised by successful-path settlement is itself a
+            # settlement failure, even when no second settlement is attempted.
+            if structured_value is not None:
+                fully_settled = False
+            if output is not None:
+                selected_error.structured_invocation_ref = StructuredInvocationRef(
+                    receipt.invocation_id, receipt.output_budget, usage,
+                    dispatched, fully_settled and selected_error is error,
+                    _error_code(selected_error),
+                )
             if selected_error is not error:
                 raise selected_error from error
             raise
@@ -575,6 +621,8 @@ class AgentModelInvocationManager:
                     "profileContextWindowTokens": snapshot.context_window_tokens,
                 },
             )
+        if call.output_contract is not None and call.output_contract.mode == "native_required":
+            messages = (*messages, AgentMessage(role=MessageRole.DEVELOPER, content=call.output_contract.schema_json()))
         physical_maximum = max_generation_tokens_for_actual_input(
             window_tokens=window,
             messages=messages,
@@ -636,6 +684,8 @@ class AgentModelInvocationManager:
             output_budget=call.output_budget,
             input_fingerprint=_fingerprint({
                 "messages": [message.to_mapping() for message in messages],
+                "structuredTask": thaw_json_mapping(call.structured_task) if call.structured_task is not None else None,
+                "outputContract": dict(call.output_contract.identity()) if call.output_contract is not None else None,
                 "modelRequest": {
                     "provider": call.request.provider,
                     "model": call.request.model,
@@ -657,7 +707,9 @@ class AgentModelInvocationManager:
                 }
                 for tool in invocation.tools
             ]),
-            budget_key=context.attempt_source_key,
+            structured_task=call.structured_task,
+            output_contract=call.output_contract.identity() if call.output_contract is not None else None,
+            budget_key=None if call.output_contract is not None else context.attempt_source_key,
             output_protocol=call.output_protocol,
             planning_scope=context.planning_scope,
             planning_attempt=context.planning_attempt,
@@ -1006,6 +1058,7 @@ def _invocation(call: AgentModelCall) -> ModelInvocation:
         tool_choice=call.tool_choice,
         output_budget=call.output_budget,
         reasoning_mode=call.reasoning_mode,
+        output_contract=call.output_contract,
     )
 
 

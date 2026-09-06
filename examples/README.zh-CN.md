@@ -32,3 +32,13 @@ npm --prefix typescript run example
 
 接入模型服务或持久化存储时，可将本地适配器替换为[可选包](../integrations/README.zh-CN.md)
 或应用自己的实现。快速开始中的 Retriever 读取固定的公开数据；应用的 Retriever 需要校验其数据源访问权限。
+
+
+## 结构化任务、只读并行与诊断
+
+- [Python 结构化任务](python/structured_task.py) / [TS 结构化任务](../typescript/examples/structured-task.ts)：本地固定响应，一次显式修复；低层 runner 回执明确没有持久化或 Root 预算绑定，宿主应传入当前 Run 的 runner/authority。
+- [Python 并行读取](python/parallel_tools.py) / [TS 并行读取](../typescript/examples/parallel-tools.ts)：宿主声明安全的只读批次，限额 2。
+- [Python 接入报告](python/integration_check.py) / [TS 接入报告](../typescript/examples/integration-check.ts)：复用已有 conformance 检查，报告已执行/未执行覆盖，只读查询缺少的恢复证据保留 unknown。
+- 安装 Core 和可选 MCP 包后，可运行 [Python stdio 消费者](../integrations/mcp/python/scripts/check_installed.py) / [TS stdio 消费者](../integrations/mcp/typescript/scripts/check-installed.mjs)。使用官方 SDK 启动并关闭本地 fixture server，不代表第三方 MCP 服务验证。
+
+所有 Core TS 示例均纳入 `npm --prefix typescript run example`。Python 示例可直接用安装了 Core 的解释器运行。诊断的边界见[公开契约](../conformance/integration-inspection.md)。

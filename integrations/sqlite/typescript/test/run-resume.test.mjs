@@ -81,7 +81,7 @@ for (const scenario of cases) test(`public resume: ${scenario.id} preserves jour
       await ready;
     } else if (scenario.id === "unreconciled-attempt") {
       await storage.runs.openInvocation(id, {
-        schemaVersion: 2, runId: id, invocationId: "unfinished-attempt",
+        schemaVersion: 3, runId: id, invocationId: "unfinished-attempt",
         messageFingerprint: "messages", toolFingerprint: "tools", requestFingerprint: "request",
         evidenceFingerprint: "evidence", contextEvidence: [], capabilityProfileId: null, outputBudget: null,
       });
@@ -89,6 +89,16 @@ for (const scenario of cases) test(`public resume: ${scenario.id} preserves jour
     const before = await storage.runs.get(id);
     const events = await storage.runs.listEvents(id, 0);
     const previousCounts = { ...counts };
+    const report = await storage.inspectRecovery(id, { expectedPreset: before.preset });
+    const expectedDiagnostic = { "checkpoint-missing": "checkpoint_missing", terminal: "run_terminal",
+      "lease-conflict": "run_lease_conflict", "unreconciled-attempt": "run_recovery_requires_reconciliation" }[scenario.id];
+    if (expectedDiagnostic) assert.ok(report.blockers.includes(expectedDiagnostic));
+    assert.equal(report.observations.configuration, "matched");
+    assert.equal(report.authority, "diagnosis_only");
+    assert.ok(report.unknown.includes("permissions"));
+    assert.deepEqual(counts, previousCounts);
+    assert.deepEqual(await storage.runs.get(id), before);
+    assert.deepEqual(await storage.runs.listEvents(id, 0), events);
     await assert.rejects(async () => { await (await agent.resume(id, request)).result; }, { code: scenario.errorCode });
     assert.deepEqual(counts, previousCounts);
     assert.deepEqual(await storage.runs.get(id), before);
@@ -167,4 +177,45 @@ test("resume rejects a checkpoint changed since the initial repository read", as
     assert.deepEqual(await current.storage.runs.get(id), before);
     assert.deepEqual(await current.storage.runs.listEvents(id, 0), events);
   } finally { current?.storage.close(); rmSync(dir, { recursive: true }); }
+});
+
+test('inspection is read-only and tool reconciliation preserves the model attempt blocker', async()=>{
+  const { DatabaseSync } = await import('node:sqlite');
+  const { StorageSession } = await import('purra');
+  const dir=mkdtempSync(join(tmpdir(),'purra-inspection-'));
+  let current, reader;
+  try {
+    const path=join(dir,'agent.db'), id=await paused(path);
+    current=host(path); const {storage,counts}=current;
+    await storage.runs.openInvocation(id, {
+      schemaVersion:3,runId:id,invocationId:'private-attempt',messageFingerprint:'messages',toolFingerprint:'tools',requestFingerprint:'request',
+      evidenceFingerprint:'evidence',contextEvidence:[],capabilityProfileId:null,outputBudget:null,
+    });
+    await assert.rejects(storage.idempotency.executeOnce('opaque-private-key',async()=>{throw Error('private-payload');}));
+    const saved=await storage.runs.get(id), previousCounts={...counts};
+    reader=new DatabaseSync(path);
+    const dump=()=>JSON.stringify(reader.prepare('SELECT * FROM purra_state ORDER BY scope,sdk').all());
+    const before=dump(), events=await storage.runs.listEvents(id,0);
+    const original=StorageSession.prototype.exportSnapshot;
+    let report;
+    StorageSession.prototype.exportSnapshot=()=>{throw Error('read query serialized state');};
+    try {
+      reader.exec('BEGIN IMMEDIATE');
+      report=await storage.inspectRecovery(id,{expectedPreset:{...saved.preset,revision:'different'}});
+      reader.exec('ROLLBACK');
+    } finally {StorageSession.prototype.exportSnapshot=original;}
+    assert.equal(dump(),before); assert.deepEqual(await storage.runs.listEvents(id,0),events);
+    assert.ok(report.blockers.includes('configuration_mismatch'));
+    assert.ok(report.blockers.includes('run_recovery_requires_reconciliation'));
+    assert.ok(report.cautions.includes('unattributed_tool_effect_unknown'));
+    assert.equal(report.blockers.includes('unattributed_tool_effect_unknown'), false);
+    assert.equal(report.observations.receiptScope,'storage');assert.ok(report.unknown.includes('runToolEffects'));
+    assert.equal(JSON.stringify(report).includes('private-'),false);
+    await storage.reconcileTool('opaque-private-key',{notExecuted:true});
+    report=await storage.inspectRecovery(id);
+    assert.equal(report.cautions.includes('unattributed_tool_effect_unknown'),false);
+    assert.ok(report.blockers.includes('run_recovery_requires_reconciliation'));
+    assert.deepEqual(counts,previousCounts);
+    await assert.rejects(storage.runs.executeOwned(id,async()=>{throw Error('must not execute');},saved.executionCheckpoint),{code:'run_recovery_requires_reconciliation'});
+  } finally {reader?.close();current?.storage.close();rmSync(dir,{recursive:true,force:true});}
 });

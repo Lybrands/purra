@@ -11,6 +11,7 @@
 | `purra-sqlite` | 持久化 Run、事件、检查点和工具回执 | [Python](sqlite/python/README.zh-CN.md) · [TypeScript](sqlite/typescript/README.zh-CN.md) |
 | `purra-interaction` | 结构化提问与等待输入后的恢复 | [Python](interaction/python/README.zh-CN.md) · [TypeScript](interaction/typescript/README.zh-CN.md) |
 | `purra-compaction` | 使用模型压缩对话历史 | [Python](compaction/python/README.zh-CN.md) · [TypeScript](compaction/typescript/README.zh-CN.md) |
+| `purra-mcp` | 宿主连接上的只读 MCP 工具（开发中） | [Python](mcp/python/README.md) · [TypeScript](mcp/typescript/README.md) |
 | `purra-mem0` | 按作用域隔离的长期记忆与检索 | [Python](mem0/python/README.zh-CN.md) · [TypeScript](mem0/typescript/README.zh-CN.md) |
 
 模型适配包支持 OpenAI 和 Anthropic 原生 API。其他厂商的协议差异、模型配置和凭据由应用处理。

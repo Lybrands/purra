@@ -15,6 +15,7 @@ from purra.contracts import (
     ToolChoiceMode,
     ToolSchema,
 )
+from purra.structured import StructuredOutputContract
 from purra.json_values import freeze_json_mapping
 from purra.json_values import thaw_json_mapping
 from purra.model_protocol import (
@@ -114,6 +115,8 @@ class AgentModelCall:
     output_budget: InvocationOutputBudget | None = None
     tools: tuple[ToolSchema, ...] = ()
     tool_choice: ToolChoiceMode = ToolChoiceMode.NONE
+    output_contract: StructuredOutputContract | None = None
+    structured_task: Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.request, ModelRequest):
@@ -124,6 +127,15 @@ class AgentModelCall:
             or self.commit_mode != OutputCommitMode.PRIVATE
         ):
             raise ValueError("planning protocol requires structured private output")
+        if self.structured_task is not None:
+            if self.output_contract is None:
+                raise ValueError("structured task requires output contract")
+            object.__setattr__(self, "structured_task", freeze_json_mapping(self.structured_task))
+        if self.output_contract is not None:
+            if not isinstance(self.output_contract, StructuredOutputContract):
+                raise TypeError("output_contract must be StructuredOutputContract")
+            if self.tools or self.output_protocol is not None or self.output_intent != AgentOutputIntent.STRUCTURED_PRIVATE or self.commit_mode != OutputCommitMode.PRIVATE:
+                raise ValueError("object output requires a private no-tool invocation")
         intent = AgentOutputIntent(self.output_intent)
         commit_mode = OutputCommitMode(self.commit_mode)
         if intent in {
@@ -176,6 +188,8 @@ class ModelInvocationReceipt:
     output_protocol: str | None = None
     planning_scope: PlanningScope | None = None
     planning_attempt: int = 0
+    output_contract: Mapping[str, object] | None = None
+    structured_task: Mapping[str, object] | None = None
     budget_key: str | None = None
     context_evidence: tuple[ContextEvidenceReceipt, ...] = field(
         default_factory=tuple
@@ -217,6 +231,12 @@ class ModelInvocationReceipt:
                 "model tool schema fingerprint",
             ),
         )
+        if self.structured_task is not None:
+            if self.output_contract is None:
+                raise ValueError("structured task requires output contract")
+            object.__setattr__(self, "structured_task", freeze_json_mapping(self.structured_task))
+        if self.output_contract is not None:
+            object.__setattr__(self, "output_contract", freeze_json_mapping(self.output_contract))
         object.__setattr__(self, "budget_key", optional_text(self.budget_key))
         evidence = tuple(self.context_evidence)
         if not all(isinstance(item, ContextEvidenceReceipt) for item in evidence):
@@ -232,7 +252,7 @@ class ModelInvocationReceipt:
 
     def to_mapping(self) -> dict[str, object]:
         return {
-            "schemaVersion": 2,
+            "schemaVersion": 3,
             "invocationId": self.invocation_id,
             "outputStreamId": self.output_stream_id,
             "runId": self.run_id,
@@ -245,6 +265,8 @@ class ModelInvocationReceipt:
             "toolSchemaFingerprint": self.tool_schema_fingerprint,
             "budgetKey": self.budget_key or self.invocation_id,
             "outputProtocol": self.output_protocol,
+            "structuredTask": thaw_json_mapping(self.structured_task) if self.structured_task is not None else None,
+            "outputContract": thaw_json_mapping(self.output_contract) if self.output_contract is not None else None,
             "planningScope": self.planning_scope.to_mapping() if self.planning_scope else None,
             "planningAttempt": self.planning_attempt,
             "contextEvidence": [
@@ -266,6 +288,7 @@ class ManagedInvocationStream:
 class ManagedInvocationCompletion:
     completion: ModelCompletion
     receipt: ModelInvocationReceipt
+    structured_value: Mapping[str, object] | None = None
 
 
 __all__ = [name for name in globals() if not name.startswith("_")]

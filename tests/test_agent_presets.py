@@ -382,3 +382,19 @@ def test_preset_snapshot_covers_operational_capability_drift():
     )
     with pytest.raises(ValueError, match="persisted snapshot"):
         changed.require_snapshot(snapshot, _request())
+
+
+def test_preset_identity_binds_parallel_policy_and_limits():
+    from purra.contracts import ToolExecutionLimits
+    catalog = _catalog(ToolExecutionMode.READ)
+    preset = AgentPreset(id='parallel',revision='1',tool_catalog=catalog,runtime_limits=RuntimeLimits(max_run_generation_tokens=None))
+    baseline = preset.snapshot(_request())
+    parallel = preset.snapshot(_request(),tool_execution_limits=ToolExecutionLimits(max_concurrency=2))
+    assert parallel.fingerprint != baseline.fingerprint
+    with pytest.raises(ValueError,match='persisted snapshot'):
+        preset.require_snapshot(parallel,_request())
+    preset.require_snapshot(parallel,_request(),tool_execution_limits=ToolExecutionLimits(max_concurrency=2))
+    registration = catalog.registrations()[0]
+    safe = replace(registration,concurrency_safe=True)
+    changed = replace(preset,tool_catalog=InMemoryToolCatalog((safe,)))
+    assert changed.snapshot(_request()).fingerprint != baseline.fingerprint

@@ -1,3 +1,4 @@
+import { validateOutput } from "./structured.js";
 import OpenAI from "openai";
 export { OpenAIChatCompletionsGateway } from "./chat.js";
 export type { OpenAIChatCompletionsOptions } from "./chat.js";
@@ -77,13 +78,20 @@ export class OpenAIResponsesGateway implements ModelGateway {
     this.#reasoning = options.reasoning;
     this.#client = (options.client ?? new OpenAI()).withOptions({ maxRetries: 0, timeout: options.timeoutMs ?? 60000 });
   }
+  public validateOutputContract(request: ModelRequest): string | undefined {
+    return validateOutput(request, this.capabilities);
+  }
   #request(request: ModelRequest): ResponseCreateParamsNonStreaming {
+    this.validateOutputContract(request);
     if (!request.outputBudget) throw new TypeError("OpenAI gateway requires a resolved generation budget");
     return { model: this.#model, input: input(request.messages), store: false, include: ["reasoning.encrypted_content"],
       max_output_tokens: request.outputBudget.maxGenerationTokens,
       tools: request.tools.map(t => ({ type: "function", name: t.name, description: t.description,
         parameters: JSON.parse(JSON.stringify(t.inputSchema)) as Record<string, unknown>, strict: false })),
       tool_choice: request.tools.length ? "auto" : "none",
+      ...(request.outputContract?.mode === "native_required" ? { text: { format: {
+        type: "json_schema" as const, name: "purra_output", strict: true, schema: JSON.parse(JSON.stringify(request.outputContract.schema)) as Record<string, unknown>,
+      } } } : {}),
       ...(this.#reasoning === undefined ? {} : { reasoning: this.#reasoning }),
     };
   }

@@ -197,7 +197,9 @@ export interface ModelInvocationReceipt {
   readonly outputProtocol?: "purra.planning-stream/v1";
   readonly planningScope?: PlanningScope;
   readonly planningAttempt?: number;
-  readonly schemaVersion: 2;
+  readonly schemaVersion: 3;
+  readonly outputContract?: Readonly<Record<string, JsonValue>>;
+  readonly structuredTask?: Readonly<{ taskId: string; attempt: number; previousInvocationId: string | null }>;
   readonly runId: string;
   readonly invocationId: string;
   readonly attempt: number;
@@ -232,6 +234,8 @@ export interface RunBeginParams {
 }
 
 export interface InvocationReceiptInput {
+  readonly outputContract?: Readonly<Record<string, JsonValue>>;
+  readonly structuredTask?: Readonly<{ taskId: string; attempt: number; previousInvocationId: string | null }>;
   readonly outputProtocol?: "purra.planning-stream/v1";
   readonly planningScope?: PlanningScope;
   readonly planningAttempt?: number;

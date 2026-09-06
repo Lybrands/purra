@@ -28,6 +28,7 @@ class RecoveryCause(StrEnum):
     MISSING_REQUIRED_TOOL_CALL_REPLAN = "missing_required_tool_call_replan"
     UNSTRUCTURED_TOOL_PROTOCOL = "unstructured_tool_protocol"
     EMPTY_MODEL_RESPONSE = "empty_model_response"
+    STRUCTURED_OUTPUT_INVALID = "structured_output_invalid"
     RESPONSE_CONSTRAINT_DETERMINISTIC = "response_constraint_deterministic"
     RESPONSE_CONSTRAINT_SEMANTIC = "response_constraint_semantic"
     FUTURE_TOOL_STEP = "future_tool_step"

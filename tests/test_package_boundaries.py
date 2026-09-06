@@ -77,6 +77,7 @@ def test_host_adapter_conformance_has_no_test_framework_or_host_dependency():
         "dataclasses",
         "datetime",
         "json",
+        "re",
         "purra",
         "uuid",
     }

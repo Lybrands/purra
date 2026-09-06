@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "cases": [
+    {"id":"unknown", "state":{}, "blockers":[]},
+    {"id":"terminal", "state":{"status":"terminal"}, "blockers":["run_terminal"]},
+    {"id":"missing-checkpoint", "state":{"checkpoint":"missing"}, "blockers":["checkpoint_missing"]},
+    {"id":"active-lease", "state":{"lease":"active"}, "blockers":["run_lease_conflict"]},
+    {"id":"config-permission", "state":{"configuration":"mismatch","permissions":"denied"}, "blockers":["configuration_mismatch","permission_denied"]},
+    {"id":"canceled-expired", "state":{"cancellation":"requested","deadline":"expired"}, "blockers":["run_canceled","run_deadline_exceeded"]},
+    {"id":"attempt-after-tool-reconciliation", "state":{"checkpoint":"present","attemptsAfterCheckpoint":1,"unknownToolReceipts":0,"receiptScope":"run"}, "blockers":["run_recovery_requires_reconciliation"]},
+    {"id":"run-claim", "state":{"unknownToolReceipts":1,"receiptScope":"run"}, "blockers":["tool_effect_unknown"]},
+    {"id":"unattributed-claim", "state":{"unknownToolReceipts":1,"receiptScope":"storage"}, "blockers":[], "cautions":["unattributed_tool_effect_unknown"]},
+    {"id":"no-observed-blocker-is-not-authorization", "state":{"status":"running","checkpoint":"present","attemptsAfterCheckpoint":0,"unknownToolReceipts":0,"receiptScope":"run","lease":"inactive","configuration":"matched","permissions":"allowed","usage":"recorded","cancellation":"clear","deadline":"open"}, "blockers":[]}
+  ],
+  "invalid": [ {"lease":"owner-secret"}, {"attemptsAfterCheckpoint":-1}, {"attemptsAfterCheckpoint":true}, {"unknownToolReceipts":1.5}, {"unknownToolReceipts":9007199254740992} ]
+}

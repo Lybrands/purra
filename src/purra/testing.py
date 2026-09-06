@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from uuid import uuid4
+
 
 from purra.adapters import InMemoryAgentAdapters
 from purra.agent_execution_checkpoint import AgentExecutionCheckpoint
@@ -1290,3 +1292,57 @@ __all__ = [
     "assert_tool_execution_gateway_conforms",
     "assert_tool_idempotency_gateway_conforms",
 ]
+
+
+@dataclass(frozen=True)
+class IntegrationCheck:
+    """Wrap an existing conformance assertion; the host owns probe isolation."""
+    capability: str
+    category: str
+    probe: Callable[[], Awaitable[object]]
+
+
+async def check_integration(*, component: str, version: str,
+                            checks: Sequence[IntegrationCheck] = (),
+                            declared_capabilities=None,
+                            enabled_categories: Sequence[str] = ("deterministic",)):
+    """Report actual assertions separately from declarations. No implicit live probes.
+
+    Each callback should use an existing assert_*_conforms helper or a host assertion.
+    A successful callback verifies only that assertion, not all behavior of a capability.
+    External callbacks require explicit category enablement. Exceptions are redacted;
+    cancellation propagates. This function cannot sandbox a host callback.
+    """
+    capabilities = ("gateway", "tools", "context", "storage", "structured_output", "mcp", "read_concurrency")
+    categories = ("deterministic", "installed_artifact", "real_provider_mcp", "downstream")
+    for label in (component, version):
+        if not isinstance(label, str) or re.fullmatch(r"[A-Za-z0-9@_./:+-]{1,80}", label) is None:
+            raise ValueError("invalid public component label")
+    enabled = tuple(enabled_categories)
+    if any(item not in categories for item in enabled):
+        raise ValueError("invalid evidence category")
+    declared = dict(declared_capabilities or {})
+    if any(key not in capabilities or value not in ("supported", "unsupported", "unknown") for key, value in declared.items()):
+        raise ValueError("invalid declared capability")
+    selected = {}
+    for check in checks:
+        key = (check.capability, check.category)
+        if check.capability not in capabilities or check.category not in categories or key in selected or not callable(check.probe):
+            raise ValueError("invalid integration check")
+        selected[key] = check.probe
+    results = []
+    for category in categories:
+        for capability in capabilities:
+            probe = selected.get((capability, category))
+            status, error = "not_run", None
+            if probe is not None and category in enabled:
+                try:
+                    await probe()
+                    status = "passed"
+                except Exception:
+                    status, error = "failed", capability + "_nonconforming"
+            results.append({"capability": capability, "category": category,
+                            "status": status, "errorCode": error})
+    return {"schemaVersion": 1, "component": component, "version": version,
+            "declaredCapabilities": {key: declared.get(key, "unknown") for key in capabilities},
+            "checks": results}

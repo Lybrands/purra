@@ -18,7 +18,7 @@ async function seed(runs) {
   await runs.begin({ ...base, requestedRunId: "other" });
 }
 const draft = (key) => ({ sourceKey: key, kind: "model.diagnostics", channel: "model", visibility: "private", payload: { text: key } });
-const invocation = (id) => ({ schemaVersion: 2, runId: id, invocationId: `invocation:${id}`,
+const invocation = (id) => ({ schemaVersion: 3, runId: id, invocationId: `invocation:${id}`,
   messageFingerprint: "messages", toolFingerprint: "tools", requestFingerprint: "request",
   evidenceFingerprint: "evidence", contextEvidence: [], capabilityProfileId: null, outputBudget: null });
 

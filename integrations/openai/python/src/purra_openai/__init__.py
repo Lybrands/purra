@@ -1,5 +1,7 @@
 """OpenAI Responses adapter; SDK retries are disabled for Core accounting."""
 
+from ._structured import validate as _validate_output
+
 import math
 
 from openai import AsyncOpenAI, APIError, APIStatusError
@@ -92,7 +94,16 @@ class OpenAIResponsesGateway:
         self._owns_client = client is None
         self._client = (client or AsyncOpenAI()).with_options(max_retries=0, timeout=timeout_seconds)
 
+    def validate_output_contract(self, invocation):
+        return _validate_output(invocation)
+
     def _request(self, messages, invocation):
+        self.validate_output_contract(invocation)
+        wire = {}
+        if invocation.output_contract is not None and invocation.output_contract.mode == "native_required":
+            fmt = {"type": "json_schema", "name": "purra_output", "strict": True,
+                   "schema": thaw_json_mapping(invocation.output_contract.schema)}
+            wire = {"text": {"format": fmt}}
         if invocation.request.provider != "openai":
             raise ValueError("OpenAI gateway requires provider='openai'")
         cap = invocation.max_generation_tokens
@@ -109,7 +120,7 @@ class OpenAIResponsesGateway:
             effort = "none"
         elif invocation.reasoning_mode.value == "enabled" and effort == "none":
             raise ValueError("reasoning effort conflicts with enabled reasoning")
-        return dict(model=invocation.request.model, input=_input(messages),
+        return dict(**wire, model=invocation.request.model, input=_input(messages),
                     tools=[{"type": "function", "name": t.name, "description": t.description,
                             "parameters": thaw_json_mapping(t.parameters), "strict": False} for t in invocation.tools],
                     tool_choice=invocation.tool_choice.value if invocation.tools else "none",

@@ -1,3 +1,5 @@
+import { StructuredOutputContract } from "../structured.js";
+import { jsonEqual } from "../shared/schema.js";
 import type { JsonValue, Message, ToolCall, ToolSpec } from "../model/types.js";
 import type { PlanningToolRegistration } from "../planning/types.js";
 import { copyJsonValue } from "../model/validation.js";
@@ -50,6 +52,7 @@ export class ToolCatalog {
   readonly #approval: ToolApprovalGateway | undefined;
   readonly #idempotency: ToolIdempotencyGateway | undefined;
   readonly #maxCallsPerBatch: number;
+  readonly #maxConcurrency: number;
   readonly #maxResultChars: number;
   readonly #approvalSummaryChars: number;
   readonly #approvalTimeoutMs: number;
@@ -59,6 +62,7 @@ export class ToolCatalog {
     this.#approval = options.approval;
     this.#idempotency = options.idempotency;
     this.#maxCallsPerBatch = positiveInteger(options.limits?.maxCallsPerBatch ?? 8, "maxCallsPerBatch");
+    this.#maxConcurrency = positiveInteger(options.limits?.maxConcurrency ?? 1, "maxConcurrency");
     this.#maxResultChars = positiveInteger(options.limits?.maxResultChars ?? 64_000, "maxResultChars");
     this.#approvalSummaryChars = positiveInteger(
       options.limits?.approvalSummaryChars ?? 420,
@@ -95,6 +99,19 @@ export class ToolCatalog {
   public specsFor(enabledTools?: readonly string[]): readonly ToolSpec[] {
     const enabled = this.#enabledNames(enabledTools);
     return Object.freeze([...enabled].map((name) => this.#tools.get(name)!.spec));
+  }
+
+  public executionSnapshotFor(enabledTools?: readonly string[]): JsonValue {
+    return copyJsonValue({
+      maxConcurrency: this.#maxConcurrency, maxCallsPerBatch: this.#maxCallsPerBatch,
+      maxResultChars: this.#maxResultChars, approvalTimeoutMs: this.#approvalTimeoutMs,
+      approvalSummaryChars: this.#approvalSummaryChars,
+      tools: [...this.#enabledNames(enabledTools)].map(name => {
+        const { definition, policy } = this.#tools.get(name)!;
+        return { name, policy, concurrencySafe: definition.concurrencySafe ?? false,
+          argumentContract: definition.argumentContract?.identity() ?? null };
+      }),
+    });
   }
 
   public planningRegistrationsFor(
@@ -135,7 +152,10 @@ export class ToolCatalog {
     options: ExecuteOptions,
   ): Promise<ToolBatchResult> {
     const admitted = this.#admitBatch(calls, options.enabledTools);
-    await this.#authorizeBatch(admitted, options.signal);
+    const parallel = this.#maxConcurrency > 1 && admitted.length > 1
+      && admitted.every(([, tool]) => tool.policy.mode === "read" && tool.definition.concurrencySafe === true);
+    await this.#authorizeBatch(admitted, options, parallel);
+    if (parallel) return this.#executeParallel(admitted, options);
 
     const messages: Message[] = [];
     const failures: { readonly errorCode: string; readonly effectState: ToolEffectState }[] = [];
@@ -199,6 +219,86 @@ export class ToolCatalog {
     });
   }
 
+  async #executeParallel(
+    admitted: readonly (readonly [ToolCall, RegisteredTool])[], options: ExecuteOptions,
+  ): Promise<ToolBatchResult> {
+    let next = 0, scheduling = true, hasFatal = false;
+    let fatal: unknown;
+    const controller = new AbortController();
+    const signal = options.signal === undefined ? controller.signal : AbortSignal.any([controller.signal, options.signal]);
+    const scoped = { ...options, signal };
+    const results = new Map<number, ToolHandlerResult>();
+    const stop = () => { scheduling = false; };
+    const fail = (error: unknown) => {
+      stop();
+      if (!hasFatal) { hasFatal = true; fatal = error; }
+      controller.abort();
+    };
+    let events = Promise.resolve();
+    const emit = (event: ToolExecutionEvent): Promise<void> => {
+      const pending = events.then(async () => {
+        if (hasFatal) throw fatal;
+        try { await options.onEvent?.(Object.freeze(event)); }
+        catch (error) { fail(error); throw error; }
+      });
+      events = pending.catch(() => undefined);
+      return pending;
+    };
+    const worker = async () => {
+      try {
+        while (scheduling && !signal.aborted && next < admitted.length) {
+          const index = next++;
+          const [call, tool] = admitted[index]!;
+          // Recheck the immutable request and current host scope at dispatch.
+          this.#admitBatch([call], options.enabledTools);
+          await emit({ type: "tool_started", toolCallId: call.id, toolName: call.name });
+          try { await this.#authorizeBatch([[call, tool]], scoped, true); }
+          catch (error) {
+            if (!(error instanceof AgentError) || !["tool_scope_violation", "tool_scope_validation_failed"].includes(error.code)) throw error;
+            stop();
+            results.set(index, { content: null, effectState: "not_started", errorCode: error.code });
+            await emit({ type: "tool_completed", toolCallId: call.id, toolName: call.name,
+              effectState: "not_started", errorCode: error.code });
+            break;
+          }
+          if (!scheduling || signal.aborted) break;
+          const result = await this.#execute(call, tool, options.executionKey, signal,
+            options.runId, options.rootRunId, options.agentId, options.parentRunId,
+            options.leaseOwnerId, options.leaseEpoch, true, stop);
+          results.set(index, result);
+          if (hasFatal) break;
+          await emit({ type: "tool_completed", toolCallId: call.id, toolName: call.name,
+            effectState: result.effectState, ...(result.errorCode === undefined ? {} : { errorCode: result.errorCode }) });
+        }
+      } catch (error) { fail(error); }
+    };
+    await Promise.all(Array.from({ length: Math.min(this.#maxConcurrency, admitted.length) }, worker));
+    await events;
+    if (hasFatal) throw fatal;
+    throwIfCanceled(options.signal);
+    const messages: Message[] = [];
+    const failures: { errorCode: string; effectState: ToolEffectState }[] = [];
+    const evidence: ContextEvidenceReceipt[] = [];
+    let replan: ToolBatchResult["replan"];
+    for (const [index, [call]] of admitted.entries()) {
+      let result = results.get(index);
+      if (result === undefined) {
+        result = { content: null, effectState: "not_started", errorCode: "tool_batch_aborted" };
+        await emit({ type: "tool_completed", toolCallId: call.id, toolName: call.name,
+          effectState: "not_started", errorCode: "tool_batch_aborted" });
+      }
+      messages.push(Object.freeze({ role: "tool", toolCallId: call.id,
+        content: result.errorCode === undefined ? result.content : safeFailure(result.errorCode, result.effectState) }));
+      if (result.errorCode !== undefined) failures.push(Object.freeze({ errorCode: result.errorCode, effectState: result.effectState }));
+      else evidence.push(...(result.contextEvidence ?? []));
+      if (result.planningDisposition === "replan") replan = Object.freeze({ reason: result.planningReason!,
+        ...(result.errorCode === undefined ? {} : { errorCode: result.errorCode }) });
+    }
+    return Object.freeze({ messages: Object.freeze(messages), failures: Object.freeze(failures),
+      toolNames: Object.freeze(admitted.map(([call]) => call.name)), contextEvidence: copyContextEvidence(evidence),
+      ...(replan === undefined ? {} : { replan }) });
+  }
+
   #enabledNames(requested: readonly string[] | undefined): ReadonlySet<string> {
     if (requested === undefined) {
       return new Set([...this.#tools]
@@ -237,27 +337,31 @@ export class ToolCatalog {
       const tool = this.#tools.get(name);
       if (tool === undefined) throw new AgentError("unknown_tool", `Unknown tool: ${name}`);
       if (!enabled.has(name)) throw new AgentError("tool_not_enabled", `Tool ${name} is not enabled`);
-      validateToolArguments(call.arguments, tool.schema, name);
+      if (tool.definition.argumentContract !== undefined) {
+        try { tool.definition.argumentContract.validateValue(call.arguments); }
+        catch { throw new AgentError("invalid_tool_arguments_schema", "Tool arguments do not satisfy the declared object contract"); }
+      } else validateToolArguments(call.arguments, tool.schema, name);
       return [call, tool] as const;
     }));
   }
 
   async #authorizeBatch(
     admitted: readonly (readonly [ToolCall, RegisteredTool])[],
-    signal: AbortSignal | undefined,
+    options: ExecuteOptions,
+    preserveControlErrors = false,
   ): Promise<void> {
+    const signal = options.signal;
     for (const [call, tool] of admitted) {
       throwIfCanceled(signal);
       if (tool.definition.scope !== undefined) {
         let decision: string | boolean | void;
         try {
-          decision = await awaitWithSignal(
-            Promise.resolve(tool.definition.scope(call.arguments, context(call, signal))),
-            signal,
-            false,
-          );
+          const checking = Promise.resolve(tool.definition.scope(call.arguments,
+            context(call, signal, options.runId, options.rootRunId, options.agentId, options.parentRunId, options.leaseOwnerId, options.leaseEpoch)));
+          try { decision = await awaitWithSignal(checking, signal, false); }
+          finally { if (preserveControlErrors && signal?.aborted) await checking.catch(() => undefined); }
         } catch (error) {
-          if (error instanceof AgentCanceledError) throw error;
+          if (error instanceof AgentCanceledError || preserveControlErrors && isControlFailure(error)) throw error;
           throw new AgentError(
             "tool_scope_validation_failed",
             `Tool ${call.name} scope validation failed`,
@@ -325,6 +429,8 @@ export class ToolCatalog {
     parentRunId: string | undefined,
     leaseOwnerId: string | undefined,
     leaseEpoch: number | undefined,
+    drainOnCancel = false,
+    onFailure?: () => void,
   ): Promise<ToolHandlerResult> {
     const operation = async (): Promise<ToolHandlerResult> => tool.definition.run(
       call.arguments,
@@ -347,8 +453,12 @@ export class ToolCatalog {
 
     let raw: ToolHandlerResult;
     try {
-      raw = await awaitWithSignal(Promise.resolve(guarded()), signal, uncertainOnCancel);
+      const running = Promise.resolve(guarded());
+      try { raw = await awaitWithSignal(running, signal, uncertainOnCancel); }
+      finally { if (drainOnCancel && signal?.aborted) await running.catch(() => undefined); }
     } catch (error) {
+      onFailure?.();
+      if (drainOnCancel && isControlFailure(error)) throw error;
       if (error instanceof AgentError && error.code === "tool_effect_unknown") throw error;
       if (error instanceof AgentCanceledError && signal?.aborted === true && !uncertainOnCancel) {
         throw error;
@@ -371,6 +481,8 @@ export class ToolCatalog {
     try {
       result = normalizeResult(raw, tool.policy.mode);
     } catch (error) {
+      onFailure?.();
+      if (drainOnCancel && isControlFailure(error)) throw error;
       if (error instanceof AgentError && error.code === "tool_effect_unknown") throw error;
       if (tool.policy.mode !== "read") {
         throw new AgentError("tool_effect_unknown", `Tool ${call.name} returned an invalid receipt`, {
@@ -385,12 +497,14 @@ export class ToolCatalog {
     }
     const serialized = JSON.stringify(result.content);
     if (serialized.length > this.#maxResultChars) {
+      onFailure?.();
       return Object.freeze({
         content: null,
         effectState: result.effectState,
         errorCode: "tool_result_too_large",
       });
     }
+    if (result.errorCode !== undefined) onFailure?.();
     return result;
   }
 }
@@ -414,6 +528,13 @@ function registerTool(value: ToolDefinition): RegisteredTool {
   }
   const policy = copyPolicy(value.policy, name);
   const schema = inspectToolSchema(value.inputSchema, name);
+  if (value.concurrencySafe !== undefined && (typeof value.concurrencySafe !== "boolean" || value.concurrencySafe && (policy.mode !== "read" || policy.riskLevel !== "read"))) {
+    throw new TypeError("concurrencySafe requires an explicitly read-only tool");
+  }
+  if (value.argumentContract !== undefined && (!(value.argumentContract instanceof StructuredOutputContract)
+    || value.argumentContract.mode !== "local" || !jsonEqual(value.argumentContract.schema, schema))) {
+    throw new TypeError("argumentContract must match the tool schema and use local validation");
+  }
   const displayNames = copyDisplayNames(value.displayNames, name);
   if (
     value.planningRequirement !== undefined
@@ -674,4 +795,8 @@ function positiveInteger(value: unknown, label: string): number {
 
 function throwIfCanceled(signal: AbortSignal | undefined): void {
   if (signal?.aborted === true) throw new AgentCanceledError();
+}
+
+function isControlFailure(error: unknown): boolean {
+  return error instanceof AgentError && ["agent_run_lease_lost", "run_lease_conflict", "output_persistence_failed", "output_publish_failed"].includes(error.code);
 }

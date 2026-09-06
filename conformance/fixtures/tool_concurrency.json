@@ -1,0 +1,1 @@
+{"schemaVersion":1,"defaults":{"maxConcurrency":1,"concurrencySafe":false},"calls":[0,1,2,3],"maxConcurrency":2,"failedCall":1,"skippedError":"tool_batch_aborted","invalidLimits":[0,-1,1.5,true,"2"]}

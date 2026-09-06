@@ -1,7 +1,8 @@
+import { validateOutput } from "./structured.js";
 import Anthropic from "@anthropic-ai/sdk";
 import type { MessageStream } from "@anthropic-ai/sdk/lib/MessageStream";
 import type { ContentBlock, ContentBlockParam, Message as AnthropicMessage, MessageCreateParamsNonStreaming, MessageParam, TextBlockParam } from "@anthropic-ai/sdk/resources/messages";
-import { AgentCanceledError, AgentError } from "purra";
+import { AgentCanceledError, AgentError, StructuredOutputError } from "purra";
 import type { JsonValue, Message, ModelCapabilitySnapshot, ModelGateway, ModelRequest, ModelStream, ModelStreamItem, ModelTokenUsage, ModelTurn, ToolCall } from "purra";
 
 const replayKey = "anthropic_message";
@@ -118,7 +119,14 @@ export class AnthropicMessagesGateway implements ModelGateway {
       ...(options.outputConfig === undefined ? {} : { outputConfig: copy(options.outputConfig) }) };
     this.#client = (options.client ?? new Anthropic()).withOptions({ maxRetries: 0, timeout: options.timeoutMs ?? 60000 });
   }
+  public validateOutputContract(request: ModelRequest): string | undefined {
+    if (request.outputContract !== undefined && this.#options.outputConfig?.format !== undefined) {
+      throw new StructuredOutputError("structured_output_mode_unsupported", "outputConfig.format");
+    }
+    return validateOutput(request, this.capabilities);
+  }
   #request(request: ModelRequest): MessageCreateParamsNonStreaming {
+    this.validateOutputContract(request);
     if (!request.outputBudget) throw new TypeError("Anthropic gateway requires a resolved generation budget");
     const o = this.#options;
     if (o.thinking?.type === "enabled" && (!Number.isInteger(o.thinking.budget_tokens) || o.thinking.budget_tokens < 1024 || o.thinking.budget_tokens >= request.outputBudget.maxGenerationTokens)) throw new TypeError("Thinking budget must be at least 1024 and below the generation budget");
@@ -126,7 +134,9 @@ export class AnthropicMessagesGateway implements ModelGateway {
     return { model: o.model, messages: rows.messages, max_tokens: request.outputBudget.maxGenerationTokens,
       ...(rows.system.length ? { system: rows.system } : {}),
       ...(o.thinking === undefined ? {} : { thinking: o.thinking }),
-      ...(o.outputConfig === undefined ? {} : { output_config: o.outputConfig }),
+      ...(request.outputContract?.mode === "native_required" ? { output_config: { ...o.outputConfig,
+        format: { type: "json_schema" as const, schema: copy(request.outputContract.schema) } } }
+        : o.outputConfig === undefined ? {} : { output_config: o.outputConfig }),
       ...(o.temperature === undefined ? {} : { temperature: o.temperature }),
       ...(o.topP === undefined ? {} : { top_p: o.topP }),
       ...(o.topK === undefined ? {} : { top_k: o.topK }),

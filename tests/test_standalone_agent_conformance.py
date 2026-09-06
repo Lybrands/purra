@@ -1280,3 +1280,63 @@ async def test_execution_entries_keep_context_reserves_and_provider_limits(mode)
         assert gateway.invocations[-1].tools == ()
     finally:
         await core.close()
+
+
+@pytest.mark.asyncio
+async def test_structured_context_task_binds_attempts_and_root_usage():
+    from purra.structured import StructuredOutputContract
+    from purra.model_execution import AgentModelTask
+    from purra.contracts import ModelTokenUsage
+    output = StructuredOutputContract("managed", "1", {
+        "type": "object", "properties": {"ok": {"type": "boolean"}},
+        "required": ["ok"], "additionalProperties": False,
+    })
+    results = []
+    class Gateway(_Gateway):
+        calls = 0
+        async def complete(self, messages, invocation, signal=None):
+            self.calls += 1
+            assert invocation.output_contract == output
+            return ModelCompletion(AgentMessage("assistant", "invalid" if self.calls == 1 else '{"ok":true}'),
+                model="portable-model", usage=ModelTokenUsage(10, 5), finish_reason=ModelFinishReason.STOP,
+                applied_generation_limit=invocation.max_generation_tokens)
+    class Context(_Context):
+        def __init__(self, tasks):
+            super().__init__()
+            self.tasks = tasks
+        async def build_context(self, request, budget, signal=None):
+            result = await self.tasks.complete_structured((AgentMessage("user", "check"),),
+                AgentModelTask(request.model), output=output, repair_attempts=1)
+            results.append(result)
+            return ContextBundle()
+    adapters = InMemoryAgentAdapters()
+    budgets = []
+    settle = adapters.runs.settle_model_attempt
+    async def capture_budget(*args):
+        snapshot = await settle(*args)
+        budgets.append(snapshot)
+        return snapshot
+    adapters.runs.settle_model_attempt = capture_budget
+    gateway = Gateway("done")
+    core = AgentCore(model_gateway=gateway, run_repository=adapters.runs,
+        output_repository=adapters.outputs, output_publisher=adapters.publisher,
+        preset=AgentPreset(id="structured", revision="1", tool_catalog=InMemoryToolCatalog(()),
+            runtime_limits=RuntimeLimits(max_run_generation_tokens=None), context_provider_factory=Context,
+            component_bindings={"contextProvider": AgentComponentBinding("structured", "1")}))
+    try:
+        result = await (await core.submit(_request())).wait()
+        events = await adapters.outputs.list_events(result.run_id, after_sequence=0)
+    finally:
+        await core.close()
+    assert result.status is RunStatus.DONE
+    receipt = results[0].receipt
+    assert receipt.run_id == result.run_id and receipt.persistence == receipt.root_budget == "bound"
+    assert receipt.attempts == 2 and receipt.usage.generation_tokens == 10
+    assert budgets[-1].model_attempts == 3
+    assert budgets[-1].generation_tokens == 10
+    rows = [event.payload for event in events
+        if event.kind == "stream.opened" and event.payload.get("outputContract")]
+    assert len(rows) == 2
+    assert rows[0]["structuredTask"]["taskId"] == rows[1]["structuredTask"]["taskId"]
+    assert rows[1]["structuredTask"]["previousInvocationId"] == rows[0]["invocationId"]
+    assert rows[0]["structuredTask"]["attempt"] == 1 and rows[1]["structuredTask"]["attempt"] == 2

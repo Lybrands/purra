@@ -21,7 +21,7 @@ def main() -> int:
         "typescript/package-lock.json packages['']": package_lock["packages"][""]["version"],
     }
     expected = next(iter(versions.values()))
-    for integration in ("mem0", "compaction", "openai", "anthropic", "interaction", "sqlite"):
+    for integration in ("mem0", "compaction", "openai", "anthropic", "interaction", "sqlite", "mcp"):
         base = ROOT / "integrations" / integration
         integration_python = tomllib.loads((base / "python/pyproject.toml").read_text())
         integration_package = json.loads((base / "typescript/package.json").read_text())

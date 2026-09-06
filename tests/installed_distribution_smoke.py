@@ -28,6 +28,8 @@ from purra.api import (
     InMemoryRunTreeRepository,
     RunCommandService,
     SpawnAgentsCommand,
+    StructuredOutputContract,
+    StructuredOutputError,
 )
 from purra.artifacts import (
     ArtifactAccessController,
@@ -397,5 +399,42 @@ async def _run() -> None:
     assert finalized.status is ArtifactStatus.FINALIZED
 
 
+async def _structured_task_smoke():
+    from purra.api import StructuredModelTaskResult, AgentModelTask, AgentModelTaskRunner
+    from purra.model_invocation import AgentModelInvocationManager, ModelInvocationContext
+    from purra.model_protocol import generic_capability_snapshot
+    from purra.contracts import ModelTokenUsage
+    from dataclasses import replace
+    class Gateway:
+        calls = 0
+        async def complete(self, messages, invocation, signal=None):
+            self.calls += 1
+            return ModelCompletion(AgentMessage("assistant", "invalid" if self.calls == 1 else '{"ok":true}'),
+                model="installed", finish_reason="stop", usage=ModelTokenUsage(10, 5),
+                applied_generation_limit=invocation.max_generation_tokens)
+        async def stream(self, *args):
+            raise AssertionError("complete only")
+    gateway = Gateway()
+    model = ModelRequest("installed", "installed", replace(generic_capability_snapshot(), max_generation_tokens=128))
+    runner = AgentModelTaskRunner(AgentModelInvocationManager(gateway), ModelInvocationContext("installed"), model)
+    result = await runner.complete_structured((), AgentModelTask(model), output=output, repair_attempts=1)
+    assert isinstance(result, StructuredModelTaskResult)
+    assert result.value == {"ok": True} and result.receipt.attempts == 2
+    assert result.receipt.persistence == "none" and result.receipt.root_budget == "not_bound"
+    assert result.receipt.usage.generation_tokens == 10
+
+
 if __name__ == "__main__":
+    output = StructuredOutputContract("installed", "1", {
+        "type": "object", "properties": {"ok": {"type": "boolean"}},
+        "required": ["ok"], "additionalProperties": False,
+    })
+    assert output.parse('{"ok":true}') == {"ok": True}
+    try:
+        output.parse('{"ok":true,"ok":false}')
+    except StructuredOutputError as error:
+        assert error.code == "structured_output_invalid_json"
+    else:
+        raise AssertionError("installed contract accepted duplicate keys")
     asyncio.run(_run())
+    asyncio.run(_structured_task_smoke())

@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, AsyncIterator, Literal, Mapping, MutableMapping, TypeAlias
 
+from purra.structured import StructuredOutputContract
+
 from purra.json_values import (
     freeze_json_mapping,
     freeze_json_value,
@@ -208,7 +210,14 @@ class ModelInvocation:
     output_budget: InvocationOutputBudget | None = None
     reasoning_mode: ReasoningMode = ReasoningMode.DEFAULT
 
+    output_contract: "StructuredOutputContract | None" = None
+
     def __post_init__(self) -> None:
+        if self.output_contract is not None:
+            if not isinstance(self.output_contract, StructuredOutputContract):
+                raise TypeError("output_contract must be StructuredOutputContract")
+            if self.tools:
+                raise ValueError("structured output invocations cannot use tools")
         object.__setattr__(self, "tools", tuple(self.tools))
         object.__setattr__(self, "tool_choice", ToolChoiceMode(self.tool_choice))
         object.__setattr__(self, "reasoning_mode", ReasoningMode(self.reasoning_mode))
@@ -1247,6 +1256,7 @@ class ToolExecutionLimits:
     max_result_chars: int = 64_000
     approval_timeout_seconds: float = 300.0
     approval_summary_chars: int = 420
+    max_concurrency: int = 1
 
     def __post_init__(self) -> None:
         for name in (
@@ -1258,6 +1268,8 @@ class ToolExecutionLimits:
             object.__setattr__(self, name, positive_int(
                 getattr(self, name), name
             ))
+        if type(self.max_concurrency) is not int or not 1 <= self.max_concurrency <= 2**53 - 1:
+            raise ValueError("max_concurrency must be a positive safe integer")
         timeout = float(self.approval_timeout_seconds)
         if timeout <= 0:
             raise ValueError("approval_timeout_seconds must be positive")

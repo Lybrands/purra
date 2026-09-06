@@ -133,3 +133,17 @@ and need not sum to the total median.
 
 The application owns database access, backups, and retention. Checkpoints contain
 private model data. Wait for active executions to settle before `storage.close()`.
+
+### Read-only recovery inspection
+
+`await storage.inspectRecovery(runId, { expectedPreset: effectivePresetSnapshot })`
+reads one committed snapshot without claiming a lease, resuming, reconciling or
+calling a model/tool. Omit `expectedPreset` when unavailable: configuration stays
+unknown. The report contains only enums/counts/fixed codes, never checkpoint
+messages or raw tool receipts. Opaque idempotency keys cannot be attributed to a
+Run, so pending claims are counted across the storage scope and Run-specific effects
+stay unknown. Reconciling a tool does not clear post-checkpoint model attempts.
+Permissions, complete usage, effects outside this adapter and Agent Tree ownership
+remain unknown. `authority` is always `diagnosis_only`; execution must revalidate.
+The current reader loads the selected Root journal to count model attempts.
+See the Core [inspection contract](../../../conformance/integration-inspection.md).

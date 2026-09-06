@@ -5,6 +5,7 @@ import { openSync, closeSync } from "node:fs";
 import { setTimeout as sleep } from "node:timers/promises";
 import {
   AgentError, StorageSession, STORAGE_PORT_METHODS,
+  buildRecoveryInspection, jsonIdentityDigest, type AgentPresetSnapshot, type RecoveryInspection,
   type StorageStores, type StoragePorts, type StorageSelection,
   type OutputPublisher, type ToolHandlerResult, type ToolIdempotencyGateway, type AgentExecutionCheckpoint,
 } from "purra";
@@ -195,6 +196,30 @@ export class SqliteAgentAdapters {
       else if (proof.notExecuted === true) delete extra.tools[key];
       else throw new TypeError("invalid tool reconciliation proof");
     });
+  }
+
+  /** Read one committed snapshot. No lease claim, reconciliation or external execution. */
+  async inspectRecovery(runId: string, options: { expectedPreset?: AgentPresetSnapshot } = {}): Promise<RecoveryInspection> {
+    return this.#transaction(async (all, extra) => {
+      const saved = await all.runs.get(runId);
+      const events = await all.runs.listEvents(runId, 0, Number.MAX_SAFE_INTEGER);
+      const lastCheckpoint = events.reduce((last, event, index) => event.kind === "agent.execution_checkpoint" ? index : last, -1);
+      const lease = extra.leases[runId];
+      return buildRecoveryInspection({
+        status: saved.status === "running" ? "running" : "terminal",
+        checkpoint: saved.executionCheckpoint === undefined ? "missing" : "present",
+        attemptsAfterCheckpoint: saved.executionCheckpoint === undefined ? null
+          : events.slice(lastCheckpoint + 1).filter(event => event.kind === "invocation.started").length,
+        // Keys are opaque; the persisted contract does not bind them to a Run.
+        unknownToolReceipts: Object.values(extra.tools).filter(receipt => receipt.state === "claimed").length,
+        receiptScope: "storage",
+        lease: lease?.owner && lease.expires > Date.now() ? "active" : "inactive",
+        configuration: options.expectedPreset === undefined ? "unknown"
+          : await jsonIdentityDigest(saved.preset) === await jsonIdentityDigest(options.expectedPreset) ? "matched" : "mismatch",
+        cancellation: saved.status === "canceled" ? "requested" : "clear",
+        deadline: saved.deadlineAt !== null && Date.parse(saved.deadlineAt) <= Date.now() ? "expired" : "open",
+      });
+    }, true, "all", runId);
   }
 
   close(): void { if (this.#active) throw new Error("storage transaction is active"); this.#db.close(); }

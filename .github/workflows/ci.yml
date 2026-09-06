@@ -27,6 +27,9 @@ jobs:
       - run: python -m coverage report
       - run: python examples/python/quickstart.py
       - run: python examples/python/planner_streaming.py
+      - run: python examples/python/parallel_tools.py
+      - run: python examples/python/integration_check.py
+      - run: python examples/python/structured_task.py
       - run: git diff --check
       - if: matrix.python-version == '3.11'
         run: python -m build --sdist --wheel
@@ -122,7 +125,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        component: [openai, anthropic, compaction, interaction, sqlite]
+        component: [openai, anthropic, compaction, interaction, sqlite, mcp]
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -144,6 +147,28 @@ jobs:
         working-directory: integrations/sqlite/typescript
       - run: npm ci && npm run check && npm pack --dry-run
         working-directory: integrations/${{ matrix.component }}/typescript
+      - name: Verify installed MCP wheel with a host-owned stdio server
+        if: matrix.component == 'mcp'
+        run: |
+          python -m build --wheel --outdir "$RUNNER_TEMP/mcp-wheels"
+          python -m build --wheel --outdir "$RUNNER_TEMP/mcp-wheels" integrations/mcp/python
+          python -m venv "$RUNNER_TEMP/mcp-consumer"
+          "$RUNNER_TEMP/mcp-consumer/bin/python" -m pip install "$RUNNER_TEMP"/mcp-wheels/*.whl
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/mcp-consumer/bin/python" -I "$GITHUB_WORKSPACE/integrations/mcp/python/scripts/check_installed.py"
+      - name: Verify installed MCP tarballs, public types and stdio server
+        if: matrix.component == 'mcp'
+        run: |
+          mkdir -p "$RUNNER_TEMP/mcp-node/consumer"
+          (cd typescript && npm pack --pack-destination "$RUNNER_TEMP/mcp-node")
+          (cd integrations/mcp/typescript && npm pack --pack-destination "$RUNNER_TEMP/mcp-node")
+          cp integrations/mcp/typescript/scripts/check-installed.mjs "$RUNNER_TEMP/mcp-node/consumer/"
+          cp integrations/mcp/typescript/test/{consumer.ts,tsconfig.json} "$RUNNER_TEMP/mcp-node/consumer/"
+          cd "$RUNNER_TEMP/mcp-node/consumer"
+          echo '{"private":true,"type":"module"}' > package.json
+          npm install --ignore-scripts ../*.tgz
+          node check-installed.mjs
+          "$GITHUB_WORKSPACE/typescript/node_modules/.bin/tsc" -p tsconfig.json
 
   package-installers:
     needs: typescript

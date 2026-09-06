@@ -164,3 +164,15 @@ thinking, drops OpenAI-only options, and maps `developer` messages to `system`.
 This does not certify unmodified OpenAI transport compatibility with DeepSeek.
 The eager reference is current code with deferred hydration disabled, not a
 historical release. One paired run is functional evidence, not a latency SLA.
+
+### Read-only recovery inspection
+
+`await storage.inspect_recovery(run_id, expected_preset=effective_preset_snapshot)`
+reads one committed snapshot without claiming a lease, resuming, reconciling or
+calling a model/tool. Omit `expected_preset` when unavailable: configuration stays
+unknown. The report contains only enums/counts/fixed codes, never checkpoint
+messages or raw tool receipts. Run-bound pending claims and post-checkpoint model
+attempts are separate blockers; reconciling a tool does not clear the attempt.
+Permissions, complete usage, effects outside this adapter and Agent Tree ownership
+remain unknown. `authority` is always `diagnosis_only`; execution must revalidate.
+See the Core [inspection contract](../../../conformance/integration-inspection.md).

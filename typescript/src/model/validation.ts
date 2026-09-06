@@ -399,8 +399,9 @@ export function copyJsonValue(value: unknown, active = new WeakSet<object>()): J
     if (prototype !== Object.prototype && prototype !== null) {
       throw new TypeError("JSON objects must be plain objects");
     }
-    const copy: Record<string, JsonValue> = {};
-    for (const [key, item] of Object.entries(value)) copy[key] = copyJsonValue(item, active);
+    const copy = Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [key, copyJsonValue(item, active)]),
+    );
     return Object.freeze(copy);
   } finally {
     active.delete(value);

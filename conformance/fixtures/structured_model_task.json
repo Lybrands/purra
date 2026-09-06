@@ -1,0 +1,104 @@
+{
+  "schemaVersion": 1,
+  "cases": [
+    {
+      "name": "valid",
+      "outputs": [
+        "{\"ok\":true}"
+      ],
+      "attempts": 1
+    },
+    {
+      "name": "invalid_default_no_repair",
+      "outputs": [
+        "not-json"
+      ],
+      "code": "structured_output_invalid_json",
+      "attempts": 1
+    },
+    {
+      "name": "mismatch_default_no_repair",
+      "outputs": [
+        "{\"ok\":\"true\"}"
+      ],
+      "code": "structured_output_schema_mismatch",
+      "attempts": 1
+    },
+    {
+      "name": "invalid_then_valid",
+      "outputs": [
+        "not-json",
+        "{\"ok\":true}"
+      ],
+      "repairs": 1,
+      "attempts": 2
+    },
+    {
+      "name": "mismatch_then_valid",
+      "outputs": [
+        "{\"ok\":3}",
+        "{\"ok\":true}"
+      ],
+      "repairs": 1,
+      "attempts": 2
+    },
+    {
+      "name": "exhausted",
+      "outputs": [
+        "not-json",
+        "not-json"
+      ],
+      "repairs": 1,
+      "attempts": 2,
+      "code": "structured_output_invalid_json"
+    },
+    {
+      "name": "unknown_usage_no_repair",
+      "outputs": [
+        "not-json"
+      ],
+      "usage": false,
+      "repairs": 2,
+      "attempts": 1,
+      "code": "structured_output_invalid_json"
+    },
+    {
+      "name": "unknown_usage_success",
+      "outputs": [
+        "{\"ok\":true}"
+      ],
+      "usage": false,
+      "attempts": 1
+    },
+    {
+      "name": "length_never_success",
+      "outputs": [
+        "{\"ok\":true}"
+      ],
+      "finish": "length",
+      "repairs": 2,
+      "attempts": 1,
+      "code": "model_output_truncated"
+    },
+    {
+      "name": "filtered_never_success",
+      "outputs": [
+        "{\"ok\":true}"
+      ],
+      "finish": "filtered",
+      "repairs": 2,
+      "attempts": 1,
+      "code": "model_output_filtered"
+    },
+    {
+      "name": "other_never_success",
+      "outputs": [
+        "{\"ok\":true}"
+      ],
+      "finish": "other",
+      "repairs": 2,
+      "attempts": 1,
+      "code": "unsupported_model_finish_reason"
+    }
+  ]
+}

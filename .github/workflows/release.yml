@@ -14,7 +14,7 @@ on:
         required: true
         default: all
         type: choice
-        options: [all, core, openai, anthropic, compaction, interaction, sqlite, mem0]
+        options: [all, core, openai, anthropic, compaction, interaction, sqlite, mem0, mcp]
 
 permissions: {}
 
@@ -24,7 +24,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        component: ${{ fromJSON(inputs.component && inputs.component != 'all' && format('["{0}"]', inputs.component) || '["core","openai","anthropic","compaction","interaction","sqlite","mem0"]') }}
+        component: ${{ fromJSON(inputs.component && inputs.component != 'all' && format('["{0}"]', inputs.component) || '["core","openai","anthropic","compaction","interaction","sqlite","mem0","mcp"]') }}
     permissions:
       contents: read
     env:
@@ -59,7 +59,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        component: ${{ fromJSON(inputs.component && inputs.component != 'all' && format('["{0}"]', inputs.component) || '["core","openai","anthropic","compaction","interaction","sqlite","mem0"]') }}
+        component: ${{ fromJSON(inputs.component && inputs.component != 'all' && format('["{0}"]', inputs.component) || '["core","openai","anthropic","compaction","interaction","sqlite","mem0","mcp"]') }}
     environment:
       name: pypi
       url: https://pypi.org/p/${{ matrix.component == 'core' && 'purra' || format('purra-{0}', matrix.component) }}

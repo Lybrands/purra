@@ -104,7 +104,7 @@ async function rejectsCode(promise, code) {
 
 function invocationInput(runId, invocationId) {
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     runId,
     invocationId,
     messageFingerprint: "message",

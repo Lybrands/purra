@@ -28,6 +28,7 @@ from purra.contracts import (
     ToolSchema,
     TraceRecord,
 )
+from purra.structured import StructuredOutputContract
 from purra.normalization import optional_positive_int
 from purra.events import AgentEvent
 from purra.json_values import freeze_json_mapping
@@ -109,8 +110,15 @@ class ToolRegistration:
     host_planned_arguments: Mapping[str, Any] | None = None
     call_handler: ToolCallHandler | None = None
     operation_display_params: OperationDisplayParamsResolver | None = None
+    argument_contract: StructuredOutputContract | None = None
+    concurrency_safe: bool = False
 
     def __post_init__(self) -> None:
+        if type(self.concurrency_safe) is not bool or (self.concurrency_safe and (self.policy.mode != "read" or self.policy.risk_level != "read")):
+            raise ValueError("concurrency_safe requires an explicitly read-only tool")
+        if self.argument_contract is not None:
+            if not isinstance(self.argument_contract, StructuredOutputContract) or self.argument_contract.schema != self.schema.parameters or self.argument_contract.mode != "local":
+                raise ValueError("argument contract must match the tool schema and use local validation")
         if self.call_handler is not None and not isinstance(
             self.call_handler,
             ToolCallHandler,

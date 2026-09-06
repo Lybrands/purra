@@ -221,6 +221,7 @@ export class InMemoryRunRepository implements RunRepository {
       if (typeof id !== "string" || run.runId !== id || !saved.runs.has(run.rootRunId)
         || !Array.isArray(run.events) || !Array.isArray(run.rootEvents) || !(run.openInvocations instanceof Set)
         || ![run.bySourceKey, run.rootBySourceKey, run.invocationReceipts, run.invocationSettlements].every(v => v instanceof Map)) throw new TypeError("Invalid stored Run");
+      for (const receipt of run.invocationReceipts.values()) validateStructuredReceipt(receipt);
       for (const value of run.invocationSettlements.values()) requireStorageFields(value, ["input", "event"], ["budgetError"]);
     }
     const deferred = options.deferredJournal;
@@ -396,7 +397,8 @@ export class InMemoryRunRepository implements RunRepository {
   ) {
     const run = this.#active(runId, claim);
     const root = this.#root(run);
-    if (input.schemaVersion !== 2) {
+    validateStructuredReceipt(input);
+    if (input.schemaVersion !== 3) {
       throw new AgentError("model_invocation_contract_invalid", "Unsupported model invocation receipt schema");
     }
     if (input.runId !== runId || (input.outputProtocol !== undefined && input.outputProtocol !== PLANNING_STREAM_SCHEMA)
@@ -425,6 +427,8 @@ export class InMemoryRunRepository implements RunRepository {
     }
     const receipt: ModelInvocationReceipt = Object.freeze({
       ...input,
+      ...(input.outputContract === undefined ? {} : { outputContract: copyJsonValue(input.outputContract) as Readonly<Record<string, JsonValue>> }),
+      ...(input.structuredTask === undefined ? {} : { structuredTask: Object.freeze({ ...input.structuredTask }) }),
       attempt: nextAttempt,
       openedAt: new Date().toISOString(),
     });
@@ -1389,4 +1393,22 @@ function nonNegativeInteger(value: unknown, label: string): number {
 
 function validText(value: unknown): boolean {
   return typeof value === "string" && value.trim() !== "";
+}
+
+
+function validateStructuredReceipt(receipt: Pick<ModelInvocationReceipt, "schemaVersion" | "outputContract" | "structuredTask" | "outputProtocol" | "planningScope">): void {
+  const output = receipt.outputContract;
+  const task = receipt.structuredTask;
+  const invalid = () => { throw new AgentError("model_invocation_contract_invalid", "Invalid structured invocation receipt"); };
+  if (receipt.schemaVersion !== 3) invalid();
+  if (output === undefined) { if (task !== undefined) invalid(); return; }
+  if (output === null || typeof output !== "object" || Array.isArray(output)
+    || receipt.outputProtocol !== undefined || receipt.planningScope !== undefined) invalid();
+  if (output.schemaProfile !== "purra.output-schema/v1" || !["local", "native_required"].includes(output.mode as string)
+    || ["schemaId", "schemaVersion"].some(key => typeof output[key] !== "string" || !(output[key] as string).trim() || new TextEncoder().encode(output[key] as string).length > 128)
+    || ["schemaDigest", "contractDigest"].some(key => typeof output[key] !== "string" || !/^[0-9a-f]{64}$/.test(output[key] as string))
+    || (output.mode === "native_required" && (typeof output.nativeDialect !== "string" || !output.nativeDialect.trim() || output.nativeDialect.length > 128))) invalid();
+  if (task !== undefined && (task === null || typeof task.taskId !== "string" || !task.taskId.trim()
+    || !Number.isSafeInteger(task.attempt) || task.attempt < 1
+    || (task.attempt === 1 ? task.previousInvocationId !== null : typeof task.previousInvocationId !== "string" || !task.previousInvocationId.trim()))) invalid();
 }

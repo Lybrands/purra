@@ -39,7 +39,7 @@
     "build": "npm run clean && tsc -p tsconfig.json",
     "example": "npm run build && npm run test:example",
     "test": "node --test test/*.test.mjs",
-    "test:example": "npm run clean:example && tsc -p tsconfig.example.json && node .example-dist/examples/quickstart.js && node .example-dist/examples/planner-streaming.js && npm run clean:example",
+    "test:example": "npm run clean:example && tsc -p tsconfig.example.json && node .example-dist/examples/quickstart.js && node .example-dist/examples/planner-streaming.js && node .example-dist/examples/parallel-tools.js && node .example-dist/examples/integration-check.js && node .example-dist/examples/structured-task.js && npm run clean:example",
     "test:types": "tsc -p test/tsconfig.json",
     "check": "npm run build && npm run test && npm run test:types && npm run test:example",
     "prepack": "npm run build",

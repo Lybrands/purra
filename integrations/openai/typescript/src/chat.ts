@@ -1,3 +1,4 @@
+import { validateOutput } from "./structured.js";
 import OpenAI from "openai";
 import type { Stream } from "openai/core/streaming";
 import type { ChatCompletionChunk, ChatCompletionCreateParamsNonStreaming, ChatCompletionMessageParam } from "openai/resources/chat/completions";
@@ -66,10 +67,17 @@ export class OpenAIChatCompletionsGateway implements ModelGateway {
     this.#options = { ...options };
     this.#client = (options.client ?? new OpenAI()).withOptions({ maxRetries: 0, timeout: options.timeoutMs ?? 60000 });
   }
+  public validateOutputContract(request: ModelRequest): string | undefined {
+    return validateOutput(request, this.capabilities);
+  }
   #request(request: ModelRequest): ChatCompletionCreateParamsNonStreaming {
+    this.validateOutputContract(request);
     if (!request.outputBudget) throw new TypeError("OpenAI gateway requires a resolved generation budget");
     const o = this.#options;
     return { model: o.model, messages: messages(request.messages), store: false, max_completion_tokens: request.outputBudget.maxGenerationTokens,
+      ...(request.outputContract?.mode === "native_required" ? { response_format: { type: "json_schema" as const, json_schema: {
+        name: "purra_output", strict: true, schema: JSON.parse(JSON.stringify(request.outputContract.schema)) as Record<string, unknown>,
+      } } } : {}),
       ...(o.reasoningEffort === undefined ? {} : { reasoning_effort: o.reasoningEffort }),
       ...(o.temperature === undefined ? {} : { temperature: o.temperature }),
       ...(o.topP === undefined ? {} : { top_p: o.topP }),

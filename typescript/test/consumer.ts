@@ -157,3 +157,16 @@ const transport: ModelTransportDiagnostics = { requestSentAtMs: 1000, firstByteA
 PLANNING_STREAM_SCHEMA satisfies "purra.planning-stream/v1";
 new PlanningStreamParser().feed("") satisfies readonly PlanningProgress[];
 void [planningProgress, planOptions, transport];
+
+import { StructuredOutputContract, type StructuredOutputLimits } from "purra";
+const structuredOutput = await StructuredOutputContract.create({
+  schemaId: "typed", schemaVersion: "1",
+  schema: { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"], additionalProperties: false },
+  limits: { outputBytes: 1024 } satisfies Partial<StructuredOutputLimits>,
+});
+const structuredValue = structuredOutput.parse('{"ok":true}');
+structuredValue satisfies Readonly<Record<string, JsonValue>>;
+// @ts-expect-error Validated JSON objects are immutable.
+structuredValue.ok = false;
+// @ts-expect-error The JSON contract does not assert an application-specific shape.
+structuredValue satisfies { readonly ok: boolean };

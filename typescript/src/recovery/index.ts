@@ -8,6 +8,7 @@ export type RecoveryCause =
   | "missing_required_tool_call_replan"
   | "unstructured_tool_protocol"
   | "empty_model_response"
+  | "structured_output_invalid"
   | "response_constraint_deterministic"
   | "response_constraint_semantic"
   | "future_tool_step"
@@ -85,6 +86,7 @@ const STANDARD_LIMITS: Readonly<Record<RecoveryCause, number>> = Object.freeze({
   missing_required_tool_call_replan: 1,
   unstructured_tool_protocol: 1,
   empty_model_response: 2,
+  structured_output_invalid: 0,
   response_constraint_deterministic: 1,
   response_constraint_semantic: 1,
   future_tool_step: 1,

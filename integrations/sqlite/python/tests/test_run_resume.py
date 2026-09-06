@@ -126,6 +126,16 @@ async def test_public_resume_rejection_preserves_run_and_calls_no_provider(tmp_p
         before = await host.storage.runs.get(run_id)
         events = await host.storage.outputs.list_events(run_id, after_sequence=0)
         calls = (host.model_calls, host.tool_calls)
+        report = await host.storage.inspect_recovery(run_id, expected_preset=before.agent_preset_snapshot)
+        expected_diagnostic = {"checkpoint-missing": "checkpoint_missing", "terminal": "run_terminal",
+                               "lease-conflict": "run_lease_conflict", "unreconciled-attempt": "run_recovery_requires_reconciliation"}.get(case["id"])
+        if expected_diagnostic:
+            assert expected_diagnostic in report["blockers"]
+        assert report["authority"] == "diagnosis_only"
+        assert "permissions" in report["unknown"]
+        assert (host.model_calls, host.tool_calls) == calls
+        assert await host.storage.runs.get(run_id) == before
+        assert await host.storage.outputs.list_events(run_id, after_sequence=0) == events
         with pytest.raises(ContractViolationError) as caught:
             await (await host.core.resume(run_id, host.request)).wait()
         assert caught.value.code == case["errorCode"]
@@ -220,3 +230,34 @@ async def test_resume_rejects_checkpoint_changed_since_initial_read(tmp_path):
         assert await host.storage.outputs.list_events(run_id, after_sequence=0) == events
     finally:
         await host.close()
+
+@pytest.mark.asyncio
+async def test_inspection_keeps_attempt_blocker_after_tool_reconciliation(tmp_path, monkeypatch):
+    from purra.contracts import ToolCall
+    from purra.storage import StorageSession
+    host = Host(tmp_path / 'inspection.db')
+    try:
+        run_id = await host.pause()
+        await host.storage.runs.reserve_model_attempt(run_id, 'unfinished-private-attempt')
+        call = ToolCall('private-call-id', 'lookup', '{}')
+        async def uncertain(): raise RuntimeError('private-payload')
+        with pytest.raises(RuntimeError): await host.storage.idempotency.execute_once(run_id, call, uncertain)
+        saved = await host.storage.runs.get(run_id)
+        counts = (host.model_calls, host.tool_calls)
+        before = tuple(host.storage._db.iterdump())
+        def forbidden(self): raise AssertionError('read query serialized state')
+        with monkeypatch.context() as patch:
+            patch.setattr(StorageSession, 'export_snapshot', forbidden)
+            report = await host.storage.inspect_recovery(run_id, expected_preset={**saved.agent_preset_snapshot, 'revision':'different'})
+        assert tuple(host.storage._db.iterdump()) == before
+        assert {'run_recovery_requires_reconciliation', 'tool_effect_unknown', 'configuration_mismatch'} <= set(report['blockers'])
+        assert report['observations']['unknownToolReceipts'] == 1
+        assert 'private-' not in json.dumps(report)
+        await host.storage.reconcile_tool(run_id, call, not_executed=True)
+        report = await host.storage.inspect_recovery(run_id)
+        assert 'tool_effect_unknown' not in report['blockers']
+        assert 'run_recovery_requires_reconciliation' in report['blockers']
+        assert (host.model_calls, host.tool_calls) == counts
+        with pytest.raises(ContractViolationError, match='reconciliation'):
+            await host.storage.leases.claim(run_id, 'diagnostic-proof', lease_duration_ms=1000)
+    finally: await host.close()

@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased — 1.0.0 development
+
+- Add versioned strict object output contracts, shared JSON identity, and Run-bound
+  structured model tasks with local/native-required modes and explicit bounded repairs.
+  OpenAI Responses/Chat and Anthropic mappings use conservative schema dialects;
+  selected live model support must be verified separately.
+- Add optional host-owned MCP read-only tools with bounded discovery, immutable
+  catalog identity, schema/result validation, and fail-closed catalog changes.
+- Add explicit bounded concurrency for wholly safe read batches; preserve ordered
+  results, actual event timing, cancellation and per-dispatch authorization.
+- Add actual integration-check coverage reports and read-only recovery inspection.
+  Unknown usage, permissions and effects remain unknown; diagnosis grants no
+  execution authority. Include public examples and external package consumers.
+
 ## 0.5.0 — 2026-09-06
 
 - Preserve transport-activity events in the opt-in Provider timing sampler

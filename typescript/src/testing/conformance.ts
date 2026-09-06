@@ -238,3 +238,56 @@ function nonconforming(code: string, message: string): never {
 function uniqueId(): string {
   return globalThis.crypto.randomUUID();
 }
+
+const integrationCapabilities = ["gateway", "tools", "context", "storage", "structured_output", "mcp", "read_concurrency"] as const;
+const evidenceCategories = ["deterministic", "installed_artifact", "real_provider_mcp", "downstream"] as const;
+export type IntegrationCapability = typeof integrationCapabilities[number];
+export type EvidenceCategory = typeof evidenceCategories[number];
+export interface IntegrationCheck {
+  readonly capability: IntegrationCapability;
+  readonly category: EvidenceCategory;
+  readonly probe: () => Promise<unknown>;
+}
+
+/** Wrap existing conformance assertions. Hosts own isolation and truthful category labels.
+ * External probes require explicit category enablement; exceptions never enter the report.
+ */
+export async function checkIntegration(input: {
+  readonly component: string;
+  readonly version: string;
+  readonly checks?: readonly IntegrationCheck[];
+  readonly declaredCapabilities?: Partial<Record<IntegrationCapability, "supported" | "unsupported" | "unknown">>;
+  readonly enabledCategories?: readonly EvidenceCategory[];
+}) {
+  for (const label of [input.component, input.version]) {
+    if (typeof label !== "string" || !/^[A-Za-z0-9@_./:+-]{1,80}$/.test(label)) throw new TypeError("invalid public component label");
+  }
+  const enabled = [...(input.enabledCategories ?? ["deterministic"])];
+  if (enabled.some(item => !evidenceCategories.includes(item))) throw new TypeError("invalid evidence category");
+  const declared = { ...input.declaredCapabilities };
+  if (Object.entries(declared).some(([key, value]) => !integrationCapabilities.includes(key as IntegrationCapability)
+    || !["supported", "unsupported", "unknown"].includes(value))) throw new TypeError("invalid declared capability");
+  const selected = new Map<string, () => Promise<unknown>>();
+  for (const check of input.checks ?? []) {
+    const key = `${check.capability}:${check.category}`;
+    if (!integrationCapabilities.includes(check.capability) || !evidenceCategories.includes(check.category)
+      || selected.has(key) || typeof check.probe !== "function") throw new TypeError("invalid integration check");
+    selected.set(key, check.probe);
+  }
+  const checks: { capability: IntegrationCapability; category: EvidenceCategory; status: "not_run" | "passed" | "failed"; errorCode: string | null }[] = [];
+  for (const category of evidenceCategories) for (const capability of integrationCapabilities) {
+    const probe = selected.get(`${capability}:${category}`);
+    let status: "not_run" | "passed" | "failed" = "not_run", errorCode: string | null = null;
+    if (probe !== undefined && enabled.includes(category)) {
+      try { await probe(); status = "passed"; }
+      catch (error) {
+        if (error instanceof Error && error.name === "AbortError") throw error;
+        status = "failed"; errorCode = `${capability}_nonconforming`;
+      }
+    }
+    checks.push(Object.freeze({ capability, category, status, errorCode }));
+  }
+  return Object.freeze({ schemaVersion: 1 as const, component: input.component, version: input.version,
+    declaredCapabilities: Object.freeze(Object.fromEntries(integrationCapabilities.map(key => [key, declared[key] ?? "unknown"]))),
+    checks: Object.freeze(checks) });
+}

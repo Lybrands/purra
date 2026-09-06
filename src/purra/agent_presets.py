@@ -13,6 +13,7 @@ from purra.context_orchestration import ContextCompressionCoordinator
 from purra.agent_tree_policy import AgentTreePolicy
 
 from purra.contracts import (
+    ToolExecutionLimits,
     AgentMessage,
     AgentRunRequest,
     MessageOrigin,
@@ -353,6 +354,7 @@ class AgentPreset:
         request: AgentRunRequest,
         *,
         tool_catalog: ToolCatalog | None = None,
+        tool_execution_limits: ToolExecutionLimits = ToolExecutionLimits(),
     ) -> AgentPresetSnapshot:
         """Freeze the complete host-declared capability surface for this run."""
 
@@ -368,6 +370,14 @@ class AgentPreset:
                 "agent preset enabled unknown tools: " + ", ".join(sorted(unknown))
             )
         composition = {
+            "toolExecutionLimits": {
+                "maxConcurrency": tool_execution_limits.max_concurrency,
+                "maxCallsPerBatch": tool_execution_limits.max_calls_per_batch,
+                "maxArgumentChars": tool_execution_limits.max_argument_chars,
+                "maxResultChars": tool_execution_limits.max_result_chars,
+                "approvalTimeoutSeconds": tool_execution_limits.approval_timeout_seconds,
+                "approvalSummaryChars": tool_execution_limits.approval_summary_chars,
+            },
             "promptSections": [
                 section.to_mapping() for section in self.prompt_sections
             ],
@@ -444,12 +454,13 @@ class AgentPreset:
         request: AgentRunRequest,
         *,
         tool_catalog: ToolCatalog | None = None,
+        tool_execution_limits: ToolExecutionLimits = ToolExecutionLimits(),
     ) -> None:
         """Fail closed when recovery would use a different composition."""
 
         if not isinstance(snapshot, AgentPresetSnapshot):
             raise TypeError("agent preset recovery requires AgentPresetSnapshot")
-        current = self.snapshot(request, tool_catalog=tool_catalog)
+        current = self.snapshot(request, tool_catalog=tool_catalog, tool_execution_limits=tool_execution_limits)
         if current != snapshot:
             raise ValueError(
                 "agent preset composition does not match the persisted snapshot"
@@ -643,6 +654,8 @@ def _tool_registration_mapping(
             "hostDerivedPaths": list(data.host_derived_paths),
             "payloadMode": data.payload_mode.value,
         },
+        "concurrencySafe": registration.concurrency_safe,
+        "argumentContract": thaw_json_mapping(registration.argument_contract.identity()) if registration.argument_contract is not None else None,
         "cancellationLinearizable": registration.cancellation_linearizable,
         "hostManagedDurability": registration.host_managed_durability,
         "maxArgumentChars": registration.max_argument_chars,

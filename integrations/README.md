@@ -12,6 +12,7 @@ the components your application uses, together with a matching Core version.
 | `purra-sqlite` | Persistent Runs, events, checkpoints, and tool receipts | [Python](sqlite/python/README.md) · [TypeScript](sqlite/typescript/README.md) |
 | `purra-interaction` | Structured user questions and resumable input waits | [Python](interaction/python/README.md) · [TypeScript](interaction/typescript/README.md) |
 | `purra-compaction` | Model-assisted conversation compression | [Python](compaction/python/README.md) · [TypeScript](compaction/typescript/README.md) |
+| `purra-mcp` | Host-owned read-only MCP tools (development) | [Python](mcp/python/README.md) · [TypeScript](mcp/typescript/README.md) |
 | `purra-mem0` | Scoped long-term memory and retrieval | [Python](mem0/python/README.md) · [TypeScript](mem0/typescript/README.md) |
 
 Model adapters support native OpenAI and Anthropic APIs. Applications handle

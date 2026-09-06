@@ -892,6 +892,7 @@ class AgentCore:
             snapshot = self._preset.snapshot(
                 request,
                 tool_catalog=self._tool_catalog,
+                tool_execution_limits=self._tool_execution_limits,
             )
             tree_grant: AgentCapabilityGrant | None = None
             if self._run_tree_repository is not None:
@@ -1191,7 +1192,7 @@ class AgentCore:
                 agent_tree_root_owner,
                 agent_tree_context_version,
             ) = await self._bind_agent_tree_run(request, options, controller)
-            dependencies = self._runtime_dependencies(controller, options, request)
+            dependencies = self._runtime_dependencies(controller, options, request, signal)
             model_tasks = dependencies.model_tasks
             context_provider = dependencies.context_provider
             conversation_compactor = dependencies.conversation_compactor
@@ -2074,6 +2075,7 @@ class AgentCore:
         controller: AgentRunController,
         options: AgentCoreRunOptions,
         request: AgentRunRequest,
+        signal: CancellationSignal | None = None,
     ) -> _RuntimeDependencies:
         model_tasks = AgentModelTaskRunner(
             self._model_invocations,
@@ -2090,6 +2092,7 @@ class AgentCore:
                 runtime_reserve_tokens=options.runtime_reserve_tokens,
             ),
             request.model,
+            signal=signal,
         )
         context_provider = (
             self._context_provider_factory(model_tasks)
@@ -2187,7 +2190,7 @@ class AgentCore:
             domain=thaw_json_mapping(checkpoint.execution_state_domain),
             run_id=controller.run_id,
         )
-        dependencies = self._runtime_dependencies(controller, options, request)
+        dependencies = self._runtime_dependencies(controller, options, request, signal)
         return await self._execute_runtime_with_auto_promotion(
             request=request,
             prepared_request=prepared_request,

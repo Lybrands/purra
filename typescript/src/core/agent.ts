@@ -536,6 +536,7 @@ export class Agent {
         durableBinding: this.#durable?.binding ?? null,
         agentTree: agentTreeSnapshot,
         recovery: this.#recoveryPolicy.snapshot(),
+        toolExecution: this.#tools.executionSnapshotFor(enabledTools),
       })),
     ]);
     const preset: AgentPresetSnapshot = Object.freeze({
@@ -2077,6 +2078,7 @@ export class Agent {
     return new ModelTaskRunner({
       model: this.#model,
       runId,
+      ...(authority === undefined ? {} : { signal: authority.signal }),
       runtimeLimits: this.#runtimeLimits,
       recovery: this.#recoveryPolicy,
       ...(maxGenerationTokens === undefined ? {} : { maxGenerationTokens }),

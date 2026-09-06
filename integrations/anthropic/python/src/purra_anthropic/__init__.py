@@ -1,6 +1,8 @@
 """Official Anthropic Messages adapter for PurrA."""
 
 import json
+from ._structured import validate as _validate_output
+
 import math
 
 from anthropic import APIError, APIStatusError, AsyncAnthropic
@@ -146,7 +148,15 @@ class AnthropicMessagesGateway:
         self._owns_client = client is None
         self._client = (client or AsyncAnthropic()).with_options(max_retries=0, timeout=timeout_seconds)
 
+    def validate_output_contract(self, invocation):
+        config = invocation.request.options.get("output_config", {})
+        if invocation.output_contract is not None and "format" in config:
+            from purra.structured import StructuredOutputError
+            raise StructuredOutputError("Output format belongs to the output contract", code="structured_output_mode_unsupported")
+        return _validate_output(invocation)
+
     def _request(self, messages, invocation):
+        self.validate_output_contract(invocation)
         if invocation.request.provider != "anthropic":
             raise ValueError("Anthropic gateway requires provider='anthropic'")
         cap = invocation.max_generation_tokens
@@ -174,6 +184,9 @@ class AnthropicMessagesGateway:
         rows, system = _input(messages, invocation.request.model)
         params = dict(model=invocation.request.model, messages=rows, max_tokens=cap,
                       **{key: options[key] for key in ("temperature", "top_p", "top_k", "output_config") if key in options})
+        if invocation.output_contract is not None and invocation.output_contract.mode == "native_required":
+            params["output_config"] = {**params.get("output_config", {}), "format": {
+                "type": "json_schema", "schema": thaw_json_mapping(invocation.output_contract.schema)}}
         if system:
             params["system"] = system
         if thinking is not None:

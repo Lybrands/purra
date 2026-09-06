@@ -151,3 +151,21 @@ from purra.planning_stream import PLANNING_STREAM_SCHEMA, PlanningScope, Plannin
 
 __all__ += ["PlanningContext", "current_planning_context", "PLANNING_STREAM_SCHEMA", "PlanningScope", "PlanningProgress", "PlanningStreamParser", "PlanningStreamError"]
 __all__ += ["UserInputRequired"]
+
+from purra.structured import (
+    StructuredOutputContract, StructuredOutputError, StructuredOutputLimits,
+)
+
+__all__ += ["StructuredOutputContract", "StructuredOutputError", "StructuredOutputLimits"]
+
+from purra.structured_task import StructuredInvocationRef, StructuredModelTaskReceipt, StructuredModelTaskResult
+
+__all__ += ["StructuredInvocationRef", "StructuredModelTaskReceipt", "StructuredModelTaskResult"]
+
+from purra.structured import json_identity_digest
+__all__ += ["json_identity_digest"]
+
+from purra.observability.inspection import build_recovery_inspection, inspect_recovery
+__all__ += ["build_recovery_inspection", "inspect_recovery"]
+from purra.testing import IntegrationCheck, check_integration
+__all__ += ["IntegrationCheck", "check_integration"]
