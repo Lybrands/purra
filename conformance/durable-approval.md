@@ -2,8 +2,9 @@
 
 English | [简体中文](durable-approval.zh-CN.md)
 
-This is the Stage A implementation contract. Durable storage, suspension,
-recovery and MCP writes are **not yet available** in this checkout. Existing
+This contract now has a Stage B storage foundation: immutable approval records,
+host-authorized transactional decisions and explicit SQLite v5 activation.
+Run suspension, execution recovery and MCP writes are **not yet available**. Existing
 in-memory approvals remain supported. The implemented prerequisite revalidates
 host scope after approval, before entering the tool idempotency gateway.
 The shared `fixtures/approval_dispatch.json` cases test that prerequisite only.
@@ -21,8 +22,9 @@ Run ownership, cancellation and budget path. Existing `ApprovalGateway` /
 durable request never falls back to an in-memory decision when its store or
 authorizer is unavailable. No required method is added to existing host ports.
 
-The following names describe the new contract to implement in both SDKs; they
-are not currently exported APIs. Python uses snake_case attributes and methods;
+The three record types below are available from Python `purra.approvals` and
+the TypeScript `purra` entry point. Dispatch association remains unimplemented.
+Python uses snake_case attributes and methods;
 the persisted/interchange view uses the camelCase names below in both SDKs.
 
 | Record | Required binding |
@@ -195,10 +197,12 @@ and activate offline; the default constructor does not migrate v4 databases.
 Previously created in-memory approvals cannot be imported as durable permission.
 Existing unresolved effects are reconciled with the original version first.
 
-These migration/format changes are not implemented at Stage A. Tests must use
-synthetic v4 databases and disposable copies, assert byte/logical preservation
-on rejection, verify both old-reader rejection and new-reader historical access,
-and separately cover active Runs, old receipts and legacy in-memory approvals.
+The storage foundation implements this activation and a database marker plus
+INSERT/UPDATE guards against preopened v4 writers. Because SDK snapshots have
+different codecs, activation rejects any foreign-SDK row rather than assuming
+it is inactive. All same-SDK scopes are inspected, including queued/waiting tree
+Runs and unresolved claims. Tests use synthetic databases only; they cover
+historical reads, rejection without row changes, and legacy version/write probes.
 No business database migration is part of the PurrA development work.
 
 ## Diagnosis and acceptance
@@ -223,3 +227,35 @@ synthetic resources and count actual writes across disconnect/restart faults.
 Real Provider/MCP evidence names the protocol, specific capability and actual
 service/model. Downstream acceptance is separate and remains unpassed until the
 host project implements and validates its authorization, storage, UI and recovery.
+
+## Storage foundation API
+
+Python: `await storage.enable_approvals()` then
+`storage.approval_store(authorize=callback, clock_ms=clock)`.
+TypeScript: `await storage.enableApprovals()` then
+`storage.approvalStore({authorize: callback, clockMs: clock})`.
+The clock is optional and defaults to current epoch milliseconds. Activation is
+a database-wide, explicit offline operation, not an application startup migration.
+
+The store exposes `create`, `get`, `list_pending` / `listPending`, `decide` and
+`refresh`. Creation requires an existing running Run, matching Root and persisted
+preset fingerprint; expiry is capped by both Run deadlines. Exact creation replay
+returns the original record without renewal. Binding/scope revisions are host
+declarations here; live verification belongs to the future dispatch gate.
+
+`decide(command, principal_id=...)` / `decide(command, {principalId})` requires
+an authenticated host principal supplied independently of model/tool data.
+`authorize(principal, record, command)` must return literal true; it runs outside
+the database transaction. The transaction then rechecks identity, revision,
+canonical Run cancellation, deadline and configuration. Competing decisions
+cannot overwrite one another. An exact command-key replay returns its original
+decision receipt, including after expiration; that receipt is historical evidence,
+not a dispatch permit.
+
+`get` and list operations are read-only persisted projections: they do not expire
+records on read. `refresh` explicitly persists expiration or canonical Run
+cancellation. `list_pending` / `listPending` includes pending and approved records
+whose invalidation has not been persisted. Neither this list nor `approved`
+proves current permission. These methods currently create no checkpoint, tool
+claim, Run suspension or public approval event. Existing live approvals remain
+the only runtime approval path until the remaining Stage B wiring is complete.

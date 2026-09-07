@@ -103,6 +103,13 @@ class StorageSession:
     def running_run_ids(self):
         return tuple(key for key, run in self._state.runs.items() if run.status is RunStatus.RUNNING)
 
+    def has_unsettled_execution(self):
+        """Whether an offline storage capability change must wait for execution."""
+        return bool(self.running_run_ids() or self.claims or any(
+            run.status.value in {"queued", "running", "waiting"}
+            for run in self._adapters.run_tree._runs.values()
+        ))
+
     def get_tool_receipt(self, key):
         return self._state.tool_receipts.get(key)
 

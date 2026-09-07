@@ -147,3 +147,11 @@ Permissions, complete usage, effects outside this adapter and Agent Tree ownersh
 remain unknown. `authority` is always `diagnosis_only`; execution must revalidate.
 The current reader loads the selected Root journal to count model attempts.
 See the Core [inspection contract](../../../conformance/integration-inspection.md).
+
+## 1.1 approval storage foundation (unreleased)
+
+Explicit offline v5 activation and host-authorized decision storage are available.
+They do not yet suspend or resume Runs, acquire tool claims, or permit writes.
+Keep production databases on their current format until the runtime integration
+and acceptance are complete. See the [durable approval contract](../../../conformance/durable-approval.md#storage-foundation-api)
+for activation, API methods, replay behavior and SDK format boundaries.

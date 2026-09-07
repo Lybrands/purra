@@ -1,0 +1,32 @@
+{
+  "intent": {
+    "schemaVersion": 1,
+    "runId": "run-1",
+    "rootRunId": "run-1",
+    "toolCallId": "call-1",
+    "toolName": "writeFixture",
+    "arguments": {
+      "target": "fixture/你好",
+      "value": {
+        "b": 2,
+        "a": 1
+      }
+    },
+    "presetFingerprint": "preset-1",
+    "bindingId": "fixture-server",
+    "bindingRevision": "catalog-1",
+    "scopeId": "fixture",
+    "scopeRevision": "scope-1",
+    "effect": "write"
+  },
+  "intentDigest": "e460edcc054e5f195af062e471dbc2fe077438f8f886a9f1dbadb4186c1aba28",
+  "createdAtMs": 1000,
+  "expiresAtMs": 2000,
+  "states": [
+    "pending",
+    "approved",
+    "rejected",
+    "expired",
+    "canceled"
+  ]
+}

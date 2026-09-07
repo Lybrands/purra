@@ -281,6 +281,9 @@ interface StoredContinueReceipt {
 }
 
 export class InMemoryRunTreeRepository implements RunTreeRepository {
+  public hasActiveRuns(): boolean {
+    return [...this.#runs.values()].some(run => ACTIVE_RUN_STATUSES.has(run.status));
+  }
   readonly #agents = new Map<string, AgentNode>();
   readonly #runs = new Map<string, AgentTreeRun>();
   readonly #checkpoints = new Map<string, ContextCheckpoint>();

@@ -1,4 +1,8 @@
-import { OutputJournal, STORAGE_VERSION } from "./journal.js";
+import { OutputJournal } from "./journal.js";
+import { storageVersion, enableApprovals } from "./approval-format.js";
+import { SqliteApprovalStore, type ApprovalAuthorizer } from "./approvals.js";
+export { SqliteApprovalStore } from "./approvals.js";
+export type { ApprovalAuthorizer, ApprovalDecisionReceipt } from "./approvals.js";
 import { DatabaseSync } from "node:sqlite";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { openSync, closeSync } from "node:fs";
@@ -62,10 +66,9 @@ export class SqliteAgentAdapters {
       catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
     }
     this.#db = new DatabaseSync(path);
-    if (this.#db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='purra_state'").get()
-      && this.#db.prepare("SELECT 1 FROM purra_state WHERE version != ? LIMIT 1").get(STORAGE_VERSION)) {
+    try { storageVersion(this.#db); } catch (error) {
       this.#db.close();
-      throw new Error("unsupported SQLite storage version");
+      throw error;
     }
     this.#db.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=0; PRAGMA foreign_keys=ON;");
     this.#db.exec("CREATE TABLE IF NOT EXISTS purra_state (scope TEXT NOT NULL, sdk TEXT NOT NULL, version INTEGER NOT NULL, body TEXT NOT NULL, PRIMARY KEY(scope,sdk))");
@@ -139,6 +142,17 @@ export class SqliteAgentAdapters {
     return this.#transaction(operation);
   }
 
+  async enableApprovals(): Promise<void> {
+    await this.#withConnection(async () => enableApprovals(this.#db));
+  }
+
+  approvalStore(options: { authorize: ApprovalAuthorizer; clockMs?: () => number }): SqliteApprovalStore {
+    return new SqliteApprovalStore({
+      read: operation => this.#withConnection(() => operation(this.#db, this.#scope), true),
+      write: operation => this.#transaction((all, extra) => operation(this.#db, this.#scope, all, extra)),
+    }, options.authorize, options.clockMs);
+  }
+
   async #withConnection<T>(operation: () => Promise<T>, readOnly = false): Promise<T> {
     const previous = this.#tail;
     let release!: () => void;
@@ -170,8 +184,9 @@ export class SqliteAgentAdapters {
 
   async #transaction<T>(operation: (all: Stores, extra: { tools: Record<string, any>; [key: string]: any }) => Promise<T>, readOnly = false, selection: StateSelection = "all", journalRunId?: string): Promise<T> {
     return this.#withConnection(async () => {
+      const version = storageVersion(this.#db);
       const row = this.#db.prepare("SELECT version,body FROM purra_state WHERE scope=? AND sdk='typescript'").get(this.#scope);
-      if (row && row.version !== STORAGE_VERSION) throw new Error("unsupported SQLite storage version");
+      if (row && row.version !== version) throw new Error("unsupported SQLite storage version");
       const rootRunId = row && journalRunId !== undefined ? this.#journal.rootForRun(journalRunId) : undefined;
       const deferredJournal = row && selection === "all" && !readOnly && rootRunId !== undefined ? this.#journal.deferred(rootRunId) : undefined;
       const events = row && selection === "all" && deferredJournal === undefined ? this.#journal.restore(rootRunId) : [];
@@ -182,7 +197,7 @@ export class SqliteAgentAdapters {
       const result = await operation(session.stores, session.extra);
       if (!readOnly) {
         const checkpoint = session.exportSnapshot();
-        if (!row || row.body !== checkpoint.body) this.#db.prepare("INSERT INTO purra_state VALUES(?, 'typescript', ?, ?) ON CONFLICT(scope,sdk) DO UPDATE SET version=excluded.version,body=excluded.body").run(this.#scope, STORAGE_VERSION, checkpoint.body);
+        if (!row || row.body !== checkpoint.body) this.#db.prepare("INSERT INTO purra_state VALUES(?, 'typescript', ?, ?) ON CONFLICT(scope,sdk) DO UPDATE SET version=excluded.version,body=excluded.body").run(this.#scope, version, checkpoint.body);
         if (selection === "all") this.#journal.append(checkpoint.journals, prior);
       }
       return result;

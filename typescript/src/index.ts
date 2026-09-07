@@ -1,4 +1,6 @@
 export { Agent } from "./core/agent.js";
+export { APPROVAL_INTENT_PROFILE, ApprovalIntent, copyApprovalDecisionCommand, copyApprovalRecord } from "./approvals.js";
+export type { ApprovalStatus, ApprovalIntentValue, ApprovalRecord, ApprovalDecisionCommand, ApprovalDecisionAudit } from "./approvals.js";
 export {
   OUTPUT_SCHEMA_PROFILE, JSON_IDENTITY_PROFILE,
   StructuredOutputContract, StructuredOutputError,

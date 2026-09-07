@@ -12,7 +12,8 @@ from purra.storage import StorageSession, STORAGE_PORT_METHODS
 from purra.contracts import ToolHandlerResult, RunExecutionLease, RunStatus
 from purra.execution.ownership import execution_owner, execution_claim
 from purra.errors import ContractViolationError
-from .journal import STORAGE_VERSION, OutputJournal
+from .journal import OutputJournal
+from .approval_format import storage_version, enable_approvals
 
 
 _READ_METHODS = {
@@ -116,10 +117,11 @@ class SqliteAgentAdapters:
             except FileExistsError: pass
         self._lock = asyncio.Lock()
         self._db = sqlite3.connect(path, timeout=0, isolation_level=None)
-        if self._db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='purra_state'").fetchone():
-            if self._db.execute("SELECT 1 FROM purra_state WHERE version != ? LIMIT 1", (STORAGE_VERSION,)).fetchone():
-                self._db.close()
-                raise ValueError("unsupported SQLite storage version")
+        try:
+            storage_version(self._db)
+        except BaseException:
+            self._db.close()
+            raise
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute("PRAGMA synchronous=FULL")
         self._db.execute("PRAGMA foreign_keys=ON")
@@ -147,6 +149,14 @@ class SqliteAgentAdapters:
     def transaction(self):
         return self._transaction()
 
+    async def enable_approvals(self):
+        """Explicitly activate v5 while all scopes have no unsettled execution."""
+        await enable_approvals(self)
+
+    def approval_store(self, *, authorize, clock_ms=None):
+        from .approvals import SqliteApprovalStore
+        return SqliteApprovalStore(self, authorize=authorize, clock_ms=clock_ms)
+
     @asynccontextmanager
     async def _connection(self, *, read_only=False):
         async with self._lock:
@@ -168,8 +178,9 @@ class SqliteAgentAdapters:
     @asynccontextmanager
     async def _transaction(self, *, read_only=False, with_journal=True, journal_run_id=None, journal_stream_id=None, lazy_journal=False):
         async with self._connection(read_only=read_only):
+            version = storage_version(self._db)
             row = self._db.execute("SELECT version,body FROM purra_state WHERE scope=? AND sdk='python'", (self.scope,)).fetchone()
-            if row and row[0] != STORAGE_VERSION:
+            if row and row[0] != version:
                 raise ValueError("unsupported SQLite storage version")
             adapters = StorageSession(row[1] if row else None)
             self._claims, self._leases, self.extra = adapters.claims, adapters.leases, adapters.extra
@@ -180,7 +191,7 @@ class SqliteAgentAdapters:
             if not read_only:
                 body = adapters.export_snapshot()
                 if row is None or row[1] != body:
-                    self._db.execute("INSERT INTO purra_state VALUES(?, 'python', ?, ?) ON CONFLICT(scope,sdk) DO UPDATE SET version=excluded.version,body=excluded.body", (self.scope, STORAGE_VERSION, body))
+                    self._db.execute("INSERT INTO purra_state VALUES(?, 'python', ?, ?) ON CONFLICT(scope,sdk) DO UPDATE SET version=excluded.version,body=excluded.body", (self.scope, version, body))
                 if with_journal:
                     self._journal.append(adapters)
 

@@ -2,7 +2,8 @@
 
 [English](durable-approval.md) | 简体中文
 
-这是阶段 A 的实施契约。持久化审批存储、暂停、恢复及 MCP 写工具**尚未实现**。
+当前已实现阶段 B 的存储基础：不可变审批记录、宿主授权的事务决策及 SQLite v5 显式激活。
+Run 暂停、执行恢复及 MCP 写工具**尚未实现**。
 当前已落地的前置修复是：审批通过后、进入工具幂等网关前重新验证宿主 scope 和取消状态。
 共享案例 `fixtures/approval_dispatch.json` 只验证这一边界。已有内存审批继续可用。
 
@@ -14,7 +15,7 @@
 不增加旧宿主端口的必需方法，不更改现有 `ApprovalGateway`／`ToolApprovalGateway`
 签名及结果状态；持久化存储或宿主授权不可用时，禁止降级为内存批准。
 
-下面是双端待实施契约名称，**不是当前已导出的 API**。Python 使用 snake_case，
+下面三种记录已在双端导出；派发关联仍待实现。Python 使用 snake_case，
 持久化 JSON 使用与 TypeScript 一致的 camelCase：
 
 | 对象 | 必需绑定 |
@@ -132,8 +133,10 @@ v5 格式，保留历史 Runs、journals、已提交 receipts。激活要求整�
 没有活跃 Run 和未协调 claim。宿主备份后离线激活；默认构造函数不自动迁移 v4。
 旧内存审批不能导入为持久化权限；旧未知效果先用原版本协调。
 
-阶段 A 尚未实现格式变更。后续仅用合成 v4 数据库或可丢弃副本验证：拒绝路径保持数据、
-旧 reader 拒绝新格式、新 reader 读取历史，以及活跃 Run、旧回执、旧内存审批各自边界。
+存储基础已实现显式激活、数据库标记及拒绝旧 v4 写入的 INSERT/UPDATE 触发器。
+两端快照 codec 不同，因此激活遇到其他 SDK 的行会拒绝，不能假设其没有活跃执行。
+同 SDK 的所有 scope、queued/waiting 子 Run 及未协调 claim 都纳入检查。
+合成数据库测试覆盖历史读取、拒绝后行不变、旧版本探测和旧连接写入被拒绝。
 PurrA 开发不迁移真实业务数据库。
 
 ## 诊断与验收
@@ -149,3 +152,25 @@ authority 始终为 diagnosis_only。诊断不能执行过期状态更新、协�
 wheel/npm tarball 使用源码目录之外的独立消费者，检查不含内部文件。独立受控 MCP 服务
 只写合成资源，并对断连/重启故障统计实际写入。真实 Provider/MCP 证据注明协议入口、能力、
 实际服务/模型。下游单独验证宿主授权、存储、UI、恢复；在目标项目完成之前保持未通过。
+
+## 已实现的存储入口
+
+Python 从 `purra.approvals` 导入三种审批记录；TypeScript 从 `purra` 导入。
+Python 显式调用 `await storage.enable_approvals()`，再通过
+`storage.approval_store(authorize=callback, clock_ms=clock)` 获取存储。
+TypeScript 对应 `enableApprovals()` 和 `approvalStore({authorize, clockMs})`。
+时钟可省略，默认当前 epoch 毫秒；格式激活是整个数据库的离线操作，不应作为启动自动迁移。
+
+存储提供 `create`、`get`、`list_pending` / `listPending`、`decide`、`refresh`。
+创建要求 Run 正在运行、Root 和持久化配置摘要一致；过期时间受 Run/Root deadline 限制。
+相同创建请求返回原记录，不续期。此处 binding/scope revision 是宿主声明，尚未接入实时派发校验。
+
+宿主从认证上下文提供主体，不能采信模型或工具返回的主体。`authorize(principal, record, command)`
+必须返回严格的 true，在事务外执行；随后事务重查身份、revision、规范 Run 取消、过期及配置。
+并发决策不能相互覆盖。相同 commandKey、命令及主体的重放返回原决策回执，即使后来已经过期；
+该回执仅为历史证据，不能授予派发权限。
+
+`get` 和列表只读取持久记录，不在读取时自动过期；`refresh` 显式持久化过期或 Run 取消。
+列表包含尚未持久化失效的 pending 和 approved，不能据此判断当前可执行。
+这些方法尚不创建 checkpoint、工具 claim、Run 暂停或公共审批事件；阶段 B 剩余链路打通前，
+运行时仍使用已有 live approval 路径。
