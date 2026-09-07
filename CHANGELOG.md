@@ -2,6 +2,13 @@
 
 ## 1.1.0 — Unreleased development
 
+- Add separate host-authorized MCP write discovery in both SDKs, preserving the
+  1.0 read-only API. Write registrations require durable approval/receipt gateways
+  and bind catalog, scope and effect identity to the persisted intent. Failures
+  after request submission retain unknown effects and block duplicate dispatch.
+  Deterministic protocol and SQLite recovery tests cover these boundaries; real
+  service and downstream acceptance remain separate.
+
 - Revalidate host scope after tool approval and check cancellation before entering
   the idempotency gateway. Revoked or unavailable authorization does not dispatch
   the tool or acquire a tool claim. Existing live approval APIs remain supported.
@@ -10,12 +17,12 @@
   Python and TypeScript additionally support opt-in tool-ready checkpoints and
   same-Run approval recovery with atomic claim/receipt associations. Reactive,
   Planned and Auto Root recovery, plus Root approval after read-only Child work,
-  pass deterministic tests. Child write approval and MCP writes remain pending.
+  pass deterministic tests. Child write approval remains pending.
 - Align Core and all seven optional packages, exact internal dependencies and
   npm lockfiles at 1.1.0. This version has not been published.
 
 The [durable approval contract](conformance/durable-approval.md) defines the
-remaining runtime parity, extended recovery and MCP write work. Storage decisions
+remaining runtime parity, diagnostics and extended recovery work. Storage decisions
 alone are not execution permissions.
 
 ## 1.0.0 — Unreleased candidate

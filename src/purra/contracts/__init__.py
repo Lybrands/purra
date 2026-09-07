@@ -1417,8 +1417,12 @@ class ApprovalRequest:
     risk_level: ToolRiskLevel
     summary: str
     timeout_seconds: float = 300.0
+    binding: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
+        if self.binding is not None:
+            from purra.approvals import copy_tool_approval_binding
+            object.__setattr__(self, "binding", copy_tool_approval_binding(self.binding))
         title = required_text(self.title, "approval title")
         timeout = float(self.timeout_seconds)
         if timeout <= 0:

@@ -39,7 +39,16 @@ export interface ToolPlanningMetadata {
   readonly prerequisiteTools?: readonly string[];
 }
 
+export interface ToolApprovalBinding {
+  readonly bindingId: string;
+  readonly bindingRevision: string;
+  readonly scopeId: string;
+  readonly scopeRevision: string;
+  readonly effect: "write" | "destructive";
+}
+
 export interface ToolDefinition {
+  readonly approvalBinding?: ToolApprovalBinding;
   readonly argumentContract?: import("../structured.js").StructuredOutputContract;
   readonly concurrencySafe?: boolean;
   readonly name: string;
@@ -66,6 +75,7 @@ export interface ToolApprovalRequest {
 }
 
 export interface ToolDispatchContext {
+  readonly approvalBinding?: ToolApprovalBinding;
   readonly runId: string;
   readonly call: ToolCall;
 }

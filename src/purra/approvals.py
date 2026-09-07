@@ -23,6 +23,17 @@ def _integer(value, name, minimum=0):
     return value
 
 
+def copy_tool_approval_binding(value):
+    keys = {"bindingId", "bindingRevision", "scopeId", "scopeRevision", "effect"}
+    if not isinstance(value, Mapping) or set(value) != keys:
+        raise ValueError("invalid tool approval binding")
+    for key in keys - {"effect"}:
+        _text(value[key], key)
+    if value["effect"] not in {"write", "destructive"}:
+        raise ValueError("invalid tool approval effect")
+    return freeze_json_mapping(value)
+
+
 @dataclass(frozen=True, slots=True)
 class ApprovalIntent:
     run_id: str

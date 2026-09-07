@@ -1,4 +1,4 @@
-"""Read-only tools through a host-owned, initialized official MCP session."""
+"""Host-owned read tools and durable approval-gated MCP writes."""
 from __future__ import annotations
 
 import asyncio
@@ -11,6 +11,7 @@ from typing import Any
 
 from mcp import ClientSession, types
 from mcp.shared.exceptions import McpError
+from purra.approvals import copy_tool_approval_binding
 from purra.cancellation import OperationCanceled, await_with_cancellation, raise_if_stopped
 from purra.contracts import ToolHandlerResult, ToolPolicy, ToolSchema
 from purra.errors import CodedAgentCoreError
@@ -103,6 +104,33 @@ class McpToolBinding:
             _fail("mcp_binding_invalid")
         if type(self.concurrency_safe) is not bool:
             _fail("mcp_binding_invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class McpWriteToolBinding:
+    local_name: str
+    policy: ToolPolicy
+    scope_validator: ScopeValidator
+    binding_id: str
+    binding_revision: str
+    scope_id: str
+    scope_revision: str
+    effect: str
+    concurrency_safe: bool = field(default=False, init=False)
+
+    def __post_init__(self):
+        if not isinstance(self.local_name, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", self.local_name):
+            _fail("mcp_binding_invalid")
+        if not isinstance(self.policy, ToolPolicy) or self.policy.mode != "confirm" or self.policy.risk_level != self.effect or not callable(self.scope_validator):
+            _fail("mcp_binding_invalid")
+        try:
+            self.identity()
+        except (ValueError, TypeError):
+            _fail("mcp_binding_invalid")
+
+    def identity(self):
+        return copy_tool_approval_binding({"bindingId": self.binding_id, "bindingRevision": self.binding_revision,
+            "scopeId": self.scope_id, "scopeRevision": self.scope_revision, "effect": self.effect})
 
 
 @dataclass(frozen=True, slots=True)
@@ -213,7 +241,7 @@ def _result(raw, output, limits):
     return value
 
 
-def _registration(client, remote, entry, binding, contract, output, monitor, revision, limits):
+def _registration(client, remote, entry, binding, contract, output, monitor, revision, limits, approval_binding=None):
     async def scope(state, arguments, signal=None):
         monitor.check(revision)
         raise_if_stopped(signal)
@@ -222,6 +250,8 @@ def _registration(client, remote, entry, binding, contract, output, monitor, rev
         return None
 
     async def run(state, arguments, signal=None):
+        dispatched = False
+        writing = approval_binding is not None
         try:
             monitor.check(revision)
             try:
@@ -233,23 +263,28 @@ def _registration(client, remote, entry, binding, contract, output, monitor, rev
                 _fail("mcp_scope_denied")
             monitor.check(revision)
             raise_if_stopped(signal)
+            dispatched = True
             result = await _request(client, types.ClientRequest(types.CallToolRequest(
                 params=types.CallToolRequestParams(name=remote, arguments=thaw_json_mapping(value)))),
                 types.CallToolResult, limits, signal)
             monitor.check(revision)
             envelope = _result(result, output, limits)
-            return ToolHandlerResult(json.dumps(thaw_json_mapping(envelope), ensure_ascii=False, separators=(",", ":")), effect_state="not_started")
+            return ToolHandlerResult(json.dumps(thaw_json_mapping(envelope), ensure_ascii=False, separators=(",", ":")), effect_state="committed" if writing else "not_started")
         except McpAdapterError as error:
-            return ToolHandlerResult('{"text":[],"structured":null}', error_code=error.code, effect_state="not_started")
+            return ToolHandlerResult('{"text":[],"structured":null}', error_code=error.code, effect_state="unknown" if writing and dispatched else "not_started")
+        except (OperationCanceled, asyncio.CancelledError):
+            if writing and dispatched:
+                return ToolHandlerResult('{"text":[],"structured":null}', error_code="mcp_canceled", effect_state="unknown")
+            raise
 
     return ToolRegistration(ToolSchema(binding.local_name, entry["description"] or binding.policy.title, contract.schema),
         run, binding.policy, scope_validator=scope, argument_contract=contract, concurrency_safe=binding.concurrency_safe,
-        max_argument_chars=limits.max_result_bytes)
+        max_argument_chars=limits.max_result_bytes, approval_binding=approval_binding)
 
 
-async def discover_mcp_tools(client: ClientSession, server_id: str,
+async def _discover_mcp_tools(client: ClientSession, server_id: str,
         bindings: Mapping[str, McpToolBinding], *, monitor: McpCatalogMonitor,
-        limits: McpToolLimits = McpToolLimits(), signal=None) -> McpToolCatalog:
+        limits: McpToolLimits = McpToolLimits(), signal=None, writing=False) -> McpToolCatalog:
     if not isinstance(client, ClientSession) or not isinstance(monitor, McpCatalogMonitor) or not isinstance(limits, McpToolLimits):
         _fail("mcp_binding_invalid")
     if not isinstance(server_id, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", server_id):
@@ -258,7 +293,7 @@ async def discover_mcp_tools(client: ClientSession, server_id: str,
         _fail("mcp_binding_invalid")
     bound = dict(bindings)
     if any(not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", name)
-           or not isinstance(binding, McpToolBinding) for name, binding in bound.items()):
+           or not isinstance(binding, McpWriteToolBinding if writing else McpToolBinding) for name, binding in bound.items()):
         _fail("mcp_binding_invalid")
     if len({binding.local_name for binding in bound.values()}) != len(bound):
         _fail("mcp_name_conflict")
@@ -299,7 +334,8 @@ async def discover_mcp_tools(client: ClientSession, server_id: str,
             entry = {"remoteName": tool.name, "localName": binding.local_name,
                 "description": description, "inputSchema": input_schema,
                 "outputSchema": output_schema,
-                "policy": {"mode": "read", "title": binding.policy.title, "riskLevel": "read"},
+                "policy": {"mode": binding.policy.mode, "title": binding.policy.title, "riskLevel": binding.policy.risk_level},
+                **({"authorization": thaw_json_mapping(binding.identity())} if writing else {}),
                 "concurrencySafe": binding.concurrency_safe}
             found[tool.name] = (entry, binding, contract, output)
         cursor = result.nextCursor
@@ -314,16 +350,29 @@ async def discover_mcp_tools(client: ClientSession, server_id: str,
         _fail("mcp_binding_missing")
     ordered = sorted(found.items(), key=lambda item: item[1][0]["localName"])
     entries = tuple(item[1][0] for item in ordered)
-    identity = {"schemaVersion": 1, "serverId": server_id, "protocolVersion": monitor.protocol_version, "entries": entries}
+    identity = {"schemaVersion": 2 if writing else 1, "serverId": server_id, "protocolVersion": monitor.protocol_version, "entries": entries}
     try:
         digest = json_identity_digest(identity)
     except (ValueError, TypeError):
         _fail("mcp_catalog_limit_exceeded")
-    snapshot = McpToolSnapshot(server_id, monitor.protocol_version, digest, entries)
-    registrations = tuple(_registration(client, remote, entry, binding, contract, output, monitor, revision, limits)
+    snapshot = McpToolSnapshot(server_id, monitor.protocol_version, digest, entries, 2 if writing else 1)
+    registrations = tuple(_registration(client, remote, entry, binding, contract, output, monitor, revision, limits,
+        {**binding.identity(), "bindingRevision": digest} if writing else None)
         for remote, (entry, binding, contract, output) in ordered)
     monitor.check(revision)
     return McpToolCatalog(snapshot, registrations, monitor, revision)
 
 
-__all__ = ["McpAdapterError", "McpToolLimits", "McpCatalogMonitor", "McpToolBinding", "McpToolSnapshot", "McpToolCatalog", "discover_mcp_tools"]
+async def discover_mcp_tools(client: ClientSession, server_id: str,
+        bindings: Mapping[str, McpToolBinding], *, monitor: McpCatalogMonitor,
+        limits: McpToolLimits = McpToolLimits(), signal=None) -> McpToolCatalog:
+    return await _discover_mcp_tools(client, server_id, bindings, monitor=monitor, limits=limits, signal=signal)
+
+
+async def discover_mcp_write_tools(client: ClientSession, server_id: str,
+        bindings: Mapping[str, McpWriteToolBinding], *, monitor: McpCatalogMonitor,
+        limits: McpToolLimits = McpToolLimits(), signal=None) -> McpToolCatalog:
+    return await _discover_mcp_tools(client, server_id, bindings, monitor=monitor, limits=limits, signal=signal, writing=True)
+
+
+__all__ = ["McpAdapterError", "McpToolLimits", "McpCatalogMonitor", "McpToolBinding", "McpToolSnapshot", "McpToolCatalog", "discover_mcp_tools", "McpWriteToolBinding", "discover_mcp_write_tools"]

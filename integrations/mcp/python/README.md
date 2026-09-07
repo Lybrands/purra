@@ -1,6 +1,6 @@
 # purra-mcp (Python)
 
-Development package for explicitly authorized, read-only MCP tools. Requires a
+Development package for host-authorized MCP read tools and durable approval-gated writes. Requires a
 matching PurrA Core and the pinned official `mcp==1.29.1` SDK (v1 line). Core has
 no MCP dependency. Install from this checkout with:
 
@@ -104,8 +104,8 @@ SDK removes the pending local request but does not send a cancellation
 notification from `send_request`; remote execution can continue. The host owns
 remote cancellation policy and connection shutdown. Neither cancellation nor a
 read result's `effect_state="not_started"` proves remote execution did not occur:
-that field describes the declared absence of host writes. No write tools are
-supported by this adapter.
+that field describes the declared absence of host writes. The separate write entry
+point below classifies uncertain effects conservatively.
 
 Tests use an official local SDK server and shared fixtures. The installed smoke
 runs a separate stdio server owned and stopped by its host script. These checks
@@ -135,3 +135,59 @@ byte limit. Other dialect URIs, nested declarations, references, and unknown
 keywords remain unsupported; no schema document is fetched. This does not add
 `$schema` to the Core structured-output profile or promise full JSON Schema
 2020-12 support. See the [MCP schema rules](https://modelcontextprotocol.io/specification/2025-11-25/server/tools).
+
+## Durable writes (1.1 development)
+
+The separate write discovery entry point requires explicit host authorization:
+confirm policy, matching `write` or `destructive` effect, a callable scope validator,
+and nonempty binding/scope IDs and revisions. Server annotations never grant this
+permission. Read discovery keeps its 1.0 contract and schema-1 snapshot. Write
+snapshots use schema 2 and include the host authorization identity; concurrency
+is disabled for these tools.
+
+```python
+from purra_mcp import McpWriteToolBinding, discover_mcp_write_tools
+
+writes = await discover_mcp_write_tools(client, "documents", {
+    "remote.update": McpWriteToolBinding(
+        local_name="update_document",
+        policy=ToolPolicy("confirm", "Update document", "write"),
+        scope_validator=validate_current_document_scope,
+        binding_id="document-service", binding_revision="host-config-1",
+        scope_id="sandbox-documents", scope_revision="scope-1", effect="write",
+    ),
+}, monitor=monitor)
+identity = writes.registrations[0].approval_binding
+```
+
+In the tool checkpoint handler, construct `ApprovalIntent` from the actual
+checkpoint call and current Run preset. Copy `identity["bindingId"]`,
+`identity["bindingRevision"]`, `identity["scopeId"]`, `identity["scopeRevision"]`,
+and `identity["effect"]` to the corresponding snake-case intent fields, then call
+`approvals.prepare`. Configure Core with `approvals.gateway()` and that store's
+`storage.idempotency` gateway and include the write name in `tool_checkpoint_names`.
+
+The registration's effective binding revision is the complete write catalog digest,
+which includes the original host binding revision, server identity, selected schemas,
+and scope identity. Do not substitute the original host revision or reuse old binding
+metadata after rediscovery. Core requires a durable approval gateway and its exact
+receipt store, and the SQLite gateway checks the current registration identity against
+the approved intent before dispatch. A live in-memory approval gateway is insufficient.
+The handler function is an adapter implementation; applications execute it through
+Core's tool catalog, never as a substitute for approval/claim checks.
+
+A validated success response records `committed`. Local argument/scope/catalog
+rejection before sending records `not_started`. Once a request is submitted,
+timeout, cancellation, disconnect, catalog changes, RPC errors, `isError` responses,
+and invalid/unsupported output record `unknown`. An error response cannot prove
+that no remote write occurred. Unknown effects retain their durable claim; the
+adapter never retries or automatically reconciles them. Host reconciliation requires
+independent evidence. A successful remote response is protocol completion evidence,
+not a read-back audit of the business data.
+
+The protocol tests include SQLite approval restart, current-binding mismatch,
+scope revocation, committed receipts and retained unknown claims against a synthetic
+SDK server. Build the sibling Core and SQLite packages before TypeScript tests; include
+Core, MCP and SQLite source directories on `PYTHONPATH` for Python tests. These are
+deterministic local tests, separate from real Provider/MCP service and downstream
+acceptance. See [durable approval](../../../conformance/durable-approval.md).

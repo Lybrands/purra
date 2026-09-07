@@ -83,6 +83,8 @@ class CoreToolExecutor:
             if expected is None or idempotency_gateway is not expected:
                 raise ContractViolationError("Durable approval requires its bound idempotency gateway", code="approval_idempotency_unavailable")
         registrations = validate_tool_contract(catalog.registrations())
+        if any(row.approval_binding is not None for row in registrations) and getattr(approval_gateway, "requires_durable_idempotency", False) is not True:
+            raise ContractViolationError("Tool binding requires durable approval", code="approval_idempotency_unavailable")
         self._registrations = MappingProxyType({
             registration.schema.name: registration
             for registration in registrations
@@ -817,6 +819,7 @@ class CoreToolExecutor:
                 max_chars=self._limits.approval_summary_chars,
             ),
             timeout_seconds=self._limits.approval_timeout_seconds,
+            binding=registration.approval_binding,
         )
         try:
             result = await self._approval_gateway.request(

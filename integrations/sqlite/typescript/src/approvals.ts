@@ -201,6 +201,8 @@ export async function checkApprovalDispatch(db: DatabaseSync, scope: string, all
     .get(scope, dispatch.runId, dispatch.call.id);
   if (!row) fail("approval_not_found");
   let record = await load(db, scope, String(row.approval_id));
+  if (dispatch.approvalBinding !== undefined && Object.entries(dispatch.approvalBinding).some(([key, value]) =>
+    record.intent[key as keyof typeof record.intent] !== value)) fail("approval_intent_conflict");
   const run = await all.runs.get(dispatch.runId), checkpoint = run.toolExecutionCheckpoint;
   if (checkpoint === undefined || await jsonIdentityDigest(checkpoint.assistant.toolCalls![0]!) !== await jsonIdentityDigest(dispatch.call)
     || record.intent.toolName !== dispatch.call.name

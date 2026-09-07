@@ -112,8 +112,15 @@ class ToolRegistration:
     operation_display_params: OperationDisplayParamsResolver | None = None
     argument_contract: StructuredOutputContract | None = None
     concurrency_safe: bool = False
+    approval_binding: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
+        if self.approval_binding is not None:
+            from purra.approvals import copy_tool_approval_binding
+            binding = copy_tool_approval_binding(self.approval_binding)
+            if self.policy.mode != "confirm" or self.policy.risk_level != binding["effect"] or self.host_managed_durability or self.scope_validator is None:
+                raise ValueError("approval binding requires scoped confirm policy and durable receipts")
+            object.__setattr__(self, "approval_binding", binding)
         if type(self.concurrency_safe) is not bool or (self.concurrency_safe and (self.policy.mode != "read" or self.policy.risk_level != "read")):
             raise ValueError("concurrency_safe requires an explicitly read-only tool")
         if self.argument_contract is not None:

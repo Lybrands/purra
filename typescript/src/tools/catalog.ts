@@ -82,6 +82,9 @@ export class ToolCatalog {
     for (const definition of definitions) {
       const registered: RegisteredTool = { ...registerTool(definition), runtimeManaged: options.runtimeManaged?.includes(definition) === true };
       const name = registered.definition.name;
+      if (registered.definition.approvalBinding !== undefined && options.approval?.requiresDurableIdempotency !== true) {
+        throw new AgentError("approval_idempotency_required", "Tool binding requires durable approval");
+      }
       if (options.approval?.requiresDurableIdempotency === true && registered.policy.mode !== "read"
         && registered.definition.hostManagedDurability === true && !registered.runtimeManaged) {
         throw new AgentError("approval_idempotency_required", "Durable approval cannot bypass its tool receipt store");
@@ -411,7 +414,7 @@ export class ToolCatalog {
       try {
         status = await awaitWithSignal(Promise.resolve(this.#approval.request(Object.freeze({
           call,
-          ...(this.#approval.requiresDurableIdempotency === true && options.runId !== undefined ? { dispatch: { runId: options.runId, call } } : {}),
+          ...(this.#approval.requiresDurableIdempotency === true && options.runId !== undefined ? { dispatch: { runId: options.runId, call, ...(tool.definition.approvalBinding === undefined ? {} : { approvalBinding: tool.definition.approvalBinding }) } } : {}),
           title: tool.policy.title,
           riskLevel: tool.policy.riskLevel,
           summary: summarize(call.arguments, this.#approvalSummaryChars),
@@ -469,7 +472,7 @@ export class ToolCatalog {
     const operation = durableApproval ? async () => copyToolHandlerResult(await run(), tool.policy.mode) : run;
     const guarded = tool.policy.mode !== "read" && tool.definition.hostManagedDurability !== true
       ? () => this.#idempotency!.executeOnce(`${executionKey}:${call.name}:${call.id}`, operation,
-        ...(durableApproval && runId !== undefined ? [{ runId, call }] : []))
+        ...(durableApproval && runId !== undefined ? [{ runId, call, ...(tool.definition.approvalBinding === undefined ? {} : { approvalBinding: tool.definition.approvalBinding }) }] : []))
       : operation;
     const uncertainOnCancel = tool.policy.mode !== "read"
       && tool.definition.cancellationLinearizable !== true;
@@ -558,6 +561,18 @@ function registerTool(value: ToolDefinition): RegisteredTool {
     || value.argumentContract.mode !== "local" || !jsonEqual(value.argumentContract.schema, schema))) {
     throw new TypeError("argumentContract must match the tool schema and use local validation");
   }
+  let approvalBinding = value.approvalBinding;
+  if (approvalBinding !== undefined) {
+    const keys = ["bindingId", "bindingRevision", "scopeId", "scopeRevision", "effect"];
+    if (approvalBinding === null || typeof approvalBinding !== "object" || Object.keys(approvalBinding).length !== keys.length
+      || !keys.every(key => Object.hasOwn(approvalBinding!, key))
+      || ![approvalBinding.bindingId, approvalBinding.bindingRevision, approvalBinding.scopeId, approvalBinding.scopeRevision]
+        .every(text => typeof text === "string" && text.length > 0 && [...text].length <= 1024 && text.trim() === text)
+      || !["write", "destructive"].includes(approvalBinding.effect)
+      || policy.mode !== "confirm" || policy.riskLevel !== approvalBinding.effect
+      || value.hostManagedDurability === true || value.scope === undefined) throw new TypeError("Invalid durable tool approval binding");
+    approvalBinding = Object.freeze({ ...approvalBinding });
+  }
   const displayNames = copyDisplayNames(value.displayNames, name);
   if (
     value.planningRequirement !== undefined
@@ -581,6 +596,7 @@ function registerTool(value: ToolDefinition): RegisteredTool {
   return Object.freeze({
     definition: Object.freeze({
       ...value,
+      ...(approvalBinding === undefined ? {} : { approvalBinding }),
       name,
       description,
       policy,

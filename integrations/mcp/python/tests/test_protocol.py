@@ -347,3 +347,180 @@ async def test_schema_byte_limit_includes_dialect_declaration():
         with pytest.raises(McpAdapterError) as caught:
             await discover(client,monitor,limits=McpToolLimits(max_schema_bytes=60))
         assert caught.value.code == 'mcp_schema_unsupported'
+
+
+async def allow_write(state, arguments, signal):
+    return None
+
+
+def write_binding(**changes):
+    from purra_mcp import McpWriteToolBinding
+    return McpWriteToolBinding(**{**dict(local_name='search', policy=ToolPolicy('confirm', 'Write', 'write'),
+        scope_validator=allow_write, binding_id='fixture', binding_revision='1', scope_id='synthetic',
+        scope_revision='1', effect='write'), **changes})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('row', FIXTURE['cases'], ids=lambda row: 'write-'+row['id'])
+async def test_write_result_effects(row):
+    from purra_mcp import discover_mcp_write_tools
+    fixture = ProtocolServer(result=row['result'], malformed=row.get('malformed', False))
+    async with fixture.connect() as (client, monitor):
+        limits = McpToolLimits(**{'max_result_bytes' if k == 'maxResultBytes' else 'max_content_blocks': v for k,v in row.get('limits', {}).items()})
+        catalog = await discover_mcp_write_tools(client, 'fixture', {'remote.search': write_binding()}, monitor=monitor, limits=limits)
+        result = await catalog.registrations[0].handler(ExecutionState(), row['arguments'])
+        assert result.error_code == row['errorCode']
+        assert result.effect_state == ('committed' if row['errorCode'] is None else 'not_started' if row['errorCode'] == 'mcp_invalid_arguments' else 'unknown')
+        assert len(fixture.calls) == (0 if row['errorCode'] == 'mcp_invalid_arguments' else 1)
+        assert len(fixture.lists) == 1
+
+
+@pytest.mark.asyncio
+async def test_write_authorization_identity_and_durable_gate():
+    from purra_mcp import discover_mcp_write_tools
+    from purra.tools import CoreToolExecutor, InMemoryToolCatalog
+    from purra.errors import ContractViolationError
+    fixture = ProtocolServer()
+    async with fixture.connect() as (client, monitor):
+        with pytest.raises(McpAdapterError):
+            await discover_mcp_tools(client, 'fixture', {'remote.search': write_binding()}, monitor=monitor)
+        with pytest.raises(McpAdapterError):
+            await discover_mcp_write_tools(client, 'fixture', {'remote.search': BINDING}, monitor=monitor)
+        for changes in [dict(scope_validator=None), dict(effect='read'), dict(binding_id=''), dict(policy=ToolPolicy('propose', 'Write', 'write'))]:
+            with pytest.raises(McpAdapterError): write_binding(**changes)
+        assert fixture.lists == []
+        digests = []
+        for revision in ['1','2']:
+            catalog = await discover_mcp_write_tools(client, 'fixture', {'remote.search': write_binding(binding_revision=revision)}, monitor=monitor)
+            registration = catalog.registrations[0]
+            assert catalog.snapshot.schema_version == 2
+            assert registration.approval_binding['bindingRevision'] == catalog.snapshot.revision_digest
+            assert registration.approval_binding['scopeId'] == 'synthetic'
+            assert registration.concurrency_safe is False
+            with pytest.raises(ContractViolationError) as error:
+                CoreToolExecutor(InMemoryToolCatalog(catalog.registrations))
+            assert error.value.code == 'approval_idempotency_unavailable'
+            digests.append(catalog.snapshot.revision_digest)
+        assert digests[0] != digests[1]
+        monitor.close()
+        result = await registration.handler(ExecutionState(), {'q':'a'})
+        assert result.effect_state == 'not_started'
+        assert not fixture.calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('mode', ['cancel','timeout','stale','rpc','disconnect'])
+async def test_write_inflight_unknown(mode):
+    from purra_mcp import discover_mcp_write_tools
+    fixture = ProtocolServer()
+    fixture.gate = asyncio.Event()
+    fixture.rpc_error = mode == 'rpc'
+    async with fixture.connect() as (client, monitor):
+        catalog = await discover_mcp_write_tools(client, 'fixture', {'remote.search': write_binding()}, monitor=monitor,
+            limits=McpToolLimits(timeout_ms=100 if mode == 'timeout' else 2000))
+        signal = asyncio.Event()
+        running = asyncio.create_task(catalog.registrations[0].handler(ExecutionState(), {'q':'a'}, signal))
+        await asyncio.wait_for(fixture.started.wait(), 1)
+        if mode == 'cancel': signal.set()
+        elif mode == 'stale':
+            await fixture.session.send_tool_list_changed()
+            while not catalog.stale: await asyncio.sleep(0)
+            fixture.gate.set()
+        elif mode == 'rpc': fixture.gate.set()
+        elif mode == 'disconnect': await fixture.server_write.aclose()
+        result = await asyncio.wait_for(running, 2)
+        assert result.effect_state == 'unknown'
+        assert result.error_code == {'cancel':'mcp_canceled', 'timeout':'mcp_timeout', 'stale':'mcp_catalog_stale', 'rpc':'mcp_protocol_error', 'disconnect':'mcp_transport_error'}[mode]
+        fixture.gate.set()
+        await asyncio.wait_for(fixture.finished.wait(), 1)
+        assert len(fixture.calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('scenario', ['success', 'unknown', 'changed-binding', 'revoked-scope', 'wrong-intent'])
+async def test_durable_mcp_recovery(tmp_path, scenario):
+    from dataclasses import replace
+    import time
+    from purra.api import AgentCore, AgentCoreRunOptions, AgentPreset
+    from purra.contracts import AgentMessage, AgentRunRequest, DomainContext, ModelRequest, ModelStream, ModelStreamChunk, RuntimeLimits, ToolCallDelta
+    from purra.model_protocol import generic_capability_snapshot
+    from purra.tools import InMemoryToolCatalog
+    from purra.approvals import ApprovalIntent, ApprovalDecisionCommand, ApprovalRequired
+    from purra.structured import json_identity_digest
+    from purra_sqlite import SqliteAgentAdapters
+    from purra_mcp import discover_mcp_write_tools
+    fixture = ProtocolServer(result={'isError':True, 'content':[{'type':'text','text':'private failure'}]} if scenario == 'unknown' else None)
+    denied = False
+    model_calls = 0
+    expiry = int(time.time()*1000)+60000
+    async def scope(*args): return 'revoked' if denied else None
+    request = AgentRunRequest(messages=(AgentMessage('user','Write synthetic fixture'),),
+        model=ModelRequest('fixture','fixture',replace(generic_capability_snapshot(),max_generation_tokens=128)),
+        domain_context=DomainContext('mcp'),context_window=65536,tools_enabled=True,planning_mode='reactive')
+    class Model:
+        async def complete(self,*args,**kwargs): raise AssertionError('stream expected')
+        async def stream(self,messages,invocation,signal=None):
+            nonlocal model_calls
+            model_calls += 1
+            async def chunks():
+                if any(m.role.value == 'tool' for m in messages) or not invocation.tools:
+                    yield ModelStreamChunk(content_delta='done',finish_reason='stop')
+                else:
+                    yield ModelStreamChunk(tool_call_deltas=(ToolCallDelta(index=0,id='write-1',name='search',arguments_fragment='{"q":"a"}'),),finish_reason='tool_calls')
+            return ModelStream(chunks=chunks(),model='fixture',applied_generation_limit=invocation.output_budget.max_generation_tokens)
+    async with fixture.connect() as (client, monitor):
+        async def discover_current(revision='1'):
+            return await discover_mcp_write_tools(client,'fixture',{'remote.search':write_binding(scope_validator=scope,binding_revision=revision)},monitor=monitor)
+        catalog = await discover_current()
+        stores, cores = [], []
+        def open_host(current):
+            storage = SqliteAgentAdapters(tmp_path/'db',scope='mcp'); stores.append(storage)
+            approvals = storage.approval_store(authorize=lambda *_:True)
+            core = AgentCore(approval_gateway=approvals.gateway(),tool_idempotency_gateway=storage.idempotency,
+                model_gateway=Model(),run_repository=storage.runs,output_repository=storage.outputs,output_publisher=storage.publisher,
+                execution_lease_store=storage.leases,preset=AgentPreset(id='mcp',revision='1',runtime_limits=RuntimeLimits(max_run_generation_tokens=None),
+                tool_catalog=InMemoryToolCatalog(current.registrations)))
+            cores.append(core)
+            async def boundary(checkpoint):
+                call = checkpoint.assistant.tool_calls[0]
+                snapshot = await storage.runs.get(checkpoint.run_id)
+                identity = catalog.registrations[0].approval_binding
+                intent = ApprovalIntent(run_id=checkpoint.run_id,root_run_id=checkpoint.run_id,tool_call_id=call.id,
+                    tool_name=call.name,arguments=json.loads(call.arguments_json),preset_fingerprint=json_identity_digest(snapshot.agent_preset_snapshot),
+                    binding_id=identity['bindingId'],binding_revision=identity['bindingRevision'],scope_id=identity['scopeId'],
+                    scope_revision='wrong' if scenario == 'wrong-intent' else identity['scopeRevision'],effect=identity['effect'])
+                await approvals.prepare(checkpoint,intent,expires_at_ms=expiry)
+            return storage, approvals, core, AgentCoreRunOptions(tool_checkpoint_handler=boundary,tool_checkpoint_names=frozenset({'search'}))
+        try:
+            storage, approvals, core, options = open_host(catalog)
+            await storage.enable_approvals()
+            handle = await core.submit(request,options=options)
+            with pytest.raises(ApprovalRequired): await handle.wait()
+            run_id = handle.run_id
+            assert model_calls == 1 and not fixture.calls
+            storage, approvals, core, options = open_host(catalog)
+            with pytest.raises(ApprovalRequired): await (await core.resume(run_id,request,options=options)).wait()
+            assert model_calls == 1 and not fixture.calls
+            record = (await approvals.list_pending())[0]
+            await approvals.decide(ApprovalDecisionCommand(record.approval_id,record.revision,record.intent.digest,'approve','approve'),principal_id='fixture-host')
+            if scenario == 'changed-binding': storage, approvals, core, options = open_host(await discover_current('2'))
+            if scenario == 'revoked-scope': denied = True
+            result = await (await core.resume(run_id,request,options=options)).wait()
+            if scenario == 'success':
+                assert result.status.value == 'done'
+                async with storage.transaction() as session:
+                    assert session.extra['approvalExecutions'][record.approval_id]['state'] == 'complete'
+                    assert not session.claims
+            elif scenario == 'unknown':
+                async with storage.transaction() as session:
+                    assert session.claims
+            assert len(fixture.calls) == (1 if scenario in {'success','unknown'} else 0)
+            before = len(fixture.calls)
+            try:
+                await (await core.resume(run_id,request,options=options)).wait()
+            except Exception:
+                pass
+            assert len(fixture.calls) == before
+        finally:
+            for core in cores: await core.close()
+            for storage in stores: storage.close()

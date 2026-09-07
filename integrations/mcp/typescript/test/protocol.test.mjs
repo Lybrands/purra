@@ -265,3 +265,127 @@ test('schema byte limit includes dialect declaration', async t => {
   await assert.rejects(discover(f,{limits:{maxSchemaBytes:60}}),errorCode('mcp_schema_unsupported'));
   assert.equal(f.calls.length,0);
 });
+
+const writeBinding = { localName:'search', policy:{mode:'confirm', title:'Write', riskLevel:'write'}, scope:() => true,
+  bindingId:'fixture', bindingRevision:'1', scopeId:'synthetic', scopeRevision:'1', effect:'write' };
+const discoverWrite = async (f, binding = writeBinding, options = {}) => {
+  const { discoverMcpWriteTools } = await import('../dist/index.js');
+  return discoverMcpWriteTools(f.client, 'fixture', {'remote.search': binding}, {monitor:f.monitor, ...options});
+};
+for (const row of fixture.cases) test(`write effect: ${row.id}`, async t => {
+  const f = await connect(t, {result:row.result, malformed:row.malformed});
+  const catalog = await discoverWrite(f, writeBinding, {limits:row.limits});
+  const result = await run(catalog, row.arguments);
+  assert.equal(result.errorCode ?? null, row.errorCode);
+  assert.equal(result.effectState, row.errorCode === null ? 'committed' : row.errorCode === 'mcp_invalid_arguments' ? 'not_started' : 'unknown');
+  assert.equal(f.calls.length, row.errorCode === 'mcp_invalid_arguments' ? 0 : 1);
+  assert.equal(f.lists.length, 1);
+});
+
+test('write identity is host-owned and requires durable approval', async t => {
+  const { Agent } = await import('purra');
+  const model = {capabilities:fixture.testModelCapabilities, async invoke() { throw new Error('unexpected model call'); }};
+  const f = await connect(t);
+  await assert.rejects(discoverMcpTools(f.client, 'fixture', {'remote.search':writeBinding}, {monitor:f.monitor}), errorCode('mcp_binding_invalid'));
+  for (const changes of [{scope:null}, {effect:'read'}, {bindingId:''}, {concurrencySafe:true}, {policy:{mode:'propose',title:'Write',riskLevel:'write'}}]) {
+    await assert.rejects(discoverWrite(f, {...writeBinding,...changes}), errorCode('mcp_binding_invalid'));
+  }
+  assert.equal(f.lists.length, 0);
+  const digests = [];
+  for (const revision of ['1','2']) {
+    const catalog = await discoverWrite(f, {...writeBinding,bindingRevision:revision});
+    assert.equal(catalog.snapshot.schemaVersion, 2);
+    assert.equal(catalog.registrations[0].approvalBinding.bindingRevision, catalog.snapshot.revisionDigest);
+    assert.equal(catalog.registrations[0].approvalBinding.scopeId, 'synthetic');
+    assert.equal(catalog.registrations[0].concurrencySafe, false);
+    assert.throws(() => new Agent({model, tools:catalog.registrations}), errorCode('approval_idempotency_required'));
+    assert.throws(() => new Agent({model, tools:catalog.registrations, approval:{request:()=> 'approved'},idempotency:{executeOnce:(_,op)=>op()}}), errorCode('approval_idempotency_required'));
+    digests.push(catalog.snapshot.revisionDigest);
+  }
+  assert.notEqual(digests[0],digests[1]);
+  const catalog = await discoverWrite(f);
+  f.monitor.close();
+  assert.equal((await run(catalog)).effectState,'not_started');
+  assert.equal(f.calls.length,0);
+});
+
+for (const mode of ['cancel','timeout','stale','rpc','disconnect']) test(`write inflight ${mode} is unknown`, async t => {
+  const f = await connect(t); f.state.gate = deferred(); f.state.rpcError = mode === 'rpc';
+  const catalog = await discoverWrite(f, writeBinding, {limits:{timeoutMs:mode === 'timeout' ? 100 : 2000}});
+  const controller = new AbortController();
+  const pending = run(catalog, {q:'a'}, {signal:controller.signal});
+  await f.started.promise;
+  if (mode === 'cancel') controller.abort();
+  if (mode === 'stale') { f.monitor.onNotification({method:'notifications/tools/list_changed'}); f.state.gate.resolve(); }
+  if (mode === 'rpc') f.state.gate.resolve();
+  if (mode === 'disconnect') await f.transport.close();
+  const result = await pending;
+  assert.equal(result.effectState,'unknown');
+  assert.equal(result.errorCode, {cancel:'mcp_canceled',timeout:'mcp_timeout',stale:'mcp_catalog_stale',rpc:'mcp_protocol_error',disconnect:'mcp_transport_error'}[mode]);
+  assert.equal(f.calls.length,1);
+});
+
+for (const scenario of ['success','unknown','changed-binding','revoked-scope','wrong-intent']) test(`durable MCP recovery: ${scenario}`, async t => {
+  const { Agent, ApprovalIntent, ApprovalRequired, jsonIdentityDigest } = await import('purra');
+  const { SqliteAgentAdapters } = await import('../../../sqlite/typescript/dist/index.js');
+  const { testGateway } = await import('../../../../typescript/test/support/model-gateway.mjs');
+  const { mkdtempSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const dir = mkdtempSync(join(tmpdir(),'purra-mcp-approval-')), stores = [];
+  t.after(() => { for (const store of stores) store.close(); rmSync(dir,{recursive:true,force:true}); });
+  const f = await connect(t, scenario === 'unknown' ? {result:{isError:true,content:[{type:'text',text:'private failure'}]}} : {});
+  let denied = false, modelCalls = 0;
+  const expiry = Date.now()+60000;
+  const binding = {...writeBinding, scope:() => !denied};
+  const catalog = await discoverWrite(f,binding);
+  const request = {messages:[{role:'user',content:'Write synthetic fixture'}],planningMode:'reactive'};
+  const open = (current = catalog) => {
+    const storage = new SqliteAgentAdapters(join(dir,'db'),{scope:'mcp'}); stores.push(storage);
+    const approvals = storage.approvalStore({authorize:()=>true});
+    const agent = new Agent({runRepository:storage.runs,outputPublisher:storage.publisher,preset:{id:'mcp',revision:'1'},
+      model:testGateway({async invoke(input) {
+        modelCalls++;
+        if (input.messages.some(m => m.role === 'tool') || input.tools.length === 0) return {message:{role:'assistant',content:'done'},finishReason:'stop'};
+        return {message:{role:'assistant',content:'',toolCalls:[{id:'write-1',name:'search',arguments:{q:'a'}}]},finishReason:'tool_calls'};
+      }}), tools:current.registrations,approval:approvals.gateway(),idempotency:storage.idempotency,
+      toolCheckpointNames:['search'],toolCheckpointHandler:async checkpoint => {
+        const call = checkpoint.assistant.toolCalls[0], run = await storage.runs.get(checkpoint.runId);
+        // The wrong-intent case proves the registered binding is checked at dispatch too.
+        const identity = scenario === 'wrong-intent' ? {...catalog.registrations[0].approvalBinding,scopeRevision:'wrong'} : catalog.registrations[0].approvalBinding;
+        const intent = await ApprovalIntent.create({schemaVersion:1,runId:checkpoint.runId,rootRunId:checkpoint.runId,
+          toolCallId:call.id,toolName:call.name,arguments:call.arguments,presetFingerprint:await jsonIdentityDigest(run.preset),...identity});
+        await approvals.prepare(checkpoint,intent,{expiresAtMs:expiry});
+      }});
+    return {storage,approvals,agent};
+  };
+  const first = open(); await first.storage.enableApprovals();
+  const handle = await first.agent.submit(request,{budgets:{maxRunGenerationTokens:null}});
+  await assert.rejects(handle.result,ApprovalRequired);
+  assert.equal(modelCalls,1); assert.equal(f.calls.length,0);
+  const second = open();
+  await assert.rejects((await second.agent.resume(handle.runId,request)).result,ApprovalRequired);
+  assert.equal(modelCalls,1); assert.equal(f.calls.length,0);
+  const [record] = await second.approvals.listPending({runId:handle.runId});
+  await second.approvals.decide({approvalId:record.approvalId,expectedRevision:record.revision,intentDigest:record.intentDigest,commandKey:'approve',decision:'approve'},{principalId:'fixture-host'});
+  const owner = scenario === 'changed-binding' ? open(await discoverWrite(f,{...binding,bindingRevision:'2'})) : second;
+  if (scenario === 'revoked-scope') denied = true;
+  if (scenario === 'success') {
+    assert.equal((await (await owner.agent.resume(handle.runId,request)).result).output,'done');
+    await owner.storage.transaction(async (_,extra) => {
+      const entries = Object.values(extra.tools); assert.equal(entries.length,1);
+      assert.equal(entries[0].state,'complete'); assert.equal(entries[0].result.effectState,'committed');
+    });
+  } else if (scenario === 'unknown') {
+    await assert.rejects((await owner.agent.resume(handle.runId,request)).result,{code:'tool_effect_unknown'});
+    await owner.storage.transaction(async (_,extra) => {
+      const entries = Object.values(extra.tools); assert.equal(entries.length,1); assert.equal(entries[0].state,'claimed');
+    });
+  } else {
+    await assert.rejects((await owner.agent.resume(handle.runId,request)).result);
+  }
+  assert.equal(f.calls.length,['success','unknown'].includes(scenario) ? 1 : 0);
+  const before = f.calls.length;
+  await assert.rejects(owner.agent.resume(handle.runId,request));
+  assert.equal(f.calls.length,before);
+});

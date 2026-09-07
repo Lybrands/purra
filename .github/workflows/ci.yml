@@ -135,14 +135,14 @@ jobs:
         with:
           node-version: 24
       - run: python -m pip install ".[test]" "./integrations/${{ matrix.component }}/python" build
-      - if: matrix.component == 'interaction'
+      - if: matrix.component == 'interaction' || matrix.component == 'mcp'
         run: python -m pip install ./integrations/sqlite/python
       - run: python -m pytest
         working-directory: integrations/${{ matrix.component }}/python
       - run: python -m build --wheel integrations/${{ matrix.component }}/python
       - run: npm ci && npm run build
         working-directory: typescript
-      - if: matrix.component == 'interaction'
+      - if: matrix.component == 'interaction' || matrix.component == 'mcp'
         run: npm ci && npm run build
         working-directory: integrations/sqlite/typescript
       - run: npm ci && npm run check && npm pack --dry-run

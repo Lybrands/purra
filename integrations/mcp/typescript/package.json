@@ -3,7 +3,7 @@
   "version": "1.1.0",
   "type": "module",
   "license": "MIT",
-  "description": "Host-owned, read-only MCP tools for PurrA",
+  "description": "Host-owned MCP tools with durable write approvals for PurrA",
   "files": [
     "dist",
     "README.md",

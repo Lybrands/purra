@@ -5,7 +5,7 @@ English | [简体中文](durable-approval.zh-CN.md)
 This contract now has a Stage B storage foundation: immutable approval records,
 host-authorized transactional decisions and explicit SQLite v5 activation.
 Python and TypeScript now have opt-in single-call tool-ready runtime paths,
-verified for Reactive, Planned and Auto Root Runs. MCP writes are **not yet available**;
+verified for Reactive, Planned and Auto Root Runs. MCP write bindings and local protocol/recovery tests are implemented;
 Stage B is not complete. Existing
 in-memory approvals remain supported. The implemented prerequisite revalidates
 host scope after approval, before entering the tool idempotency gateway.
@@ -302,7 +302,7 @@ Deterministic acceptance currently covers Root Run restart, repeated
 pending recovery, concurrent resume, cancellation after approval, changed binding,
 unknown effects, receipt persistence failure and committed-receipt replay.
 Child write-approval acceptance, broader runtime parity, normalized
-approval inspection, MCP write transport behavior and real service/downstream
+approval inspection and real service/downstream
 validation remain unfinished. This is not a 1.1 release acceptance claim.
 
 ## TypeScript tool-ready runtime path (development)
@@ -356,7 +356,7 @@ Deterministic tests cover restart, repeated pending waits, concurrent resume,
 current-scope denial, expiry between gateway and claim, opaque-key association,
 unknown results, receipt persistence failure and completed-receipt replay.
 The generic inspection recognizes tool checkpoints; normalized approval diagnostics,
-Child write-approval acceptance, MCP writes and real service/downstream acceptance remain
+Child write-approval acceptance and real service/downstream acceptance remain
 unfinished. These tests do not establish end-to-end exactly-once external effects.
 
 ## Root planning and Agent Tree composition
@@ -385,4 +385,19 @@ not a tool name or a caller-provided flag: a business tool named `delegateToAgen
 cannot bypass durable receipt binding. Child grants remain read-only by default.
 This acceptance does not enable Child writes or establish arbitrary mixed/nested
 approval-and-clarification recovery. Those paths, normalized approval diagnostics,
-MCP writes and external/downstream validation remain unfinished.
+External/downstream validation remains unfinished.
+
+## MCP write implementation slice
+
+Both SDKs now provide a separate write discovery entry point (see the MCP package
+READMEs). An immutable optional Core tool approval binding requires a scoped confirm
+policy with matching effect and durable approval/receipt gateways. The effective
+binding revision is the schema-2 catalog digest; the host supplies that current
+registration identity when preparing the checkpoint intent. SQLite compares it
+again at dispatch, including receipt replay. Existing read snapshots remain schema 1.
+
+Shared result cases and local official-SDK servers cover committed success,
+pre-request rejection and post-request unknown effects. SQLite tests reopen the
+approval Run without replaying its model, approve and dispatch once, reject changed
+binding/scope or incorrect intent, and retain claims after remote error. The tests
+use synthetic data. They do not establish third-party service or downstream acceptance.

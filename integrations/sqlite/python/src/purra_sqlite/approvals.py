@@ -305,6 +305,10 @@ class _DurableApprovalGateway:
             return ApprovalResult(None, ApprovalStatus.CANCELED)
         async with self._store._storage._transaction(with_journal=False) as session:
             record = await self._store._dispatch_record(session, run_id, approval.tool_call)
+            if approval.binding is not None:
+                intent = record.intent.to_mapping()
+                if any(intent[key] != value for key, value in approval.binding.items()):
+                    _fail("approval_intent_conflict")
         return ApprovalResult(record.approval_id, ApprovalStatus.APPROVED)
 
     async def resolve(self, run_id, approval_id, decision):
