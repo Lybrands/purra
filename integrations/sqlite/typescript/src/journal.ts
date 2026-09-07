@@ -1,3 +1,4 @@
+import { storageVersion } from "./approval-format.js";
 import type { DatabaseSync } from "node:sqlite";
 import { AgentError, type OutputEvent } from "purra";
 
@@ -105,7 +106,7 @@ export class OutputJournal {
 
   read(runId: string, after: number, limit = 200, root = false): readonly OutputEvent[] {
     const row = this.db.prepare("SELECT version FROM purra_state WHERE scope=? AND sdk='typescript'").get(this.scope);
-    if (row && row.version !== STORAGE_VERSION) throw new Error("unsupported SQLite storage version");
+    if (row && row.version !== storageVersion(this.db)) throw new Error("unsupported SQLite storage version");
     const run = row && this.db.prepare("SELECT root_run_id FROM purra_journal_runs WHERE scope=? AND sdk='typescript' AND run_id=?").get(this.scope, runId);
     if (!run) throw new AgentError("run_not_found", "Run does not exist");
     if (root && run.root_run_id !== runId) throw new AgentError("run_scope_conflict", "Root journal query requires a Root Run");

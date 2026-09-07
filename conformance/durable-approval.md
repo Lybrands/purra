@@ -4,7 +4,9 @@ English | [简体中文](durable-approval.zh-CN.md)
 
 This contract now has a Stage B storage foundation: immutable approval records,
 host-authorized transactional decisions and explicit SQLite v5 activation.
-Run suspension, execution recovery and MCP writes are **not yet available**. Existing
+Python now has an opt-in single-call tool-ready runtime path, verified for
+Reactive Root Runs. TypeScript approval suspension/recovery and MCP writes are
+**not yet available**; Stage B is not complete. Existing
 in-memory approvals remain supported. The implemented prerequisite revalidates
 host scope after approval, before entering the tool idempotency gateway.
 The shared `fixtures/approval_dispatch.json` cases test that prerequisite only.
@@ -23,7 +25,7 @@ durable request never falls back to an in-memory decision when its store or
 authorizer is unavailable. No required method is added to existing host ports.
 
 The three record types below are available from Python `purra.approvals` and
-the TypeScript `purra` entry point. Dispatch association remains unimplemented.
+the TypeScript `purra` entry point. Python dispatch associations are implemented; TypeScript runtime association remains pending.
 Python uses snake_case attributes and methods;
 the persisted/interchange view uses the camelCase names below in both SDKs.
 
@@ -256,6 +258,51 @@ not a dispatch permit.
 records on read. `refresh` explicitly persists expiration or canonical Run
 cancellation. `list_pending` / `listPending` includes pending and approved records
 whose invalidation has not been persisted. Neither this list nor `approved`
-proves current permission. These methods currently create no checkpoint, tool
-claim, Run suspension or public approval event. Existing live approvals remain
-the only runtime approval path until the remaining Stage B wiring is complete.
+proves current permission. The storage-only methods create no checkpoint or tool claim. Python additionally
+exposes the runtime path below; TypeScript still uses the existing live runtime
+approval path.
+
+## Python tool-ready runtime path (development)
+
+`AgentCoreRunOptions(tool_checkpoint_handler=boundary, tool_checkpoint_names=...)`
+adds a host gate before the selected tool batch. Select the explicitly bound write
+tool names; other read-only batches retain their existing behavior. Omit names
+to gate every batch. Any selected batch with multiple calls fails before dispatch.
+The callback receives `AgentToolExecutionCheckpoint` (schema 3, phase
+`tool_ready`) with the actual assistant message, invocation ID and separate model
+budget key. The old `AgentExecutionCheckpoint` remains schema 2 / `model_ready`.
+Provider continuation, planning state, evidence and round counters are preserved.
+
+At each callback, construct `ApprovalIntent` using **current host bindings**, the
+checkpoint's exact call and the canonical Run preset fingerprint. Call
+`await approvals.prepare(checkpoint, intent, expires_at_ms=expiry)` with the
+original absolute expiry on every resume. This commits the intent, tool-ready
+checkpoint and private `approval.required` event together under the active lease.
+A pending decision raises `ApprovalRequired`; the supervisor releases ownership
+and preserves the Run. Do not catch this signal and continue executing tools.
+
+Bind `approval_gateway=approvals.gateway()` and
+`tool_idempotency_gateway=storage.idempotency` to the same `AgentCore`, together
+with SQLite Run/output repositories, publisher and execution lease store. Missing
+or mismatched idempotency binding is rejected. Resolve through `approvals.decide`
+with authenticated host context; the gateway's legacy `resolve` never approves.
+Resume with the original request and the same gate via `core.resume`. Resuming a
+tool-ready Run without the gate is rejected before execution.
+
+Before acquiring the existing tool claim, the SQLite transaction rechecks the
+lease, Run/Root cancellation, settled invocation and budget key, checkpoint/call,
+intent arguments, preset and current approval expiry. The existing executor still
+validates schema and scope, including its post-approval scope check. The claim
+association stores the approved revision, intent digest and lease owner/epoch.
+No external tool call runs inside a database transaction. Known effect results
+commit the receipt and association together; unknown results and receipt-write
+failures retain an unknown claim and block lease recovery. An idle host can use
+the existing `reconcile_tool` with a known result or proof of non-execution.
+A committed, matching receipt can be replayed after expiry without a new effect.
+
+Deterministic acceptance currently covers Reactive Root Run restart, repeated
+pending recovery, concurrent resume, cancellation after approval, changed binding,
+unknown effects, receipt persistence failure and committed-receipt replay.
+Planned/Auto and Agent Tree acceptance, TypeScript runtime parity, normalized
+approval inspection, MCP write transport behavior and real service/downstream
+validation remain unfinished. This is not a 1.1 release acceptance claim.

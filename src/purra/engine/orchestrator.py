@@ -25,8 +25,9 @@ from purra.agent_tree import (
     SpawnAgentsCommand,
     SpawnAgentsReceipt,
 )
-from purra.agent_execution_checkpoint import AgentExecutionCheckpoint
+from purra.agent_execution_checkpoint import AgentExecutionCheckpoint, AgentToolExecutionCheckpoint
 from purra.interaction import UserInputRequired
+from purra.approvals import ApprovalRequired
 from purra.evidence import RunEvidenceStore
 from purra.agent_tree_execution import (
     AgentTreeExecutionResult,
@@ -866,6 +867,11 @@ class AgentCore:
             raise ContractViolationError(
                 "Run has no resumable checkpoint", code="checkpoint_missing",
             )
+        if isinstance(snapshot.execution_checkpoint, AgentToolExecutionCheckpoint):
+            pending_names = {call.name for call in snapshot.execution_checkpoint.assistant.tool_calls}
+            if (options is None or options.tool_checkpoint_handler is None
+                    or options.tool_checkpoint_names is not None and not pending_names <= options.tool_checkpoint_names):
+                raise ContractViolationError("Tool-ready recovery requires its host gate", code="approval_gate_unavailable")
         return await self.submit(request, options=replace(
             options or AgentCoreRunOptions(), agent_execution_checkpoint=snapshot.execution_checkpoint,
             deadline_at_ms=snapshot.deadline_at_ms,
@@ -1546,7 +1552,7 @@ class AgentCore:
                 controller,
                 model=(runtime_result.model if runtime_result is not None else request.model.model),
             )
-        except UserInputRequired:
+        except (UserInputRequired, ApprovalRequired):
             input_suspended = True
             raise
         except Exception as error:
@@ -2778,6 +2784,12 @@ class AgentCore:
             )
             await controller.save_execution_checkpoint(saved)
             return saved
+        async def tool_checkpoint(checkpoint):
+            saved = replace(checkpoint,
+                execution_profile="planned" if plan is not None else planning_mode.value,
+                planning_state=planning_hook.checkpoint_state() if planning_hook is not None else {},
+            )
+            await options.tool_checkpoint_handler(saved)
         try:
             stream = runtime.run(
                 prepared_request,
@@ -2841,10 +2853,12 @@ class AgentCore:
                 resume_checkpoint=resume_checkpoint,
                 checkpoint_writer=(
                     save_checkpoint
-                    if options.agent_tree_run_id is not None or options.checkpoint_handler is not None
+                    if options.agent_tree_run_id is not None or options.checkpoint_handler is not None or options.tool_checkpoint_handler is not None
                     else None
                 ),
                 checkpoint_handler=options.checkpoint_handler,
+                tool_checkpoint_handler=tool_checkpoint if options.tool_checkpoint_handler is not None else None,
+                tool_checkpoint_names=options.tool_checkpoint_names,
                 signal=signal,
             )
             async with aclosing(stream) as updates:
@@ -2878,7 +2892,7 @@ class AgentCore:
                 round_count=0,
                 error_code=error.code,
             )
-        except UserInputRequired:
+        except (UserInputRequired, ApprovalRequired):
             raise
         except Exception as error:
             await _record_safe_exception(

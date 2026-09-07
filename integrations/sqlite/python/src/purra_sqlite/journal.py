@@ -115,7 +115,8 @@ class OutputJournal:
         row = self.db.execute(
             "SELECT version FROM purra_state WHERE scope=? AND sdk='python'", (self.scope,),
         ).fetchone()
-        if row and row[0] != STORAGE_VERSION:
+        from .approval_format import storage_version
+        if row and row[0] != storage_version(self.db):
             raise ValueError("unsupported SQLite storage version")
         run = self.db.execute(
             "SELECT root_run_id FROM purra_journal_runs WHERE scope=? AND sdk='python' AND run_id=?",

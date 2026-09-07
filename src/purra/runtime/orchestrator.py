@@ -20,7 +20,7 @@ from purra.cancellation import (
     is_canceled as _is_canceled,
     stop_reason,
 )
-from purra.agent_execution_checkpoint import AgentExecutionCheckpoint
+from purra.agent_execution_checkpoint import AgentExecutionCheckpoint, AgentToolExecutionCheckpoint
 from purra.context_budget import (
     context_budget_contract_error as _context_budget_contract_error,
     estimate_agent_messages_tokens,
@@ -209,6 +209,7 @@ class _RuntimeLoopState:
     retry_round: bool = False
     terminal_result: AgentRuntimeResult | None = None
     provider_attempt: _PendingProviderAttempt | None = None
+    pending_tool_checkpoint: AgentToolExecutionCheckpoint | None = None
     stream: Any = None
     accumulator: _ModelRoundAccumulator | None = None
     direct_content_released: bool = False
@@ -291,6 +292,8 @@ class AgentRuntime:
         checkpoint_writer: (
             Callable[[AgentExecutionCheckpoint], Awaitable[AgentExecutionCheckpoint | None]] | None
         ) = None,
+        tool_checkpoint_names: frozenset[str] | None = None,
+        tool_checkpoint_handler: Callable[[AgentToolExecutionCheckpoint], Awaitable[None]] | None = None,
         checkpoint_handler: Callable[[AgentExecutionCheckpoint], Awaitable[AgentExecutionCheckpoint]] | None = None,
         signal: CancellationSignal | None = None,
     ) -> AsyncIterator[RuntimeUpdate]:
@@ -325,6 +328,8 @@ class AgentRuntime:
             context_budget=context_budget,
         )
         start_round_index = 0
+        if isinstance(resume_checkpoint, AgentToolExecutionCheckpoint) and tool_checkpoint_handler is None:
+            raise ContractViolationError("Tool-ready continuation requires its host gate", code="approval_gate_unavailable")
         if resume_checkpoint is not None:
             if run_id is None or resume_checkpoint.run_id != run_id:
                 raise ContractViolationError(
@@ -332,11 +337,12 @@ class AgentRuntime:
                     code="agent_execution_checkpoint_conflict",
                 )
             self._restore_checkpoint(loop, resume_checkpoint)
-            if checkpoint_handler is not None:
+            if checkpoint_handler is not None and not isinstance(resume_checkpoint, AgentToolExecutionCheckpoint):
                 resumed = await checkpoint_handler(resume_checkpoint)
                 if resumed.run_id != resume_checkpoint.run_id:
                     raise ValueError("checkpoint handler changed Run identity")
                 self._restore_checkpoint(loop, resumed)
+            loop.pending_tool_checkpoint = resume_checkpoint if isinstance(resume_checkpoint, AgentToolExecutionCheckpoint) else None
             start_round_index = resume_checkpoint.next_round - 1
             if start_round_index >= loop.absolute_round_limit:
                 yield _runtime_result(
@@ -404,82 +410,115 @@ class AgentRuntime:
                 )
                 return
 
-            await self._prepare_provider_attempt(
-                loop,
-                request,
-                context_budget=context_budget,
-                round_input_tokens=round_input_tokens,
-                output_budget=output_budget,
-                scope_tools_to_observer=scope_tools_to_observer,
-                reasoning_mode=reasoning_mode,
-                planning_hook=planning_hook,
-                stage_context_projection_enabled=(
-                    stage_context_projection_enabled
-                ),
-                signal=signal,
-                run_id=run_id,
-            )
-            if loop.terminal_result is not None:
-                yield loop.terminal_result
-                return
+            if loop.pending_tool_checkpoint is None:
+                await self._prepare_provider_attempt(
+                    loop,
+                    request,
+                    context_budget=context_budget,
+                    round_input_tokens=round_input_tokens,
+                    output_budget=output_budget,
+                    scope_tools_to_observer=scope_tools_to_observer,
+                    reasoning_mode=reasoning_mode,
+                    planning_hook=planning_hook,
+                    stage_context_projection_enabled=(
+                        stage_context_projection_enabled
+                    ),
+                    signal=signal,
+                    run_id=run_id,
+                )
+                if loop.terminal_result is not None:
+                    yield loop.terminal_result
+                    return
 
-            async for event in self._execute_provider_stream(
-                loop,
-                run_id=run_id,
-                output_budget=output_budget,
-                signal=signal,
-            ):
-                yield event
-            if loop.terminal_result is not None:
-                yield loop.terminal_result
-                return
-            if loop.retry_round:
-                continue
+                async for event in self._execute_provider_stream(
+                    loop,
+                    run_id=run_id,
+                    output_budget=output_budget,
+                    signal=signal,
+                ):
+                    yield event
+                if loop.terminal_result is not None:
+                    yield loop.terminal_result
+                    return
+                if loop.retry_round:
+                    continue
 
-            async for event in self._classify_model_output(
-                loop,
-                response_constraints=response_constraints,
-                output_budget=output_budget,
-                planning_hook=planning_hook,
-                planning_mode=planning_mode,
-                signal=signal,
-                run_id=run_id,
-            ):
-                yield event
-            if loop.terminal_result is not None:
-                yield loop.terminal_result
-                return
-            if loop.retry_round:
-                continue
+                async for event in self._classify_model_output(
+                    loop,
+                    response_constraints=response_constraints,
+                    output_budget=output_budget,
+                    planning_hook=planning_hook,
+                    planning_mode=planning_mode,
+                    signal=signal,
+                    run_id=run_id,
+                ):
+                    yield event
+                if loop.terminal_result is not None:
+                    yield loop.terminal_result
+                    return
+                if loop.retry_round:
+                    continue
 
-            activation = await self._resolve_planning_activation(
-                loop,
-                planning_mode=planning_mode,
-                planning_available=planning_available,
-                planning_required_tool_names=planning_required_tool_names,
-                run_id=run_id,
-            )
-            if isinstance(activation, AgentRuntimeResult):
-                yield activation
-                return
-            if activation is not None:
-                yield activation
-                return
+                activation = await self._resolve_planning_activation(
+                    loop,
+                    planning_mode=planning_mode,
+                    planning_available=planning_available,
+                    planning_required_tool_names=planning_required_tool_names,
+                    run_id=run_id,
+                )
+                if isinstance(activation, AgentRuntimeResult):
+                    yield activation
+                    return
+                if activation is not None:
+                    yield activation
+                    return
 
-            async for event in self._authorize_tool_batch(
-                loop,
-                planning_hook=planning_hook,
-                scope_tools_to_observer=scope_tools_to_observer,
-                tools_executable=tools_executable,
-                signal=signal,
-                run_id=run_id,
-            ):
-                yield event
-            if loop.terminal_result is not None:
-                yield loop.terminal_result
-                return
-            if loop.retry_round:
-                continue
+                async for event in self._authorize_tool_batch(
+                    loop,
+                    planning_hook=planning_hook,
+                    scope_tools_to_observer=scope_tools_to_observer,
+                    tools_executable=tools_executable,
+                    signal=signal,
+                    run_id=run_id,
+                ):
+                    yield event
+                if loop.terminal_result is not None:
+                    yield loop.terminal_result
+                    return
+                if loop.retry_round:
+                    continue
+
+            else:
+                pending = loop.pending_tool_checkpoint
+                loop.calls = pending.assistant.tool_calls
+                loop.requested_names = frozenset(call.name for call in loop.calls)
+                loop.allowed_names = frozenset(pending.allowed_tool_names) & frozenset(tool.name for tool in loop.configured_tools)
+                if not tools_executable or not loop.requested_names <= loop.allowed_names:
+                    raise ContractViolationError("Pending tool is no longer available", code="approval_tool_unavailable")
+
+            if loop.pending_tool_checkpoint is not None and tool_checkpoint_names is not None and not loop.requested_names <= tool_checkpoint_names:
+                raise ContractViolationError("Pending tool gate binding changed", code="approval_gate_unavailable")
+            if tool_checkpoint_handler is not None and (tool_checkpoint_names is None or any(call.name in tool_checkpoint_names for call in loop.calls)):
+                if loop.pending_tool_checkpoint is None:
+                    if len(loop.calls) != 1:
+                        raise ContractViolationError("Durable tool boundary requires one call", code="approval_batch_unsupported")
+                    base = self._build_execution_checkpoint(loop, run_id)
+                    if base is None:
+                        raise ContractViolationError("Tool boundary is not serializable", code="approval_checkpoint_unavailable")
+                    from dataclasses import fields
+                    loop.pending_tool_checkpoint = AgentToolExecutionCheckpoint(
+                        **{item.name: getattr(base, item.name) for item in fields(AgentExecutionCheckpoint)
+                           if item.name not in {"schema_version", "phase", "next_round"}},
+                        next_round=loop.round_number,
+                        assistant=AgentMessage(role=MessageRole.ASSISTANT,
+                            content="" if loop.require_tool else loop.accumulator.content,
+                            reasoning=loop.accumulator.reasoning, provider_data=loop.accumulator.provider_data,
+                            tool_calls=loop.calls),
+                        invocation_id=loop.stream.receipt.invocation_id,
+                        model_budget_key=loop.stream.receipt.budget_key or loop.stream.receipt.invocation_id,
+                        allowed_tool_names=tuple(loop.allowed_names),
+                    )
+                await tool_checkpoint_handler(loop.pending_tool_checkpoint)
 
             async for event in self._execute_tool_batch(
                 loop,
@@ -492,6 +531,7 @@ class AgentRuntime:
             if loop.terminal_result is not None:
                 yield loop.terminal_result
                 return
+            loop.pending_tool_checkpoint = None
             if planning_mode is PlanningMode.AUTO and loop.calls:
                 loop.initial_planning_open = False
             if checkpoint_writer is not None:
@@ -777,9 +817,11 @@ class AgentRuntime:
         signal: CancellationSignal | None,
         run_id: RunId | None,
     ) -> AsyncIterator[AgentEvent]:
-        accumulator = loop.accumulator
-        if accumulator is None or loop.stream is None:
+        pending = loop.pending_tool_checkpoint
+        accumulator = pending.assistant if pending is not None else loop.accumulator
+        if accumulator is None or pending is None and loop.stream is None:
             raise RuntimeError("tool execution has no settled model response")
+        invocation_id = pending.invocation_id if pending is not None else loop.stream.receipt.invocation_id
         tool_started = perf_counter()
         try:
             batch_result: ToolBatchResult | None = None
@@ -791,7 +833,7 @@ class AgentRuntime:
                 self._tool_execution_gateway,
                 ToolBatchRequest(
                     run_id=run_id,
-                    invocation_id=loop.stream.receipt.invocation_id,
+                    invocation_id=invocation_id,
                     calls=loop.calls,
                     allowed_tool_names=(
                         loop.allowed_names

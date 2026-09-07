@@ -12,7 +12,8 @@ The application supplies its models, tools, data sources, and access rules.
 This checkout is unreleased 1.1.0 development. Install matching local Core and
 integration artifacts; registry commands do not identify this development build.
 The [durable approval contract](conformance/durable-approval.md) describes the
-work in progress. Durable approval recovery and MCP writes are not yet available.
+work in progress. Python approval recovery is in development with Reactive Root tests; TypeScript
+approval recovery and MCP writes are not yet available.
 Existing capabilities and 1.x compatibility are documented in the
 [1.0 support guide](conformance/release-1.0.md).
 

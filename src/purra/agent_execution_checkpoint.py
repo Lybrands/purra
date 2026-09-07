@@ -330,3 +330,68 @@ def _mapping(value: Any, label: str) -> Mapping[str, Any]:
 
 
 __all__ = ["AgentExecutionCheckpoint"]
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class AgentToolExecutionCheckpoint(AgentExecutionCheckpoint):
+    """A settled model round whose single tool call has not been dispatched.
+
+    This boundary preserves the real assistant continuation and invocation identity.
+    It carries no authorization; a bound gate must revalidate it before dispatch.
+    """
+    assistant: AgentMessage
+    invocation_id: str
+    model_budget_key: str
+    allowed_tool_names: tuple[str, ...]
+    schema_version: int = 3
+    phase: str = "tool_ready"
+
+    def __post_init__(self):
+        from dataclasses import fields
+        if type(self.schema_version) is not int or self.schema_version != 3 or self.phase != "tool_ready":
+            raise ValueError("invalid tool-ready checkpoint version or phase")
+        if type(self.next_round) is not int or type(self.round_limit) is not int:
+            raise ValueError("tool-ready round values must be integers")
+        if not isinstance(self.allowed_tool_names, (tuple, list)):
+            raise TypeError("tool-ready allowed names must be a sequence")
+        values = {item.name: getattr(self, item.name) for item in fields(AgentExecutionCheckpoint)}
+        validated = AgentExecutionCheckpoint(**{**values, "schema_version": 2, "phase": "model_ready"})
+        for item in fields(AgentExecutionCheckpoint):
+            if item.name not in {"schema_version", "phase"}:
+                object.__setattr__(self, item.name, getattr(validated, item.name))
+        if not isinstance(self.assistant, AgentMessage) or self.assistant.role is not MessageRole.ASSISTANT or len(self.assistant.tool_calls) != 1:
+            raise ValueError("tool-ready checkpoint requires one assistant tool call")
+        call = self.assistant.tool_calls[0]
+        required_text(call.id, "pending tool call id")
+        required_text(call.name, "pending tool name")
+        if any(call.id == old.id for message in self.messages for old in message.tool_calls):
+            raise ValueError("pending tool call already exists in checkpoint history")
+        names = tuple(sorted(required_text(name, "allowed tool name") for name in self.allowed_tool_names))
+        if len(names) != len(set(names)) or call.name not in names:
+            raise ValueError("invalid tool-ready allowed tool names")
+        object.__setattr__(self, "allowed_tool_names", names)
+        object.__setattr__(self, "invocation_id", required_text(self.invocation_id, "settled invocation id"))
+        object.__setattr__(self, "model_budget_key", required_text(self.model_budget_key, "settled budget key"))
+        if self.next_round >= self.round_limit:
+            raise ValueError("tool-ready checkpoint requires a remaining model round")
+
+    def to_mapping(self):
+        return {**AgentExecutionCheckpoint.to_mapping(self), "assistant": _message_to_mapping(self.assistant),
+                "invocationId": self.invocation_id, "modelBudgetKey": self.model_budget_key, "allowedToolNames": list(self.allowed_tool_names)}
+
+    @classmethod
+    def from_mapping(cls, value):
+        from dataclasses import fields
+        if value.get("schemaVersion") != 3 or value.get("phase") != "tool_ready":
+            raise ValueError("invalid tool-ready checkpoint")
+        if type(value.get("nextRound")) is not int or type(value.get("roundLimit")) is not int or not isinstance(value.get("allowedToolNames"), (list, tuple)):
+            raise ValueError("invalid tool-ready checkpoint fields")
+        base = AgentExecutionCheckpoint.from_mapping({**value, "schemaVersion": 2, "phase": "model_ready"})
+        if set(value) != set(base.to_mapping()) | {"assistant", "invocationId", "modelBudgetKey", "allowedToolNames"}:
+            raise ValueError("invalid tool-ready checkpoint fields")
+        return cls(**{item.name: getattr(base, item.name) for item in fields(AgentExecutionCheckpoint) if item.name not in {"schema_version", "phase"}},
+                   assistant=_message_from_mapping(value["assistant"]), invocation_id=value["invocationId"], model_budget_key=value["modelBudgetKey"],
+                   allowed_tool_names=tuple(value["allowedToolNames"]))
+
+
+__all__.append("AgentToolExecutionCheckpoint")

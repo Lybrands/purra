@@ -34,6 +34,7 @@ class AgentExecutionFactory(Protocol):
 
 from purra.execution.ownership import execution_owner, execution_claim
 from purra.interaction import UserInputRequired
+from purra.approvals import ApprovalRequired
 
 
 class AgentRunSupervisor:
@@ -201,7 +202,7 @@ class AgentRunSupervisor:
             _settle_future_exception(ready, error)
             _settle_future_exception(result_future, error)
             raise
-        except UserInputRequired as error:
+        except (UserInputRequired, ApprovalRequired) as error:
             if session is not None:
                 await session.close()
                 session = None

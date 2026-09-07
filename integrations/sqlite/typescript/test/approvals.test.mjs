@@ -19,7 +19,10 @@ test('explicit activation preserves history and rejects preopened legacy writes'
  const f=setup(t),s=f.open();await assertRunRepositoryConforms(s.runs);
  const db=new DatabaseSync(f.path);t.after(()=>db.close());
  const before=db.prepare("SELECT body FROM purra_state WHERE sdk='typescript'").get().body;
+ const events=await s.runs.listEvents("conformance-run-1",0);
  await s.enableApprovals();await s.enableApprovals();
+ assert.deepEqual(await s.runs.listEvents("conformance-run-1",0),events);
+ await s.publisher.publishCommitted(events[0]);
  assert.equal(db.prepare("SELECT body FROM purra_state WHERE sdk='typescript'").get().body,before);
  assert.ok(db.prepare('SELECT 1 FROM purra_state WHERE version != 4').get());
  assert.throws(()=>db.exec("INSERT INTO purra_state VALUES('new','typescript',4,'{}')"),/unsupported SQLite storage version/);

@@ -27,7 +27,7 @@ from purra.contracts import (
     ToolHandlerResult,
     TraceRecord,
 )
-from purra.agent_execution_checkpoint import AgentExecutionCheckpoint
+from purra.agent_execution_checkpoint import AgentExecutionCheckpoint, AgentToolExecutionCheckpoint
 from purra.errors import ContractViolationError
 from purra.events import AgentEvent
 from purra.json_values import thaw_json_mapping
@@ -281,6 +281,8 @@ def _apply_commit(record: _RunRecord, commit: RunCommit) -> None:
                 checkpoint.next_round == current.next_round
                 and checkpoint != current
                 and not is_input_checkpoint_update(current, checkpoint)
+                and not (type(current) is AgentExecutionCheckpoint and isinstance(checkpoint, AgentToolExecutionCheckpoint)
+                         and checkpoint.messages[:len(current.messages)] == current.messages)
             ):
                 raise ContractViolationError(
                     "Agent execution checkpoint content conflicts",

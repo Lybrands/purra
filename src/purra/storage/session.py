@@ -103,6 +103,19 @@ class StorageSession:
     def running_run_ids(self):
         return tuple(key for key, run in self._state.runs.items() if run.status is RunStatus.RUNNING)
 
+    def has_settled_tool_invocation(self, run_id, invocation_id, model_budget_key):
+        run = self._state.runs.get(run_id)
+        stream_id = self._state.stream_by_invocation.get(invocation_id)
+        stream = self._state.streams.get(stream_id)
+        return bool(run is not None and model_budget_key in run.model_usage_by_invocation
+                    and run.model_attempt_ids == set(run.model_usage_by_invocation)
+                    and stream is not None and stream.spec.run_id == run_id and stream.status == "committed"
+                    and stream.finish_reason is not None and stream.finish_reason.value == "tool_calls")
+
+    def has_tool_ready_checkpoint(self):
+        from purra.agent_execution_checkpoint import AgentToolExecutionCheckpoint
+        return any(isinstance(row.execution_checkpoint, AgentToolExecutionCheckpoint) for row in self._state.runs.values())
+
     def has_unsettled_execution(self):
         """Whether an offline storage capability change must wait for execution."""
         return bool(self.running_run_ids() or self.claims or any(

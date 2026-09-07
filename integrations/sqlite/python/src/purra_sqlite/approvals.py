@@ -86,28 +86,132 @@ class SqliteApprovalStore:
         _integer(expires_at_ms, "expiry")
         identifier = json_identity_digest({"profile": "purra.approval-key/v1", "runId": intent.run_id, "toolCallId": intent.tool_call_id})
         async with self._storage._transaction(with_journal=False) as session:
-            self._enabled()
-            canceled, deadline, fingerprint = await self._run_state(session, intent)
-            if canceled:
-                _fail("approval_run_terminal")
-            if fingerprint != intent.preset_fingerprint:
-                _fail("approval_configuration_mismatch")
-            expiry = min(expires_at_ms, deadline) if deadline is not None else expires_at_ms
-            existing = self._storage._db.execute(
-                "SELECT 1 FROM purra_approvals WHERE scope=? AND sdk='python' AND approval_id=?",
-                (self._storage.scope, identifier),
-            ).fetchone()
-            if existing:
-                record = self._load(identifier)
-                if record.intent.digest != intent.digest or record.expires_at_ms != expiry:
-                    _fail("approval_intent_conflict")
-                return record
-            now = self._now()
-            if now >= expiry:
-                _fail("approval_expired")
-            record = ApprovalRecord(identifier, intent, 1, "pending", now, expiry)
-            self._save(record)
+            return await self._create(session, intent, expires_at_ms, identifier)
+
+    async def _create(self, session, intent, expires_at_ms, identifier):
+        self._enabled()
+        canceled, deadline, fingerprint = await self._run_state(session, intent)
+        if canceled:
+            _fail("approval_run_terminal")
+        if fingerprint != intent.preset_fingerprint:
+            _fail("approval_configuration_mismatch")
+        expiry = min(expires_at_ms, deadline) if deadline is not None else expires_at_ms
+        existing = self._storage._db.execute(
+            "SELECT 1 FROM purra_approvals WHERE scope=? AND sdk='python' AND approval_id=?",
+            (self._storage.scope, identifier),
+        ).fetchone()
+        if existing:
+            record = self._load(identifier)
+            if record.intent.digest != intent.digest or record.expires_at_ms != expiry:
+                _fail("approval_intent_conflict")
             return record
+        now = self._now()
+        if now >= expiry:
+            _fail("approval_expired")
+        record = ApprovalRecord(identifier, intent, 1, "pending", now, expiry)
+        self._save(record)
+        return record
+
+    async def prepare(self, checkpoint, intent, *, expires_at_ms):
+        """Commit the intent and real tool-ready cursor together, then suspend.
+
+        Called only by a leased runtime boundary. Reconstruct intent from current
+        host bindings on every resume; no record itself grants dispatch authority.
+        """
+        from purra.agent_execution_checkpoint import AgentToolExecutionCheckpoint
+        from purra.approvals import ApprovalRequired
+        from purra.ports import RunCommit
+        from purra.events import AgentEvent
+        if not isinstance(checkpoint, AgentToolExecutionCheckpoint) or not isinstance(intent, ApprovalIntent):
+            raise TypeError("tool-ready checkpoint and intent required")
+        _integer(expires_at_ms, "expiry")
+        call = checkpoint.assistant.tool_calls[0]
+        if (checkpoint.run_id != intent.run_id or call.id != intent.tool_call_id or call.name != intent.tool_name
+                or json_identity_digest(json.loads(call.arguments_json)) != json_identity_digest(intent.arguments)):
+            _fail("approval_checkpoint_conflict")
+        identifier = json_identity_digest({"profile": "purra.approval-key/v1", "runId": intent.run_id, "toolCallId": intent.tool_call_id})
+        async with self._storage._transaction() as session:
+            self._require_owner(session, intent.run_id)
+            if not session.has_settled_tool_invocation(intent.run_id, checkpoint.invocation_id, checkpoint.model_budget_key):
+                _fail("approval_invocation_unsettled")
+            record = await self._create(session, intent, expires_at_ms, identifier)
+            current = (await session.runs.get(intent.run_id)).execution_checkpoint
+            if current != checkpoint:
+                await session.runs.commit(intent.run_id, RunCommit(execution_checkpoint=checkpoint,
+                    events=(AgentEvent("agent.execution_checkpointed", {"schemaVersion": 3, "phase": "tool_ready", "nextRound": checkpoint.next_round}, intent.run_id),)))
+                if record.status == "pending":
+                    from datetime import datetime, timezone
+                    from purra.output import AgentOutputEventDraft
+                    await session.outputs.append_event(AgentOutputEventDraft(
+                        run_id=intent.run_id, turn_id=None, output_stream_id=None, invocation_id=checkpoint.invocation_id,
+                        source_event_key=f"approval:{record.approval_id}:required:{record.revision}",
+                        source="runtime", kind="runtime.event", channel="lifecycle", visibility="private",
+                        payload={"type": "approval.required", "status": "pending", "revision": record.revision},
+                        occurred_at=datetime.now(timezone.utc)))
+            record, _ = await self._refresh(session, record, self._now())
+            completed = self._completed_receipt(session, record, call)
+        if completed:
+            return record
+        if record.status == "pending":
+            raise ApprovalRequired(record.intent.run_id, record.approval_id)
+        if record.status != "approved":
+            _fail("approval_" + record.status)
+        return record
+
+    def _require_owner(self, session, run_id):
+        from purra.execution.ownership import execution_owner, execution_claim
+        claim = execution_claim.get()
+        lease = session.leases.get(run_id)
+        if (claim is None or claim[0] != run_id or lease is None or execution_owner.get() is None
+                or lease.owner_id != execution_owner.get() or claim[2] != lease.attempt
+                or (lease.expires_at_ms or 0) <= int(time.time() * 1000)):
+            _fail("agent_run_lease_lost")
+
+    def gateway(self):
+        """Bind only alongside prepare and this adapter's idempotency gateway."""
+        return _DurableApprovalGateway(self)
+
+    def _completed_receipt(self, session, record, call):
+        receipt = session.get_tool_receipt((record.intent.run_id, call.id))
+        if receipt is None:
+            return False
+        association = session.extra.get("approvalExecutions", {}).get(record.approval_id)
+        if (receipt[0] != call or receipt[1].effect_state.value == "unknown" or not isinstance(association, dict)
+                or set(association) != {"intentDigest", "state", "effectState", "approvalRevision", "leaseOwnerId", "leaseEpoch"}
+                or association["intentDigest"] != record.intent.digest or association["state"] != "complete"
+                or association["effectState"] != receipt[1].effect_state.value
+                or association["approvalRevision"] != record.decision_audit.get("revision")
+                or not isinstance(association["leaseOwnerId"], str) or not association["leaseOwnerId"]
+                or type(association["leaseEpoch"]) is not int or association["leaseEpoch"] < 1):
+            _fail("approval_claim_conflict")
+        return True
+
+    async def _dispatch_record(self, session, run_id, call):
+        self._enabled()
+        from purra.agent_execution_checkpoint import AgentToolExecutionCheckpoint
+        self._require_owner(session, run_id)
+        identifier = json_identity_digest({"profile": "purra.approval-key/v1", "runId": run_id, "toolCallId": call.id})
+        record = self._load(identifier)
+        intent = record.intent
+        checkpoint = (await session.runs.get(run_id)).execution_checkpoint
+        if (not isinstance(checkpoint, AgentToolExecutionCheckpoint) or checkpoint.assistant.tool_calls != (call,)
+                or call.name != intent.tool_name
+                or json_identity_digest(json.loads(call.arguments_json)) != json_identity_digest(intent.arguments)):
+            _fail("approval_checkpoint_conflict")
+        if not session.has_settled_tool_invocation(run_id, checkpoint.invocation_id, checkpoint.model_budget_key):
+            _fail("approval_invocation_unsettled")
+        if self._completed_receipt(session, record, call):
+            return record
+        canceled, deadline, fingerprint = await self._run_state(session, intent)
+        if canceled:
+            _fail("approval_canceled")
+        if record.status != "approved":
+            _fail("approval_" + record.status)
+        if self._now() >= min(record.expires_at_ms, deadline if deadline is not None else record.expires_at_ms):
+            _fail("approval_expired")
+        if fingerprint != intent.preset_fingerprint:
+            _fail("approval_configuration_mismatch")
+        return record
 
     async def get(self, approval_id):
         async with self._storage._connection(read_only=True):
@@ -183,3 +287,29 @@ def _receipt(record):
     return freeze_json_mapping({"approvalId": record.approval_id, "intentDigest": record.intent.digest,
         "commandKey": audit["command"]["commandKey"], "status": "approved" if audit["command"]["decision"] == "approve" else "rejected",
         "revision": audit["revision"], "decidedAtMs": audit["decidedAtMs"]})
+
+
+class _DurableApprovalGateway:
+    requires_durable_idempotency = True
+
+    @property
+    def idempotency_gateway(self):
+        return self._store._storage.idempotency
+
+    def __init__(self, store):
+        self._store = store
+
+    async def request(self, run_id, approval, event_sink, signal=None):
+        from purra.contracts import ApprovalResult, ApprovalStatus
+        if signal is not None and signal.is_set():
+            return ApprovalResult(None, ApprovalStatus.CANCELED)
+        async with self._store._storage._transaction(with_journal=False) as session:
+            record = await self._store._dispatch_record(session, run_id, approval.tool_call)
+        return ApprovalResult(record.approval_id, ApprovalStatus.APPROVED)
+
+    async def resolve(self, run_id, approval_id, decision):
+        return None
+
+    async def cancel_pending(self, run_id):
+        # Suspending a durable Run must not cancel its persisted intent.
+        return 0

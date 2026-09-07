@@ -78,6 +78,10 @@ class CoreToolExecutor:
         idempotency_gateway: ToolIdempotencyGateway | None = None,
         operation_controller: AgentOperationController | None = None,
     ) -> None:
+        if getattr(approval_gateway, "requires_durable_idempotency", False) is True:
+            expected = getattr(approval_gateway, "idempotency_gateway", None)
+            if expected is None or idempotency_gateway is not expected:
+                raise ContractViolationError("Durable approval requires its bound idempotency gateway", code="approval_idempotency_unavailable")
         registrations = validate_tool_contract(catalog.registrations())
         self._registrations = MappingProxyType({
             registration.schema.name: registration

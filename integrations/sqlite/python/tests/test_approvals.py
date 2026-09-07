@@ -36,7 +36,9 @@ async def test_explicit_activation_preserves_history_and_fences_preopened_legacy
         await begin(storage)
         await storage.runs.commit('run-1',RunCommit(terminal_status='done',final_response='done', events=(AgentEvent('run.completed', {}, 'run-1'),)))
         before=legacy.execute("SELECT body FROM purra_state WHERE sdk='python'").fetchone()[0]
+        before_events=await storage.outputs.list_events("run-1",after_sequence=0)
         await storage.enable_approvals()
+        assert await storage.outputs.list_events("run-1",after_sequence=0)==before_events
         assert legacy.execute("SELECT body FROM purra_state WHERE sdk='python'").fetchone()[0]==before
         assert legacy.execute('SELECT 1 FROM purra_state WHERE version != 4 LIMIT 1').fetchone()
         with pytest.raises(sqlite3.IntegrityError,match='unsupported SQLite storage version'):

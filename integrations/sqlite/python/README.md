@@ -180,7 +180,9 @@ See the Core [inspection contract](../../../conformance/integration-inspection.m
 ## 1.1 approval storage foundation (unreleased)
 
 Explicit offline v5 activation and host-authorized decision storage are available.
-They do not yet suspend or resume Runs, acquire tool claims, or permit writes.
+Python now has an opt-in tool-ready runtime gate with Reactive Root recovery and
+atomic claim/receipt association. Extended runtime and MCP write acceptance remain
+incomplete.
 Keep production databases on their current format until the runtime integration
 and acceptance are complete. See the [durable approval contract](../../../conformance/durable-approval.md#storage-foundation-api)
 for activation, API methods, replay behavior and SDK format boundaries.

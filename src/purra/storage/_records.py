@@ -10,7 +10,7 @@ from purra.adapters.memory import (
     _RunRecord, _StreamRecord,
 )
 from purra.agent_execution_checkpoint import (
-    AgentExecutionCheckpoint,
+    AgentExecutionCheckpoint, AgentToolExecutionCheckpoint,
 )
 from purra.agent_tree import (
     AgentCapabilityGrant, AgentNode, AgentNodeState, AgentTreeRun, AgentTreeRunStatus, ContextCheckpoint, ContinueAgentReceipt, SpawnAgentsReceipt, SpawnedAgent,
@@ -143,3 +143,5 @@ ENUMS = {
     "ToolStepDisposition": ToolStepDisposition,
     "VisibleOutputReservation": VisibleOutputReservation,
 }
+
+RECORDS["AgentToolExecutionCheckpoint"] = (AgentToolExecutionCheckpoint, RECORDS["AgentExecutionCheckpoint"][1] + ("assistant", "invocation_id", "model_budget_key", "allowed_tool_names"))

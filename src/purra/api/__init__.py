@@ -44,7 +44,7 @@ from purra.agent_tree_execution import (
     RunCommandService,
 )
 from purra.agent_tree_policy import AgentTreePolicy
-from purra.agent_execution_checkpoint import AgentExecutionCheckpoint
+from purra.agent_execution_checkpoint import AgentExecutionCheckpoint, AgentToolExecutionCheckpoint
 from purra.agent_tree_lease import (
     AgentRunLeaseClaim,
     current_agent_run_lease,
@@ -169,3 +169,6 @@ from purra.observability.inspection import build_recovery_inspection, inspect_re
 __all__ += ["build_recovery_inspection", "inspect_recovery"]
 from purra.testing import IntegrationCheck, check_integration
 __all__ += ["IntegrationCheck", "check_integration"]
+
+from purra.approvals import ApprovalRequired
+__all__ += ["AgentToolExecutionCheckpoint", "ApprovalRequired"]

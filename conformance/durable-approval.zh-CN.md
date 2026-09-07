@@ -3,7 +3,8 @@
 [English](durable-approval.md) | 简体中文
 
 当前已实现阶段 B 的存储基础：不可变审批记录、宿主授权的事务决策及 SQLite v5 显式激活。
-Run 暂停、执行恢复及 MCP 写工具**尚未实现**。
+Python 已接通 opt-in 单调用工具续点，当前仅完成 Reactive Root Run 的确定性验证。
+TypeScript 审批暂停/恢复与 MCP 写工具**尚未实现**，阶段 B 仍未完成。
 当前已落地的前置修复是：审批通过后、进入工具幂等网关前重新验证宿主 scope 和取消状态。
 共享案例 `fixtures/approval_dispatch.json` 只验证这一边界。已有内存审批继续可用。
 
@@ -15,7 +16,7 @@ Run 暂停、执行恢复及 MCP 写工具**尚未实现**。
 不增加旧宿主端口的必需方法，不更改现有 `ApprovalGateway`／`ToolApprovalGateway`
 签名及结果状态；持久化存储或宿主授权不可用时，禁止降级为内存批准。
 
-下面三种记录已在双端导出；派发关联仍待实现。Python 使用 snake_case，
+下面三种记录已在双端导出；Python 已实现派发关联；TypeScript 运行关联仍待实现。Python 使用 snake_case，
 持久化 JSON 使用与 TypeScript 一致的 camelCase：
 
 | 对象 | 必需绑定 |
@@ -172,5 +173,35 @@ TypeScript 对应 `enableApprovals()` 和 `approvalStore({authorize, clockMs})`�
 
 `get` 和列表只读取持久记录，不在读取时自动过期；`refresh` 显式持久化过期或 Run 取消。
 列表包含尚未持久化失效的 pending 和 approved，不能据此判断当前可执行。
-这些方法尚不创建 checkpoint、工具 claim、Run 暂停或公共审批事件；阶段 B 剩余链路打通前，
-运行时仍使用已有 live approval 路径。
+上述存储方法本身不创建 checkpoint 或工具 claim。Python 另外新增下述运行入口；
+TypeScript 运行时仍使用已有 live approval 路径。
+
+## Python 工具续点运行入口（开发中）
+
+在 `AgentCoreRunOptions` 配置 `tool_checkpoint_handler` 及可选 `tool_checkpoint_names`。
+后者选择宿主明确绑定的写工具名称；省略则检查全部批次。选中批次只支持单个调用，
+混合或多个调用在派发前拒绝；未选中的只读批次沿用原路径。回调取得
+`AgentToolExecutionCheckpoint`（schema 3 / tool_ready），含真实 assistant 消息、
+invocation ID、独立的模型预算 key、规划/证据/轮次状态。旧 v2 / model_ready 语义不变。
+
+每次回调都根据**当前宿主绑定**、续点中的精确调用和规范 Run 配置摘要构造 intent，
+调用 `await approvals.prepare(checkpoint, intent, expires_at_ms=原绝对过期时间)`。
+有效 lease 下同事务提交意图、工具续点和私有 `approval.required` 事件；待审批时抛出
+独立 `ApprovalRequired`，supervisor 释放 ownership、保留 Run。不能捕获后继续执行工具。
+
+同一个 Core 必须同时绑定 `approval_gateway=approvals.gateway()`、
+`tool_idempotency_gateway=storage.idempotency`，以及 SQLite Run/output、publisher 和 lease。
+遗漏或错配 idempotency 会拒绝配置。宿主用已认证主体调用 `approvals.decide`；
+这个 gateway 的旧 `resolve` 不授予审批。用原 request 和相同回调调用 `core.resume`，
+缺少回调的 tool-ready 恢复会在执行前被拒绝。
+
+实际 claim 事务再次检查 lease、Run/Root 取消、已结算 invocation/预算 key、调用/参数、
+配置、审批及过期。原执行器仍执行 schema 和 scope 校验，包括批准后的 scope 复验。
+关联记录包含审批 revision、意图 digest、lease owner/epoch；外部调用在事务外。
+已知效果的回执与关联同事务提交；未知结果或回执落盘失败保留 unknown claim，阻止恢复取得 lease。
+空闲宿主可通过既有 `reconcile_tool` 提供已知结果或未执行证明。已提交的匹配回执即使过期
+也可以重放，不重新执行效果。
+
+当前确定性验证覆盖 Reactive Root 重启、重复待审恢复、并发恢复、批准后取消、binding 变化、
+未知效果、回执落盘失败和已提交回执重放。Planned/Auto、Agent Tree、TypeScript 运行对齐、
+规范化审批诊断、MCP 写传输、真实服务与下游验收仍待完成。不能据此宣称 1.1 已验收。

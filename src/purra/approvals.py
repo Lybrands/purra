@@ -146,3 +146,17 @@ class ApprovalRecord:
 
 
 __all__ = ["APPROVAL_INTENT_PROFILE", "ApprovalIntent", "ApprovalDecisionCommand", "ApprovalRecord"]
+
+
+class ApprovalRequired(Exception):
+    """A host gate signals that a committed tool-ready Run is waiting."""
+    code = "approval_required"
+
+    def __init__(self, run_id: str, approval_id: str):
+        _text(run_id, "Run id")
+        _text(approval_id, "id")
+        super().__init__("The Run is waiting for approval")
+        self.run_id, self.approval_id = run_id, approval_id
+
+
+__all__.append("ApprovalRequired")

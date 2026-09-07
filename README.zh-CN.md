@@ -9,7 +9,7 @@ PurrA 是面向 Python 和 TypeScript 的 Agent 运行时，负责在应用中�
 ## 1.1.0 开发状态
 
 当前源码为尚未发布的 1.1.0 开发版。请安装版本一致的 Core 与集成本地产物；注册表命令不保证获取此开发版本。
-[持久化审批契约](conformance/durable-approval.zh-CN.md)记录本版开发中的能力；持久化审批恢复与 MCP 写工具尚未实现。
+[持久化审批契约](conformance/durable-approval.zh-CN.md)记录本版开发中的能力；Python 审批恢复已进入 Reactive Root 验证；TypeScript 审批恢复和 MCP 写工具尚未实现。
 已有能力及 1.x 兼容承诺见[1.0 支持说明](conformance/release-1.0.zh-CN.md)。
 
 ## 安装

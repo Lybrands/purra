@@ -7,13 +7,15 @@
   the tool or acquire a tool claim. Existing live approval APIs remain supported.
 - Add immutable approval intents and host-authorized SQLite decision storage,
   with revision checks, historical command replay and explicit v5 activation.
-  This foundation does not yet suspend Runs or authorize tool dispatch.
+  Python additionally supports an opt-in tool-ready checkpoint and same-Run
+  approval recovery with atomic claim/receipt association; Reactive Root fault
+  tests pass. TypeScript approval recovery and MCP writes remain pending.
 - Align Core and all seven optional packages, exact internal dependencies and
   npm lockfiles at 1.1.0. This version has not been published.
 
 The [durable approval contract](conformance/durable-approval.md) defines the
-remaining suspension/recovery and MCP write work. Those runtime capabilities
-are not yet implemented; storage decisions are not execution permissions.
+remaining runtime parity, extended recovery and MCP write work. Storage decisions
+alone are not execution permissions.
 
 ## 1.0.0 — Unreleased candidate
 
