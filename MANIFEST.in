@@ -1,2 +1,3 @@
 recursive-include conformance *.json *.md
 prune conformance/reports
+include tests/installed_response_reasoning_smoke.py

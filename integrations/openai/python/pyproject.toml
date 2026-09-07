@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "purra-openai"
-version = "0.5.0"
+version = "0.5.1"
 description = "Official OpenAI Responses and Chat Completions SDK adapter for PurrA"
 requires-python = ">=3.11"
-dependencies = ["purra==0.5.0", "openai==3.7.0"]
+dependencies = ["purra==0.5.1", "openai==3.7.0"]
 readme = "README.md"
 license = "MIT"
 

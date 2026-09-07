@@ -935,27 +935,37 @@ def test_reasoning_usage_unknown_is_distinct_from_reported_zero():
 
 
 @pytest.mark.asyncio
-async def test_reasoning_mode_conflict_is_rejected_before_gateway_call():
+@pytest.mark.parametrize("method", ["complete", "stream"])
+@pytest.mark.parametrize("call_mode, context_mode", [
+    (call_mode, context_mode)
+    for call_mode in ReasoningMode
+    for context_mode in ReasoningMode
+    if call_mode is not context_mode
+])
+async def test_reasoning_mode_conflict_is_rejected_before_gateway_call(
+    method, call_mode, context_mode,
+):
     AgentModelCall, AgentModelInvocationManager, ModelInvocationContext = _types()
-    gateway = _CompletionGateway()
+    gateway = _Gateway()
     manager = AgentModelInvocationManager(gateway)
 
     with pytest.raises(ContractViolationError) as captured:
-        await manager.complete(
+        await getattr(manager, method)(
             (),
             AgentModelCall(
                 request=_request(),
                 output_intent=AgentOutputIntent.STRUCTURED_PRIVATE,
                 commit_mode=OutputCommitMode.PRIVATE,
-                reasoning_mode=ReasoningMode.DISABLED,
+                reasoning_mode=call_mode,
             ),
             ModelInvocationContext(
                 run_id="run-conflict",
-                requested_reasoning_mode=ReasoningMode.ENABLED,
+                requested_reasoning_mode=context_mode,
             ),
         )
 
     assert captured.value.code == "model_reasoning_mode_conflict"
+    assert gateway.calls == []
 
 
 @pytest.mark.asyncio

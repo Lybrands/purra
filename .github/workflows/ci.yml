@@ -36,6 +36,7 @@ jobs:
           python -m venv "$RUNNER_TEMP/purra-smoke"
           "$RUNNER_TEMP/purra-smoke/bin/python" -m pip install --no-deps dist/*.whl
           "$RUNNER_TEMP/purra-smoke/bin/python" tests/installed_distribution_smoke.py
+          "$RUNNER_TEMP/purra-smoke/bin/python" -I tests/installed_response_reasoning_smoke.py
 
   typescript:
     runs-on: ubuntu-latest

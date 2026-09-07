@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.5.1 — 2026-09-07
+
+- Fix Python response transactions to forward the context's requested reasoning
+  mode to model calls, including direct replies, private candidate repairs and
+  public presentation retries. Preserve reasoning-mode conflict admission checks.
+- Add offline call-configuration regression tests and installed-wheel checks for
+  direct/presentation replies in default, enabled and disabled modes.
+- Keep the 0.5.0 APIs and storage contracts; synchronize Core and the six optional
+  package versions at 0.5.1. Offline checks do not establish real Provider or
+  downstream application acceptance.
+
 ## 0.5.0 — 2026-09-06
 
 - Preserve transport-activity events in the opt-in Provider timing sampler

@@ -1,9 +1,9 @@
 {
-  "name": "purra-compaction", "version": "0.5.0", "type": "module", "license": "MIT",
+  "name": "purra-compaction", "version": "0.5.1", "type": "module", "license": "MIT",
   "description": "Managed semantic conversation compaction for PurrA",
   "files": ["dist", "README.md", "LICENSE"],
   "exports": { ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" } },
-  "peerDependencies": { "purra": "0.5.0" },
+  "peerDependencies": { "purra": "0.5.1" },
   "devDependencies": { "purra": "file:../../../typescript", "typescript": "7.0.2" },
   "scripts": { "build": "tsc -p tsconfig.json", "test": "node --test test/*.test.mjs", "check": "npm run build && npm test", "prepack": "npm run build" }
 }

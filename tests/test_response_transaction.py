@@ -11,6 +11,7 @@ from purra.contracts import (
     ModelFinishReason,
     ModelRequest,
     ModelStreamChunk,
+    ReasoningMode,
     RunStatus,
 )
 from purra.model_invocation import ModelInvocationContext
@@ -133,7 +134,8 @@ class _Facts:
 
 
 @pytest.mark.asyncio
-async def test_direct_answer_streams_before_provider_finish():
+@pytest.mark.parametrize("reasoning_mode", list(ReasoningMode))
+async def test_direct_answer_streams_before_provider_finish(reasoning_mode):
     (
         Transaction,
         _PublicFact,
@@ -152,7 +154,9 @@ async def test_direct_answer_streams_before_provider_finish():
     result_task = asyncio.create_task(transaction.execute_direct(
         (AgentMessage(role="user", content="answer"),),
         request=_model_request(),
-        context=ModelInvocationContext(run_id="run-1"),
+        context=ModelInvocationContext(
+            run_id="run-1", requested_reasoning_mode=reasoning_mode,
+        ),
     ))
     await manager.first_chunk_seen.wait()
 
@@ -162,10 +166,12 @@ async def test_direct_answer_streams_before_provider_finish():
     manager.release.set()
     result = await result_task
     assert result.final_response == "第一块第二块"
+    assert manager.calls[0][1].reasoning_mode is reasoning_mode
 
 
 @pytest.mark.asyncio
-async def test_validated_candidate_is_private_until_commit():
+@pytest.mark.parametrize("reasoning_mode", list(ReasoningMode))
+async def test_validated_candidate_is_private_until_commit(reasoning_mode):
     (
         Transaction,
         PublicFact,
@@ -192,7 +198,9 @@ async def test_validated_candidate_is_private_until_commit():
         (AgentMessage(role="user", content="review"),),
         committer,
         request=_model_request(),
-        context=ModelInvocationContext(run_id="run-1"),
+        context=ModelInvocationContext(
+            run_id="run-1", requested_reasoning_mode=reasoning_mode,
+        ),
     )
 
     assert result.status is RunStatus.DONE
@@ -201,10 +209,12 @@ async def test_validated_candidate_is_private_until_commit():
     assert manager.calls[0][1].commit_mode.value == "gated"
     assert facts.calls == []
     assert len(manager.calls) == 1
+    assert manager.calls[0][1].reasoning_mode is reasoning_mode
 
 
 @pytest.mark.asyncio
-async def test_public_presentation_uses_only_committed_facts_and_no_tools():
+@pytest.mark.parametrize("reasoning_mode", list(ReasoningMode))
+async def test_public_presentation_uses_only_committed_facts_and_no_tools(reasoning_mode):
     (
         Transaction,
         PublicFact,
@@ -235,7 +245,9 @@ async def test_public_presentation_uses_only_committed_facts_and_no_tools():
     response = await transaction.present(
         committed,
         request=_model_request(),
-        context=ModelInvocationContext(run_id="run-1"),
+        context=ModelInvocationContext(
+            run_id="run-1", requested_reasoning_mode=reasoning_mode,
+        ),
     )
 
     messages, call, _context = manager.calls[0]
@@ -245,10 +257,12 @@ async def test_public_presentation_uses_only_committed_facts_and_no_tools():
     assert call.tool_choice.value == "none"
     assert call.output_intent.value == "final_public"
     assert facts.calls == [("run-1", committed)]
+    assert call.reasoning_mode is reasoning_mode
 
 
 @pytest.mark.asyncio
-async def test_presentation_retry_does_not_repeat_candidate_commit():
+@pytest.mark.parametrize("reasoning_mode", list(ReasoningMode))
+async def test_presentation_retry_does_not_repeat_candidate_commit(reasoning_mode):
     (
         Transaction,
         PublicFact,
@@ -277,9 +291,15 @@ async def test_presentation_retry_does_not_repeat_candidate_commit():
         (AgentMessage(role="user", content="review"),),
         committer,
         request=_model_request(),
-        context=ModelInvocationContext(run_id="run-1"),
+        context=ModelInvocationContext(
+            run_id="run-1", requested_reasoning_mode=reasoning_mode,
+        ),
     )
 
+    assert all(
+        call.reasoning_mode is context.requested_reasoning_mode is reasoning_mode
+        for _, call, context in manager.calls
+    )
     assert result.final_response == "公开结论"
     assert committer.calls == [("run-1", "私有候选")]
     assert len(facts.calls) == 1
@@ -291,7 +311,8 @@ async def test_presentation_retry_does_not_repeat_candidate_commit():
 
 
 @pytest.mark.asyncio
-async def test_private_candidate_repair_commits_only_accepted_candidate_once():
+@pytest.mark.parametrize("reasoning_mode", list(ReasoningMode))
+async def test_private_candidate_repair_commits_only_accepted_candidate_once(reasoning_mode):
     (
         Transaction,
         _PublicFact,
@@ -329,11 +350,18 @@ async def test_private_candidate_repair_commits_only_accepted_candidate_once():
         (AgentMessage(role="user", content="review"),),
         committer,
         request=_model_request(),
-        context=ModelInvocationContext(run_id="run-1"),
+        context=ModelInvocationContext(
+            run_id="run-1", requested_reasoning_mode=reasoning_mode,
+        ),
     )
 
+    assert all(
+        call.reasoning_mode is context.requested_reasoning_mode is reasoning_mode
+        for _, call, context in manager.calls
+    )
     assert result.final_response == "accepted"
     assert committer.calls == [("run-1", "accepted")]
+    assert len(manager.calls) == 2
     assert manager.calls[1][0][-2].content == "invalid"
     assert "Return the accepted fixture" in manager.calls[1][0][-1].content
 
@@ -408,3 +436,12 @@ def test_run_options_reject_incompatible_response_transactions():
         committed_result_facts_provider=Facts(),
     )
     assert configured.committed_result_facts_provider is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["direct", "presentation"])
+@pytest.mark.parametrize("reasoning_mode", list(ReasoningMode))
+async def test_response_reasoning_mode_passes_real_manager_admission(path, reasoning_mode):
+    from installed_response_reasoning_smoke import verify_response_reasoning_mode
+
+    await verify_response_reasoning_mode(path, reasoning_mode)

@@ -1,6 +1,6 @@
 {
   "name": "purra-mem0",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Scoped Mem0 OSS memory integration for PurrA",
   "license": "MIT",
   "type": "module",
@@ -30,7 +30,7 @@
   },
   "peerDependencies": {
     "mem0ai": "3.1.7",
-    "purra": "0.5.0",
+    "purra": "0.5.1",
     "@langchain/core": "1.1.47"
   },
   "devDependencies": {
