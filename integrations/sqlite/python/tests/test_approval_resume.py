@@ -201,6 +201,9 @@ async def test_unknown_result_keeps_existing_claim_and_blocks_another_dispatch(t
         result=await handle.wait()
         assert result.status.value=='failed'
         assert host.tool_calls==1
+        report=await host.storage.inspect_recovery(record.intent.run_id)
+        assert report['observations']['approvalUnknownReceipts']==1
+        assert 'tool_effect_unknown' in report['blockers']
         async with host.storage.transaction() as session:
             assert (record.intent.run_id,record.intent.tool_call_id) in session.claims
             assert session.extra['approvalExecutions'][record.approval_id]['effectState']=='unknown'
@@ -273,6 +276,10 @@ async def test_committed_receipt_replay_after_expiry_does_not_repeat_effect(tmp_
         await host.close();host=ApprovalHost(path);host.expiry=record.expires_at_ms
         host.approvals._clock=lambda:record.expires_at_ms+1
         assert (await host.approvals.refresh(record.approval_id)).status=='expired'
+        report=await host.storage.inspect_recovery(record.intent.run_id)
+        assert report['observations']['approvalReceipt']=='complete'
+        assert 'approval_expired' not in report['blockers']
+        assert 'approval_terminal_receipt_present' in report['cautions']
         resumed=await host.core.resume(record.intent.run_id,host.request,options=AgentCoreRunOptions(tool_checkpoint_handler=host.boundary))
         assert (await resumed.wait()).status.value=='done'
         assert host.tool_calls==0
@@ -411,4 +418,32 @@ async def test_auto_remaining_plan_after_approved_write_preserves_second_wait(tm
         options = AgentCoreRunOptions(tool_checkpoint_handler=host.boundary, tool_checkpoint_names=frozenset({"lookup"}))
         result = await (await host.core.resume(handle.run_id, original, options=options)).wait()
         assert result.status.value == "done" and host.tool_calls == 1 and planner.calls == 0
+    finally: await host.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('status', ['pending','approved','expired'])
+async def test_approval_inspection_never_refreshes_or_dispatches(tmp_path, monkeypatch, status):
+    host=ApprovalHost(tmp_path/'db');host.expiry=int(time.time()*1000)+60000
+    try:
+        await host.storage.enable_approvals()
+        options=AgentCoreRunOptions(tool_checkpoint_handler=host.boundary)
+        handle=await host.core.submit(host.request,options=options)
+        with pytest.raises(ApprovalRequired): await handle.wait()
+        record=(await host.approvals.list_pending())[0]
+        if status == 'approved':
+            await host.approvals.decide(ApprovalDecisionCommand(record.approval_id,record.revision,record.intent.digest,'approve','approve'),principal_id='private-principal')
+        if status == 'expired': monkeypatch.setattr(time,'time',lambda:host.expiry/1000)
+        before=list(host.storage._db.iterdump())
+        report=await host.storage.inspect_recovery(handle.run_id)
+        assert list(host.storage._db.iterdump()) == before
+        assert report['observations']['approvalState']==status
+        assert report['observations']['approvalCheckpointIntent']=='matched'
+        assert report['observations']['approvalRecords']==1
+        assert report['observations']['approvalReceipt']=='absent'
+        assert report['observations']['attemptsAfterCheckpoint']==0
+        assert (host.model_calls,host.tool_calls)==(1,0)
+        assert record.approval_id not in json.dumps(report)
+        assert record.intent.digest not in json.dumps(report)
+        assert 'private-principal' not in json.dumps(report)
     finally: await host.close()

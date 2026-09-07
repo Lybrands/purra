@@ -2,6 +2,10 @@
 
 ## 1.1.0 — Unreleased development
 
+- Extend v5 SQLite recovery inspection with private-data-free approval state,
+  checkpoint intent matching, completed receipts and Run-associated unknown claims.
+  Reads never refresh decisions or grant execution authority; v4 reports stay unchanged.
+
 - Add separate host-authorized MCP write discovery in both SDKs, preserving the
   1.0 read-only API. Write registrations require durable approval/receipt gateways
   and bind catalog, scope and effect identity to the persisted intent. Failures

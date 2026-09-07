@@ -171,7 +171,8 @@ class SqliteApprovalStore:
         """Bind only alongside prepare and this adapter's idempotency gateway."""
         return _DurableApprovalGateway(self)
 
-    def _completed_receipt(self, session, record, call):
+    @staticmethod
+    def _completed_receipt(session, record, call):
         receipt = session.get_tool_receipt((record.intent.run_id, call.id))
         if receipt is None:
             return False
@@ -317,3 +318,38 @@ class _DurableApprovalGateway:
     async def cancel_pending(self, run_id):
         # Suspending a durable Run must not cancel its persisted intent.
         return 0
+
+
+def inspect_approval_state(storage, session, saved, now):
+    """Read committed approval evidence without refreshing or authorizing a record."""
+    from purra.agent_execution_checkpoint import AgentToolExecutionCheckpoint
+    if storage_version(storage._db) != 5:
+        return {}
+    rows = storage._db.execute("SELECT approval_id,call_id,body FROM purra_approvals WHERE scope=? AND sdk='python' AND run_id=?",
+        (storage.scope, saved.run_id)).fetchall()
+    records = []
+    for identifier, call_id, body in rows:
+        record = ApprovalRecord.from_mapping(json.loads(body))
+        if record.approval_id != identifier or record.intent.run_id != saved.run_id or record.intent.tool_call_id != call_id:
+            _fail("approval_record_conflict")
+        records.append(record)
+    observation = {"approvalState": "unknown" if records else "none", "approvalRecords": len(records),
+        "approvalUnknownReceipts": sum((saved.run_id, record.intent.tool_call_id) in session.claims for record in records),
+        "approvalCheckpointIntent": "unknown", "approvalReceipt": "unknown"}
+    checkpoint = saved.execution_checkpoint
+    if not isinstance(checkpoint, AgentToolExecutionCheckpoint):
+        return observation
+    call = checkpoint.assistant.tool_calls[0]
+    record = next((record for record in records if record.intent.tool_call_id == call.id), None)
+    if record is None:
+        observation.update(approvalState="missing", approvalReceipt="absent")
+        return observation
+    matches = (record.intent.tool_name == call.name and json_identity_digest(record.intent.arguments) == json_identity_digest(json.loads(call.arguments_json))
+        and record.intent.preset_fingerprint == json_identity_digest(saved.agent_preset_snapshot))
+    complete = matches and SqliteApprovalStore._completed_receipt(session, record, call)
+    state = record.status
+    if state in {"pending", "approved"}:
+        if saved.status.value != "running": state = "canceled"
+        elif now >= min(record.expires_at_ms, saved.deadline_at_ms if saved.deadline_at_ms is not None else record.expires_at_ms): state = "expired"
+    observation.update(approvalState=state, approvalCheckpointIntent="matched" if matches else "mismatch", approvalReceipt="complete" if complete else "absent")
+    return observation

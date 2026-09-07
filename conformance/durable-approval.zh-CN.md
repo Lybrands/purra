@@ -4,7 +4,7 @@
 
 当前已实现阶段 B 的存储基础：不可变审批记录、宿主授权的事务决策及 SQLite v5 显式激活。
 Python 和 TypeScript 已接通 opt-in 单调用工具续点，目前完成 Reactive、Planned 和 Auto Root Run 的确定性验证。
-MCP 写绑定与本地协议/恢复测试已实现；规范化诊断、扩展恢复和外部验收仍未完成。
+MCP 写绑定与本地协议/恢复测试已实现；只读审批诊断已实现，扩展恢复和外部验收仍未完成。
 当前已落地的前置修复是：审批通过后、进入工具幂等网关前重新验证宿主 scope 和取消状态。
 共享案例 `fixtures/approval_dispatch.json` 只验证这一边界。已有内存审批继续可用。
 
@@ -203,7 +203,7 @@ invocation ID、独立的模型预算 key、规划/证据/轮次状态。旧 v2 
 
 当前确定性验证覆盖 Root 重启、重复待审恢复、并发恢复、批准后取消、binding 变化、
 未知效果、回执落盘失败和已提交回执重放。Child 写审批、扩展运行对齐、
-规范化审批诊断、真实服务与下游验收仍待完成。不能据此宣称 1.1 已验收。
+真实服务与下游验收仍待完成。不能据此宣称 1.1 已验收。
 
 ## TypeScript 工具续点运行入口（开发中）
 
@@ -243,7 +243,7 @@ lease 始终使用真实墙钟。
 
 确定性测试覆盖重启、重复待审、并发恢复、当前 scope 拒绝、gateway 后到 claim 前过期、
 不透明 key 关联、效果不明、回执落盘失败及完成回执重放。通用诊断已识别工具续点；
-规范化审批诊断、Child 写审批验收、真实服务和下游验收仍未完成。
+Child 写审批验收、真实服务和下游验收仍未完成。
 这些测试不证明外部系统端到端 exactly-once。
 
 ## Root 规划与 Agent Tree 共存
@@ -265,7 +265,7 @@ TypeScript 开启 Agent Tree 与审批时，必须用 `toolCheckpointNames` 明�
 Core 自己生成的委派工具保留原有宿主托管 Run/claim 链路；内部例外按定义对象身份识别，
 不按名称或调用方可填写的标记识别。同名 `delegateToAgents` 业务工具仍不能绕过持久回执绑定。
 Child 默认只读授权保持不变。上述验收不开放 Child 写入，也不代表任意嵌套审批与
-clarification 组合已经通过。Child 写审批、规范化审批诊断和真实服务/下游验收仍待完成。
+clarification 组合已经通过。Child 写审批和真实服务/下游验收仍待完成。
 
 ## MCP 写绑定实施切片
 
@@ -279,3 +279,19 @@ clarification 组合已经通过。Child 写审批、规范化审批诊断和真
 请求后错误 unknown。SQLite 测试覆盖等待后重新打开存储且不重跑模型、批准后只派发
 一次、绑定变更、scope 撤销、错误意图，以及远端报错后保留 claim。全部使用合成数据；
 不代表真实第三方服务或下游验收通过。
+
+## 只读审批诊断（已实现）
+
+显式启用 v5 的 SQLite 存储在已有恢复检查中新增 approvalState、approvalRecords、
+approvalCheckpointIntent、approvalReceipt 和 approvalUnknownReceipts。v4 及仅读取
+通用快照的报告保持旧格式。纯构造器仅在传入审批观察时扩展报告。
+
+状态针对当前 tool_ready 调用；没有对应续点时，只统计历史记录，不推定其当前作用。
+意图匹配仅比对工具、参数及已存 preset，不代表当前宿主授权；currentApprovalBinding
+始终未知。到期只作读取时观察，不更新决策。已匹配的完成回执使终态审批成为提醒，
+避免错误阻止回执重放；实际执行仍需通过运行时门禁。
+
+明确关联当前 Run 的未知审批 claim 产生 tool_effect_unknown 阻塞；TypeScript 剩余
+不透明 claim 仍是存储级提醒。诊断不刷新决策、不获取 lease、不执行、不对账、不调用
+模型，也不输出标识、参数、主体或摘要。测试比较等待、批准及到期检查前后全部数据库
+行，并覆盖未知 claim 和审批到期但回执已完成的场景。扩展故障及外部/下游验收仍单独进行。

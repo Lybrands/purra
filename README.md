@@ -14,8 +14,8 @@ integration artifacts; registry commands do not identify this development build.
 The [durable approval contract](conformance/durable-approval.md) describes the
 work in progress. Both SDKs have deterministic approval recovery tests for Reactive,
 Planned and Auto Root Runs, plus host-authorized MCP writes with durable receipts.
-Normalized approval diagnostics, extended recovery and real service/downstream
-acceptance remain unfinished.
+Read-only approval observations are available. Extended recovery and real
+service/downstream acceptance remain unfinished.
 Existing capabilities and 1.x compatibility are documented in the
 [1.0 support guide](conformance/release-1.0.md).
 

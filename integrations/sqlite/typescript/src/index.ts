@@ -1,6 +1,6 @@
 import { OutputJournal } from "./journal.js";
 import { storageVersion, enableApprovals } from "./approval-format.js";
-import { checkApprovalDispatch, requireApprovalOwner, SqliteApprovalStore, type ApprovalAuthorizer } from "./approvals.js";
+import { inspectApprovalState, checkApprovalDispatch, requireApprovalOwner, SqliteApprovalStore, type ApprovalAuthorizer } from "./approvals.js";
 export { SqliteApprovalStore } from "./approvals.js";
 export type { ApprovalAuthorizer, ApprovalDecisionReceipt } from "./approvals.js";
 import { DatabaseSync } from "node:sqlite";
@@ -264,13 +264,15 @@ export class SqliteAgentAdapters {
       const events = await all.runs.listEvents(runId, 0, Number.MAX_SAFE_INTEGER);
       const lastCheckpoint = events.reduce((last, event, index) => event.kind === "agent.execution_checkpoint" ? index : last, -1);
       const lease = extra.leases[runId];
+      const approval = await inspectApprovalState(this.#db, this.#scope, saved, extra, (this.#approvalRuntimeClock ?? Date.now)());
       return buildRecoveryInspection({
+        ...approval,
         status: saved.status === "running" ? "running" : "terminal",
         checkpoint: saved.executionCheckpoint === undefined && saved.toolExecutionCheckpoint === undefined ? "missing" : "present",
         attemptsAfterCheckpoint: saved.executionCheckpoint === undefined && saved.toolExecutionCheckpoint === undefined ? null
           : events.slice(lastCheckpoint + 1).filter(event => event.kind === "invocation.started").length,
-        // Keys are opaque; the persisted contract does not bind them to a Run.
-        unknownToolReceipts: Object.values(extra.tools).filter(receipt => receipt.state === "claimed").length,
+        // Legacy opaque claims remain storage-wide; proven approval claims are reported separately.
+        unknownToolReceipts: Object.values(extra.tools).filter(receipt => receipt.state === "claimed").length - (approval.approvalUnknownReceipts ?? 0),
         receiptScope: "storage",
         lease: lease?.owner && lease.expires > Date.now() ? "active" : "inactive",
         configuration: options.expectedPreset === undefined ? "unknown"

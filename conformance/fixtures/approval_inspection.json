@@ -1,0 +1,125 @@
+{
+  "cases": [
+    {
+      "id": "missing",
+      "state": {
+        "approvalState": "missing",
+        "approvalRecords": 1,
+        "approvalUnknownReceipts": 0
+      },
+      "blockers": [
+        "approval_not_found"
+      ]
+    },
+    {
+      "id": "pending",
+      "state": {
+        "approvalState": "pending",
+        "approvalRecords": 1,
+        "approvalUnknownReceipts": 0
+      },
+      "blockers": [
+        "approval_required"
+      ]
+    },
+    {
+      "id": "rejected",
+      "state": {
+        "approvalState": "rejected",
+        "approvalRecords": 1,
+        "approvalUnknownReceipts": 0
+      },
+      "blockers": [
+        "approval_rejected"
+      ]
+    },
+    {
+      "id": "expired",
+      "state": {
+        "approvalState": "expired",
+        "approvalRecords": 1,
+        "approvalUnknownReceipts": 0
+      },
+      "blockers": [
+        "approval_expired"
+      ]
+    },
+    {
+      "id": "canceled",
+      "state": {
+        "approvalState": "canceled",
+        "approvalRecords": 1,
+        "approvalUnknownReceipts": 0
+      },
+      "blockers": [
+        "approval_canceled"
+      ]
+    },
+    {
+      "id": "approved",
+      "state": {
+        "approvalState": "approved",
+        "approvalRecords": 1,
+        "approvalUnknownReceipts": 0
+      },
+      "blockers": []
+    },
+    {
+      "id": "none",
+      "state": {
+        "approvalState": "none",
+        "approvalRecords": 1,
+        "approvalUnknownReceipts": 0
+      },
+      "blockers": []
+    },
+    {
+      "id": "intent-conflict",
+      "state": {
+        "approvalState": "approved",
+        "approvalCheckpointIntent": "mismatch"
+      },
+      "blockers": [
+        "approval_intent_conflict"
+      ]
+    },
+    {
+      "id": "unknown-receipt",
+      "state": {
+        "approvalState": "approved",
+        "approvalUnknownReceipts": 1
+      },
+      "blockers": [
+        "tool_effect_unknown"
+      ]
+    },
+    {
+      "id": "expired-complete",
+      "state": {
+        "approvalState": "expired",
+        "approvalReceipt": "complete"
+      },
+      "blockers": [],
+      "cautions": [
+        "approval_terminal_receipt_present"
+      ]
+    }
+  ],
+  "invalid": [
+    {
+      "approvalState": "private-secret"
+    },
+    {
+      "approvalState": "pending",
+      "approvalRecords": -1
+    },
+    {
+      "approvalState": "approved",
+      "approvalCheckpointIntent": "yes"
+    },
+    {
+      "approvalState": "pending",
+      "approvalUnknownReceipts": true
+    }
+  ]
+}

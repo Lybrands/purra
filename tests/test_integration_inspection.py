@@ -68,3 +68,17 @@ async def test_report_preflight_and_cancellation():
     with pytest.raises(ValueError): await check_integration(component='host',version='1',checks=[check,check])
     assert not calls
     with pytest.raises(asyncio.CancelledError): await check_integration(component='host',version='1',checks=[check])
+
+APPROVAL_FIXTURE = json.loads((Path(__file__).parents[1] / 'conformance/fixtures/approval_inspection.json').read_text())
+@pytest.mark.parametrize('case', APPROVAL_FIXTURE['cases'], ids=lambda case: 'approval-'+case['id'])
+def test_approval_inspection_shared(case):
+    report = build_recovery_inspection({**case['state'], 'approvalDigest':'private-secret','principalId':'private-secret','arguments':{'secret':'private-secret'}})
+    assert report['blockers'] == case['blockers']
+    assert report['cautions'] == case.get('cautions', [])
+    assert report['authority'] == 'diagnosis_only'
+    assert 'currentApprovalBinding' in report['unknown']
+    assert 'private-secret' not in json.dumps(report)
+
+@pytest.mark.parametrize('state', APPROVAL_FIXTURE['invalid'])
+def test_invalid_approval_inspection(state):
+    with pytest.raises(ValueError): build_recovery_inspection(state)

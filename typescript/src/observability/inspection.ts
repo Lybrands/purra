@@ -1,6 +1,11 @@
 import type { RunSnapshot } from "../run/types.js";
 
 export interface RecoveryObservations {
+  readonly approvalState?: "none" | "missing" | "pending" | "approved" | "rejected" | "expired" | "canceled" | "unknown";
+  readonly approvalCheckpointIntent?: "matched" | "mismatch" | "unknown";
+  readonly approvalReceipt?: "complete" | "absent" | "unknown";
+  readonly approvalRecords?: number | null;
+  readonly approvalUnknownReceipts?: number | null;
   readonly status?: "running" | "terminal" | "unknown";
   readonly checkpoint?: "present" | "missing" | "unknown";
   readonly lease?: "active" | "inactive" | "unknown";
@@ -22,6 +27,11 @@ export function buildRecoveryInspection(state: RecoveryObservations) {
     permissions: ["allowed", "denied", "unknown"], usage: ["recorded", "unknown"],
     receiptScope: ["run", "storage", "unknown"], cancellation: ["requested", "clear", "unknown"],
     deadline: ["expired", "open", "unknown"],
+    ...(state.approvalState === undefined ? {} : {
+      approvalState: ["none", "missing", "pending", "approved", "rejected", "expired", "canceled", "unknown"],
+      approvalCheckpointIntent: ["matched", "mismatch", "unknown"],
+      approvalReceipt: ["complete", "absent", "unknown"],
+    }),
   } as const;
   const observed: Record<string, string | number | null> = {};
   for (const key of Object.keys(enums) as (keyof typeof enums)[]) {
@@ -29,7 +39,8 @@ export function buildRecoveryInspection(state: RecoveryObservations) {
     if (!(enums[key] as readonly unknown[]).includes(value)) throw new TypeError("invalid recovery observation");
     observed[key] = value;
   }
-  for (const key of ["attemptsAfterCheckpoint", "unknownToolReceipts"] as const) {
+  const countKeys = ["attemptsAfterCheckpoint", "unknownToolReceipts", ...(state.approvalState === undefined ? [] : ["approvalRecords", "approvalUnknownReceipts"])] as const;
+  for (const key of countKeys as readonly ("attemptsAfterCheckpoint" | "unknownToolReceipts" | "approvalRecords" | "approvalUnknownReceipts")[]) {
     const value = state[key] ?? null;
     if (value !== null && (!Number.isSafeInteger(value) || value < 0)) throw new TypeError("invalid recovery count");
     observed[key] = value;
@@ -54,6 +65,23 @@ export function buildRecoveryInspection(state: RecoveryObservations) {
     if (observed.receiptScope === "run") blockers.push("tool_effect_unknown");
     else cautions.push("unattributed_tool_effect_unknown");
     actions.push("reconcile_tools");
+  }
+  if (state.approvalState !== undefined) {
+    for (const [status, code, action] of [["missing", "approval_not_found", "inspect_approval"],
+      ["pending", "approval_required", "await_approval"], ["rejected", "approval_rejected", "inspect_approval"],
+      ["expired", "approval_expired", "inspect_approval"], ["canceled", "approval_canceled", "inspect_approval"]] as const) {
+      if (observed.approvalState === status) {
+        if ((status === "expired" || status === "canceled") && observed.approvalReceipt === "complete") cautions.push("approval_terminal_receipt_present");
+        else blockers.push(code);
+        actions.push(action);
+      }
+    }
+    if (observed.approvalCheckpointIntent === "mismatch") { blockers.push("approval_intent_conflict"); actions.push("inspect_approval"); }
+    if (typeof observed.approvalUnknownReceipts === "number" && observed.approvalUnknownReceipts > 0) {
+      if (!blockers.includes("tool_effect_unknown")) blockers.push("tool_effect_unknown");
+      actions.push("reconcile_tools");
+    }
+    unknown.push("currentApprovalBinding"); actions.push("verify_approval_binding");
   }
   for (const [key, value] of Object.entries(observed)) if (value === null || value === "unknown") unknown.push(key);
   if (observed.receiptScope !== "run") unknown.push("runToolEffects");

@@ -301,8 +301,7 @@ A committed, matching receipt can be replayed after expiry without a new effect.
 Deterministic acceptance currently covers Root Run restart, repeated
 pending recovery, concurrent resume, cancellation after approval, changed binding,
 unknown effects, receipt persistence failure and committed-receipt replay.
-Child write-approval acceptance, broader runtime parity, normalized
-approval inspection and real service/downstream
+Child write-approval acceptance, broader runtime parity and real service/downstream
 validation remain unfinished. This is not a 1.1 release acceptance claim.
 
 ## TypeScript tool-ready runtime path (development)
@@ -355,7 +354,7 @@ lease expiry always uses wall time.
 Deterministic tests cover restart, repeated pending waits, concurrent resume,
 current-scope denial, expiry between gateway and claim, opaque-key association,
 unknown results, receipt persistence failure and completed-receipt replay.
-The generic inspection recognizes tool checkpoints; normalized approval diagnostics,
+The inspection recognizes tool checkpoints and approval observations;
 Child write-approval acceptance and real service/downstream acceptance remain
 unfinished. These tests do not establish end-to-end exactly-once external effects.
 
@@ -384,8 +383,8 @@ host-managed Run/claim path. The exemption uses the generated definition identit
 not a tool name or a caller-provided flag: a business tool named `delegateToAgents`
 cannot bypass durable receipt binding. Child grants remain read-only by default.
 This acceptance does not enable Child writes or establish arbitrary mixed/nested
-approval-and-clarification recovery. Those paths, normalized approval diagnostics,
-External/downstream validation remains unfinished.
+approval-and-clarification recovery. Those paths and external/downstream validation
+remain unfinished.
 
 ## MCP write implementation slice
 
@@ -401,3 +400,28 @@ pre-request rejection and post-request unknown effects. SQLite tests reopen the
 approval Run without replaying its model, approve and dispatch once, reject changed
 binding/scope or incorrect intent, and retain claims after remote error. The tests
 use synthetic data. They do not establish third-party service or downstream acceptance.
+
+## Read-only approval inspection (implemented)
+
+On explicitly enabled v5 stores, the existing SQLite recovery inspection includes
+`approvalState`, `approvalRecords`, `approvalCheckpointIntent`, `approvalReceipt`
+and `approvalUnknownReceipts`. Legacy v4 and generic snapshot-only reports retain
+their existing shape. The pure builder accepts these optional observations in both
+SDKs. Unknown observations remain unknown; no identifiers, arguments, principals
+or approval digests are returned.
+
+The state refers to the current tool-ready call. Without that continuation,
+historical records are counted but their relevance is unknown. Checkpoint intent
+matching compares the tool/arguments and saved preset, **not current host authority**;
+`currentApprovalBinding` always remains unknown. Expiry is observed at read time
+without updating stored decisions. A matching completed receipt turns a terminal
+approval into a caution rather than falsely blocking receipt replay; runtime gates
+still decide whether replay is permitted.
+
+Run-associated unknown approval claims produce `tool_effect_unknown`. TypeScript
+keeps remaining opaque claims as storage-wide cautions, without attributing them to
+the inspected Run. Inspection performs no decision refresh, lease claim, execution,
+reconciliation or model call. Tests compare all database rows before and after
+pending/approved/expired reads and exercise retained unknown claims and expired
+approvals with completed receipts. Extended fault and external/downstream acceptance
+remain separate.

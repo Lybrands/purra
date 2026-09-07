@@ -275,7 +275,9 @@ class SqliteAgentAdapters:
             configuration = "unknown"
             if expected_preset and saved.agent_preset_snapshot:
                 configuration = "matched" if saved.agent_preset_snapshot == expected_preset else "mismatch"
+            from .approvals import inspect_approval_state
             return build_recovery_inspection({
+                **inspect_approval_state(self, adapters, saved, now),
                 "status": "running" if saved.status is RunStatus.RUNNING else "terminal",
                 "checkpoint": "present" if info.has_checkpoint else "missing",
                 "attemptsAfterCheckpoint": info.model_attempt_count - info.checkpoint_attempt_count if info.has_checkpoint else None,

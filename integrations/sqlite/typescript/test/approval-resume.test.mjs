@@ -120,6 +120,8 @@ test('unknown effect keeps its claim and rejects unknown reconciliation', async 
   const owner = open({ run: () => ({ content: 'uncertain', effectState: 'unknown' }) });
   await approve(owner, id);
   await assert.rejects((await owner.agent.resume(id, request)).result, { code: 'tool_effect_unknown' });
+  const report=await owner.storage.inspectRecovery(id);
+  assert.equal(report.observations.approvalUnknownReceipts,1);assert.ok(report.blockers.includes('tool_effect_unknown'));
   const key = await owner.storage.transaction(async (_, extra) => {
     const [[key, entry]] = Object.entries(extra.tools);
     assert.equal(entry.state, 'claimed'); assert.equal(entry.result, undefined); assert.equal(entry.runId, id);
@@ -128,6 +130,12 @@ test('unknown effect keeps its claim and rejects unknown reconciliation', async 
   await assert.rejects(owner.storage.reconcileTool(key, { result: { content: 'uncertain', effectState: 'unknown', errorCode: 'fixture_unknown' } }), { code: 'tool_effect_unknown' });
   await assert.rejects(owner.agent.resume(id, request), { code: 'run_terminal' });
   assert.equal(owner.counts.tool, 1);
+  const other=await owner.agent.submit(request,options);
+  await assert.rejects(other.result,ApprovalRequired);
+  const otherReport=await owner.storage.inspectRecovery(other.runId);
+  assert.equal(otherReport.observations.approvalUnknownReceipts,0);
+  assert.equal(otherReport.blockers.includes('tool_effect_unknown'),false);
+  assert.ok(otherReport.cautions.includes('unattributed_tool_effect_unknown'));
 });
 
 test('receipt failure after the effect survives reopen and blocks redispatch', async t => {
@@ -154,6 +162,9 @@ test('completed receipt replays after expiry without repeating the effect', asyn
   assert.equal(owner.counts.tool, 1);
   const restored = open({ expiry: record.expiresAtMs, clockMs: () => record.expiresAtMs + 1 });
   assert.equal((await restored.approvals.refresh(record.approvalId)).status, 'expired');
+  const report=await restored.storage.inspectRecovery(id);
+  assert.equal(report.observations.approvalReceipt,'complete');assert.equal(report.blockers.includes('approval_expired'),false);
+  assert.ok(report.cautions.includes('approval_terminal_receipt_present'));
   assert.equal((await (await restored.agent.resume(id, request)).result).output, 'done');
   assert.equal(restored.counts.tool, 0);
 });
@@ -327,4 +338,19 @@ test('Auto can request a remaining plan after the first approved write and suspe
   const rebound = writePlanner(), last = open({ planner: rebound }); await approve(last, handle.runId);
   assert.equal((await (await last.agent.resume(handle.runId, original)).result).output, 'done');
   assert.equal(last.counts.tool, 1); assert.equal(rebound.calls, 0);
+});
+
+for (const status of ['pending','approved','expired']) test(`approval inspection observes ${status} without mutation`,async t => {
+  let now=Date.now(); const open=setup(t),host=open({clockMs:()=>now,expiry:now+60000}),id=await paused(host);
+  if(status==='approved') await approve(host,id);
+  if(status==='expired') now+=60000;
+  const db=new DatabaseSync(host.path);t.after(()=>db.close());
+  const snapshot=()=>JSON.stringify(db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all().map(({name})=>[name,db.prepare(`SELECT * FROM ${name}`).all()]));
+  const before=snapshot(),report=await host.storage.inspectRecovery(id);
+  assert.equal(snapshot(),before);assert.equal(report.observations.approvalState,status);
+  assert.equal(report.observations.approvalCheckpointIntent,'matched');assert.equal(report.observations.approvalRecords,1);
+  assert.equal(report.observations.approvalReceipt,'absent');assert.equal(report.observations.attemptsAfterCheckpoint,0);
+  assert.deepEqual(host.counts,{model:1,tool:0});
+  const [record]=await host.approvals.listPending({runId:id});
+  assert.equal(JSON.stringify(report).includes(record.approvalId),false);assert.equal(JSON.stringify(report).includes(record.intentDigest),false);
 });

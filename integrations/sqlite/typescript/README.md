@@ -160,3 +160,12 @@ Child write approval and MCP write acceptance remain incomplete.
 Keep production databases on their current format until the runtime integration
 and acceptance are complete. See the [durable approval contract](../../../conformance/durable-approval.md#storage-foundation-api)
 for activation, API methods, replay behavior and SDK format boundaries.
+
+### Approval observations (1.1 development)
+
+On explicitly activated v5 storage, recovery inspection adds current tool-ready
+approval state, record count, checkpoint intent match, matching completed receipt
+and Run-associated unknown approval claims. Reads do not expire or alter decisions.
+Current host binding/permission checks remain unknown and required at execution.
+Reports retain `diagnosis_only` authority and omit private approval data. Legacy v4
+reports retain their existing shape. See the [approval inspection contract](../../../conformance/durable-approval.md#read-only-approval-inspection-implemented).

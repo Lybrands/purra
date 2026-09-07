@@ -220,3 +220,33 @@ export async function checkApprovalDispatch(db: DatabaseSync, scope: string, all
   }
   return { record, ...(record.status === "approved" ? {} : { error: `approval_${record.status}` }) };
 }
+
+
+/** Snapshot-only observations. Never refreshes approval state or acquires ownership. */
+export async function inspectApprovalState(db: DatabaseSync, scope: string, saved: Awaited<ReturnType<StorageStores["runs"]["get"]>>, extra: Record<string, any>, now: number) {
+  if (storageVersion(db) !== 5) return {};
+  const rows = db.prepare("SELECT approval_id FROM purra_approvals WHERE scope=? AND sdk='typescript' AND run_id=?").all(scope, saved.runId);
+  const records = await Promise.all(rows.map(row => load(db, scope, String(row.approval_id))));
+  const unknown = Object.values(extra.tools).filter((entry: any) => entry.state === "claimed" && entry.runId === saved.runId
+    && records.some(record => record.approvalId === entry.approvalId && record.intentDigest === entry.intentDigest && record.intent.toolCallId === entry.callId)).length;
+  const observation: import("purra").RecoveryObservations = {approvalState: records.length ? "unknown" : "none", approvalRecords: records.length,
+    approvalUnknownReceipts: unknown, approvalCheckpointIntent: "unknown", approvalReceipt: "unknown"};
+  const call = saved.toolExecutionCheckpoint?.assistant.toolCalls?.[0];
+  if (call === undefined) return observation;
+  const record = records.find(record => record.intent.toolCallId === call.id);
+  if (record === undefined) return {...observation, approvalState: "missing" as const, approvalReceipt: "absent" as const};
+  const matches = record.intent.toolName === call.name && await jsonIdentityDigest(record.intent.arguments) === await jsonIdentityDigest(call.arguments)
+    && record.intent.presetFingerprint === await jsonIdentityDigest(saved.preset);
+  const complete = matches && Object.values(extra.tools).some((entry: any) => entry.state === "complete" && entry.runId === saved.runId
+    && entry.callId === call.id && entry.approvalId === record.approvalId && entry.intentDigest === record.intentDigest
+    && ["not_started", "committed"].includes(entry.result?.effectState)
+    && entry.approvalRevision === record.decisionAudit?.revision && typeof entry.leaseOwnerId === "string" && entry.leaseOwnerId.length > 0
+    && Number.isSafeInteger(entry.leaseEpoch) && entry.leaseEpoch > 0);
+  let state = record.status;
+  if (state === "pending" || state === "approved") {
+    if (saved.status !== "running") state = "canceled";
+    else if (now >= Math.min(record.expiresAtMs, saved.deadlineAt === null ? record.expiresAtMs : Date.parse(saved.deadlineAt))) state = "expired";
+  }
+  return {...observation, approvalState: state, approvalCheckpointIntent: matches ? "matched" as const : "mismatch" as const,
+    approvalReceipt: complete ? "complete" as const : "absent" as const};
+}
