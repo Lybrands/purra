@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.1.0 — Unreleased development
+
+- Revalidate host scope after tool approval and check cancellation before entering
+  the idempotency gateway. Revoked or unavailable authorization does not dispatch
+  the tool or acquire a tool claim. Existing live approval APIs remain supported.
+- Align Core and all seven optional packages, exact internal dependencies and
+  npm lockfiles at 1.1.0. This version has not been published.
+
+The [durable approval contract](conformance/durable-approval.md) defines the
+remaining opt-in storage, suspension/recovery and MCP write work. Those capabilities
+are not yet implemented; the shared dispatch tests cover scope revalidation only.
+
 ## 1.0.0 — Unreleased candidate
 
 - Add versioned strict object output contracts, shared JSON identity, and Run-bound

@@ -401,6 +401,35 @@ class CoreToolExecutor:
                         )
                     continue
 
+            if approval_status is ApprovalStatus.APPROVED:
+                scope_failure = await self._validate_scope(
+                    registration, request, parsed, signal,
+                    preserve_control_errors=True,
+                )
+                if scope_failure is not None:
+                    halt()
+                    code, message, canceled = scope_failure
+                    outcome = (
+                        ToolBatchOutcome.CANCELED if canceled else
+                        ToolBatchOutcome.REJECTED if code == "tool_scope_violation" else
+                        ToolBatchOutcome.FAILED
+                    )
+                    await self._finish_tool_operation(operation_id, outcome, code)
+                    return await _failed_call_batch(
+                        request, event_sink, parsed, index, results, cache_hits,
+                        remaining=parsed_calls[position + 1:], outcome=outcome,
+                        code=code, message=message, approval_status=approval_status,
+                        effect_state=ToolEffectState.NOT_STARTED,
+                    )
+                if _is_canceled(signal):
+                    halt()
+                    await self._finish_tool_operation(
+                        operation_id, ToolBatchOutcome.CANCELED, "tool_execution_canceled",
+                    )
+                    return await self._canceled_result(
+                        request, event_sink, parsed, index, results, cache_hits,
+                    )
+
             try:
                 async def execute_handler() -> ToolHandlerResult:
                     # Core keeps model-generated arguments recursively immutable

@@ -168,6 +168,10 @@ export class ToolCatalog {
         toolCallId: call.id,
         toolName: call.name,
       }));
+      if (tool.policy.mode === "confirm") {
+        await this.#authorizeBatch([[call, tool]], options, true, false);
+        throwIfCanceled(options.signal);
+      }
       const result = await this.#execute(
         call,
         tool,
@@ -349,6 +353,7 @@ export class ToolCatalog {
     admitted: readonly (readonly [ToolCall, RegisteredTool])[],
     options: ExecuteOptions,
     preserveControlErrors = false,
+    requestApproval = true,
   ): Promise<void> {
     const signal = options.signal;
     for (const [call, tool] of admitted) {
@@ -374,6 +379,7 @@ export class ToolCatalog {
       }
     }
 
+    if (!requestApproval) return;
     for (const [call, tool] of admitted) {
       if (tool.policy.mode !== "confirm") continue;
       if (this.#approval === undefined) {

@@ -41,6 +41,12 @@ concurrency declarations and effective tool limits. Changing them changes the
 configuration fingerprint; it does not silently rebind a checkpoint. Hosts
 still version their scope and handler implementations through preset revisions.
 
+Confirm-mode tools additionally revalidate current host scope after approval,
+before entering idempotency. Scope callbacks must tolerate repeated validation
+and must not perform the approved write themselves. This check does not provide
+durable approval or close a remote service's authorization race. The
+[durable approval contract](durable-approval.md) defines the remaining work.
+
 The shared fixture and latch/barrier tests establish overlap, bounds, ordering,
 queue shutdown, revocation, cancellation cleanup and failure propagation.
 Official local MCP client/server tests also verify several requests on one

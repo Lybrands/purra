@@ -6,12 +6,14 @@ An ESM Agent runtime for Node.js 22+. Applications provide a `ModelGateway` and
 compose tools, context, planning, and persistence through the public `purra` exports.
 
 
-## 1.0.0 candidate status
+## 1.1.0 development status
 
-This checkout contains an unreleased 1.0.0 candidate. Install the exact local
-artifacts from its candidate manifest; registry commands do not identify this candidate.
-See the [candidate support and upgrade guide](../conformance/release-1.0.md)
-for structured tasks, read-only MCP, safe read concurrency, inspection, and 1.x compatibility.
+This checkout is unreleased 1.1.0 development. Install matching local Core and
+integration artifacts; registry commands do not identify this development build.
+The [durable approval contract](../conformance/durable-approval.md) describes the
+work in progress. Durable approval recovery and MCP writes are not yet available.
+Existing capabilities and 1.x compatibility are documented in the
+[1.0 support guide](../conformance/release-1.0.md).
 
 ## Install
 

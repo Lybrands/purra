@@ -118,7 +118,7 @@ class _InstalledRetriever:
 async def _run() -> None:
     package_path = Path(purra.__file__).resolve()
     assert "site-packages" in package_path.parts, package_path
-    assert version("purra") == "1.0.0"
+    assert version("purra") == "1.1.0"
     assert PlanningMode.AUTO.value == "auto"
     assert ToolPlanningRequirement.REQUIRED.value == "required"
 
@@ -424,6 +424,45 @@ async def _structured_task_smoke():
     assert result.receipt.usage.generation_tokens == 10
 
 
+async def _approval_scope_smoke():
+    from purra.contracts import ApprovalResult, ApprovalStatus, ToolBatchRequest, ToolCall, ToolPolicy, ToolSchema
+    from purra.ports import ToolRegistration
+    from purra.tools import CoreToolExecutor
+
+    allowed = True
+
+    class Approval:
+        async def request(self, run_id, approval, event_sink, signal=None):
+            nonlocal allowed
+            allowed = False
+            return ApprovalResult("installed-approval", ApprovalStatus.APPROVED)
+
+    class Idempotency:
+        async def execute_once(self, *args):
+            raise AssertionError("revoked write acquired a tool claim")
+
+    class Sink:
+        async def emit(self, event):
+            pass
+
+    async def scope(state, arguments, signal=None):
+        return None if allowed else "Access revoked"
+
+    async def handler(state, arguments, signal=None):
+        raise AssertionError("revoked write was dispatched")
+
+    tool = ToolRegistration(
+        ToolSchema("write", "Write fixture", {"type": "object"}), handler,
+        ToolPolicy(mode="confirm", title="Write fixture", risk_level="write"), scope_validator=scope,
+    )
+    executor = CoreToolExecutor(InMemoryToolCatalog((tool,)), approval_gateway=Approval(), idempotency_gateway=Idempotency())
+    result = await executor.execute_batch(ToolBatchRequest(
+        "installed-approval-run", (ToolCall("call", "write", "{}"),), frozenset({"write"}), ExecutionState(),
+    ), Sink())
+    assert result.results[0].error == "tool_scope_violation"
+    assert result.effect_state.value == "not_started"
+
+
 if __name__ == "__main__":
     output = StructuredOutputContract("installed", "1", {
         "type": "object", "properties": {"ok": {"type": "boolean"}},
@@ -438,3 +477,4 @@ if __name__ == "__main__":
         raise AssertionError("installed contract accepted duplicate keys")
     asyncio.run(_run())
     asyncio.run(_structured_task_smoke())
+    asyncio.run(_approval_scope_smoke())

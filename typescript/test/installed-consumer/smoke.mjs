@@ -31,6 +31,34 @@ const RUN_OPTIONS = Object.freeze({
 
 await assertRunRepositoryConforms(new InMemoryAgentAdapters().runs);
 
+let approvalScopeAllowed = true;
+let approvalDispatches = 0;
+let approvalClaims = 0;
+const approvalAgent = new Agent({
+  model: {
+    capabilities: { ...capabilities(), protocol: { ...capabilities().protocol, streaming: "unknown" } },
+    async invoke(request) {
+      return {
+        message: { role: "assistant", content: "", toolCalls: [{ id: "approved-call", name: "write", arguments: {} }] },
+        finishReason: "tool_calls",
+        appliedGenerationLimit: request.outputBudget?.maxGenerationTokens,
+      };
+    },
+  },
+  tools: [{
+    name: "write", description: "Write fixture", inputSchema: { type: "object" },
+    policy: { mode: "confirm", title: "Write fixture", riskLevel: "write" },
+    scope: () => approvalScopeAllowed,
+    run: () => { approvalDispatches++; return { content: "done", effectState: "committed" }; },
+  }],
+  approval: { request: () => { approvalScopeAllowed = false; return "approved"; } },
+  idempotency: { executeOnce: async (_, operation) => { approvalClaims++; return operation(); } },
+});
+await assert.rejects(approvalAgent.invoke({ messages: [{ role: "user", content: "Write fixture" }] }),
+  error => error.code === "tool_scope_violation");
+assert.equal(approvalDispatches, 0);
+assert.equal(approvalClaims, 0);
+
 const installedRetrieverTool = new RetrieverTool({
   retriever: {
     async retrieve(request) {
