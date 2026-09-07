@@ -2,6 +2,11 @@
 
 ## 1.1.0 — Unreleased development
 
+- Add installed Python/TypeScript consumers against an independent synthetic MCP
+  writer, covering response loss and process exit before/after writes. The checks
+  verify remote file evidence, retained unknown claims, no repeat dispatch and
+  process cleanup; CI now runs them with matching Core/SQLite/MCP artifacts.
+
 - Fence late approved tool results by the original execution lease epoch. Expired
   TypeScript leases cannot be revived by heartbeats; stale execution contexts
   cannot alter Run state, renew or release a newer epoch, or complete a receipt.

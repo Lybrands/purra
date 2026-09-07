@@ -191,3 +191,27 @@ SDK server. Build the sibling Core and SQLite packages before TypeScript tests; 
 Core, MCP and SQLite source directories on `PYTHONPATH` for Python tests. These are
 deterministic local tests, separate from real Provider/MCP service and downstream
 acceptance. See [durable approval](../../../conformance/durable-approval.md).
+
+## Independent write-server acceptance
+
+The repository's installed-consumer check now runs five scenarios against the
+separate Python SDK process in `integrations/mcp/fixtures/write_server.py`:
+success, lost response, exit before write, exit after write, and an error response
+after write. The server accepts only a fixed synthetic value, writes inside a
+fresh temporary directory, and fsyncs an independent event ledger. The host waits
+for durable approval, reopens SQLite before approving, then checks both the local
+receipt/unknown claim and the remote file. Reopening after completion/failure must
+not dispatch again. Every scenario verifies that the server process has exited.
+
+Run from the repository root using an isolated virtual environment containing
+the matching installed Core, SQLite and MCP wheels:
+
+```sh
+python -I integrations/mcp/python/scripts/check_installed_write.py integrations/mcp/fixtures/write_server.py
+```
+
+These are controlled independent-service fault checks, using a scripted model.
+They do not prove real Provider capability or third-party business-service
+acceptance. The remote ledger is verification evidence, never an approval or
+automatic reconciliation command. The CI workflow includes both consumers;
+local success does not claim that remote CI has executed.

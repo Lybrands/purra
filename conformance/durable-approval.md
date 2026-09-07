@@ -441,3 +441,31 @@ the claim before starting its monitor so both execution and monitor inherit the
 same epoch; SQLite renewal/release honor that proof. Existing host lease port
 signatures remain unchanged. These local fault injections do not establish remote
 server cancellation or an end-to-end exactly-once guarantee.
+
+## Independent MCP writer acceptance
+
+Both installed SDK consumers now exercise the same separately launched official
+Python MCP SDK server over stdio. The negotiated protocol is recorded in each
+consumer report. The service owns a fresh temporary directory and fsyncs both a
+fixed-value file and an independent event ledger. No business resources are used.
+
+| Service scenario | Observed remote writes | Host effect / receipt |
+| --- | ---: | --- |
+| Success | 1 | committed receipt |
+| Response suppressed after writing (simulated loss) | 1 | unknown claim retained |
+| Process exits before writing | 0 | unknown claim retained |
+| Process exits after writing | 1 | unknown claim retained |
+| Error response after writing | 1 | unknown claim retained |
+
+Each scenario proves approval waits across SQLite reopen without another model
+call or remote dispatch, host-authorized approval before dispatch, and rejection
+of subsequent recovery as `run_terminal`. Exactly one remote request is recorded,
+and every server PID is confirmed gone after transport shutdown. The host does not
+convert the fixture ledger into an automatic reconciliation command. In particular,
+a transport error alone cannot establish the zero-write result of the exit-before
+fixture: that fact comes from the independent server/file evidence.
+
+Reproducible commands are in the MCP READMEs and CI installed-consumer steps.
+These checks use a scripted model and a controlled server. Real Provider capabilities,
+third-party business MCP services and downstream enablement remain separate and
+are not passed by these checks. Updating CI does not claim remote CI execution.

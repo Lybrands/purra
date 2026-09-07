@@ -152,22 +152,26 @@ jobs:
         run: |
           python -m build --wheel --outdir "$RUNNER_TEMP/mcp-wheels"
           python -m build --wheel --outdir "$RUNNER_TEMP/mcp-wheels" integrations/mcp/python
+          python -m build --wheel --outdir "$RUNNER_TEMP/mcp-wheels" integrations/sqlite/python
           python -m venv "$RUNNER_TEMP/mcp-consumer"
           "$RUNNER_TEMP/mcp-consumer/bin/python" -m pip install "$RUNNER_TEMP"/mcp-wheels/*.whl
           cd "$RUNNER_TEMP"
           "$RUNNER_TEMP/mcp-consumer/bin/python" -I "$GITHUB_WORKSPACE/integrations/mcp/python/scripts/check_installed.py"
+          "$RUNNER_TEMP/mcp-consumer/bin/python" -I "$GITHUB_WORKSPACE/integrations/mcp/python/scripts/check_installed_write.py" "$GITHUB_WORKSPACE/integrations/mcp/fixtures/write_server.py"
       - name: Verify installed MCP tarballs, public types and stdio server
         if: matrix.component == 'mcp'
         run: |
           mkdir -p "$RUNNER_TEMP/mcp-node/consumer"
           (cd typescript && npm pack --pack-destination "$RUNNER_TEMP/mcp-node")
           (cd integrations/mcp/typescript && npm pack --pack-destination "$RUNNER_TEMP/mcp-node")
-          cp integrations/mcp/typescript/scripts/check-installed.mjs "$RUNNER_TEMP/mcp-node/consumer/"
+          (cd integrations/sqlite/typescript && npm pack --pack-destination "$RUNNER_TEMP/mcp-node")
+          cp integrations/mcp/typescript/scripts/check-installed*.mjs "$RUNNER_TEMP/mcp-node/consumer/"
           cp integrations/mcp/typescript/test/{consumer.ts,tsconfig.json} "$RUNNER_TEMP/mcp-node/consumer/"
           cd "$RUNNER_TEMP/mcp-node/consumer"
           echo '{"private":true,"type":"module"}' > package.json
           npm install --ignore-scripts ../*.tgz
           node check-installed.mjs
+          node check-installed-write.mjs "$GITHUB_WORKSPACE/integrations/mcp/fixtures/write_server.py" "$RUNNER_TEMP/mcp-consumer/bin/python"
           "$GITHUB_WORKSPACE/typescript/node_modules/.bin/tsc" -p tsconfig.json
 
   package-installers:
