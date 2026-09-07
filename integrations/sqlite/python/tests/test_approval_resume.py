@@ -6,14 +6,14 @@ from pathlib import Path
 import pytest
 
 from purra.api import (
-    AgentCore, AgentCoreRunOptions, AgentPreset, UserInputRequired,
+    AgentCore, AgentCoreRunOptions, AgentPreset, UserInputRequired, AgentComponentBinding, ExecutionProfile,
     AgentTreePolicy, AgentCapabilityGrant, BeginRootAgentCommand,
     ChildAgentSpec, SpawnAgentsCommand,
 )
 from purra.contracts import (
     AgentMessage, AgentRunRequest, DomainContext, ModelRequest, ModelStream,
     ModelStreamChunk, RunCreateParams, RuntimeLimits, ToolCallDelta,
-    ToolHandlerResult, ToolPolicy, ToolSchema,
+    ToolHandlerResult, ToolPolicy, ToolSchema, PlanningResult, WorkPlan, WorkStep,
 )
 from purra.errors import ContractViolationError
 from purra.events import AgentEvent
@@ -28,7 +28,7 @@ from purra.structured import json_identity_digest
 import time
 import asyncio
 class ApprovalHost:
-    def __init__(self, path, *, revision="1", leased=True, tree=False, first_snapshot=None):
+    def __init__(self, path, *, revision="1", leased=True, tree=False, first_snapshot=None, planner=None):
         self.storage = SqliteAgentAdapters(path, scope="resume")
         self.approvals = self.storage.approval_store(authorize=lambda *_: True)
         self.model_calls = 0
@@ -46,6 +46,8 @@ class ApprovalHost:
             output_repository=self.storage.outputs, output_publisher=self.storage.publisher,
             execution_lease_store=self.storage.leases if leased else None,
             preset=AgentPreset(id="resume", revision=revision,
+                execution_profile=ExecutionProfile(planner=planner),
+                component_bindings={"planner": AgentComponentBinding("approval.planner", "1")} if planner is not None else {},
                 agent_tree_policy=AgentTreePolicy() if tree else None,
                 runtime_limits=RuntimeLimits(max_run_generation_tokens=None),
                 tool_catalog=InMemoryToolCatalog((ToolRegistration(
@@ -76,7 +78,16 @@ class ApprovalHost:
     async def stream(self, messages, invocation, signal=None):
         self.model_calls += 1
         async def chunks():
-            if any(m.role.value == "tool" for m in messages) or not invocation.tools:
+            if getattr(self, "script", None) is not None:
+                output = self.script(messages, invocation)
+                if isinstance(output, tuple):
+                    name, arguments = output
+                    yield ModelStreamChunk(tool_call_deltas=(ToolCallDelta(index=0, id=f"call-{sum(len(m.tool_calls) for m in messages)+1}", name=name, arguments_fragment=json.dumps(arguments)),), finish_reason="tool_calls")
+                else:
+                    yield ModelStreamChunk(content_delta=output, finish_reason="stop")
+            elif getattr(self, "promote", False) and self.model_calls == 1:
+                yield ModelStreamChunk(tool_call_deltas=(ToolCallDelta(index=0, id="plan", name="request_plan", arguments_fragment="{}"),), finish_reason="tool_calls")
+            elif any(m.role.value == "tool" for m in messages) or not invocation.tools:
                 yield ModelStreamChunk(content_delta="42", finish_reason="stop")
             else:
                 yield ModelStreamChunk(tool_call_deltas=(ToolCallDelta(
@@ -266,3 +277,138 @@ async def test_committed_receipt_replay_after_expiry_does_not_repeat_effect(tmp_
         assert (await resumed.wait()).status.value=='done'
         assert host.tool_calls==0
     finally:await host.close()
+
+
+class ApprovalPlanner:
+    def __init__(self): self.calls = 0; self.revisions = []
+    async def create_plan(self, *args, **kwargs):
+        self.calls += 1
+        return PlanningResult(kind="planned", work_plan=WorkPlan(title="Write and finish", steps=(
+            WorkStep(id="prepare", title="Prepare", type="review", executor="model"),
+            WorkStep(id="write", title="Write", type="write", executor="tool", capability_names=("lookup",), depends_on=("prepare",)),
+            WorkStep(id="finish", title="Finish", type="review", executor="model", depends_on=("write",)),
+        )))
+    async def revise_plan(self, request, capabilities, turn, *args, **kwargs):
+        self.revisions.append(turn.revision)
+        raise AssertionError("Pending approval must not trigger replanning")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scenario", json.loads((Path(__file__).resolve().parents[4] / "conformance/fixtures/approval_runtime_modes.json").read_text())["cases"], ids=lambda item: item["id"])
+async def test_planning_approval_restart_preserves_tool_transition_without_model_work(tmp_path, scenario):
+    mode = scenario["id"]
+    path = tmp_path / 'db'; planner = ApprovalPlanner(); host = ApprovalHost(path, planner=planner)
+    host.request = replace(host.request, planning_mode=scenario["requestPlanningMode"])
+    original = host.request; expiry = int(time.time()*1000)+60000; host.expiry = expiry
+    host.promote = mode == "promoted"
+    try:
+        await host.storage.enable_approvals()
+        handle = await host.core.submit(original, options=AgentCoreRunOptions(tool_checkpoint_handler=host.boundary, tool_checkpoint_names=frozenset({"lookup"})))
+        with pytest.raises(ApprovalRequired): await handle.wait()
+        snapshot = await host.storage.runs.get(handle.run_id); checkpoint = snapshot.execution_checkpoint
+        assert checkpoint.execution_profile == scenario["checkpointProfile"]
+        assert planner.calls == scenario["plannerCreationsBeforeWait"]
+        if mode != "auto":
+            assert snapshot.steps[0].status.value == "done"
+            assert snapshot.steps[1].status.value == "running"
+        await host.close(); planner = ApprovalPlanner(); host = ApprovalHost(path, planner=planner); host.expiry = expiry
+        host.request = original
+        options = AgentCoreRunOptions(tool_checkpoint_handler=host.boundary, tool_checkpoint_names=frozenset({"lookup"}))
+        with pytest.raises(ApprovalRequired): await (await host.core.resume(handle.run_id, original, options=options)).wait()
+        assert host.model_calls == host.tool_calls == planner.calls == 0
+        assert (await host.storage.runs.get(handle.run_id)).execution_checkpoint == checkpoint
+        (record,) = await host.approvals.list_pending(run_id=handle.run_id)
+        await host.approvals.decide(ApprovalDecisionCommand(approval_id=record.approval_id, expected_revision=record.revision,
+            intent_digest=record.intent.digest, command_key="approve", decision="approve"), principal_id="host")
+        result = await (await host.core.resume(handle.run_id, original, options=options)).wait()
+        assert result.status.value == "done"
+        assert host.tool_calls == 1 and planner.calls == 0 and planner.revisions == []
+    finally: await host.close()
+
+
+class TreeApprovalPlanner(ApprovalPlanner):
+    async def create_plan(self, *args, **kwargs):
+        self.calls += 1
+        return PlanningResult(kind="planned", work_plan=WorkPlan(title="Delegate, write, finish", steps=(
+            WorkStep(id="delegate", title="Delegate", type="read", executor="tool", capability_names=("delegateToAgents",)),
+            WorkStep(id="write", title="Write", type="write", executor="tool", capability_names=("lookup",), depends_on=("delegate",)),
+            WorkStep(id="finish", title="Finish", type="review", executor="model", depends_on=("write",)),
+        )))
+
+    async def revise_plan(self, request, capabilities, turn, *args, **kwargs):
+        self.revisions.append(turn.revision)
+        return PlanningResult(kind="planned", work_plan=WorkPlan(title="Write after delegation", steps=(
+            WorkStep(id=f"write-{turn.revision}", title="Write", type="write", executor="tool", capability_names=("lookup",)),
+            WorkStep(id=f"finish-{turn.revision}", title="Finish", type="review", executor="model", depends_on=(f"write-{turn.revision}",)),
+        )))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["reactive", "planned"])
+async def test_tree_root_approval_after_read_only_child_keeps_child_result(tmp_path, mode):
+    def script(messages, invocation):
+        if any(message.attributes.get("agentId") for message in messages):
+            assert all(tool.name != "lookup" for tool in invocation.tools)
+            return "Child result"
+        names = [call.name for message in messages for call in message.tool_calls]
+        if "lookup" in names or not invocation.tools: return "42"
+        if "delegateToAgents" in names: return "lookup", {}
+        return "delegateToAgents", {"children": [{"name": "reader", "title": "Read", "instruction": "Read only", "objective": "Report"}]}
+    path = tmp_path / "db"
+    host = ApprovalHost(path, tree=True, planner=TreeApprovalPlanner() if mode == "planned" else None)
+    host.script = script; host.expiry = int(time.time()*1000)+60000; expiry = host.expiry
+    original = replace(host.request, planning_mode=mode)
+    try:
+        await host.storage.enable_approvals()
+        options = AgentCoreRunOptions(tool_checkpoint_handler=host.boundary, tool_checkpoint_names=frozenset({"lookup"}))
+        handle = await host.core.submit(original, options=options)
+        with pytest.raises(ApprovalRequired):
+            result = await handle.wait()
+            pytest.fail(f"Expected approval wait, received {result!r}")
+        if mode == "planned":
+            assert (await host.storage.runs.get(handle.run_id)).execution_checkpoint.planning_state["revision"] == 1
+        children = await host.storage.run_tree.list_descendants(handle.run_id)
+        assert len(children) == 1 and children[0].status.value == "done"
+        await host.close()
+        host = ApprovalHost(path, tree=True, planner=TreeApprovalPlanner() if mode == "planned" else None)
+        host.script = script; host.expiry = expiry
+        options = AgentCoreRunOptions(tool_checkpoint_handler=host.boundary, tool_checkpoint_names=frozenset({"lookup"}))
+        with pytest.raises(ApprovalRequired): await (await host.core.resume(handle.run_id, original, options=options)).wait()
+        assert host.model_calls == host.tool_calls == 0
+        (record,) = await host.approvals.list_pending(run_id=handle.run_id)
+        await host.approvals.decide(ApprovalDecisionCommand(approval_id=record.approval_id, expected_revision=record.revision,
+            intent_digest=record.intent.digest, command_key="approve", decision="approve"), principal_id="host")
+        result = await (await host.core.resume(handle.run_id, original, options=options)).wait()
+        assert result.status.value == "done" and host.tool_calls == 1
+        assert await host.storage.run_tree.list_descendants(handle.run_id) == children
+    finally: await host.close()
+
+
+@pytest.mark.asyncio
+async def test_auto_remaining_plan_after_approved_write_preserves_second_wait(tmp_path):
+    path = tmp_path / 'db'; host = ApprovalHost(path, planner=ApprovalPlanner())
+    original = replace(host.request, planning_mode="auto"); expiry = int(time.time()*1000)+60000; host.expiry = expiry
+    async def approve_pending(current, run_id):
+        record = next(record for record in await current.approvals.list_pending(run_id=run_id) if record.status == "pending")
+        await current.approvals.decide(ApprovalDecisionCommand(approval_id=record.approval_id, expected_revision=record.revision,
+            intent_digest=record.intent.digest, command_key="approve", decision="approve"), principal_id="host")
+    try:
+        await host.storage.enable_approvals()
+        options = AgentCoreRunOptions(tool_checkpoint_handler=host.boundary, tool_checkpoint_names=frozenset({"lookup"}))
+        handle = await host.core.submit(original, options=options)
+        with pytest.raises(ApprovalRequired): await handle.wait()
+        assert (await host.storage.runs.get(handle.run_id)).execution_checkpoint.initial_planning_open is True
+        await approve_pending(host, handle.run_id)
+        await host.close(); planner = ApprovalPlanner(); host = ApprovalHost(path, planner=planner); host.expiry = expiry
+        host.script = lambda messages, invocation: ("request_remaining_plan", {}) if host.model_calls == 1 else ("lookup", {})
+        options = AgentCoreRunOptions(tool_checkpoint_handler=host.boundary, tool_checkpoint_names=frozenset({"lookup"}))
+        with pytest.raises(ApprovalRequired): await (await host.core.resume(handle.run_id, original, options=options)).wait()
+        checkpoint = (await host.storage.runs.get(handle.run_id)).execution_checkpoint
+        assert checkpoint.execution_profile == "planned" and not checkpoint.initial_planning_open
+        assert host.tool_calls == 1 and planner.calls == 1
+        await host.close(); planner = ApprovalPlanner(); host = ApprovalHost(path, planner=planner); host.expiry = expiry
+        await approve_pending(host, handle.run_id)
+        options = AgentCoreRunOptions(tool_checkpoint_handler=host.boundary, tool_checkpoint_names=frozenset({"lookup"}))
+        result = await (await host.core.resume(handle.run_id, original, options=options)).wait()
+        assert result.status.value == "done" and host.tool_calls == 1 and planner.calls == 0
+    finally: await host.close()

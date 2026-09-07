@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "cases": [
+    {"id": "planned", "requestPlanningMode": "planned", "checkpointProfile": "planned", "plannerCreationsBeforeWait": 1},
+    {"id": "auto", "requestPlanningMode": "auto", "checkpointProfile": "auto", "plannerCreationsBeforeWait": 0},
+    {"id": "promoted", "requestPlanningMode": "auto", "checkpointProfile": "planned", "plannerCreationsBeforeWait": 1}
+  ],
+  "invariants": [
+    "Pending recovery preserves the checkpoint and does not call the model or Planner.",
+    "Planned approval waits retain the running tool step and completed preceding model step.",
+    "Approval permits one tool dispatch under the existing claim and receipt boundary.",
+    "Restore never creates another initial plan for the pending tool call."
+  ]
+}

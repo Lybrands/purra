@@ -3,7 +3,7 @@
 [English](durable-approval.md) | 简体中文
 
 当前已实现阶段 B 的存储基础：不可变审批记录、宿主授权的事务决策及 SQLite v5 显式激活。
-Python 和 TypeScript 已接通 opt-in 单调用工具续点，目前完成 Reactive Root Run 的确定性验证。
+Python 和 TypeScript 已接通 opt-in 单调用工具续点，目前完成 Reactive、Planned 和 Auto Root Run 的确定性验证。
 MCP 写工具**尚未实现**，阶段 B 仍未完成。
 当前已落地的前置修复是：审批通过后、进入工具幂等网关前重新验证宿主 scope 和取消状态。
 共享案例 `fixtures/approval_dispatch.json` 只验证这一边界。已有内存审批继续可用。
@@ -16,7 +16,7 @@ MCP 写工具**尚未实现**，阶段 B 仍未完成。
 不增加旧宿主端口的必需方法，不更改现有 `ApprovalGateway`／`ToolApprovalGateway`
 签名及结果状态；持久化存储或宿主授权不可用时，禁止降级为内存批准。
 
-下面三种记录已在双端导出；双端已实现 Reactive Root 派发关联。Python 使用 snake_case，
+下面三种记录已在双端导出；双端已实现 Root 审批派发关联。Python 使用 snake_case，
 持久化 JSON 使用与 TypeScript 一致的 camelCase：
 
 | 对象 | 必需绑定 |
@@ -201,15 +201,15 @@ invocation ID、独立的模型预算 key、规划/证据/轮次状态。旧 v2 
 空闲宿主可通过既有 `reconcile_tool` 提供已知结果或未执行证明。已提交的匹配回执即使过期
 也可以重放，不重新执行效果。
 
-当前确定性验证覆盖 Reactive Root 重启、重复待审恢复、并发恢复、批准后取消、binding 变化、
-未知效果、回执落盘失败和已提交回执重放。Planned/Auto、Agent Tree、扩展运行对齐、
+当前确定性验证覆盖 Root 重启、重复待审恢复、并发恢复、批准后取消、binding 变化、
+未知效果、回执落盘失败和已提交回执重放。Child 写审批、扩展运行对齐、
 规范化审批诊断、MCP 写传输、真实服务与下游验收仍待完成。不能据此宣称 1.1 已验收。
 
 ## TypeScript 工具续点运行入口（开发中）
 
 在 `Agent` 配置 `toolCheckpointHandler` 及可选 `toolCheckpointNames`。选中批次只支持
-单次调用，目前只允许持久化 Reactive Root；Planned/Auto 或 Child 的工具续点执行以
-`approval_runtime_unsupported` 拒绝。未选中的只读批次沿用原行为。
+单次调用，支持持久化 Reactive、Planned、Auto 直接执行、升级及剩余计划 Root。
+Child 的工具续点执行仍以 `approval_runtime_unsupported` 拒绝。未选中的只读批次沿用原行为。
 
 新的 `AgentToolExecutionCheckpoint` 为 schema 3 / `tool_ready`，包含实际 assistant
 消息（含 Provider 回放数据）、已结算 `invocationId`、真实 `appliedGenerationLimit`、
@@ -243,5 +243,26 @@ lease 始终使用真实墙钟。
 
 确定性测试覆盖重启、重复待审、并发恢复、当前 scope 拒绝、gateway 后到 claim 前过期、
 不透明 key 关联、效果不明、回执落盘失败及完成回执重放。通用诊断已识别工具续点；
-规范化审批诊断、Planned/Auto/Tree 验收、MCP 写工具、真实服务和下游验收仍未完成。
+规范化审批诊断、Child 写审批验收、MCP 写工具、真实服务和下游验收仍未完成。
 这些测试不证明外部系统端到端 exactly-once。
+
+## Root 规划与 Agent Tree 共存
+
+双端用共享 `fixtures/approval_runtime_modes.json` 验证 Planned、Auto 直接执行和
+Auto 升级规划的相同不变量：待审重启不调用模型或 Planner，保留正在执行的工具步骤。
+续点必须在进入工具步骤后、实际派发前保存；待审时不能把写步骤标成完成。
+TypeScript 在该边界新增完整规划快照及当前 Auto 激活阶段。
+
+双端另有“批准第一次写入 → 申请剩余计划 → 第二次审批等待”的验证；TypeScript
+还覆盖业务工具请求重规划后再次审批。已完成回执和 planner revision 继续保留，
+审批等待不触发新的初始计划。
+
+Reactive、Planned Root 完成只读 Child 后，再为自身写入等待审批，双端测试均通过；
+恢复不会重复运行已经完成的 Child。Python 委派工具按既有契约请求一次剩余计划修订，
+该 revision 随审批续点保存，不因重启再执行一遍。
+
+TypeScript 开启 Agent Tree 与审批时，必须用 `toolCheckpointNames` 明确选择业务写工具。
+Core 自己生成的委派工具保留原有宿主托管 Run/claim 链路；内部例外按定义对象身份识别，
+不按名称或调用方可填写的标记识别。同名 `delegateToAgents` 业务工具仍不能绕过持久回执绑定。
+Child 默认只读授权保持不变。上述验收不开放 Child 写入，也不代表任意嵌套审批与
+clarification 组合已经通过。Child 写审批、规范化审批诊断、MCP 写工具和真实服务/下游验收仍待完成。

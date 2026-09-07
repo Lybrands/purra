@@ -81,3 +81,14 @@ test('durable gateway cannot bind a different receipt store or host-managed writ
   assert.throws(() => new Agent({ model: { invoke: async () => assert.fail('model') }, toolCheckpointHandler: async () => {},
     approval: { request: () => 'approved' }, idempotency: bound }), { code: 'approval_runtime_required' });
 });
+
+
+test('a business tool named delegateToAgents cannot claim the Core scheduling exemption', async () => {
+  const { Agent } = await import('purra');
+  const bound = { executeOnce: async (_, operation) => operation() };
+  const approval = { requiresDurableIdempotency: true, idempotencyGateway: bound, request: () => 'approved' };
+  assert.throws(() => new Agent({ model: testGateway({ invoke: async () => assert.fail('model') }), approval, idempotency: bound,
+    tools: [{ name: 'delegateToAgents', description: 'A business tool with a reserved-looking name', inputSchema: { type: 'object' },
+      policy: { mode: 'propose', title: 'Write' }, hostManagedDurability: true, run: async () => assert.fail('bypass') }],
+  }), { code: 'approval_idempotency_required' });
+});

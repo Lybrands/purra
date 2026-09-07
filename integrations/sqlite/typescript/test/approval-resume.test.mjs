@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -23,8 +23,12 @@ function setup(t) {
     } });
     const agent = new Agent({
       runRepository: repository, outputPublisher: storage.publisher, preset: { id: 'approval', revision: '1' },
+      ...(settings.planner ? { planning: { planner: settings.planner } } : {}),
+      ...(settings.tree ? { agentTree: { repository: storage.runTree } } : {}),
+      toolCheckpointNames: ['write'],
       model: testGateway({ async invoke(input) {
         counts.model++;
+        if (settings.script) return settings.script(input, counts.model);
         if (input.messages.some(message => message.role === 'tool') || input.tools.length === 0) return { message: { role: 'assistant', content: 'done' }, finishReason: 'stop' };
         return { message: { role: 'assistant', content: '', reasoning: 'private fixture reasoning', providerData: { fixture: 'opaque replay' },
           toolCalls: [{ id: 'write-1', name: 'write', arguments: { value: 42 } }] }, finishReason: 'tool_calls' };
@@ -54,7 +58,8 @@ async function paused(host) {
   return handle.runId;
 }
 async function approve(host, id) {
-  const [record] = await host.approvals.listPending({ runId: id });
+  const records = await host.approvals.listPending({ runId: id });
+  const record = records.find(record => record.status === "pending") ?? records[0];
   await host.approvals.decide({ approvalId: record.approvalId, expectedRevision: record.revision, intentDigest: record.intentDigest,
     commandKey: 'approve', decision: 'approve' }, { principalId: 'host' });
   return record;
@@ -205,4 +210,121 @@ test('receipt identity uses explicit Run and call context and cannot move to ano
     assert.equal(entry.approvalId, record.approvalId); assert.equal(entry.intentDigest, record.intentDigest);
     assert.equal(entry.approvalRevision, 2); assert.ok(entry.leaseEpoch >= 2);
   });
+});
+
+
+function writePlan(suffix = '') { return { workPlan: { title: 'Write and finish', steps: [
+  { id: 'prepare' + suffix, title: 'Prepare', type: 'review', executor: 'model' },
+  { id: 'write' + suffix, title: 'Write', type: 'write', executor: 'tool', capabilityNames: ['write'], dependsOn: ['prepare' + suffix] },
+  { id: 'finish' + suffix, title: 'Finish', type: 'review', executor: 'model', dependsOn: ['write' + suffix] },
+] } }; }
+function writePlanner() { return { calls: 0, revisions: [], createPlan() { this.calls++; return writePlan(); },
+  revisePlan(_request, _capabilities, turn) { this.revisions.push(turn.revision); return writePlan(String(turn.revision)); } }; }
+const modeCases = JSON.parse(readFileSync(new URL('../../../../conformance/fixtures/approval_runtime_modes.json', import.meta.url), 'utf8')).cases;
+for (const scenario of modeCases) test(`${scenario.id} approval restart preserves the active tool step and does not rerun planning`, async t => {
+  const mode = scenario.id;
+  const open = setup(t), planner = writePlanner();
+  const first = open({ planner, ...(mode === 'promoted' ? { script: (_input, count) => ({ message: { role: 'assistant', content: '', toolCalls: [
+    count === 1 ? { id: 'plan', name: 'request_plan', arguments: {} } : { id: 'write-1', name: 'write', arguments: { value: 42 } },
+  ] }, finishReason: 'tool_calls' }) } : {}) });
+  await first.storage.enableApprovals();
+  const original = { ...request, planningMode: scenario.requestPlanningMode };
+  const handle = await first.agent.submit(original, options);
+  await assert.rejects(handle.result, ApprovalRequired);
+  const saved = await first.storage.runs.get(handle.runId), checkpoint = saved.toolExecutionCheckpoint;
+  assert.equal(checkpoint.executionProfile, scenario.checkpointProfile);
+  if (checkpoint.planning) {
+    assert.equal(checkpoint.planning.plan.steps[0].status, 'done');
+    assert.equal(checkpoint.planning.plan.steps[1].status, 'running');
+    assert.equal(checkpoint.planning.plan.steps[2].status, 'pending');
+  }
+  assert.equal(planner.calls, scenario.plannerCreationsBeforeWait);
+  const restoredPlanner = writePlanner(), restored = open({ planner: restoredPlanner });
+  await assert.rejects((await restored.agent.resume(handle.runId, original)).result, ApprovalRequired);
+  assert.deepEqual(restored.counts, { model: 0, tool: 0 }); assert.equal(restoredPlanner.calls, 0);
+  assert.deepEqual((await restored.storage.runs.get(handle.runId)).usage, saved.usage);
+  await approve(restored, handle.runId);
+  assert.equal((await (await restored.agent.resume(handle.runId, original)).result).output, 'done');
+  assert.equal(restored.counts.tool, 1); assert.equal(restoredPlanner.calls, 0); assert.deepEqual(restoredPlanner.revisions, []);
+});
+
+
+test('replanning followed by another approval preserves revision and completed write receipts', async t => {
+  const open = setup(t), original = { ...request, planningMode: 'planned' };
+  const script = input => {
+    const writes = input.messages.filter(message => message.role === 'tool').length;
+    return writes >= 2 || input.tools.length === 0 ? { message: { role: 'assistant', content: 'done' }, finishReason: 'stop' }
+      : { message: { role: 'assistant', content: '', toolCalls: [{ id: `write-${writes + 1}`, name: 'write', arguments: { value: 42 } }] }, finishReason: 'tool_calls' };
+  };
+  const first = open({ planner: writePlanner(), script }); await first.storage.enableApprovals();
+  let handle = await first.agent.submit(original, options);
+  await assert.rejects(handle.result, ApprovalRequired); await approve(first, handle.runId);
+  const secondPlanner = writePlanner(), second = open({ planner: secondPlanner, script,
+    run: () => ({ content: 'written', effectState: 'committed', planningDisposition: 'replan', planningReason: 'Continue with the second fixture' }) });
+  handle = await second.agent.resume(handle.runId, original);
+  await assert.rejects(handle.result, ApprovalRequired);
+  const checkpoint = (await second.storage.runs.get(handle.runId)).toolExecutionCheckpoint;
+  assert.equal(checkpoint.planning.revision, 1); assert.equal(checkpoint.assistant.toolCalls[0].id, 'write-2');
+  assert.deepEqual(secondPlanner.revisions, [1]); assert.equal(second.counts.tool, 1);
+  const lastPlanner = writePlanner(), last = open({ planner: lastPlanner, script });
+  await approve(last, handle.runId);
+  assert.equal((await (await last.agent.resume(handle.runId, original)).result).output, 'done');
+  assert.equal(last.counts.tool, 1); assert.equal(lastPlanner.calls, 0); assert.deepEqual(lastPlanner.revisions, []);
+  await last.storage.transaction(async (_, extra) => assert.equal(Object.values(extra.tools).filter(entry => entry.state === 'complete').length, 2));
+});
+
+
+for (const mode of ['reactive', 'planned']) test(`Agent Tree ${mode} Root waits for approval after a read-only Child without repeating the Child`, async t => {
+  const open = setup(t), planner = mode === 'planned' ? { createPlan: () => ({ workPlan: { title: 'Delegate, write, finish', steps: [
+    { id: 'delegate', title: 'Delegate', type: 'read', executor: 'tool', capabilityNames: ['delegateToAgents'] },
+    { id: 'write', title: 'Write', type: 'write', executor: 'tool', capabilityNames: ['write'], dependsOn: ['delegate'] },
+    { id: 'finish', title: 'Finish', type: 'review', executor: 'model', dependsOn: ['write'] },
+  ] } }), revisePlan: () => assert.fail('unexpected replanning') } : undefined;
+  const script = input => {
+    if (input.messages.some(message => message.attributes?.agentId)) {
+      assert.equal(input.tools.some(tool => tool.name === 'write'), false);
+      return { message: { role: 'assistant', content: 'child result' }, finishReason: 'stop' };
+    }
+    const calls = input.messages.flatMap(message => message.toolCalls ?? []);
+    return calls.some(call => call.name === 'write') || input.tools.length === 0
+      ? { message: { role: 'assistant', content: 'done' }, finishReason: 'stop' }
+      : { message: { role: 'assistant', content: '', toolCalls: [calls.some(call => call.name === 'delegateToAgents')
+        ? { id: 'write-1', name: 'write', arguments: { value: 42 } }
+        : { id: 'delegate', name: 'delegateToAgents', arguments: { children: [{ name: 'reader', title: 'Read', instruction: 'Read only', objective: 'Report' }] } },
+      ] }, finishReason: 'tool_calls' };
+  };
+  const first = open({ tree: true, planner, script }); await first.storage.enableApprovals();
+  const original = { ...request, planningMode: mode }, handle = await first.agent.submit(original, options);
+  await assert.rejects(handle.result, ApprovalRequired);
+  const children = await first.storage.runTree.listDescendants(handle.runId);
+  assert.equal(children.length, 1); assert.equal(children[0].status, 'done');
+  const restored = open({ tree: true, planner, script });
+  await assert.rejects((await restored.agent.resume(handle.runId, original)).result, ApprovalRequired);
+  assert.deepEqual(restored.counts, { model: 0, tool: 0 });
+  await approve(restored, handle.runId);
+  assert.equal((await (await restored.agent.resume(handle.runId, original)).result).output, 'done');
+  assert.equal(restored.counts.tool, 1);
+  assert.deepEqual(await restored.storage.runTree.listDescendants(handle.runId), children);
+  assert.equal((await restored.storage.runTree.getRun(handle.runId)).status, 'done');
+});
+
+test('Auto can request a remaining plan after the first approved write and suspend at the second', async t => {
+  const open = setup(t), original = { ...request, planningMode: 'auto' }, first = open({ planner: writePlanner() });
+  await first.storage.enableApprovals();
+  const handle = await first.agent.submit(original, options);
+  await assert.rejects(handle.result, ApprovalRequired);
+  assert.equal((await first.storage.runs.get(handle.runId)).toolExecutionCheckpoint.initialPlanningOpen, true);
+  await approve(first, handle.runId);
+  const planner = writePlanner();
+  const second = open({ planner, script: (input, count) => ({ message: { role: 'assistant', content: '', toolCalls: [
+    count === 1 ? { id: 'remaining-plan', name: 'request_remaining_plan', arguments: {} }
+      : { id: 'write-2', name: 'write', arguments: { value: 42 } },
+  ] }, finishReason: 'tool_calls' }) });
+  await assert.rejects((await second.agent.resume(handle.runId, original)).result, ApprovalRequired);
+  assert.equal(second.counts.tool, 1); assert.equal(planner.calls, 1);
+  const checkpoint = (await second.storage.runs.get(handle.runId)).toolExecutionCheckpoint;
+  assert.equal(checkpoint.executionProfile, 'planned'); assert.equal(checkpoint.initialPlanningOpen, false);
+  const rebound = writePlanner(), last = open({ planner: rebound }); await approve(last, handle.runId);
+  assert.equal((await (await last.agent.resume(handle.runId, original)).result).output, 'done');
+  assert.equal(last.counts.tool, 1); assert.equal(rebound.calls, 0);
 });

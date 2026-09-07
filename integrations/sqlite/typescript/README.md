@@ -151,11 +151,12 @@ See the Core [inspection contract](../../../conformance/integration-inspection.m
 ## 1.1 approval storage foundation (unreleased)
 
 Explicit offline v5 activation and host-authorized decision storage are available.
-The opt-in Reactive Root runtime now supports atomic approval waits, same-Run
+The opt-in Reactive/Planned/Auto Root runtime supports atomic approval waits, same-Run
 recovery and claim/receipt association. Configure `toolCheckpointHandler`,
 `approval: approvals.gateway()` and the same adapter’s `idempotency`; existing
-model-ready checkpoint types remain unchanged. Planned/Auto/Tree and MCP write
-acceptance remain incomplete.
+model-ready checkpoint types remain unchanged. Root approval after read-only Child
+work is covered; select business writes explicitly with `toolCheckpointNames`.
+Child write approval and MCP write acceptance remain incomplete.
 Keep production databases on their current format until the runtime integration
 and acceptance are complete. See the [durable approval contract](../../../conformance/durable-approval.md#storage-foundation-api)
 for activation, API methods, replay behavior and SDK format boundaries.

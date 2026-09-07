@@ -20,6 +20,7 @@ import type {
 import type { ContextEvidenceReceipt } from "../context/types.js";
 
 interface CatalogOptions {
+  readonly runtimeManaged?: readonly ToolDefinition[];
   readonly approval?: ToolApprovalGateway;
   readonly idempotency?: ToolIdempotencyGateway;
   readonly limits?: ToolExecutionLimits;
@@ -39,6 +40,7 @@ interface ExecuteOptions {
 }
 
 interface RegisteredTool {
+  readonly runtimeManaged?: boolean;
   readonly definition: ToolDefinition;
   readonly schema: JsonSchema;
   readonly policy: ToolPolicy & { readonly riskLevel: "read" | "write" | "destructive" };
@@ -78,10 +80,10 @@ export class ToolCatalog {
     );
 
     for (const definition of definitions) {
-      const registered = registerTool(definition);
+      const registered: RegisteredTool = { ...registerTool(definition), runtimeManaged: options.runtimeManaged?.includes(definition) === true };
       const name = registered.definition.name;
       if (options.approval?.requiresDurableIdempotency === true && registered.policy.mode !== "read"
-        && registered.definition.hostManagedDurability === true) {
+        && registered.definition.hostManagedDurability === true && !registered.runtimeManaged) {
         throw new AgentError("approval_idempotency_required", "Durable approval cannot bypass its tool receipt store");
       }
       if (this.#tools.has(name)) throw new AgentError("duplicate_tool", `Duplicate tool: ${name}`);
@@ -387,7 +389,7 @@ export class ToolCatalog {
       }
     }
 
-    if (this.#approval?.requiresDurableIdempotency === true && admitted.some(([, tool]) => tool.policy.mode === "propose")) {
+    if (this.#approval?.requiresDurableIdempotency === true && admitted.some(([, tool]) => tool.policy.mode === "propose" && !tool.runtimeManaged)) {
       throw new AgentError("approval_runtime_unsupported", "Durable approval writes require confirm policy");
     }
     if (!requestApproval) return;

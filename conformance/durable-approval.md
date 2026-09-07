@@ -5,7 +5,7 @@ English | [简体中文](durable-approval.zh-CN.md)
 This contract now has a Stage B storage foundation: immutable approval records,
 host-authorized transactional decisions and explicit SQLite v5 activation.
 Python and TypeScript now have opt-in single-call tool-ready runtime paths,
-verified for Reactive Root Runs. MCP writes are **not yet available**;
+verified for Reactive, Planned and Auto Root Runs. MCP writes are **not yet available**;
 Stage B is not complete. Existing
 in-memory approvals remain supported. The implemented prerequisite revalidates
 host scope after approval, before entering the tool idempotency gateway.
@@ -25,7 +25,7 @@ durable request never falls back to an in-memory decision when its store or
 authorizer is unavailable. No required method is added to existing host ports.
 
 The three record types below are available from Python `purra.approvals` and
-the TypeScript `purra` entry point. Both SDKs implement dispatch associations for the Reactive Root path.
+the TypeScript `purra` entry point. Both SDKs implement dispatch associations for Root approval paths.
 Python uses snake_case attributes and methods;
 the persisted/interchange view uses the camelCase names below in both SDKs.
 
@@ -298,19 +298,20 @@ failures retain an unknown claim and block lease recovery. An idle host can use
 the existing `reconcile_tool` with a known result or proof of non-execution.
 A committed, matching receipt can be replayed after expiry without a new effect.
 
-Deterministic acceptance currently covers Reactive Root Run restart, repeated
+Deterministic acceptance currently covers Root Run restart, repeated
 pending recovery, concurrent resume, cancellation after approval, changed binding,
 unknown effects, receipt persistence failure and committed-receipt replay.
-Planned/Auto and Agent Tree acceptance, broader runtime parity, normalized
+Child write-approval acceptance, broader runtime parity, normalized
 approval inspection, MCP write transport behavior and real service/downstream
 validation remain unfinished. This is not a 1.1 release acceptance claim.
 
 ## TypeScript tool-ready runtime path (development)
 
 Configure `Agent` with `toolCheckpointHandler` and optional `toolCheckpointNames`.
-Selected batches must contain one call and currently require a persistent Reactive
-Root Run. Planned/Auto and Child tool-ready execution reject with
-`approval_runtime_unsupported`. Unselected read batches retain their behavior.
+Selected batches must contain one call and require a persistent Root Run. Reactive,
+Planned, Auto direct execution, Auto promotion and remaining-plan activation are
+covered. Child tool-ready execution still rejects with `approval_runtime_unsupported`.
+Unselected read batches retain their behavior.
 
 The callback receives a new `AgentToolExecutionCheckpoint`: schema 3, `tool_ready`,
 actual assistant message (including provider replay data), settled `invocationId`,
@@ -355,5 +356,33 @@ Deterministic tests cover restart, repeated pending waits, concurrent resume,
 current-scope denial, expiry between gateway and claim, opaque-key association,
 unknown results, receipt persistence failure and completed-receipt replay.
 The generic inspection recognizes tool checkpoints; normalized approval diagnostics,
-Planned/Auto/Tree acceptance, MCP writes and real service/downstream acceptance remain
+Child write-approval acceptance, MCP writes and real service/downstream acceptance remain
 unfinished. These tests do not establish end-to-end exactly-once external effects.
+
+## Root planning and Agent Tree composition
+
+The shared `fixtures/approval_runtime_modes.json` matrix verifies the same Planned,
+Auto direct and Auto-promoted Root invariants in both SDKs. Pending restart performs
+no model/Planner work and preserves the current tool step. The checkpoint captures
+planning state after entering that step and before dispatch; it must not mark the
+write completed while approval is pending. TypeScript now persists the complete
+planning checkpoint and the current Auto activation phase at this boundary.
+
+Both SDKs also test approval followed by remaining-plan activation and a second
+approval wait. TypeScript covers tool-requested replanning between two approved
+writes. These tests preserve completed receipts and planner revisions; waiting for
+approval is not a reason to request a new initial plan.
+
+A Root may complete read-only Child work, then wait for approval for its own write.
+Reactive and Planned Root composition passes in both SDKs without rerunning the
+completed Child. Python's delegation tool requests a remaining-plan revision under
+its existing contract; that revision is retained across the approval wait.
+
+For TypeScript Agent Tree composition, explicitly set `toolCheckpointNames` to the
+business write tools. Core's own generated delegation tool retains its canonical
+host-managed Run/claim path. The exemption uses the generated definition identity,
+not a tool name or a caller-provided flag: a business tool named `delegateToAgents`
+cannot bypass durable receipt binding. Child grants remain read-only by default.
+This acceptance does not enable Child writes or establish arbitrary mixed/nested
+approval-and-clarification recovery. Those paths, normalized approval diagnostics,
+MCP writes and external/downstream validation remain unfinished.

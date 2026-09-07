@@ -8,8 +8,9 @@
 - Add immutable approval intents and host-authorized SQLite decision storage,
   with revision checks, historical command replay and explicit v5 activation.
   Python and TypeScript additionally support opt-in tool-ready checkpoints and
-  same-Run approval recovery with atomic claim/receipt associations; Reactive Root
-  fault tests pass. Planned/Auto/Tree acceptance and MCP writes remain pending.
+  same-Run approval recovery with atomic claim/receipt associations. Reactive,
+  Planned and Auto Root recovery, plus Root approval after read-only Child work,
+  pass deterministic tests. Child write approval and MCP writes remain pending.
 - Align Core and all seven optional packages, exact internal dependencies and
   npm lockfiles at 1.1.0. This version has not been published.
 

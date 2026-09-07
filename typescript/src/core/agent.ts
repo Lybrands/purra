@@ -337,7 +337,11 @@ export class Agent {
       this.#configuredAgentTreeGrant = undefined;
       effectiveDefinitions = definitions;
     }
+    if (options.agentTree !== undefined && this.#toolCheckpointHandler !== undefined && this.#toolCheckpointNames === undefined) {
+      throw new AgentError("approval_gate_unavailable", "Agent tree approvals require explicit tool checkpoint names");
+    }
     this.#tools = new ToolCatalog(effectiveDefinitions, {
+      runtimeManaged: effectiveDefinitions.slice(definitions.length),
       ...(options.approval === undefined ? {} : { approval: options.approval }),
       ...(options.idempotency === undefined ? {} : { idempotency: options.idempotency }),
       ...(options.toolLimits === undefined ? {} : { limits: options.toolLimits }),
@@ -419,7 +423,6 @@ export class Agent {
     const checkpoint = saved.toolExecutionCheckpoint ?? saved.executionCheckpoint;
     if (checkpoint?.phase === "tool_ready") {
       copyToolExecutionCheckpoint(checkpoint);
-      if (checkpoint.executionProfile !== "reactive") throw new AgentError("approval_runtime_unsupported", "Tool recovery currently requires a Reactive Root Run");
       if (this.#toolCheckpointHandler === undefined || this.#runRepository.executeToolOwned === undefined
         || (this.#toolCheckpointNames !== undefined && !this.#toolCheckpointNames.includes(checkpoint.assistant.toolCalls![0]!.name))) {
         throw new AgentError("approval_runtime_required", "Tool recovery requires its durable approval handler and execution ownership");
@@ -1546,12 +1549,14 @@ export class Agent {
       }
       if (this.#toolCheckpointHandler !== undefined && (this.#toolCheckpointNames === undefined
         || calls.some(call => this.#toolCheckpointNames!.includes(call.name)))) {
-        if (session === undefined || session.parentRunId !== undefined || planningMode !== "reactive" || planning !== undefined) {
-          throw new AgentError("approval_runtime_unsupported", "Durable tool checkpoints currently require a Reactive Root Run");
+        if (session === undefined || session.parentRunId !== undefined) {
+          throw new AgentError("approval_runtime_unsupported", "Durable tool checkpoints currently require a Root Run");
         }
         const checkpoint = pendingTool ?? copyToolExecutionCheckpoint({
-          schemaVersion: 3, runId: session.runId, phase: "tool_ready", executionProfile: "reactive",
-          roundLimit, initialPlanningOpen: false, nextRound: round,
+          schemaVersion: 3, runId: session.runId, phase: "tool_ready",
+          executionProfile: planning?.state === undefined ? planningMode : "planned",
+          ...(planning?.state === undefined ? {} : { planning: planning.checkpoint() }),
+          roundLimit, initialPlanningOpen: autoPlanningPhase === "initial", nextRound: round,
           messages: messages.slice(0, -1), assistant, invocationId: receipt!.invocationId, appliedGenerationLimit: turn.appliedGenerationLimit,
           allowedToolNames: businessTools.map(tool => tool.name),
           context: context?.snapshot() ?? null, contextEvidence: activeEvidence,
