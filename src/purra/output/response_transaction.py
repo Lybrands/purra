@@ -304,6 +304,7 @@ class AgentResponseTransaction:
             tuple(messages),
             AgentModelCall(
                 request=request,
+                reasoning_mode=context.requested_reasoning_mode,
                 output_intent=intent,
                 commit_mode=commit_mode,
                 requires_full_text_validation=(
