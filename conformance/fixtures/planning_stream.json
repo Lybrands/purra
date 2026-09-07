@@ -146,5 +146,10 @@
       ],
       "status": "failed"
     }
+  ],
+  "deltaChunkWidths": [
+    1,
+    7,
+    4096
   ]
 }

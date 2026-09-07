@@ -316,9 +316,13 @@ class AgentOutputProcessor:
                 len(_canonical_json(entry.entry())) for entry in additions
             )
 
+            planning_delta = (
+                spec.output_protocol == PLANNING_STREAM_SCHEMA
+                and spec.planning_scope is not None and bool(authorized.content_delta)
+            )
             events: list[AgentOutputEvent] = []
             must_flush = (
-                bool(authorized.progress_delta)
+                planning_delta or bool(authorized.progress_delta)
                 or
                 authorized.usage is not None
                 or authorized.finish_reason is not None
@@ -329,6 +333,26 @@ class AgentOutputProcessor:
                 events.extend(await self._flush_batch_locked(spec, batch))
             elif additions:
                 self._schedule_batch_timer(spec, batch)
+            if planning_delta:
+                authorize_delta = getattr(self._policy, "authorize_planning_delta", None)
+                projected = authorized if authorize_delta is None else await authorize_delta(spec, authorized)
+                if projected is not None:
+                    if projected != authorized:
+                        raise ContractViolationError("output policy cannot rewrite planning Provider bytes")
+                    events.append(await self._append(AgentOutputEventDraft(
+                        run_id=spec.run_id, turn_id=spec.turn_id,
+                        output_stream_id=spec.output_stream_id, invocation_id=spec.invocation_id,
+                        source_event_key=f"planning-delta:{spec.invocation_id}:{chunk_index}",
+                        source=OutputSource.PROVIDER, kind=OutputEventKind.PLANNING_DELTA,
+                        channel=OutputChannel.COMMENTARY, visibility=OutputVisibility.PUBLIC,
+                        payload={"schemaVersion": PLANNING_STREAM_SCHEMA,
+                                 "operationId": spec.planning_scope.operation_id,
+                                 "revision": spec.planning_scope.revision,
+                                 "attempt": spec.planning_attempt,
+                                 "sourceChunkIndex": chunk_index,
+                                 "textDelta": authorized.content_delta},
+                        occurred_at=occurred_at,
+                    )))
             if authorized.usage is not None:
                 events.append(await self._append(self._provider_draft(
                     spec,

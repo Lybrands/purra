@@ -54,4 +54,4 @@ capabilities, and storage paths. They also own client lifecycles, backups, and
 retention. Components use Core's execution and budget interfaces; installing a
 package does not enable it on an Agent.
 
-[1.0.0 candidate service evidence and upgrade boundaries](../conformance/release-1.0.md): live protocol/capability/service-model evidence and downstream acceptance are recorded separately; first-party model credentials are not required.
+[Upgrade notes](../CHANGELOG.md#upgrading-from-0x). Validate each selected protocol, capability and service/model combination separately; adapter installation does not establish live support.

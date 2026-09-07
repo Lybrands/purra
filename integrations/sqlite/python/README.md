@@ -143,29 +143,7 @@ independently and need not sum to the total median.
 The application owns database access, backups, and retention. Checkpoints contain
 private model data. Call `await core.close()` before `storage.close()`.
 
-## Opt-in closeout verification
-
-After building TypeScript Core and SQLite, run both SDKs through separate writer
-processes, transaction termination, tool-receipt reconciliation and checkpoint
-reopening. The default fixture has 20 Roots, 60 Runs, 20,000 events and 64 KiB
-checkpoint messages per Root; all databases and effect markers are temporary.
-
-```sh
-PYTHONPATH=src:integrations/sqlite/python/src .venv/bin/python integrations/sqlite/python/scripts/verify_load.py --output /tmp/purra-load.json
-```
-
-`scripts/verify_provider.py` additionally runs a synthetic lookup task against a
-user-selected DeepSeek configuration in a PurrTypos settings database. It requires
-network access and consumes real API tokens. Supply `--config-db`, `--config-id`
-and `--output`; add `.:integrations/openai/python/src` to `PYTHONPATH` and install
-the OpenAI SDK. Credentials are read in memory, never written to the report.
-Its explicit test transport maps `max_completion_tokens` to `max_tokens`, disables
-thinking, drops OpenAI-only options, and maps `developer` messages to `system`.
-This does not certify unmodified OpenAI transport compatibility with DeepSeek.
-The eager reference is current code with deferred hydration disabled, not a
-historical release. One paired run is functional evidence, not a latency SLA.
-
-### Read-only recovery inspection
+## Read-only recovery inspection
 
 `await storage.inspect_recovery(run_id, expected_preset=effective_preset_snapshot)`
 reads one committed snapshot without claiming a lease, resuming, reconciling or
@@ -175,4 +153,4 @@ messages or raw tool receipts. Run-bound pending claims and post-checkpoint mode
 attempts are separate blockers; reconciling a tool does not clear the attempt.
 Permissions, complete usage, effects outside this adapter and Agent Tree ownership
 remain unknown. `authority` is always `diagnosis_only`; execution must revalidate.
-See the Core [inspection contract](../../../conformance/integration-inspection.md).
+See the Core [inspection contract](../../../ARCHITECTURE.md#integration-reports-and-recovery-inspection).

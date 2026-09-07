@@ -107,7 +107,7 @@ test("public planning is committed before plan arrival, replayable, and private 
   }
   assert.equal((await handle.result).output, "done");
   assert.deepEqual(await collect(handle.events()), seen);
-  assert.doesNotMatch(JSON.stringify(seen), /PRIVATE_REASONING|PRIVATE_PLAN_MARKER|capabilityNames/);
+  assert.doesNotMatch(JSON.stringify(seen.filter((e) => e.kind !== "planning.delta")), /PRIVATE_REASONING|PRIVATE_PLAN_MARKER|capabilityNames/);
   const phases = seen.filter((e) => e.kind === "operation.started" && e.payload.kind === "planning");
   assert.equal(phases.length, 1);
   const terminals = seen.filter((e) => e.kind === "operation.finished" && e.payload.operationId === phases[0].payload.operationId);
@@ -172,7 +172,7 @@ for (const failure of ["envelope", "step type"]) test(`repair uses the rejected 
   assert.deepEqual(state.planningRequests[1].messages.slice(0, -2), state.planningRequests[0].messages);
   assert.doesNotMatch(JSON.stringify(state.planningRequests), /PRIVATE_REASONING/);
   const events = await collect(handle.events());
-  assert.doesNotMatch(JSON.stringify(events), /PRIVATE_PLAN_MARKER|PRIVATE_TASK|PRIVATE_REASONING/);
+  assert.doesNotMatch(JSON.stringify(events.filter((e) => e.kind !== "planning.delta")), /PRIVATE_PLAN_MARKER|PRIVATE_TASK|PRIVATE_REASONING/);
   const diagnostics = (await collect(handle.events({ visibility: "all" }))).filter((event) => event.kind === "model.diagnostics");
   assert.doesNotMatch(JSON.stringify(diagnostics), /PRIVATE_PLAN_MARKER|PRIVATE_TASK|PRIVATE_REASONING/);
   assert.equal(state.opened, state.closed);
@@ -196,7 +196,7 @@ test("repair evidence is bounded by Unicode characters and replaces earlier atte
   assert.deepEqual(second.messages.slice(0, -2), first.messages);
   assert.deepEqual(third.messages.slice(0, -2), first.messages);
   assert.doesNotMatch(JSON.stringify([second, third]), /OMITTED_PRIVATE|PRIVATE_REASONING/);
-  assert.doesNotMatch(JSON.stringify(await collect(handle.events())), /SECOND_PRIVATE|OMITTED_PRIVATE|PRIVATE_REASONING|😀/);
+  assert.doesNotMatch(JSON.stringify((await collect(handle.events())).filter((e) => e.kind !== "planning.delta")), /SECOND_PRIVATE|OMITTED_PRIVATE|PRIVATE_REASONING|😀/);
 });
 
 test("rejected Planner content is absent from serialized terminal errors", async () => {
@@ -210,7 +210,7 @@ test("rejected Planner content is absent from serialized terminal errors", async
     return true;
   });
   assert.equal(state.planningCalls, 2);
-  assert.doesNotMatch(JSON.stringify(await collect(handle.events())), /PRIVATE_INVALID_OUTPUT/);
+  assert.doesNotMatch(JSON.stringify((await collect(handle.events())).filter((e) => e.kind !== "planning.delta")), /PRIVATE_INVALID_OUTPUT/);
 });
 
 for (const boundary of ["invocation", "operation"]) test(`failed planning ${boundary} persistence prevents repair`, async () => {
@@ -275,7 +275,7 @@ for (const script of [[{ reasoningDelta: "SECRET" }], [wire("只有意图。")],
     assert.equal(state.planningCalls, 2);
     assert.equal(state.executions, 0);
     assert.equal(state.closed, state.opened);
-    assert.doesNotMatch(JSON.stringify(await collect(handle.events())), /SECRET/);
+    assert.doesNotMatch(JSON.stringify((await collect(handle.events())).filter((e) => e.kind !== "planning.delta")), /SECRET/);
   });
 }
 
@@ -287,17 +287,17 @@ test("non-streaming gateways fail explicitly without fake realtime progress", as
   assert.equal(calls, 0);
 });
 
-test("planning projections reject forgery, raw promotion, cross-Run delivery and terminal appends", async () => {
+for (const kind of ["planning.progress", "planning.delta"]) test(`planning projections reject forgery, raw promotion, cross-Run delivery and terminal appends: ${kind}`, async () => {
   const gate = deferred();
   const { agent, adapters } = managed([[wire("准备检查。"), gate, wire()], [wire()]]);
   const first = await agent.submit(input, runOptions);
   try {
     let event;
-    for await (const item of first.events()) { if (item.kind === "planning.progress") { event = item; break; } }
+    for await (const item of first.events()) { if (item.kind === kind) { event = item; break; } }
     const draft = { sourceKey: event.sourceKey, kind: event.kind, channel: event.channel, visibility: event.visibility, payload: event.payload };
     assert.equal((await adapters.runs.appendEvent(first.runId, draft)).eventId, event.eventId);
-    await assert.rejects(adapters.runs.appendEvent(first.runId, { ...draft, payload: { ...draft.payload, text: "forged" } }));
-    await assert.rejects(adapters.runs.appendEvent(first.runId, { ...draft, sourceKey: `planning:${draft.payload.invocationId}:2`, payload: { ...draft.payload, recordIndex: 2, sourceStart: 1 } }));
+    await assert.rejects(adapters.runs.appendEvent(first.runId, { ...draft, payload: { ...draft.payload, [kind === "planning.delta" ? "textDelta" : "text"]: "forged" } }));
+    await assert.rejects(adapters.runs.appendEvent(first.runId, { ...draft, sourceKey: kind === "planning.delta" ? `planning-delta:${draft.payload.invocationId}:999` : `planning:${draft.payload.invocationId}:2`, payload: { ...draft.payload, ...(kind === "planning.delta" ? { sourceChunkIndex: 999 } : { recordIndex: 2, sourceStart: 1 }) } }));
     const raw = (await adapters.runs.listEvents(first.runId, 0)).find((e) => e.kind === "provider.delta_batch");
     await assert.rejects(adapters.runs.appendEvent(first.runId, { ...raw, sourceKey: "promote-raw", visibility: "public" }));
     const { invocationId: _invocation, ...unattributed } = raw.payload;
@@ -566,4 +566,73 @@ test('revision repairs a reused completed id without accepting partial work', as
   });
   assert.equal(calls, 2);
   assert.deepEqual(result.workPlan.steps.map((s) => s.id), ['remaining']);
+});
+
+
+for (const width of fixture.deltaChunkWidths) test(`planning delta publishes each chunk before next source chunk: ${width}`, { timeout: 10000 }, async () => {
+  const text = wire("准备核对。") + wire().trimEnd();
+  const parts = [];
+  for (let i = 0; i < text.length; i += width) parts.push(text.slice(i, i + width));
+  const gates = parts.map(() => deferred());
+  const script = [{ reasoningDelta: "reasoning-only" }];
+  parts.forEach((part, i) => script.push(part, gates[i]));
+  const { agent, adapters, state } = managed([script]);
+  const handle = await agent.submit(input, runOptions);
+  const seen = [];
+  try {
+    for await (const event of handle.events()) {
+      if (event.kind !== "planning.delta") continue;
+      const i = seen.length;
+      assert.equal(event.payload.textDelta, parts[i]);
+      assert.equal(event.payload.sourceChunkIndex, i + 1);
+      assert.equal(state.executions, 0);
+      assert.ok((await adapters.runs.listEvents(handle.runId, event.sequence - 1)).some((e) => e.eventId === event.eventId));
+      seen.push(event);
+      gates[i].resolve();
+    }
+    await handle.result;
+    assert.equal(seen.map((e) => e.payload.textDelta).join(""), text);
+    assert.equal(seen.length, parts.length);
+    assert.deepEqual((await collect(handle.events())).filter((e) => e.kind === "planning.delta"), seen);
+  } finally { gates.forEach((gate) => gate.resolve()); await handle.cancel(); }
+});
+
+test("planning delta repair keeps failed and successful invocation previews separate", async () => {
+  const { agent, state } = managed([["{", "invalid\n"], [wire()]]);
+  const handle = await agent.submit(input, runOptions);
+  await handle.result;
+  const deltas = (await collect(handle.events())).filter((e) => e.kind === "planning.delta");
+  assert.deepEqual(deltas.map((e) => e.payload.attempt), [0, 0, 1]);
+  assert.deepEqual(deltas.slice(0, 2).map((e) => e.payload.textDelta), ["{", "invalid\n"]);
+  assert.notEqual(deltas[0].payload.invocationId, deltas[2].payload.invocationId);
+  assert.equal(state.executions, 1);
+});
+
+test("cancel after partial planning delta stops late preview and execution", { timeout: 5000 }, async () => {
+  const gate = deferred();
+  const { agent, state } = managed([["{", gate, '"late":true}']]);
+  const handle = await agent.submit(input, runOptions);
+  void handle.result.catch(() => undefined);
+  try {
+    for await (const event of handle.events()) if (event.kind === "planning.delta") { await handle.cancel(); break; }
+    await assert.rejects(handle.result);
+    const before = await collect(handle.events());
+    gate.resolve();
+    assert.deepEqual(await collect(handle.events()), before);
+    assert.deepEqual(before.filter((e) => e.kind === "planning.delta").map((e) => e.payload.textDelta), ["{"]);
+    assert.equal(state.executions, 0);
+  } finally { gate.resolve(); await handle.cancel(); }
+});
+
+for (const rewrite of [false, true]) test(`planning delta policy suppresses but never rewrites: ${rewrite}`, async () => {
+  const { agent, state } = managed([[wire()]], { outputPolicy: {
+    authorize(event) {
+      if (event.kind !== "planning.delta") return event;
+      return rewrite ? { ...event, payload: { ...event.payload, textDelta: "forged" } } : null;
+    },
+  } });
+  const handle = await agent.submit(input, runOptions);
+  if (rewrite) await assert.rejects(handle.result); else await handle.result;
+  assert.equal((await collect(handle.events())).filter((e) => e.kind === "planning.delta").length, 0);
+  assert.equal(state.executions, rewrite ? 0 : 1);
 });

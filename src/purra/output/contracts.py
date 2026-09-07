@@ -76,6 +76,7 @@ class OutputEventKind(StrEnum):
     PROVIDER_DELTA_BATCH = "provider.delta_batch"
     PROVIDER_USAGE = "provider.usage"
     PLANNING_PROGRESS = "planning.progress"
+    PLANNING_DELTA = "planning.delta"
     AGENT_PROGRESS = "agent.progress"
     MODEL_DIAGNOSTICS = "model.diagnostics"
     STREAM_COMMITTED = "stream.committed"
@@ -677,6 +678,17 @@ def _validate_public_text(
             or payload.get("sourceChunkIndex", 0) < 1
         ):
             raise ValueError("agent progress requires a bounded Provider projection")
+        return
+    if kind is OutputEventKind.PLANNING_DELTA:
+        if (source is not OutputSource.PROVIDER or channel is not OutputChannel.COMMENTARY
+                or visibility is not OutputVisibility.PUBLIC or not output_stream_id or not invocation_id
+                or payload.get("schemaVersion") != PLANNING_STREAM_SCHEMA
+                or set(payload) != {"schemaVersion", "operationId", "revision", "attempt", "textDelta", "sourceChunkIndex"}
+                or not isinstance(payload.get("textDelta"), str) or not payload["textDelta"]
+                or type(payload.get("sourceChunkIndex")) is not int or payload["sourceChunkIndex"] < 1
+                or not isinstance(payload.get("operationId"), str) or not payload["operationId"]
+                or any(type(payload.get(key)) is not int or payload[key] < 0 for key in ("revision", "attempt"))):
+            raise ValueError("planning delta requires a Provider chunk projection")
         return
     if kind is OutputEventKind.PLANNING_PROGRESS:
         if (source is not OutputSource.PROVIDER or channel is not OutputChannel.COMMENTARY

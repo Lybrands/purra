@@ -233,7 +233,8 @@ async def _run() -> None:
         public = [e async for e in planned_handle.subscribe()]
         assert (await planned_handle.wait()).status is RunStatus.DONE
         assert any(e.kind.value == "planning.progress" for e in public)
-        assert "PRIVATE_PLAN" not in str(public)
+        assert any(event.kind == "planning.delta" for event in public)
+        assert "PRIVATE_PLAN" not in str([event for event in public if event.kind != "planning.delta"])
         assert public == [e async for e in planned_handle.subscribe()]
     finally:
         await planned_core.close()

@@ -9,8 +9,7 @@ PurrA 是面向 Python 和 TypeScript 的 Agent 运行时，负责在应用中�
 ## 1.0.0 候选状态
 
 当前源码为尚未发布的 1.0.0 候选。请按候选清单安装准确本地产物；注册表安装命令不保证获取本候选。
-首发结构化任务、MCP 只读工具、安全读批次并行及只读诊断的支持范围，
-以及 0.x 升级和 1.x 兼容承诺，见[候选说明](conformance/release-1.0.zh-CN.md)。
+0.x 升级要求见[升级说明](CHANGELOG.md#从-0x-升级)。
 
 ## 安装
 
@@ -106,3 +105,5 @@ JavaScript 和 TypeScript 用法见 [TypeScript 指南](typescript/README.zh-CN.
 ## 许可证
 
 [MIT](LICENSE)
+
+长期公共接口约定见[兼容承诺](ARCHITECTURE.md#public-compatibility)。

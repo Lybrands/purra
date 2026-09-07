@@ -278,6 +278,8 @@ export class RunSession {
         );
       }
     }
+    const planningDelta = receipt.outputProtocol === PLANNING_STREAM_SCHEMA
+      && receipt.planningScope !== undefined && (chunk.contentDelta?.length ?? 0) > 0;
     const entries = providerDeltaEntries(index, chunk);
     await this.#withBatch(receipt, async (batch) => {
       batch.entries.push(...entries);
@@ -286,7 +288,7 @@ export class RunSession {
         0,
       );
       if (
-        (chunk.progressDelta !== undefined && chunk.progressDelta !== "")
+        planningDelta || (chunk.progressDelta !== undefined && chunk.progressDelta !== "")
         || chunk.usage !== undefined
         || chunk.finishReason !== undefined
         || batch.payloadBytes >= this.#batchLimits.maxPayloadBytes
@@ -297,6 +299,16 @@ export class RunSession {
         this.#scheduleBatchFlush(receipt, batch);
       }
     });
+    if (planningDelta) {
+      await this.#persist({
+        sourceKey: `planning-delta:${receipt.invocationId}:${index}`,
+        kind: "planning.delta", channel: "commentary", visibility: this.#outwardVisibility,
+        payload: { schemaVersion: PLANNING_STREAM_SCHEMA, source: "provider",
+          invocationId: receipt.invocationId, operationId: receipt.planningScope!.operationId,
+          revision: receipt.planningScope!.revision, attempt: receipt.planningAttempt ?? 0,
+          sourceChunkIndex: index, textDelta: chunk.contentDelta! },
+      });
+    }
     if (chunk.progressDelta !== undefined && chunk.progressDelta !== "") {
       await this.#persist({
         sourceKey: `agent-progress:${receipt.invocationId}:${index}`,
@@ -668,7 +680,7 @@ export class RunSession {
   async #persist(draft: OutputEventDraft): Promise<OutputEvent | undefined> {
     const authorized = await this.#authorize(draft);
     if (authorized === null) return undefined;
-    if ((draft.kind === "planning.progress" || draft.kind === "agent.progress") && this.signal.aborted) throw new AgentCanceledError();
+    if ((draft.kind === "planning.progress" || draft.kind === "planning.delta" || draft.kind === "agent.progress") && this.signal.aborted) throw new AgentCanceledError();
     let event: OutputEvent;
     try {
       event = await this.#repository.appendEvent(this.#runId, authorized, this.#leaseClaim);
@@ -847,7 +859,7 @@ function validatePolicyResult(original: OutputEventDraft, authorized: OutputEven
     throw new AgentError("output_policy_violation", "Output policy changed event authority fields");
   }
   if (
-    (original.kind === "planning.progress"
+    (original.kind === "planning.progress" || original.kind === "planning.delta"
       || original.kind === "agent.progress"
       || (original.kind === "commentary" && original.payload?.source === "provider"))
     && JSON.stringify(original.payload) !== JSON.stringify(authorized.payload)

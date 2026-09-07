@@ -73,7 +73,7 @@ Agent 树、产物和长任务仓储操作跳过输出历史的还原与写回�
 已有 v4 数据库时会建立该索引。租约认领、公开 `transaction()` 和无法定位 Run 的操作
 仍执行完整作用域校验。执行快照仍按作用域加载和保存，包含 Run 历史、
 检查点和回执，适合数据量受控的本地场景。
-本次存储格式为 v4。构造器在修改数据库参数、表或索引之前拒绝其他所有版本（包括
+存储格式为 v4。构造器在修改数据库参数、表或索引之前拒绝其他所有版本（包括
 v1/v2/v3）；拒绝后原库不变。没有自动迁移或旧格式恢复路径。
 Python 与 TypeScript 的执行快照不能互换。
 Python 与 TypeScript 均在指向已有 Run 的写入中按需加载历史。
@@ -120,22 +120,3 @@ PYTHONPATH=src:integrations/sqlite/python/src .venv/bin/python integrations/sqli
 
 应用负责数据库访问、备份和数据保留。检查点包含私有模型数据。
 先调用 `await core.close()`，再调用 `storage.close()`。
-## 可选收尾验证
-
-先构建 TypeScript Core 和 SQLite，再从仓库根目录执行：
-
-```sh
-PYTHONPATH=src:integrations/sqlite/python/src .venv/bin/python integrations/sqlite/python/scripts/verify_load.py --output /tmp/purra-load.json
-```
-
-脚本分别验证两个 SDK 的独立进程并发写入、事务中断回滚、未知工具效果对账和
-检查点重新打开。默认包含 20 个 Root、60 个 Run、20,000 条事件及每 Root 64 KiB
-检查点消息；数据库和副作用标记均为临时合成数据。
-
-`scripts/verify_provider.py` 可使用 PurrTypos 设置数据库中明确选择的 DeepSeek
-配置执行真实工具任务，需要网络权限并消耗 API Token。传入 `--config-db`、
-`--config-id`、`--output`，在 `PYTHONPATH` 增加 `.:integrations/openai/python/src`
-并安装 OpenAI SDK。凭据仅在内存中读取，不写入报告。
-该脚本专用适配器映射输出上限和消息角色，关闭 thinking，移除 OpenAI 专用参数；
-结果不代表原版 OpenAI 网关可直接兼容 DeepSeek。对照组为当前代码关闭延迟读取，
-并非历史发行版；单组对照仅用于功能验证，不构成延迟保证。

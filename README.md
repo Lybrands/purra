@@ -11,8 +11,8 @@ The application supplies its models, tools, data sources, and access rules.
 
 This checkout contains an unreleased 1.0.0 candidate. Install the exact local
 artifacts from its candidate manifest; registry commands do not identify this candidate.
-See the [candidate support and upgrade guide](conformance/release-1.0.md)
-for structured tasks, read-only MCP, safe read concurrency, inspection, and 1.x compatibility.
+See the [upgrade notes](CHANGELOG.md#upgrading-from-0x)
+and [public compatibility](ARCHITECTURE.md#public-compatibility) before upgrading.
 
 ## Install
 

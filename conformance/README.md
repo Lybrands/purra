@@ -45,16 +45,34 @@ For package installation and consumer checks, see
 [SDK parity smoke](../sdk-parity-smoke/README.md).
 
 
-## Object output, MCP and recovery inspection
+## Capability contracts and tests
 
+- [Planning chunk delivery](../ARCHITECTURE.md#planning-output): `planning_stream.json`.
 - [Structured output](structured-output.md): `structured_output.json`,
   `structured_model_task.json`, and `native_output_schema.json`.
-- [Safe read concurrency](tool-concurrency.md): `tool_concurrency.json`.
-- [Integration checks and read-only diagnosis](integration-inspection.md):
+- [Safe read concurrency](../ARCHITECTURE.md#read-only-tool-concurrency): `tool_concurrency.json`.
+- [Integration checks and read-only diagnosis](../ARCHITECTURE.md#integration-reports-and-recovery-inspection):
   `recovery_inspection.json`.
 - MCP protocol and selected-schema rejection vectors live in
   `integrations/mcp/fixtures/tools.json` and run in both optional package suites.
 
 Protocol fixtures and SDK transport tests do not certify a live model or remote
 server. Record deterministic, installed-artifact, real-service and downstream
-results separately. See each contract for supported dialects and unknown states.
+results separately. See the architecture and structured-output reference for capability boundaries.
+
+Runtime behavior lives in the architecture document. This directory retains shared
+fixtures, their test guide, the detailed schema reference and the version-specific
+[upgrade notes](../CHANGELOG.md#upgrading-from-0x).
+
+## Repository documentation
+
+Keep installation guides, public contracts, reproducible test instructions and
+license notices in Git. Keep implementation plans, one-off validation evidence,
+release checklists and local environment notes in ignored `docs/` or
+`conformance/reports/`. Do not force-add these directories. Removing a tracked
+file from the current tree does not remove it from earlier commits.
+
+The optional SQLite multiprocess/load check uses disposable synthetic databases:
+`PYTHONPATH=src:integrations/sqlite/python/src python integrations/sqlite/python/scripts/verify_load.py --output /tmp/purra-load.json`.
+Build TypeScript Core and SQLite first. This checks local persistence behavior,
+not live Provider latency.

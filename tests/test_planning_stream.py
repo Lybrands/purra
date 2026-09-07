@@ -151,7 +151,7 @@ async def test_public_progress_is_persisted_before_final_and_replayed_without_pr
         assert (await handle.wait()).status.value == "done"
         replay = [event async for event in handle.subscribe()]
         assert replay == seen
-        text = str([(e.kind, dict(e.payload)) for e in replay])
+        text = str([(e.kind, dict(e.payload)) for e in replay if e.kind is not OutputEventKind.PLANNING_DELTA])
         assert "PRIVATE_REASONING" not in text and "PRIVATE_PLAN_MARKER" not in text
         all_events = await adapters.outputs.list_events(handle.run_id, after_sequence=0)
         phase = next(e for e in replay if e.kind is OutputEventKind.OPERATION_STARTED and e.payload["kind"] == "planning")
@@ -303,7 +303,7 @@ async def test_format_and_host_repairs_receive_only_the_previous_output(repair_a
         public = [event async for event in handle.subscribe()]
         events = await adapters.outputs.list_events(handle.run_id, after_sequence=0)
         diagnostics = [event for event in events if event.kind is OutputEventKind.MODEL_DIAGNOSTICS]
-        for serialized in (str(public), str(diagnostics)):
+        for serialized in (str([event for event in public if event.kind is not OutputEventKind.PLANNING_DELTA]), str(diagnostics)):
             assert "PRIVATE_REPAIR_EVIDENCE" not in serialized
             assert "PRIVATE_REASONING" not in serialized
     finally:
@@ -380,20 +380,23 @@ async def test_no_complete_plan_never_executes_and_repair_is_bounded(script):
 
 
 @pytest.mark.asyncio
-async def test_projection_dedup_forgery_run_isolation_and_terminal_fences():
+@pytest.mark.parametrize("kind", [OutputEventKind.PLANNING_PROGRESS, OutputEventKind.PLANNING_DELTA])
+async def test_projection_dedup_forgery_run_isolation_and_terminal_fences(kind):
     gate = asyncio.Event()
     core, adapters, gateway = managed([[wire(text="准备核对。"), gate, wire()], [wire()]])
     try:
         first = await core.submit(_request())
         async for event in first.subscribe():
-            if event.kind is OutputEventKind.PLANNING_PROGRESS: break
+            if event.kind is kind: break
         draft = AgentOutputEventDraft(**{name: getattr(event, name) for name in
             ("run_id", "turn_id", "output_stream_id", "invocation_id", "source_event_key", "source", "kind", "channel", "visibility", "payload", "occurred_at")})
         assert (await adapters.outputs.append_event(draft)).event_id == event.event_id
         with pytest.raises(ContractViolationError):
-            await adapters.outputs.append_event(replace(draft, payload={**draft.payload, "text": "forged"}))
+            await adapters.outputs.append_event(replace(draft, payload={**draft.payload, ("textDelta" if kind is OutputEventKind.PLANNING_DELTA else "text"): "forged"}))
         with pytest.raises(ContractViolationError):
-            await adapters.outputs.append_event(replace(draft, source_event_key=f"planning:{event.invocation_id}:2", payload={**draft.payload, "recordIndex": 2, "sourceStart": 1}))
+            await adapters.outputs.append_event(replace(draft,
+                source_event_key=f"planning-delta:{event.invocation_id}:999" if kind is OutputEventKind.PLANNING_DELTA else f"planning:{event.invocation_id}:2",
+                payload={**draft.payload, **({"sourceChunkIndex": 999} if kind is OutputEventKind.PLANNING_DELTA else {"recordIndex": 2, "sourceStart": 1})}))
         with pytest.raises(ContractViolationError):
             await adapters.outputs.append_event(replace(draft, kind=OutputEventKind.PROVIDER_CONTENT_DELTA,
                 source_event_key="raw-leak", payload={"delta": "PRIVATE"}))
@@ -768,4 +771,95 @@ async def test_cancel_settles_already_reported_planning_usage_once():
         assert len(usages) == 1
     finally:
         gate.set()
+        await core.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("width", FIXTURE["deltaChunkWidths"])
+async def test_planning_delta_preserves_each_chunk_before_next_chunk_and_plan_commit(width):
+    wire_text = wire(text="准备核对。") + wire().rstrip("\n")
+    parts = [wire_text[i:i + width] for i in range(0, len(wire_text), width)]
+    gates = [asyncio.Event() for _ in parts]
+    script = [ModelStreamChunk(reasoning_delta="reasoning-only")]
+    for part, gate in zip(parts, gates):
+        script.extend([part, gate])
+    core, adapters, gateway = managed([script])
+    seen = []
+    try:
+        async with asyncio.timeout(10):
+            handle = await core.submit(_request())
+            async for event in handle.subscribe():
+                if event.kind is not OutputEventKind.PLANNING_DELTA:
+                    continue
+                index = len(seen)
+                assert event.payload["textDelta"] == parts[index]
+                assert event.payload["sourceChunkIndex"] == index + 2
+                assert event in await adapters.outputs.list_events(handle.run_id, after_sequence=event.sequence - 1)
+                assert gateway.executions == 0
+                assert not gates[index].is_set()
+                seen.append(event)
+                gates[index].set()
+            assert (await handle.wait()).status.value == "done"
+        assert len(seen) == len(parts)
+        assert "".join(event.payload["textDelta"] for event in seen) == wire_text
+        assert seen == [event async for event in handle.subscribe() if event.kind is OutputEventKind.PLANNING_DELTA]
+    finally:
+        for gate in gates:
+            gate.set()
+        await core.close()
+
+
+@pytest.mark.asyncio
+async def test_planning_delta_keeps_rejected_attempt_separate_from_repair():
+    core, adapters, gateway = managed([["{", "invalid\n"], [wire()]])
+    try:
+        handle = await core.submit(_request())
+        assert (await handle.wait()).status.value == "done"
+        events = [event async for event in handle.subscribe() if event.kind is OutputEventKind.PLANNING_DELTA]
+        assert [event.payload["attempt"] for event in events] == [0, 0, 1]
+        assert [event.payload["textDelta"] for event in events[:2]] == ["{", "invalid\n"]
+        assert events[0].invocation_id != events[2].invocation_id
+        assert gateway.executions == 1
+    finally:
+        await core.close()
+
+
+@pytest.mark.asyncio
+async def test_cancel_after_partial_planning_delta_prevents_late_preview_and_execution():
+    gate = asyncio.Event()
+    core, adapters, gateway = managed([["{", gate, '"late":true}']])
+    try:
+        async with asyncio.timeout(5):
+            handle = await core.submit(_request())
+            async for event in handle.subscribe():
+                if event.kind is OutputEventKind.PLANNING_DELTA:
+                    await handle.cancel("test cancellation")
+                    break
+            assert (await handle.wait()).status.value == "canceled"
+            before = [event async for event in handle.subscribe()]
+            gate.set()
+            assert before == [event async for event in handle.subscribe()]
+            assert [e.payload["textDelta"] for e in before if e.kind is OutputEventKind.PLANNING_DELTA] == ["{"]
+            assert gateway.executions == 0
+    finally:
+        gate.set()
+        await core.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rewrite", [False, True])
+async def test_planning_delta_policy_can_suppress_but_cannot_rewrite(rewrite):
+    class Policy:
+        async def authorize_provider_chunk(self, spec, chunk):
+            return chunk
+        async def authorize_planning_delta(self, spec, chunk):
+            return replace(chunk, content_delta="forged") if rewrite else None
+    core, adapters, gateway = managed([[wire()]])
+    core._output_processor._policy = Policy()
+    try:
+        handle = await core.submit(_request())
+        assert (await handle.wait()).status.value == ("failed" if rewrite else "done")
+        assert not [e async for e in handle.subscribe() if e.kind is OutputEventKind.PLANNING_DELTA]
+        assert gateway.executions == (0 if rewrite else 1)
+    finally:
         await core.close()

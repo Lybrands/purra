@@ -13,6 +13,7 @@ export type OutputVisibility = "private" | "public";
 
 export type OutputEventKind =
   | "planning.progress"
+  | "planning.delta"
   | "agent.progress"
   | "model.diagnostics"
   | "operation.started"

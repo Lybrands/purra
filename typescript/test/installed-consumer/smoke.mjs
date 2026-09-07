@@ -532,6 +532,7 @@ const managedEvents = [];
 for await (const event of managedHandle.events({ visibility: "all" })) managedEvents.push(event);
 assert.equal(managedEvents.filter((event) => event.kind === "invocation.started").length, 4);
 assert.equal(managedEvents.filter((event) => event.kind === "planning.progress").length, 1);
+assert.ok(managedEvents.some((event) => event.kind === "planning.delta" && event.payload.textDelta.length > 0));
 assert.equal(managedEvents.filter((event) => event.kind === "model.diagnostics").length, 1);
 
 function capabilities() {
