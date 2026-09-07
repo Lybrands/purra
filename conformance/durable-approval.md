@@ -425,3 +425,19 @@ reconciliation or model call. Tests compare all database rows before and after
 pending/approved/expired reads and exercise retained unknown claims and expired
 approvals with completed receipts. Extended fault and external/downstream acceptance
 remain separate.
+
+## Late-result lease fencing
+
+Synthetic persisted-state fault tests cover an expired lease, a replacement owner,
+and a newer epoch with the same owner while an approved tool is in flight. The old
+execution must preserve the pending claim and must not commit the late result,
+change the Run/checkpoint/events, renew or release the replacement lease. A reopened
+runtime must refuse redispatch without reconciliation.
+
+TypeScript captures the acquired epoch for its entire execution context, including
+approval preparation/dispatch, receipt writes, Run writes, heartbeat and finalization.
+Heartbeat renewal rejects expiry even when no replacement owner exists. Python binds
+the claim before starting its monitor so both execution and monitor inherit the
+same epoch; SQLite renewal/release honor that proof. Existing host lease port
+signatures remain unchanged. These local fault injections do not establish remote
+server cancellation or an end-to-end exactly-once guarantee.

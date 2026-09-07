@@ -354,3 +354,36 @@ for (const status of ['pending','approved','expired']) test(`approval inspection
   const [record]=await host.approvals.listPending({runId:id});
   assert.equal(JSON.stringify(report).includes(record.approvalId),false);assert.equal(JSON.stringify(report).includes(record.intentDigest),false);
 });
+
+for (const fault of ['expired','replaced-owner','advanced-epoch']) test(`late approved result is fenced after ${fault}`,{timeout:5000},async t=>{
+  const open=setup(t),first=open(),id=await paused(first);
+  let enter,release;const entered=new Promise(r=>enter=r),gate=new Promise(r=>release=r);
+  const owner=open({run:async()=>{enter();await gate;return {content:'late committed',effectState:'committed'};}}),other=open();
+  await approve(owner,id);
+  const handle=await owner.agent.resume(id,request);
+  // Attach before inducing failure so delayed rejection is always observed.
+  const outcome=handle.result.then(value=>({value}),error=>({error}));
+  await entered;
+  let replacement,claim;
+  await other.storage.transaction(async(_,extra)=>{
+    replacement=fault==='expired'?{...extra.leases[id],expires:0}:{...extra.leases[id],
+      owner:fault==='replaced-owner'?'replacement-owner':extra.leases[id].owner,
+      epoch:extra.leases[id].epoch+1,expires:Date.now()+60000};
+    extra.leases[id]=replacement;claim=structuredClone(Object.values(extra.tools)[0]);
+  });
+  try {
+    const before=await other.storage.runs.get(id);
+    const events=await other.storage.runs.listEvents(id,0);
+    if(fault==='expired'||fault==='advanced-epoch') await new Promise(r=>setTimeout(r,1200));
+    release();const result=await outcome;assert.ok(result.error);
+    await other.storage.transaction(async(_,extra)=>{
+      assert.deepEqual(Object.values(extra.tools),[claim]);
+      if(fault!=='expired') assert.deepEqual(extra.leases[id],replacement);
+    });
+    assert.deepEqual(await other.storage.runs.get(id),before);
+    assert.deepEqual(await other.storage.runs.listEvents(id,0),events);
+    const reopened=open();await assert.rejects(async()=>{const resumed=await reopened.agent.resume(id,request);await resumed.result;});
+    assert.deepEqual(reopened.counts,{model:0,tool:0});assert.equal(owner.counts.tool,1);
+    assert.ok((await reopened.storage.inspectRecovery(id)).blockers.includes('tool_effect_unknown'));
+  } finally {release();await outcome;}
+});

@@ -2,6 +2,11 @@
 
 ## 1.1.0 — Unreleased development
 
+- Fence late approved tool results by the original execution lease epoch. Expired
+  TypeScript leases cannot be revived by heartbeats; stale execution contexts
+  cannot alter Run state, renew or release a newer epoch, or complete a receipt.
+  Unknown claims remain persisted and block repeat dispatch after reopen.
+
 - Extend v5 SQLite recovery inspection with private-data-free approval state,
   checkpoint intent matching, completed receipts and Run-associated unknown claims.
   Reads never refresh decisions or grant execution authority; v4 reports stay unchanged.

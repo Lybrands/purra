@@ -295,3 +295,14 @@ approvalCheckpointIntent、approvalReceipt 和 approvalUnknownReceipts。v4 及�
 不透明 claim 仍是存储级提醒。诊断不刷新决策、不获取 lease、不执行、不对账、不调用
 模型，也不输出标识、参数、主体或摘要。测试比较等待、批准及到期检查前后全部数据库
 行，并覆盖未知 claim 和审批到期但回执已完成的场景。扩展故障及外部/下游验收仍单独进行。
+
+## 迟到结果与 lease 隔离
+
+合成存储故障测试覆盖审批工具执行期间 lease 到期、owner 被替换，以及 owner 相同但
+epoch 已更新。旧执行必须保留未知 claim，不得提交迟到回执、修改 Run/续点/事件、
+续活过期 lease 或释放更新的 lease。重新打开存储后仍需先对账，不能重复派发。
+
+TypeScript 将领取时的 epoch 贯穿审批准备/派发、回执、Run 写入、心跳及清理；
+即使没有替代 owner，心跳也不能续活已到期 lease。Python 在启动监控任务前绑定 claim，
+使执行与监控继承相同 epoch，SQLite 续租/释放据此校验。既有宿主 lease 端口签名保持。
+这些本地故障注入不代表远端取消已生效，也不提供端到端 exactly-once 保证。

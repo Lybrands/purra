@@ -447,3 +447,50 @@ async def test_approval_inspection_never_refreshes_or_dispatches(tmp_path, monke
         assert record.intent.digest not in json.dumps(report)
         assert 'private-principal' not in json.dumps(report)
     finally: await host.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('fault', ['expired','replaced-owner','advanced-epoch'])
+async def test_late_approved_result_cannot_cross_lease_fence(tmp_path, fault):
+    path=tmp_path/'db';host,options,record=await approved_host(path)
+    host.block_tool=True;host.entered=asyncio.Event();host.release=asyncio.Event()
+    other=ApprovalHost(path);other.expiry=host.expiry
+    run_id=record.intent.run_id
+    try:
+        handle=await host.core.resume(run_id,host.request,options=options)
+        await asyncio.wait_for(host.entered.wait(),2)
+        async with other.storage.transaction() as session:
+            old=session.leases[run_id]
+            replacement=replace(old,expires_at_ms=0) if fault=='expired' else replace(old,
+                owner_id='replacement-owner' if fault=='replaced-owner' else old.owner_id,
+                attempt=old.attempt+1,expires_at_ms=int(time.time()*1000)+60000)
+            session.leases[run_id]=replacement
+            claim=dict(session.extra['approvalExecutions'][record.approval_id])
+        before=await other.storage.runs.get(run_id)
+        events=await other.storage.outputs.list_events(run_id,after_sequence=0)
+        if fault=='advanced-epoch':
+            from purra.execution.ownership import execution_claim
+            token=execution_claim.set((run_id,old.owner_id,old.attempt))
+            try:
+                assert not await other.storage.leases.renew(run_id,old.owner_id,lease_duration_ms=60000)
+                assert not await other.storage.leases.release(run_id,old.owner_id)
+            finally: execution_claim.reset(token)
+        host.release.set()
+        try: await asyncio.wait_for(handle.wait(),3)
+        except ContractViolationError: pass
+        async with other.storage.transaction() as session:
+            assert session.get_tool_receipt((run_id,record.intent.tool_call_id)) is None
+            assert (run_id,record.intent.tool_call_id) in session.claims
+            assert session.extra['approvalExecutions'][record.approval_id]==claim
+            if fault!='expired': assert session.leases[run_id]==replacement
+        assert host.tool_calls==1
+        assert await other.storage.runs.get(run_id)==before
+        assert await other.storage.outputs.list_events(run_id,after_sequence=0)==events
+        await other.close();other=ApprovalHost(path);other.expiry=host.expiry
+        with pytest.raises(ContractViolationError):
+            resumed=await other.core.resume(run_id,other.request,options=AgentCoreRunOptions(tool_checkpoint_handler=other.boundary))
+            await resumed.wait()
+        assert other.tool_calls==other.model_calls==0
+        assert 'tool_effect_unknown' in (await other.storage.inspect_recovery(run_id))['blockers']
+    finally:
+        host.release.set();await other.close();await host.close()

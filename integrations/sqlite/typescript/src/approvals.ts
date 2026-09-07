@@ -7,6 +7,7 @@ type Operation<T> = (db: DatabaseSync, scope: string, all: StorageStores, extra:
 export interface ApprovalStorageAccess {
   readonly bindRuntimeClock?: (clock: () => number) => void;
   readonly owner?: () => string | undefined;
+  readonly epoch?: () => number | undefined;
   readonly idempotency?: ToolIdempotencyGateway;
   read<T>(operation: (db: DatabaseSync, scope: string) => Promise<T>): Promise<T>;
   write<T>(operation: Operation<T>): Promise<T>;
@@ -94,7 +95,7 @@ export class SqliteApprovalStore {
     if (copied.runId !== intent.value.runId || call.id !== intent.value.toolCallId || call.name !== intent.value.toolName
       || await jsonIdentityDigest(call.arguments) !== await jsonIdentityDigest(intent.value.arguments)) fail("approval_intent_conflict");
     const outcome = await this.access.write(async (db, scope, all, extra) => {
-      requireApprovalOwner(extra, copied.runId, this.access.owner?.());
+      requireApprovalOwner(extra, copied.runId, this.access.owner?.(), this.access.epoch?.());
       let record = await this.#create(db, scope, all, extra, intent, expiry);
       record = (await this.#refresh(db, scope, all, extra, record, integer(this.clock()))).record;
       await all.runs.saveToolExecutionCheckpoint(copied.runId, copied);
@@ -116,7 +117,7 @@ export class SqliteApprovalStore {
       request: async (request: Parameters<ToolApprovalGateway["request"]>[0]) => {
         if (request.dispatch === undefined) fail("approval_run_conflict");
         const outcome = await this.access.write((db, scope, all, extra) => checkApprovalDispatch(
-          db, scope, all, extra, request.dispatch!, this.access.owner!(), integer(this.clock())));
+          db, scope, all, extra, request.dispatch!, this.access.owner!(), integer(this.clock()), this.access.epoch?.()));
         if (outcome.error !== undefined) fail(outcome.error);
         return "approved" as const;
       },
@@ -186,17 +187,17 @@ export class SqliteApprovalStore {
   }
 }
 
-export function requireApprovalOwner(extra: Record<string, any>, runId: string, owner: string | undefined) {
+export function requireApprovalOwner(extra: Record<string, any>, runId: string, owner: string | undefined, epoch?: number) {
   const lease = extra.leases[runId];
   if (owner === undefined || lease?.owner !== owner || lease.expires <= Date.now()
-    || !Number.isSafeInteger(lease.epoch) || lease.epoch < 1) fail("run_lease_lost");
+    || !Number.isSafeInteger(lease.epoch) || lease.epoch < 1 || epoch !== undefined && epoch !== lease.epoch) fail("run_lease_lost");
   return lease;
 }
 
 export async function checkApprovalDispatch(db: DatabaseSync, scope: string, all: StorageStores, extra: Record<string, any>,
-  dispatch: ToolDispatchContext, owner: string | undefined, now: number) {
+  dispatch: ToolDispatchContext, owner: string | undefined, now: number, epoch?: number) {
   enabled(db);
-  requireApprovalOwner(extra, dispatch.runId, owner);
+  requireApprovalOwner(extra, dispatch.runId, owner, epoch);
   const row = db.prepare("SELECT approval_id FROM purra_approvals WHERE scope=? AND sdk='typescript' AND run_id=? AND call_id=?")
     .get(scope, dispatch.runId, dispatch.call.id);
   if (!row) fail("approval_not_found");

@@ -27,6 +27,7 @@ export class SqliteAgentAdapters {
   #active = false;
   #approvalRuntimeClock: (() => number) | undefined;
   readonly #owner = new AsyncLocalStorage<string>();
+  readonly #epoch = new AsyncLocalStorage<number>();
   readonly runs = this.#port("runs") as StoragePorts["runs"] & Pick<RunRepository, "executeOwned" | "executeToolOwned" | "saveToolExecutionCheckpoint">;
   readonly runTree = this.#port("runTree");
   readonly artifacts = this.#port("artifacts");
@@ -46,7 +47,7 @@ export class SqliteAgentAdapters {
     executeOnce: async (key, operation, dispatch) => {
       const outcome = await this.#transaction(async (all, extra) => {
         const approval = dispatch === undefined ? undefined : await checkApprovalDispatch(
-          this.#db, this.#scope, all, extra, dispatch, this.#owner.getStore(), (this.#approvalRuntimeClock ?? Date.now)());
+          this.#db, this.#scope, all, extra, dispatch, this.#owner.getStore(), (this.#approvalRuntimeClock ?? Date.now)(), this.#epoch.getStore());
         if (approval?.error !== undefined) return { error: approval.error };
         const prior = extra.tools[key];
         if (prior) {
@@ -74,7 +75,7 @@ export class SqliteAgentAdapters {
       if (dispatch !== undefined && !["committed", "not_started"].includes(result?.effectState)) throw new AgentError("tool_effect_unknown", "Tool outcome requires reconciliation");
       await this.#extraTransaction(async (extra) => {
         if (dispatch !== undefined) {
-          const lease = requireApprovalOwner(extra, dispatch.runId, this.#owner.getStore());
+          const lease = requireApprovalOwner(extra, dispatch.runId, this.#owner.getStore(), this.#epoch.getStore());
           const claim = extra.tools[key];
           if (claim?.state !== "claimed" || claim.leaseOwnerId !== lease.owner || claim.leaseEpoch !== lease.epoch) throw new AgentError("run_lease_lost", "Tool claim ownership changed");
         }
@@ -115,7 +116,7 @@ export class SqliteAgentAdapters {
         if (name === "runs" && !["get", "listEvents", "listRootEvents"].includes(method)) {
           const lease = extra.leases[String(args[0])];
           const owner = this.#owner.getStore();
-          if (owner !== undefined && lease && (lease.owner !== owner || lease.expires <= Date.now())) throw new Error("run_lease_lost");
+          if (owner !== undefined && lease && (lease.owner !== owner || lease.expires <= Date.now() || lease.epoch !== this.#epoch.getStore())) throw new Error("run_lease_lost");
         }
         return (all[name] as any)[method](...args);
       }, name === "runs" && RUN_READ_METHODS.has(method), name === "runs" ? "all" : name,
@@ -125,7 +126,7 @@ export class SqliteAgentAdapters {
 
   async #executeOwned<T>(runId: string, operation: () => Promise<T>, checkpoint?: AgentExecutionCheckpoint | AgentToolExecutionCheckpoint): Promise<T> {
     const owner = globalThis.crypto.randomUUID();
-    await this.transaction(async (all, extra) => {
+    const epoch = await this.transaction(async (all, extra) => {
       const saved = await all.runs.get(runId);
       if (saved.status !== "running") throw new AgentError("run_terminal", "Run is terminal");
       const old = extra.leases[runId];
@@ -139,6 +140,7 @@ export class SqliteAgentAdapters {
         if (events.slice(lastCheckpoint + 1).some(event => event.kind === "invocation.started")) throw new AgentError("run_recovery_requires_reconciliation", "The last model/tool attempt needs reconciliation");
       }
       extra.leases[runId] = { owner, epoch: (old?.epoch ?? 0) + 1, expires: Date.now() + 30000 };
+      return extra.leases[runId].epoch;
     });
     let stopped = false;
     const heartbeat = async () => {
@@ -146,7 +148,8 @@ export class SqliteAgentAdapters {
         await sleep(1000, undefined, { signal: stop.signal }).catch(() => {});
         if (stopped) break;
         await this.#extraTransaction(async (extra) => {
-          if (extra.leases[runId]?.owner !== owner) throw new Error("run_lease_lost");
+          const lease = extra.leases[runId];
+          if (lease?.owner !== owner || lease.epoch !== epoch || lease.expires <= Date.now()) throw new AgentError("run_lease_lost", "Execution lease was lost");
           extra.leases[runId].expires = Date.now() + 30000;
         });
       }
@@ -155,13 +158,13 @@ export class SqliteAgentAdapters {
     let heartbeatError: unknown;
     const monitor = heartbeat().catch((error) => { heartbeatError = error; });
     try {
-      const result = await this.#owner.run(owner, operation);
+      const result = await this.#epoch.run(epoch, () => this.#owner.run(owner, operation));
       if (heartbeatError) throw heartbeatError;
       return result;
     } finally {
       stopped = true; stop.abort(); await monitor;
       await this.#extraTransaction(async (extra) => {
-        if (extra.leases[runId]?.owner === owner) extra.leases[runId] = { ...extra.leases[runId], owner: null, expires: 0 };
+        if (extra.leases[runId]?.owner === owner && extra.leases[runId].epoch === epoch) extra.leases[runId] = { ...extra.leases[runId], owner: null, expires: 0 };
       });
     }
   }
@@ -181,6 +184,7 @@ export class SqliteAgentAdapters {
         this.#approvalRuntimeClock = clock;
       },
       owner: () => this.#owner.getStore(),
+      epoch: () => this.#epoch.getStore(),
       idempotency: this.idempotency,
       read: operation => this.#withConnection(() => operation(this.#db, this.#scope), true),
       write: operation => this.#transaction((all, extra) => operation(this.#db, this.#scope, all, extra)),

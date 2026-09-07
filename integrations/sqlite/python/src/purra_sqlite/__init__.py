@@ -328,6 +328,8 @@ class _Leases:
             now = int(time.time() * 1000)
             old = self.store._leases.get(run_id)
             if old is None or old.owner_id != owner_id or (old.expires_at_ms or 0) <= now: return False
+            claim = execution_claim.get()
+            if claim is not None and claim[:2] == (run_id, owner_id) and claim[2] != old.attempt: return False
             self.store._leases[run_id] = replace(old, expires_at_ms=now + lease_duration_ms, heartbeat_at_ms=now)
             return True
 
@@ -335,6 +337,8 @@ class _Leases:
         async with self.store._transaction(with_journal=False):
             old = self.store._leases.get(run_id)
             if old is None or old.owner_id != owner_id: return False
+            claim = execution_claim.get()
+            if claim is not None and claim[:2] == (run_id, owner_id) and claim[2] != old.attempt: return False
             self.store._leases[run_id] = replace(old, owner_id=None, expires_at_ms=None)
             return True
 
