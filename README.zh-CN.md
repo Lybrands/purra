@@ -12,6 +12,8 @@ PurrA 是面向 Python 和 TypeScript 的 Agent 运行时，负责在应用中�
 [持久化审批契约](conformance/durable-approval.zh-CN.md)记录本版开发中的能力；双端已通过 Reactive、Planned、Auto Root 审批恢复，以及宿主授权 MCP 写工具和持久回执的确定性验证。已提供只读审批诊断；扩展恢复、真实服务及下游验收仍未完成。
 已有能力及 1.x 兼容承诺见[1.0 支持说明](conformance/release-1.0.zh-CN.md)。
 
+0.x 升级要求见[升级说明](CHANGELOG.md#从-0x-升级)。
+
 ## 安装
 
 Python 3.11+：
@@ -106,3 +108,5 @@ JavaScript 和 TypeScript 用法见 [TypeScript 指南](typescript/README.zh-CN.
 ## 许可证
 
 [MIT](LICENSE)
+
+长期公共接口约定见[兼容承诺](ARCHITECTURE.md#public-compatibility)。

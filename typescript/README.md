@@ -11,9 +11,12 @@ compose tools, context, planning, and persistence through the public `purra` exp
 This checkout is unreleased 1.1.0 development. Install matching local Core and
 integration artifacts; registry commands do not identify this development build.
 The [durable approval contract](../conformance/durable-approval.md) describes the
-work in progress. Durable approval recovery and MCP writes are not yet available.
+work in progress. Durable Root approval recovery and host-authorized MCP writes have deterministic
+coverage; real Provider, business-service and downstream acceptance remain separate.
 Existing capabilities and 1.x compatibility are documented in the
 [1.0 support guide](../conformance/release-1.0.md).
+
+See the [upgrade notes](../CHANGELOG.md#upgrading-from-0x) and [public compatibility](../ARCHITECTURE.md#public-compatibility) before upgrading.
 
 ## Install
 
@@ -86,7 +89,10 @@ Run requests accept `planningMode`:
 | `planned` | Plan before executing the task. |
 
 The planner requires a streaming gateway. Subscribe to Run events for public
-`planning.progress`; private plans and reasoning are excluded. See the
+`planning.delta` for each nonempty raw planning content chunk, without waiting
+for complete JSON, and `planning.progress` for complete progress records. Raw
+previews may include invalid plan fragments; execution still requires validation.
+Reasoning remains private. See the [output contract](../ARCHITECTURE.md#planning-output) and
 [planning example](examples/planner-streaming.ts) for subscription and replay.
 
 ## Budgets and persistence

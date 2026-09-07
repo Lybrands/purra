@@ -9,8 +9,10 @@
 ## 1.1.0 开发状态
 
 当前源码为尚未发布的 1.1.0 开发版。请安装版本一致的 Core 与集成本地产物；注册表命令不保证获取此开发版本。
-[持久化审批契约](../conformance/durable-approval.zh-CN.md)记录本版开发中的能力；持久化审批恢复与 MCP 写工具尚未实现。
+[持久化审批契约](../conformance/durable-approval.zh-CN.md)记录本版开发中的能力；Root 持久化审批恢复与宿主授权 MCP 写工具已具备确定性验证；真实 Provider、业务服务与下游验收仍需分别完成。
 已有能力及 1.x 兼容承诺见[1.0 支持说明](../conformance/release-1.0.zh-CN.md)。
+
+0.x 升级要求见[升级说明](../CHANGELOG.md#从-0x-升级)。
 
 ## 安装
 
@@ -77,8 +79,9 @@ Run 请求通过 `planningMode` 选择模式：
 | `reactive` | 通过模型与工具循环执行，不激活规划。 |
 | `planned` | 执行任务前先规划。 |
 
-Planner 要求网关支持流式输出。订阅 Run 事件可接收公开的 `planning.progress`，
-其中不包含私有计划和推理。订阅与重放用法见[规划示例](examples/planner-streaming.ts)。
+Planner 要求网关支持流式输出。订阅 Run 事件可逐片段接收 `planning.delta`，无需等待完整 JSON；
+`planning.progress` 保留完整进度记录的语义。原始预览可能包含无效计划片段，执行仍须通过校验，推理保持私有。
+契约见[计划输出](../ARCHITECTURE.md#planning-output)，订阅与重放用法见[规划示例](examples/planner-streaming.ts)。
 
 ## 预算与持久化
 
@@ -103,3 +106,5 @@ Core 会保留“未知”状态，而不会把它记成 0。
 - [示例](../examples/README.zh-CN.md)
 - [可选包](../integrations/README.zh-CN.md)
 - [MIT 许可证](LICENSE)
+
+长期公共接口约定见[兼容承诺](../ARCHITECTURE.md#public-compatibility)。

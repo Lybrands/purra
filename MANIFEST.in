@@ -1,2 +1,3 @@
 recursive-include conformance *.json *.md
 prune conformance/reports
+prune docs

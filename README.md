@@ -19,6 +19,8 @@ service/downstream acceptance remain unfinished.
 Existing capabilities and 1.x compatibility are documented in the
 [1.0 support guide](conformance/release-1.0.md).
 
+See the [upgrade notes](CHANGELOG.md#upgrading-from-0x) and [public compatibility](ARCHITECTURE.md#public-compatibility) before upgrading.
+
 ## Install
 
 Python 3.11+:

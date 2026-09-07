@@ -34,6 +34,14 @@ candidates pending. Model similarity alone does not authorize activation.
 | `supersede` | Keep the accepted replacement and disable older records |
 | `conflict` | Disable the group until it is resolved |
 
+For workflow retries, keep capture key, input and policy revision unchanged.
+Completed resolutions replay their receipts; they do not re-extract or reactivate
+withdrawn records. Running/unknown operations require inspection or reconciliation.
+Policy may run again before a resolution is persisted, so it must be free of
+side effects. Change its revision when changing its meaning. An empty search
+does not prove independence, and `review.proposal` may be absent. Stale source
+or record versions fail before activation. SDK examples are in the usage guides.
+
 ## Read and manage
 
 | API | Purpose |

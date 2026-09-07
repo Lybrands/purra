@@ -145,6 +145,13 @@ class AgentOutputJournalQuery(Protocol):
 
 @runtime_checkable
 class AgentOutputPolicy(Protocol):
+    """Authorize source chunks.
+
+    Optional async authorize_planning_delta(spec, chunk) may return None to
+    suppress a public planning preview, or the unchanged chunk to allow it.
+    Omitting the hook allows previews; modifying their source is rejected.
+    """
+
     async def authorize_provider_chunk(
         self,
         spec: OutputStreamSpec,

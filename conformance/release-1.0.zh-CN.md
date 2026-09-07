@@ -8,7 +8,7 @@
 
 Python 和 TypeScript 均提供 Run 绑定的完整对象结构化任务、显式 `local`／`native_required`、有界且默认关闭的格式修复、限定作用域的 MCP 只读工具、显式安全只读批次的有界并行、接入检查报告及只读恢复诊断。Core 没有运行时依赖；七个可选包分别为 OpenAI、Anthropic、SQLite、interaction、compaction、Mem0、MCP。
 
-模型能力、凭据、SDK 客户端、授权、资源范围、持久化、预算和关闭操作归宿主管理。安装适配包不会自动在 Agent 中启用它。参见[结构化输出](structured-output.md)、[工具并行](tool-concurrency.md)、[接入与诊断](integration-inspection.md)。
+模型能力、凭据、SDK 客户端、授权、资源范围、持久化、预算和关闭操作归宿主管理。安装适配包不会自动在 Agent 中启用它。参见[结构化输出](structured-output.md)、[工具并行](../ARCHITECTURE.md#read-only-tool-concurrency)、[接入与诊断](../ARCHITECTURE.md#integration-reports-and-recovery-inspection)。
 
 ## 服务验证与边界
 
