@@ -156,7 +156,8 @@ recovery and claim/receipt association. Configure `toolCheckpointHandler`,
 `approval: approvals.gateway()` and the same adapter’s `idempotency`; existing
 model-ready checkpoint types remain unchanged. Root approval after read-only Child
 work is covered; select business writes explicitly with `toolCheckpointNames`.
-Child write approval and MCP write acceptance remain incomplete.
+Child write approval is unsupported. MCP writes have deterministic and controlled
+independent-service coverage; business-service and downstream acceptance remain separate.
 Keep production databases on their current format until the runtime integration
 and acceptance are complete. See the [durable approval contract](../../../conformance/durable-approval.md#storage-foundation-api)
 for activation, API methods, replay behavior and SDK format boundaries.

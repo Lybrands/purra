@@ -2,12 +2,13 @@
 
 English | [简体中文](durable-approval.zh-CN.md)
 
-This contract now has a Stage B storage foundation: immutable approval records,
-host-authorized transactional decisions and explicit SQLite v5 activation.
-Python and TypeScript now have opt-in single-call tool-ready runtime paths,
-verified for Reactive, Planned and Auto Root Runs. MCP write bindings and local protocol/recovery tests are implemented;
-Stage B is not complete. Existing
-in-memory approvals remain supported. The implemented prerequisite revalidates
+Both SDKs implement immutable approval records, host-authorized transactional
+decisions, explicit SQLite v5 activation, and opt-in single-call tool-ready
+recovery for Reactive, Planned and Auto Root Runs. MCP write bindings, approval
+inspection and lease-fault protection have deterministic coverage; installed
+consumers also exercise an independent synthetic MCP writer. Existing
+in-memory approvals remain supported. See the [1.1 handoff](release-1.1.md)
+for support and acceptance boundaries. The implemented prerequisite revalidates
 host scope after approval, before entering the tool idempotency gateway.
 The shared `fixtures/approval_dispatch.json` cases test that prerequisite only.
 
@@ -243,7 +244,7 @@ The store exposes `create`, `get`, `list_pending` / `listPending`, `decide` and
 `refresh`. Creation requires an existing running Run, matching Root and persisted
 preset fingerprint; expiry is capped by both Run deadlines. Exact creation replay
 returns the original record without renewal. Binding/scope revisions are host
-declarations here; live verification belongs to the future dispatch gate.
+declarations here; the runtime gateway verifies current binding identity before dispatch.
 
 `decide(command, principal_id=...)` / `decide(command, {principalId})` requires
 an authenticated host principal supplied independently of model/tool data.
@@ -301,8 +302,8 @@ A committed, matching receipt can be replayed after expiry without a new effect.
 Deterministic acceptance currently covers Root Run restart, repeated
 pending recovery, concurrent resume, cancellation after approval, changed binding,
 unknown effects, receipt persistence failure and committed-receipt replay.
-Child write-approval acceptance, broader runtime parity and real service/downstream
-validation remain unfinished. This is not a 1.1 release acceptance claim.
+Child write approval is unsupported. Real Provider, business MCP service and
+downstream validation remain unpassed. This is not a 1.1 release acceptance claim.
 
 ## TypeScript tool-ready runtime path (development)
 
@@ -355,8 +356,8 @@ Deterministic tests cover restart, repeated pending waits, concurrent resume,
 current-scope denial, expiry between gateway and claim, opaque-key association,
 unknown results, receipt persistence failure and completed-receipt replay.
 The inspection recognizes tool checkpoints and approval observations;
-Child write-approval acceptance and real service/downstream acceptance remain
-unfinished. These tests do not establish end-to-end exactly-once external effects.
+Child write approval is unsupported; real Provider, business MCP and downstream
+acceptance remain unpassed. These tests do not establish end-to-end exactly-once external effects.
 
 ## Root planning and Agent Tree composition
 

@@ -37,12 +37,12 @@
   Python and TypeScript additionally support opt-in tool-ready checkpoints and
   same-Run approval recovery with atomic claim/receipt associations. Reactive,
   Planned and Auto Root recovery, plus Root approval after read-only Child work,
-  pass deterministic tests. Child write approval remains pending.
+  pass deterministic tests. Child write approval is unsupported.
 - Align Core and all seven optional packages, exact internal dependencies and
   npm lockfiles at 1.1.0. This version has not been published.
 
 The [durable approval contract](conformance/durable-approval.md) defines the
-remaining runtime parity, diagnostics and extended recovery work. Storage decisions
+implemented runtime, diagnostics and recovery boundaries. Storage decisions
 alone are not execution permissions.
 
 ## 1.0.0 — Unreleased candidate

@@ -1,0 +1,62 @@
+# 1.1 development handoff
+
+English | [简体中文](release-1.1.zh-CN.md)
+
+1.1.0 is unreleased. Install matching Core, SQLite and MCP artifacts; publishing,
+remote CI and downstream enablement are separate from local development checks.
+The [approval contract](durable-approval.md) defines the public APIs.
+
+## Supported execution boundary
+
+Both SDKs support one approval-bearing write per selected batch in persistent
+Reactive, Planned and Auto Root Runs. Waiting commits the exact tool continuation,
+settled model invocation and approval intent together, then releases the lease.
+Restart preserves planning, usage, deadlines and completed read-only Child work.
+No model round or completed write is repeated to reconstruct an approval wait.
+
+Host decisions require an authenticated principal and an explicit authorizer.
+At dispatch, current binding, arguments, scope, configuration, cancellation,
+deadline, budget and lease still apply. MCP writes use separate explicit host
+bindings; remote annotations never authorize them. Approved intent and existing
+tool claim are associated atomically. Unknown effects retain the claim and block
+automatic redispatch; reconciliation requires independent host evidence.
+
+Child writes, mixed/multiple-call approval batches, arbitrary nested approval and
+clarification combinations, and general distributed effect recovery are outside
+this supported boundary. No end-to-end exactly-once guarantee is made.
+
+## Host integration sequence
+
+1. Preserve a backup and finish active Runs/reconcile unresolved effects with the
+   original runtime. Offline v5 activation rejects active or foreign-SDK rows and
+   unresolved claims across all scopes; default construction does not migrate v4.
+   Historical same-SDK data is retained. Do not switch an active production Run.
+2. Bind authenticated decision handling outside model/tool APIs. Treat approval
+   display text as a host projection, not the private intent or authorization input.
+3. Select business write names in the tool checkpoint callback. Build the intent
+   from the actual call, saved preset and current registration identity. Persist
+   the original expiry. Bind the approval gateway and its exact idempotency store.
+4. On `ApprovalRequired`, display the pending decision and release the worker.
+   After a host decision, resume the original Run/request with the same callback.
+   Approval and inspection are observations; neither bypasses dispatch checks.
+5. Present unknown effects for host reconciliation. Never clear a claim merely
+   because a transport failed, a process exited or the user canceled a local wait.
+
+Legacy live approvals, clarification, read-only MCP and v4-only applications keep
+their existing contracts. Old model-ready checkpoints remain schema 2; the opt-in
+tool-ready continuation is schema 3. Python/TypeScript storage is not interchangeable.
+
+## Verification entry points and evidence classes
+
+| Evidence | Reproducible entry points | Boundary |
+| --- | --- | --- |
+| Deterministic | SQLite `test_approvals.py`, `test_approval_resume.py`; TypeScript `approvals.test.mjs`, `approval-resume.test.mjs`; shared `approval_*.json` fixtures | Synthetic authorization, decision races, restart, receipt failure, lease faults and read-only inspection |
+| Installed artifacts | MCP Python `scripts/check_installed_write.py`, TypeScript `scripts/check-installed-write.mjs` | Install matching wheel/tarballs outside source; check package origins and private-file exclusion |
+| Independent MCP process | `integrations/mcp/fixtures/write_server.py`, driven by both installed consumers | Scripted model, synthetic file; success, lost response, exit before/after write and error after write; verify ledger and process cleanup |
+| Real Provider/business MCP | Host-selected protocol + capability + actual service/model | Not established by scripted models or synthetic writers |
+| Downstream | Host authentication, UI, resource policy, offline activation and restart acceptance | Not run by this PurrA-only task; no adjacent project enabled |
+
+Commands and executable host wiring are in the [Python MCP README](../integrations/mcp/python/README.md)
+and [TypeScript MCP README](../integrations/mcp/typescript/README.md). Approval
+observations omit private identifiers/arguments/digests and retain `diagnosis_only`.
+Validate the exact delivered artifacts in the host before enabling business writes.

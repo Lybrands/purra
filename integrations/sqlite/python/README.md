@@ -158,9 +158,10 @@ See the Core [inspection contract](../../../ARCHITECTURE.md#integration-reports-
 ## 1.1 approval storage foundation (unreleased)
 
 Explicit offline v5 activation and host-authorized decision storage are available.
-Python now has an opt-in tool-ready runtime gate with Reactive Root recovery and
-atomic claim/receipt association. Extended runtime and MCP write acceptance remain
-incomplete.
+The opt-in tool-ready runtime supports Reactive, Planned and Auto Root recovery
+with atomic claim/receipt association. Host-authorized MCP writes have deterministic
+and controlled independent-service coverage. Child writes are unsupported; real
+Provider, business MCP and downstream acceptance remain separate.
 Keep production databases on their current format until the runtime integration
 and acceptance are complete. See the [durable approval contract](../../../conformance/durable-approval.md#storage-foundation-api)
 for activation, API methods, replay behavior and SDK format boundaries.

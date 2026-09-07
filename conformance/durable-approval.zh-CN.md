@@ -2,9 +2,10 @@
 
 [English](durable-approval.md) | 简体中文
 
-当前已实现阶段 B 的存储基础：不可变审批记录、宿主授权的事务决策及 SQLite v5 显式激活。
+双端已实现持久化审批存储：不可变审批记录、宿主授权的事务决策及 SQLite v5 显式激活。
 Python 和 TypeScript 已接通 opt-in 单调用工具续点，目前完成 Reactive、Planned 和 Auto Root Run 的确定性验证。
-MCP 写绑定与本地协议/恢复测试已实现；只读审批诊断已实现，扩展恢复和外部验收仍未完成。
+MCP 写绑定、只读审批诊断与 lease 故障隔离已具备确定性验证；安装消费者另验证了独立合成 MCP 写服务。
+支持边界及外部验收状态见[1.1 接入交接](release-1.1.zh-CN.md)。
 当前已落地的前置修复是：审批通过后、进入工具幂等网关前重新验证宿主 scope 和取消状态。
 共享案例 `fixtures/approval_dispatch.json` 只验证这一边界。已有内存审批继续可用。
 
@@ -164,7 +165,7 @@ TypeScript 对应 `enableApprovals()` 和 `approvalStore({authorize, clockMs})`�
 
 存储提供 `create`、`get`、`list_pending` / `listPending`、`decide`、`refresh`。
 创建要求 Run 正在运行、Root 和持久化配置摘要一致；过期时间受 Run/Root deadline 限制。
-相同创建请求返回原记录，不续期。此处 binding/scope revision 是宿主声明，尚未接入实时派发校验。
+相同创建请求返回原记录，不续期。此处 binding/scope revision 是宿主声明，运行时网关会在派发前重新校验当前绑定身份。
 
 宿主从认证上下文提供主体，不能采信模型或工具返回的主体。`authorize(principal, record, command)`
 必须返回严格的 true，在事务外执行；随后事务重查身份、revision、规范 Run 取消、过期及配置。
@@ -202,8 +203,7 @@ invocation ID、独立的模型预算 key、规划/证据/轮次状态。旧 v2 
 也可以重放，不重新执行效果。
 
 当前确定性验证覆盖 Root 重启、重复待审恢复、并发恢复、批准后取消、binding 变化、
-未知效果、回执落盘失败和已提交回执重放。Child 写审批、扩展运行对齐、
-真实服务与下游验收仍待完成。不能据此宣称 1.1 已验收。
+未知效果、回执落盘失败和已提交回执重放。Child 写审批不受支持；真实 Provider、业务 MCP 和下游验收仍未通过。不能据此宣称 1.1 已验收。
 
 ## TypeScript 工具续点运行入口（开发中）
 
