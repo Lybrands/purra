@@ -1,10 +1,13 @@
 import type { DatabaseSync } from "node:sqlite";
-import { AgentError, ApprovalIntent, copyApprovalDecisionCommand, copyApprovalRecord, jsonIdentityDigest,
-  type ApprovalRecord, type ApprovalDecisionCommand, type ApprovalDecisionAudit, type StorageStores } from "purra";
+import { AgentError, ApprovalIntent, ApprovalRequired, copyToolExecutionCheckpoint, copyApprovalDecisionCommand, copyApprovalRecord, jsonIdentityDigest,
+  type AgentToolExecutionCheckpoint, type ToolApprovalGateway, type ToolIdempotencyGateway, type ToolDispatchContext, type ApprovalRecord, type ApprovalDecisionCommand, type ApprovalDecisionAudit, type StorageStores } from "purra";
 import { storageVersion } from "./approval-format.js";
 
 type Operation<T> = (db: DatabaseSync, scope: string, all: StorageStores, extra: Record<string, any>) => Promise<T>;
 export interface ApprovalStorageAccess {
+  readonly bindRuntimeClock?: (clock: () => number) => void;
+  readonly owner?: () => string | undefined;
+  readonly idempotency?: ToolIdempotencyGateway;
   read<T>(operation: (db: DatabaseSync, scope: string) => Promise<T>): Promise<T>;
   write<T>(operation: Operation<T>): Promise<T>;
 }
@@ -52,7 +55,7 @@ function receipt(record: ApprovalRecord): ApprovalDecisionReceipt {
     status: audit.command.decision === "approve" ? "approved" : "rejected", revision: audit.revision, decidedAtMs: audit.decidedAtMs });
 }
 
-/** Host-only decisions. No method suspends a Run or permits tool dispatch. */
+/** Host-authorized decisions and atomic durable waits. Dispatch is revalidated separately. */
 export class SqliteApprovalStore {
   constructor(private readonly access: ApprovalStorageAccess, private readonly authorize: ApprovalAuthorizer, private readonly clock: () => number = Date.now) {
     if (typeof authorize !== "function") throw new TypeError("Approval authorizer is required");
@@ -61,24 +64,62 @@ export class SqliteApprovalStore {
   async create(intent: ApprovalIntent, options: { expiresAtMs: number }): Promise<ApprovalRecord> {
     if (!(intent instanceof ApprovalIntent)) throw new TypeError("Approval intent is required");
     const requestedExpiry = integer(options.expiresAtMs);
+    return this.access.write((db, scope, all, extra) => this.#create(db, scope, all, extra, intent, requestedExpiry));
+  }
+
+  async #create(db: DatabaseSync, scope: string, all: StorageStores, extra: Record<string, any>, intent: ApprovalIntent, requestedExpiry: number): Promise<ApprovalRecord> {
     const id = await jsonIdentityDigest({ profile: "purra.approval-key/v1", runId: intent.value.runId, toolCallId: intent.value.toolCallId });
-    return this.access.write(async (db, scope, all, extra) => {
-      enabled(db);
-      const state = await runState(db, scope, all, extra, intent.value);
-      if (state.canceled) fail("approval_run_terminal");
-      if (state.fingerprint !== intent.value.presetFingerprint) fail("approval_configuration_mismatch");
-      const expiresAtMs = Math.min(requestedExpiry, state.deadline ?? requestedExpiry);
-      if (db.prepare("SELECT 1 FROM purra_approvals WHERE scope=? AND sdk='typescript' AND approval_id=?").get(scope, id)) {
-        const record = await load(db, scope, id);
-        if (record.intentDigest !== intent.digest || record.expiresAtMs !== expiresAtMs) fail("approval_intent_conflict");
-        return record;
-      }
-      const now = integer(this.clock());
-      if (now >= expiresAtMs) fail("approval_expired");
-      const record = await copyApprovalRecord({ approvalId: id, intent: intent.value, intentDigest: intent.digest,
-        revision: 1, status: "pending", createdAtMs: now, expiresAtMs, decisionAudit: {} });
-      save(db, scope, record);
+    enabled(db);
+    const state = await runState(db, scope, all, extra, intent.value);
+    if (state.canceled) fail("approval_run_terminal");
+    if (state.fingerprint !== intent.value.presetFingerprint) fail("approval_configuration_mismatch");
+    const expiresAtMs = Math.min(requestedExpiry, state.deadline ?? requestedExpiry);
+    if (db.prepare("SELECT 1 FROM purra_approvals WHERE scope=? AND sdk='typescript' AND approval_id=?").get(scope, id)) {
+      const record = await load(db, scope, id);
+      if (record.intentDigest !== intent.digest || record.expiresAtMs !== expiresAtMs) fail("approval_intent_conflict");
       return record;
+    }
+    const now = integer(this.clock());
+    if (now >= expiresAtMs) fail("approval_expired");
+    const record = await copyApprovalRecord({ approvalId: id, intent: intent.value, intentDigest: intent.digest,
+      revision: 1, status: "pending", createdAtMs: now, expiresAtMs, decisionAudit: {} });
+    save(db, scope, record);
+    return record;
+  }
+
+  async prepare(checkpoint: AgentToolExecutionCheckpoint, intent: ApprovalIntent, options: { expiresAtMs: number }): Promise<void> {
+    const copied = copyToolExecutionCheckpoint(checkpoint), expiry = integer(options.expiresAtMs);
+    if (!(intent instanceof ApprovalIntent)) throw new TypeError("Approval intent is required");
+    const call = copied.assistant.toolCalls![0]!;
+    if (copied.runId !== intent.value.runId || call.id !== intent.value.toolCallId || call.name !== intent.value.toolName
+      || await jsonIdentityDigest(call.arguments) !== await jsonIdentityDigest(intent.value.arguments)) fail("approval_intent_conflict");
+    const outcome = await this.access.write(async (db, scope, all, extra) => {
+      requireApprovalOwner(extra, copied.runId, this.access.owner?.());
+      let record = await this.#create(db, scope, all, extra, intent, expiry);
+      record = (await this.#refresh(db, scope, all, extra, record, integer(this.clock()))).record;
+      await all.runs.saveToolExecutionCheckpoint(copied.runId, copied);
+      await all.runs.appendEvent(copied.runId, { sourceKey: `approval-required:${record.approvalId}`, kind: "approval.required",
+        channel: "lifecycle", visibility: "private", payload: { approvalId: record.approvalId } });
+      const completed = Object.values(extra.tools).some((entry: any) => entry.approvalId === record.approvalId && entry.intentDigest === record.intentDigest
+          && entry.runId === record.intent.runId && entry.callId === record.intent.toolCallId && entry.state === "complete");
+      return { record, completed };
+    });
+    if (outcome.completed) return;
+    if (outcome.record.status === "pending") throw new ApprovalRequired(copied.runId, outcome.record.approvalId);
+    if (outcome.record.status !== "approved") fail(`approval_${outcome.record.status}`);
+  }
+
+  gateway(): ToolApprovalGateway {
+    if (this.access.idempotency === undefined || this.access.owner === undefined) fail("approval_runtime_required");
+    this.access.bindRuntimeClock?.(this.clock);
+    return Object.freeze({ requiresDurableIdempotency: true, idempotencyGateway: this.access.idempotency,
+      request: async (request: Parameters<ToolApprovalGateway["request"]>[0]) => {
+        if (request.dispatch === undefined) fail("approval_run_conflict");
+        const outcome = await this.access.write((db, scope, all, extra) => checkApprovalDispatch(
+          db, scope, all, extra, request.dispatch!, this.access.owner!(), integer(this.clock())));
+        if (outcome.error !== undefined) fail(outcome.error);
+        return "approved" as const;
+      },
     });
   }
 
@@ -143,4 +184,37 @@ export class SqliteApprovalStore {
     if (result.error) fail(result.error);
     return result.receipt!;
   }
+}
+
+export function requireApprovalOwner(extra: Record<string, any>, runId: string, owner: string | undefined) {
+  const lease = extra.leases[runId];
+  if (owner === undefined || lease?.owner !== owner || lease.expires <= Date.now()
+    || !Number.isSafeInteger(lease.epoch) || lease.epoch < 1) fail("run_lease_lost");
+  return lease;
+}
+
+export async function checkApprovalDispatch(db: DatabaseSync, scope: string, all: StorageStores, extra: Record<string, any>,
+  dispatch: ToolDispatchContext, owner: string | undefined, now: number) {
+  enabled(db);
+  requireApprovalOwner(extra, dispatch.runId, owner);
+  const row = db.prepare("SELECT approval_id FROM purra_approvals WHERE scope=? AND sdk='typescript' AND run_id=? AND call_id=?")
+    .get(scope, dispatch.runId, dispatch.call.id);
+  if (!row) fail("approval_not_found");
+  let record = await load(db, scope, String(row.approval_id));
+  const run = await all.runs.get(dispatch.runId), checkpoint = run.toolExecutionCheckpoint;
+  if (checkpoint === undefined || await jsonIdentityDigest(checkpoint.assistant.toolCalls![0]!) !== await jsonIdentityDigest(dispatch.call)
+    || record.intent.toolName !== dispatch.call.name
+    || await jsonIdentityDigest(record.intent.arguments) !== await jsonIdentityDigest(dispatch.call.arguments)) fail("approval_intent_conflict");
+  if (!all.runs.hasSettledToolInvocation(dispatch.runId, checkpoint.invocationId)) fail("approval_invocation_unsettled");
+  const state = await runState(db, scope, all, extra, record.intent);
+  if (state.canceled) return { record, error: "approval_canceled" };
+  if (state.fingerprint !== record.intent.presetFingerprint) return { record, error: "approval_configuration_mismatch" };
+  const completed = Object.values(extra.tools).some((entry: any) => entry.approvalId === record.approvalId && entry.intentDigest === record.intentDigest
+          && entry.runId === record.intent.runId && entry.callId === record.intent.toolCallId && entry.state === "complete");
+  if (completed) return { record };
+  if (now >= Math.min(record.expiresAtMs, state.deadline ?? record.expiresAtMs) && ["pending", "approved"].includes(record.status)) {
+    record = await copyApprovalRecord({ ...record, status: "expired", revision: record.revision + 1 });
+    save(db, scope, record);
+  }
+  return { record, ...(record.status === "approved" ? {} : { error: `approval_${record.status}` }) };
 }

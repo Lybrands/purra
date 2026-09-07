@@ -43,6 +43,7 @@ export type OutputEventKind =
   | "long_task.checkpoint"
   | "durable.recovery_snapshot"
   | "agent.execution_checkpoint"
+  | "approval.required"
   | "input.required"
   | "input.answered";
 

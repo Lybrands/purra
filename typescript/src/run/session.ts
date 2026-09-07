@@ -150,7 +150,7 @@ export class RunSession {
     batchLimits: OutputBatchLimits,
   ): RunSession {
     snapshot = normalizeRunSnapshot(snapshot);
-    if (snapshot.status !== "running" || snapshot.executionCheckpoint === undefined) {
+    if (snapshot.status !== "running" || (snapshot.executionCheckpoint === undefined && snapshot.toolExecutionCheckpoint === undefined)) {
       throw new AgentError(
         "agent_run_resume_checkpoint_missing",
         "Running Agent Run has no resumable checkpoint",

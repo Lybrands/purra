@@ -170,3 +170,13 @@ structuredValue satisfies Readonly<Record<string, JsonValue>>;
 structuredValue.ok = false;
 // @ts-expect-error The JSON contract does not assert an application-specific shape.
 structuredValue satisfies { readonly ok: boolean };
+
+// The 1.0 checkpoint literals and host callback remain source compatible.
+function existingCheckpointConsumer(checkpoint: import('purra').AgentExecutionCheckpoint): 'model_ready' {
+  const version: 2 = checkpoint.schemaVersion;
+  void version;
+  return checkpoint.phase;
+}
+const optionalApprovalHost: Pick<import('purra').RunRepository, 'executeToolOwned' | 'saveToolExecutionCheckpoint'> = {};
+void existingCheckpointConsumer;
+void optionalApprovalHost;

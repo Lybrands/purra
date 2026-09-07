@@ -73,5 +73,5 @@ export type RecoveryInspection = ReturnType<typeof buildRecoveryInspection>;
 export async function inspectRecovery(repository: { get(runId: string): Promise<RunSnapshot> }, runId: string): Promise<RecoveryInspection> {
   const saved = await repository.get(runId);
   return buildRecoveryInspection({ status: saved.status === "running" ? "running" : "terminal",
-    checkpoint: saved.executionCheckpoint === undefined ? "missing" : "present" });
+    checkpoint: saved.executionCheckpoint === undefined && saved.toolExecutionCheckpoint === undefined ? "missing" : "present" });
 }

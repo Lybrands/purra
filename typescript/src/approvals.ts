@@ -1,4 +1,5 @@
 /** Immutable approval data; no record or digest is a dispatch permit. */
+import { AgentError } from "./shared/errors.js";
 import { StructuredOutputContract, jsonIdentityDigest } from "./structured.js";
 import { copyJsonValue } from "./model/validation.js";
 import type { JsonValue } from "./model/types.js";
@@ -97,4 +98,12 @@ export async function copyApprovalRecord(input: ApprovalRecord): Promise<Approva
     if (["approved", "rejected"].includes(value.status)) throw new TypeError("Approval decision audit is required");
   }
   return value;
+}
+
+/** Durable wait control flow, distinct from tool failure and user clarification. */
+export class ApprovalRequired extends AgentError {
+  constructor(readonly runId: string, readonly approvalId: string) {
+    super("approval_required", "Run is waiting for approval");
+    this.name = "ApprovalRequired";
+  }
 }

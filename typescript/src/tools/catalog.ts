@@ -61,6 +61,10 @@ export class ToolCatalog {
     if (!Array.isArray(definitions)) throw new TypeError("Agent tools must be an array");
     this.#approval = options.approval;
     this.#idempotency = options.idempotency;
+    if (options.approval?.requiresDurableIdempotency === true
+      && (options.idempotency === undefined || options.approval.idempotencyGateway !== options.idempotency)) {
+      throw new AgentError("approval_idempotency_required", "Durable approvals require their own idempotency gateway");
+    }
     this.#maxCallsPerBatch = positiveInteger(options.limits?.maxCallsPerBatch ?? 8, "maxCallsPerBatch");
     this.#maxConcurrency = positiveInteger(options.limits?.maxConcurrency ?? 1, "maxConcurrency");
     this.#maxResultChars = positiveInteger(options.limits?.maxResultChars ?? 64_000, "maxResultChars");
@@ -76,6 +80,10 @@ export class ToolCatalog {
     for (const definition of definitions) {
       const registered = registerTool(definition);
       const name = registered.definition.name;
+      if (options.approval?.requiresDurableIdempotency === true && registered.policy.mode !== "read"
+        && registered.definition.hostManagedDurability === true) {
+        throw new AgentError("approval_idempotency_required", "Durable approval cannot bypass its tool receipt store");
+      }
       if (this.#tools.has(name)) throw new AgentError("duplicate_tool", `Duplicate tool: ${name}`);
       if (
         registered.definition.enabled !== false
@@ -379,6 +387,9 @@ export class ToolCatalog {
       }
     }
 
+    if (this.#approval?.requiresDurableIdempotency === true && admitted.some(([, tool]) => tool.policy.mode === "propose")) {
+      throw new AgentError("approval_runtime_unsupported", "Durable approval writes require confirm policy");
+    }
     if (!requestApproval) return;
     for (const [call, tool] of admitted) {
       if (tool.policy.mode !== "confirm") continue;
@@ -398,6 +409,7 @@ export class ToolCatalog {
       try {
         status = await awaitWithSignal(Promise.resolve(this.#approval.request(Object.freeze({
           call,
+          ...(this.#approval.requiresDurableIdempotency === true && options.runId !== undefined ? { dispatch: { runId: options.runId, call } } : {}),
           title: tool.policy.title,
           riskLevel: tool.policy.riskLevel,
           summary: summarize(call.arguments, this.#approvalSummaryChars),
@@ -438,7 +450,7 @@ export class ToolCatalog {
     drainOnCancel = false,
     onFailure?: () => void,
   ): Promise<ToolHandlerResult> {
-    const operation = async (): Promise<ToolHandlerResult> => tool.definition.run(
+    const run = async (): Promise<ToolHandlerResult> => tool.definition.run(
       call.arguments,
       context(
         call,
@@ -451,8 +463,11 @@ export class ToolCatalog {
         leaseEpoch,
       ),
     );
+    const durableApproval = this.#approval?.requiresDurableIdempotency === true && tool.policy.mode === "confirm";
+    const operation = durableApproval ? async () => copyToolHandlerResult(await run(), tool.policy.mode) : run;
     const guarded = tool.policy.mode !== "read" && tool.definition.hostManagedDurability !== true
-      ? () => this.#idempotency!.executeOnce(`${executionKey}:${call.name}:${call.id}`, operation)
+      ? () => this.#idempotency!.executeOnce(`${executionKey}:${call.name}:${call.id}`, operation,
+        ...(durableApproval && runId !== undefined ? [{ runId, call }] : []))
       : operation;
     const uncertainOnCancel = tool.policy.mode !== "read"
       && tool.definition.cancellationLinearizable !== true;
@@ -485,7 +500,7 @@ export class ToolCatalog {
 
     let result: ToolHandlerResult;
     try {
-      result = normalizeResult(raw, tool.policy.mode);
+      result = copyToolHandlerResult(raw, tool.policy.mode);
     } catch (error) {
       onFailure?.();
       if (drainOnCancel && isControlFailure(error)) throw error;
@@ -648,7 +663,7 @@ function copyDisplayNames(
   return Object.freeze(result);
 }
 
-function normalizeResult(value: ToolHandlerResult, mode: ToolPolicy["mode"]): ToolHandlerResult {
+export function copyToolHandlerResult(value: ToolHandlerResult, mode: ToolPolicy["mode"]): ToolHandlerResult {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     throw new TypeError("Tool handler must return a ToolHandlerResult");
   }

@@ -143,6 +143,7 @@ export interface RunSnapshot {
   readonly finalOutput?: JsonValue;
   readonly errorCode?: string;
   readonly executionCheckpoint?: AgentExecutionCheckpoint;
+  readonly toolExecutionCheckpoint?: AgentToolExecutionCheckpoint;
 }
 
 export interface AgentExecutionCheckpoint {
@@ -165,6 +166,16 @@ export interface AgentExecutionCheckpoint {
     readonly scope: string;
     readonly attempts: number;
   }[];
+}
+
+/** A settled model turn awaiting a single tool dispatch. Saving does not authorize execution. */
+export interface AgentToolExecutionCheckpoint extends Omit<AgentExecutionCheckpoint, "schemaVersion" | "phase"> {
+  readonly schemaVersion: 3;
+  readonly phase: "tool_ready";
+  readonly assistant: Message;
+  readonly invocationId: string;
+  readonly appliedGenerationLimit: number;
+  readonly allowedToolNames: readonly string[];
 }
 
 export interface RunCancellationReceipt {

@@ -3,8 +3,8 @@
 [English](durable-approval.md) | 简体中文
 
 当前已实现阶段 B 的存储基础：不可变审批记录、宿主授权的事务决策及 SQLite v5 显式激活。
-Python 已接通 opt-in 单调用工具续点，当前仅完成 Reactive Root Run 的确定性验证。
-TypeScript 审批暂停/恢复与 MCP 写工具**尚未实现**，阶段 B 仍未完成。
+Python 和 TypeScript 已接通 opt-in 单调用工具续点，目前完成 Reactive Root Run 的确定性验证。
+MCP 写工具**尚未实现**，阶段 B 仍未完成。
 当前已落地的前置修复是：审批通过后、进入工具幂等网关前重新验证宿主 scope 和取消状态。
 共享案例 `fixtures/approval_dispatch.json` 只验证这一边界。已有内存审批继续可用。
 
@@ -16,7 +16,7 @@ TypeScript 审批暂停/恢复与 MCP 写工具**尚未实现**，阶段 B 仍�
 不增加旧宿主端口的必需方法，不更改现有 `ApprovalGateway`／`ToolApprovalGateway`
 签名及结果状态；持久化存储或宿主授权不可用时，禁止降级为内存批准。
 
-下面三种记录已在双端导出；Python 已实现派发关联；TypeScript 运行关联仍待实现。Python 使用 snake_case，
+下面三种记录已在双端导出；双端已实现 Reactive Root 派发关联。Python 使用 snake_case，
 持久化 JSON 使用与 TypeScript 一致的 camelCase：
 
 | 对象 | 必需绑定 |
@@ -173,8 +173,7 @@ TypeScript 对应 `enableApprovals()` 和 `approvalStore({authorize, clockMs})`�
 
 `get` 和列表只读取持久记录，不在读取时自动过期；`refresh` 显式持久化过期或 Run 取消。
 列表包含尚未持久化失效的 pending 和 approved，不能据此判断当前可执行。
-上述存储方法本身不创建 checkpoint 或工具 claim。Python 另外新增下述运行入口；
-TypeScript 运行时仍使用已有 live approval 路径。
+上述存储方法本身不创建 checkpoint 或工具 claim。双端另外提供下述 opt-in 运行入口。
 
 ## Python 工具续点运行入口（开发中）
 
@@ -203,5 +202,46 @@ invocation ID、独立的模型预算 key、规划/证据/轮次状态。旧 v2 
 也可以重放，不重新执行效果。
 
 当前确定性验证覆盖 Reactive Root 重启、重复待审恢复、并发恢复、批准后取消、binding 变化、
-未知效果、回执落盘失败和已提交回执重放。Planned/Auto、Agent Tree、TypeScript 运行对齐、
+未知效果、回执落盘失败和已提交回执重放。Planned/Auto、Agent Tree、扩展运行对齐、
 规范化审批诊断、MCP 写传输、真实服务与下游验收仍待完成。不能据此宣称 1.1 已验收。
+
+## TypeScript 工具续点运行入口（开发中）
+
+在 `Agent` 配置 `toolCheckpointHandler` 及可选 `toolCheckpointNames`。选中批次只支持
+单次调用，目前只允许持久化 Reactive Root；Planned/Auto 或 Child 的工具续点执行以
+`approval_runtime_unsupported` 拒绝。未选中的只读批次沿用原行为。
+
+新的 `AgentToolExecutionCheckpoint` 为 schema 3 / `tool_ready`，包含实际 assistant
+消息（含 Provider 回放数据）、已结算 `invocationId`、真实 `appliedGenerationLimit`、
+工具名称范围及轮次/上下文状态。`messages` 是这条 assistant 消息之前的历史。
+Run 新增可选 `toolExecutionCheckpoint` 字段；旧 `executionCheckpoint` 和
+`checkpointHandler` 的 v2 / `model_ready` 类型不变。工具执行成功后提交下一轮旧格式
+模型续点，并移除工具续点字段。
+
+同一个 SQLite 实例的 `runs`、`publisher`、`idempotency` 与
+`approval: approvals.gateway()` 一起绑定到 Agent。每次回调根据**当前宿主绑定**和
+续点调用构造 `ApprovalIntent`，然后调用
+`approvals.prepare(checkpoint, intent, { expiresAtMs: 原绝对过期时间 })`。
+宿主须持久化并复用原过期时间，不能在恢复时重新顺延。该事务原子提交审批、续点和私有
+`approval.required` 事件；待审时 `ApprovalRequired` 保留 Run 并释放 lease。
+宿主认证后调用 `decide`，再以原 request 和相同回调调用 `agent.resume`。
+
+RunRepository 新增**可选** `saveToolExecutionCheckpoint` 与 `executeToolOwned`，
+旧宿主不必实现；缺少能力或回调时，在 Provider/工具执行前拒绝恢复。
+旧 `executeOwned` 不能绕过待执行的工具续点。v4 禁止保存这种续点，必须在启动 Run 前
+显式激活 v5。
+
+持久化 gateway 要求匹配的 idempotency 实例，禁止写工具通过 `hostManagedDurability`
+绕开回执链。Core 向既有幂等方法额外传递可选 `ToolDispatchContext`；不解析不透明 key
+猜测 Run。实际 claim 事务重查 ownership、已结算 invocation、配置、调用身份和审批过期；
+claim 保存审批 revision、intent digest、Run/call、lease owner/epoch。
+同一审批不能通过更换回执 key 再次派发。外部执行不占用数据库事务。
+Core 先校验效果结果，再提交回执；效果不明或回执落盘失败保留 claim，不能清空后自动重试。
+这些 claim 的 `reconcileTool` 要求空闲 Run，以及已知结果或确未执行的证明。
+已提交的匹配回执可以在审批过期后重放。测试时，同一适配器的 gateway 必须共用时钟；
+lease 始终使用真实墙钟。
+
+确定性测试覆盖重启、重复待审、并发恢复、当前 scope 拒绝、gateway 后到 claim 前过期、
+不透明 key 关联、效果不明、回执落盘失败及完成回执重放。通用诊断已识别工具续点；
+规范化审批诊断、Planned/Auto/Tree 验收、MCP 写工具、真实服务和下游验收仍未完成。
+这些测试不证明外部系统端到端 exactly-once。

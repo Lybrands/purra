@@ -58,13 +58,21 @@ export interface ToolDefinition {
 }
 
 export interface ToolApprovalRequest {
+  readonly dispatch?: ToolDispatchContext;
   readonly call: ToolCall;
   readonly title: string;
   readonly riskLevel: ToolRiskLevel;
   readonly summary: string;
 }
 
+export interface ToolDispatchContext {
+  readonly runId: string;
+  readonly call: ToolCall;
+}
+
 export interface ToolApprovalGateway {
+  readonly requiresDurableIdempotency?: boolean;
+  readonly idempotencyGateway?: ToolIdempotencyGateway;
   request(
     approval: ToolApprovalRequest,
     signal?: AbortSignal,
@@ -75,6 +83,7 @@ export interface ToolIdempotencyGateway {
   executeOnce(
     key: string,
     operation: () => Promise<ToolHandlerResult>,
+    dispatch?: ToolDispatchContext,
   ): Promise<ToolHandlerResult>;
 }
 

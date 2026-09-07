@@ -1,12 +1,13 @@
 import { encodeStorageState, decodeStorageState, requireStorageFields } from "../shared/storage-state.js";
 import { PLANNING_STREAM_SCHEMA, PlanningStreamParser } from "../planning/stream.js";
 import type { JsonValue, ModelTokenUsage } from "../model/types.js";
-import { copyJsonValue } from "../model/validation.js";
+import { copyJsonValue, copyMessages } from "../model/validation.js";
 import { copyPreparedContextSnapshot } from "../context/coordinator.js";
 import type { OutputEvent, OutputEventDraft } from "../output/types.js";
 import { AgentError } from "../shared/errors.js";
 import type {
   AgentExecutionCheckpoint,
+  AgentToolExecutionCheckpoint,
   InvocationSettlement,
   ModelInvocationReceipt,
   RunBeginParams,
@@ -19,6 +20,8 @@ import type {
 
 export interface RunRepository {
   executeOwned?<T>(runId: string, operation: () => Promise<T>, checkpoint?: AgentExecutionCheckpoint): Promise<T>;
+  executeToolOwned?<T>(runId: string, operation: () => Promise<T>, checkpoint: AgentToolExecutionCheckpoint): Promise<T>;
+  saveToolExecutionCheckpoint?(runId: string, checkpoint: AgentToolExecutionCheckpoint, claim?: RunLeaseClaim): Promise<{ readonly snapshot: RunSnapshot; readonly event: OutputEvent }>;
   begin(params: RunBeginParams): Promise<{ readonly snapshot: RunSnapshot; readonly event: OutputEvent }>;
   openInvocation(
     runId: string,
@@ -200,6 +203,40 @@ export class InMemoryRunRepository implements RunRepository {
   public hasActiveRuns(): boolean {
     return [...this.#runs.values()].some(run => run.snapshot.status === "running");
   }
+  public hasToolExecutionCheckpoint(): boolean {
+    return [...this.#runs.values()].some(run => run.snapshot.toolExecutionCheckpoint !== undefined);
+  }
+
+  public hasSettledToolInvocation(runId: string, invocationId: string): boolean {
+    const run = this.#require(runId);
+    const receipt = run.invocationReceipts.get(invocationId), settlement = run.invocationSettlements.get(invocationId);
+    return receipt !== undefined && receipt.attempt === run.snapshot.usage.modelAttempts
+      && run.openInvocations.size === 0 && settlement?.input.status === "completed"
+      && settlement.budgetError === undefined && exceededTokenBudget(this.#root(run)) === undefined;
+  }
+
+  public async saveToolExecutionCheckpoint(
+    runId: string, checkpoint: AgentToolExecutionCheckpoint, claim: RunLeaseClaim = {},
+  ): Promise<{ readonly snapshot: RunSnapshot; readonly event: OutputEvent }> {
+    const run = this.#active(runId, claim);
+    const copied = copyToolExecutionCheckpoint(checkpoint);
+    const current = run.snapshot.toolExecutionCheckpoint;
+    if (copied.runId !== runId || !this.hasSettledToolInvocation(runId, copied.invocationId)) {
+      throw new AgentError("agent_execution_checkpoint_conflict", "Tool checkpoint requires the latest settled invocation");
+    }
+    if ((run.snapshot.executionCheckpoint?.nextRound ?? 1) > copied.nextRound
+      || (current !== undefined && canonicalJson(current) !== canonicalJson(copied))) {
+      throw new AgentError("agent_execution_checkpoint_conflict", "Tool checkpoint conflicts with the canonical continuation");
+    }
+    const key = `agent-tool-checkpoint:${runId}:${copied.nextRound}`;
+    const event = sourceEvent(run, key) ?? append(run, runId, {
+      sourceKey: key, kind: "agent.execution_checkpoint", channel: "lifecycle", visibility: "private",
+      payload: { schemaVersion: 3, phase: "tool_ready", executionProfile: copied.executionProfile, nextRound: copied.nextRound },
+    }, false);
+    run.snapshot = freezeSnapshot({ ...run.snapshot, toolExecutionCheckpoint: copied });
+    return Object.freeze({ snapshot: run.snapshot, event });
+  }
+
   /** Execution state without the canonical journal, for transactional row storage. */
   public exportJournalState(options: { readonly incremental?: boolean } = {}): {
     readonly state: string;
@@ -225,6 +262,7 @@ export class InMemoryRunRepository implements RunRepository {
       if (typeof id !== "string" || run.runId !== id || !saved.runs.has(run.rootRunId)
         || !Array.isArray(run.events) || !Array.isArray(run.rootEvents) || !(run.openInvocations instanceof Set)
         || ![run.bySourceKey, run.rootBySourceKey, run.invocationReceipts, run.invocationSettlements].every(v => v instanceof Map)) throw new TypeError("Invalid stored Run");
+      run.snapshot = freezeSnapshot(run.snapshot);
       for (const receipt of run.invocationReceipts.values()) validateStructuredReceipt(receipt);
       for (const value of run.invocationSettlements.values()) requireStorageFields(value, ["input", "event"], ["budgetError"]);
     }
@@ -501,6 +539,10 @@ export class InMemoryRunRepository implements RunRepository {
         "Agent execution checkpoint belongs to another Run",
       );
     }
+    const pendingTool = run.snapshot.toolExecutionCheckpoint;
+    if (pendingTool !== undefined && copied.nextRound !== pendingTool.nextRound + 1) {
+      throw new AgentError("agent_execution_checkpoint_conflict", "Pending tool continuation must advance exactly one round");
+    }
     const current = run.snapshot.executionCheckpoint;
     if (current !== undefined) {
       if (copied.nextRound < current.nextRound) {
@@ -532,8 +574,9 @@ export class InMemoryRunRepository implements RunRepository {
         nextRound: copied.nextRound,
       },
     }, false);
+    const { toolExecutionCheckpoint: _pending, ...snapshot } = run.snapshot;
     run.snapshot = freezeSnapshot({
-      ...run.snapshot,
+      ...snapshot,
       executionCheckpoint: copied,
     });
     return Object.freeze({ snapshot: run.snapshot, event });
@@ -1214,6 +1257,8 @@ function freezeSnapshot(snapshot: RunSnapshot): RunSnapshot {
     budgets: normalizeRunBudgets(snapshot.budgets),
     usage: Object.freeze({ ...snapshot.usage }),
     preset: Object.freeze({ ...snapshot.preset }),
+    ...(snapshot.toolExecutionCheckpoint === undefined
+      ? {} : { toolExecutionCheckpoint: copyToolExecutionCheckpoint(snapshot.toolExecutionCheckpoint) }),
     ...(snapshot.executionCheckpoint === undefined
       ? {}
       : { executionCheckpoint: copyExecutionCheckpoint(snapshot.executionCheckpoint) }),
@@ -1316,6 +1361,27 @@ function copyExecutionCheckpoint(
     context: copied.context === null ? null : copyPreparedContextSnapshot(copied.context),
     contextEvidence: copyCheckpointEvidence(copied.contextEvidence),
   });
+}
+
+export function copyToolExecutionCheckpoint(value: AgentToolExecutionCheckpoint): AgentToolExecutionCheckpoint {
+  if (value.schemaVersion !== 3 || value.phase !== "tool_ready") throw new TypeError("Invalid tool checkpoint contract");
+  const { assistant: rawAssistant, invocationId, allowedToolNames, ...base } = value;
+  const copied = copyExecutionCheckpoint({ ...base, schemaVersion: 2, phase: "model_ready" });
+  const assistant = copyMessages([rawAssistant])[0]!;
+  const messages = Object.freeze(copyMessages(copied.messages));
+  const calls = assistant.toolCalls ?? [];
+  requiredText(invocationId, "tool checkpoint invocation id");
+  if (!Number.isSafeInteger(value.appliedGenerationLimit) || value.appliedGenerationLimit < 1) throw new TypeError("Invalid settled generation limit");
+  for (const attempt of copied.recoveryAttempts) nonNegativeInteger(attempt.attempts, "checkpoint recovery attempts");
+  if (assistant.role !== "assistant" || calls.length !== 1 || copied.pendingReplan !== undefined
+    || copied.roundLimit === undefined || copied.nextRound >= copied.roundLimit
+    || !Array.isArray(allowedToolNames) || allowedToolNames.some(name => typeof name !== "string" || !name.trim())
+    || new Set(allowedToolNames).size !== allowedToolNames.length || !allowedToolNames.includes(calls[0]!.name)
+    || messages.some(message => message.toolCallId === calls[0]!.id || message.toolCalls?.some(call => call.id === calls[0]!.id))) {
+    throw new TypeError("Invalid tool checkpoint continuation");
+  }
+  return Object.freeze({ ...copied, schemaVersion: 3, phase: "tool_ready", messages, assistant,
+    invocationId, appliedGenerationLimit: value.appliedGenerationLimit, allowedToolNames: Object.freeze([...allowedToolNames]) });
 }
 
 function copyCheckpointEvidence(

@@ -4,9 +4,9 @@ English | [简体中文](durable-approval.zh-CN.md)
 
 This contract now has a Stage B storage foundation: immutable approval records,
 host-authorized transactional decisions and explicit SQLite v5 activation.
-Python now has an opt-in single-call tool-ready runtime path, verified for
-Reactive Root Runs. TypeScript approval suspension/recovery and MCP writes are
-**not yet available**; Stage B is not complete. Existing
+Python and TypeScript now have opt-in single-call tool-ready runtime paths,
+verified for Reactive Root Runs. MCP writes are **not yet available**;
+Stage B is not complete. Existing
 in-memory approvals remain supported. The implemented prerequisite revalidates
 host scope after approval, before entering the tool idempotency gateway.
 The shared `fixtures/approval_dispatch.json` cases test that prerequisite only.
@@ -25,7 +25,7 @@ durable request never falls back to an in-memory decision when its store or
 authorizer is unavailable. No required method is added to existing host ports.
 
 The three record types below are available from Python `purra.approvals` and
-the TypeScript `purra` entry point. Python dispatch associations are implemented; TypeScript runtime association remains pending.
+the TypeScript `purra` entry point. Both SDKs implement dispatch associations for the Reactive Root path.
 Python uses snake_case attributes and methods;
 the persisted/interchange view uses the camelCase names below in both SDKs.
 
@@ -258,9 +258,7 @@ not a dispatch permit.
 records on read. `refresh` explicitly persists expiration or canonical Run
 cancellation. `list_pending` / `listPending` includes pending and approved records
 whose invalidation has not been persisted. Neither this list nor `approved`
-proves current permission. The storage-only methods create no checkpoint or tool claim. Python additionally
-exposes the runtime path below; TypeScript still uses the existing live runtime
-approval path.
+proves current permission. The storage-only methods create no checkpoint or tool claim. Both SDKs additionally expose the opt-in runtime paths below.
 
 ## Python tool-ready runtime path (development)
 
@@ -303,6 +301,59 @@ A committed, matching receipt can be replayed after expiry without a new effect.
 Deterministic acceptance currently covers Reactive Root Run restart, repeated
 pending recovery, concurrent resume, cancellation after approval, changed binding,
 unknown effects, receipt persistence failure and committed-receipt replay.
-Planned/Auto and Agent Tree acceptance, TypeScript runtime parity, normalized
+Planned/Auto and Agent Tree acceptance, broader runtime parity, normalized
 approval inspection, MCP write transport behavior and real service/downstream
 validation remain unfinished. This is not a 1.1 release acceptance claim.
+
+## TypeScript tool-ready runtime path (development)
+
+Configure `Agent` with `toolCheckpointHandler` and optional `toolCheckpointNames`.
+Selected batches must contain one call and currently require a persistent Reactive
+Root Run. Planned/Auto and Child tool-ready execution reject with
+`approval_runtime_unsupported`. Unselected read batches retain their behavior.
+
+The callback receives a new `AgentToolExecutionCheckpoint`: schema 3, `tool_ready`,
+actual assistant message (including provider replay data), settled `invocationId`,
+actual `appliedGenerationLimit`, allowed tool names and the existing round/context
+state. `messages` contains history before this assistant message. The Run stores it
+in optional `toolExecutionCheckpoint`; `executionCheckpoint` and the existing
+`checkpointHandler` keep their schema 2 / `model_ready` types. Successful tool
+completion advances to the next model-ready checkpoint and removes the tool field.
+
+Bind the same SQLite instance's `runs`, `publisher`, `idempotency`, and
+`approval: approvals.gateway()`. In `toolCheckpointHandler`, build an
+`ApprovalIntent` from current host bindings and the checkpoint call, then await
+`approvals.prepare(checkpoint, intent, { expiresAtMs: originalAbsoluteExpiry })`.
+Persist/reuse that original expiry; recomputing a later expiry conflicts with the
+stored intent. Preparation atomically saves the approval, checkpoint and private
+`approval.required` event. `ApprovalRequired` suspends the Run and releases its
+execution lease; it is not a tool failure. Decide with authenticated host context,
+then call `agent.resume(runId, originalRequest)` with the same handler.
+
+The repository adds optional `saveToolExecutionCheckpoint` and `executeToolOwned`
+capabilities; existing repository implementations need not implement them. Missing
+runtime capability or handler rejects recovery before Provider/tool execution.
+Legacy `executeOwned` cannot bypass a pending tool checkpoint. Storage v4 rejects
+tool checkpoints; explicitly activate v5 before starting approval Runs.
+
+The durable gateway requires its exact idempotency adapter and rejects
+`hostManagedDurability` write bypasses. Core passes an optional explicit
+`ToolDispatchContext` to the existing idempotency method; opaque receipt keys are
+never parsed to infer Run identity. The claim transaction rechecks ownership,
+settled invocation, current approval/configuration/call identity and expiry.
+The claim stores the approved revision, intent digest, explicit Run/call identity
+and lease owner/epoch. One approval cannot acquire claims under two receipt keys.
+External execution occurs outside the transaction. Core validates the effect result
+before its receipt is committed. Unknown effects or failed receipt commits retain
+the claim. Recovery does not clear it or replay a model to produce another write.
+`reconcileTool` requires an idle Run and a known result or non-execution proof for
+these claims. A matching committed receipt can replay after approval expiry.
+If a test clock is supplied, gateways sharing an adapter must use the same clock;
+lease expiry always uses wall time.
+
+Deterministic tests cover restart, repeated pending waits, concurrent resume,
+current-scope denial, expiry between gateway and claim, opaque-key association,
+unknown results, receipt persistence failure and completed-receipt replay.
+The generic inspection recognizes tool checkpoints; normalized approval diagnostics,
+Planned/Auto/Tree acceptance, MCP writes and real service/downstream acceptance remain
+unfinished. These tests do not establish end-to-end exactly-once external effects.

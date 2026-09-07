@@ -7,9 +7,9 @@
   the tool or acquire a tool claim. Existing live approval APIs remain supported.
 - Add immutable approval intents and host-authorized SQLite decision storage,
   with revision checks, historical command replay and explicit v5 activation.
-  Python additionally supports an opt-in tool-ready checkpoint and same-Run
-  approval recovery with atomic claim/receipt association; Reactive Root fault
-  tests pass. TypeScript approval recovery and MCP writes remain pending.
+  Python and TypeScript additionally support opt-in tool-ready checkpoints and
+  same-Run approval recovery with atomic claim/receipt associations; Reactive Root
+  fault tests pass. Planned/Auto/Tree acceptance and MCP writes remain pending.
 - Align Core and all seven optional packages, exact internal dependencies and
   npm lockfiles at 1.1.0. This version has not been published.
 

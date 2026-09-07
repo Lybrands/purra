@@ -114,3 +114,8 @@ node integrations/sqlite/typescript/scripts/benchmark-execution-writes.mjs
 
 应用负责数据库访问、备份和数据保留。检查点包含私有模型数据。
 等待活动执行结束后再调用 `storage.close()`。
+
+TypeScript 新增 opt-in Reactive Root 审批等待、同 Run 恢复及 claim/receipt 关联。
+配置 `toolCheckpointHandler`、`approval: approvals.gateway()` 和同一适配器的
+`idempotency`，旧模型续点类型保持不变。详见[运行入口](../../../conformance/durable-approval.zh-CN.md#typescript-工具续点运行入口开发中)。
+Planned/Auto/Tree 和 MCP 写验收仍未完成。
