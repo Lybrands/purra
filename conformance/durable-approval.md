@@ -302,8 +302,8 @@ A committed, matching receipt can be replayed after expiry without a new effect.
 Deterministic acceptance currently covers Root Run restart, repeated
 pending recovery, concurrent resume, cancellation after approval, changed binding,
 unknown effects, receipt persistence failure and committed-receipt replay.
-Child write approval is unsupported. Real Provider, business MCP service and
-downstream validation remain unpassed. This is not a 1.1 release acceptance claim.
+Child write approval is unsupported. Real Provider evidence is limited to the [recorded combination](release-1.1.md#verified-real-provider-combination);
+business MCP and downstream validation remain unpassed. This is not a 1.1 release acceptance claim.
 
 ## TypeScript tool-ready runtime path (development)
 
@@ -356,8 +356,8 @@ Deterministic tests cover restart, repeated pending waits, concurrent resume,
 current-scope denial, expiry between gateway and claim, opaque-key association,
 unknown results, receipt persistence failure and completed-receipt replay.
 The inspection recognizes tool checkpoints and approval observations;
-Child write approval is unsupported; real Provider, business MCP and downstream
-acceptance remain unpassed. These tests do not establish end-to-end exactly-once external effects.
+Child write approval is unsupported; real Provider evidence is limited to the [recorded combination](release-1.1.md#verified-real-provider-combination).
+Business MCP and downstream acceptance remain unpassed. These tests do not establish end-to-end exactly-once external effects.
 
 ## Root planning and Agent Tree composition
 

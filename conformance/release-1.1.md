@@ -60,3 +60,20 @@ Commands and executable host wiring are in the [Python MCP README](../integratio
 and [TypeScript MCP README](../integrations/mcp/typescript/README.md). Approval
 observations omit private identifiers/arguments/digests and retain `diagnosis_only`.
 Validate the exact delivered artifacts in the host before enabling business writes.
+
+## Verified real Provider combination
+
+GLM-5.3-Flash at `open.bigmodel.cn`, Z.ai Chat Completions, thinking enabled with
+`reasoning_effort=low`, passed the Python and TypeScript installed-consumer success
+and lost-response scenarios against the independent synthetic MCP writer. Each
+scenario waited across SQLite reopen without another model call, dispatched only
+after host approval, and performed one remote write. Lost responses retained an
+unknown claim; repeated terminal resume did not dispatch. All server processes exited.
+
+This evidence uses test-only host HTTP gateways: developer messages become system
+messages, JSON tool results become text, and Z.ai uses `max_tokens` plus its thinking
+field. Requests were nonstreaming (Python projected the complete response through
+its Core stream port). It is not native OpenAI adapter, wire-streaming, Planned/Auto
+real-model, native-schema, business MCP, or downstream acceptance. Requests were
+bounded at 4096 generation tokens; a Root aggregate usage guarantee was not tested.
+No credentials, model content or business resources are part of this evidence.

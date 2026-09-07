@@ -48,3 +48,16 @@ Child 写入、混合／多调用审批批次、任意嵌套审批与 clarificat
 可执行宿主接线及命令见 [Python MCP README](../integrations/mcp/python/README.md) 和
 [TypeScript MCP README](../integrations/mcp/typescript/README.md)。审批诊断不含私有标识、
 参数或摘要，authority 保持 diagnosis_only。启用业务写入前须用实际交付产物完成宿主验收。
+
+## 已验证的真实 Provider 组合
+
+智谱 `open.bigmodel.cn` 的 GLM-5.3-Flash，通过 Z.ai Chat Completions、思考开启且
+`reasoning_effort=low`，已在双端安装消费者中通过成功写入和响应丢失两种场景。
+MCP 为独立合成写服务；每个场景均在 SQLite 重开后保持待审且不重跑模型，宿主批准后
+才执行一次远端写入。响应丢失保留 unknown claim，再次恢复终态 Run 不重派；服务均已退出。
+
+此证据使用测试专用宿主 HTTP 网关：developer 转 system，JSON 工具结果转文本，
+使用智谱的 max_tokens 和 thinking 字段。请求为非流式，Python 将完整响应投影到 Core
+stream 端口。因此不证明原生 OpenAI 适配器、线级流式、Planned/Auto 真实模型、原生
+Schema、业务 MCP 或下游验收。每次生成上限 4096 token；未验证 Root 聚合用量保证。
+证据不含凭据、模型正文或业务资源。
