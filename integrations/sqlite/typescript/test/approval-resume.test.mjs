@@ -552,6 +552,7 @@ test('candidate page can feed worker without resuming a terminal Run', async t =
   const { RecoveryWorker } = await import('purra');
   const open = setup(t), host = open(), id = await paused(host);
   await approve(host, id); await (await host.agent.resume(id, request)).result;
+  assert.deepEqual((await host.storage.inspectRecoveryMany([id]))[id], await host.storage.inspectRecovery(id));
   assert.deepEqual((await host.storage.listRunCandidates({ limit: 1 })).runIds, [id]);
   const calls = [];
   const worker = new RecoveryWorker({

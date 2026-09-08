@@ -231,3 +231,37 @@ beginning. The host owns cursor persistence and filtering. This bounds discovery
 read volume per page but still traverses retained terminal history, and subsequent
 inspection/Run recovery can restore full state and history. An indexed running-only
 projection, persistent fair cursor and mixed-load capacity evidence remain open.
+
+## Shared-snapshot batch diagnosis
+
+`inspect_recovery_many(run_ids)` / `inspectRecoveryMany(runIds)` diagnoses up to
+100 supplied IDs in one read transaction and returns reports keyed by Run ID.
+Duplicate IDs share one report. Empty input performs no I/O. Invalid input,
+missing Runs or corrupt state reject the whole call; no partial batch is returned.
+Reports use the same builder as single-Run inspection, with configuration unknown
+(no expected-preset parameter on the batch API). All reports remain diagnosis-only;
+public resume must still revalidate current state after this snapshot.
+
+Python decodes the scoped state once and does not load the journal. TypeScript
+restores scoped state and the entire scoped journal once. That can reduce repeated
+state decoding for small histories, but can be more expensive than single-Run
+Root-scoped inspection for large unrelated histories. Batch size caps report work,
+not state/journal size. Existing single-Run APIs remain unchanged. Use batches only
+when the measured workload benefits; do not use a cached report as execution permission.
+
+Reproduce synthetic measurements with
+`integrations/sqlite/python/scripts/benchmark_recovery.py` (source PYTHONPATH as
+specified in its docstring) and, after builds,
+`node integrations/sqlite/typescript/scripts/benchmark-recovery.mjs`. Both create
+and delete isolated temporary databases, use 20/100 Runs with 80% terminal and a
+20-ID page, discard two warmups and report the median of five reads. Python uses
+completed Runs, TypeScript canceled Runs; histories and SDK representations differ,
+so timings are not cross-SDK performance rankings. No Provider or business data is
+used. The scripts measure read costs, not mixed-load concurrency or production capacity.
+
+One local run with 100 Runs measured candidate pages at 0.019 ms / 0.032 ms
+(Python / TypeScript). In that same post-change measurement, 20 individual diagnoses
+cost 90.284 ms / 48.321 ms, and batch diagnosis cost 4.429 ms / 3.035 ms.
+These small-history observations justify an optional batch path, not a universal
+speedup claim. Terminal-history filtering, large-journal/mixed-load measurement,
+persistent fair cursors and maximum retry policy remain open.

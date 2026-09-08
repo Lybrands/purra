@@ -308,28 +308,43 @@ class SqliteAgentAdapters:
         expected_preset is a host-supplied *complete* effective preset snapshot.
         Permissions and complete usage/effect coverage outside this adapter remain unknown.
         """
-        from purra.observability.inspection import build_recovery_inspection
         async with self._transaction(read_only=True, with_journal=False) as adapters:
-            saved = await adapters.runs.get(run_id)
-            info = adapters.get_run_info(run_id)
-            lease = adapters.leases.get(run_id)
-            now = int(time.time() * 1000)
-            configuration = "unknown"
-            if expected_preset and saved.agent_preset_snapshot:
-                configuration = "matched" if saved.agent_preset_snapshot == expected_preset else "mismatch"
-            from .approvals import inspect_approval_state
-            return build_recovery_inspection({
-                **inspect_approval_state(self, adapters, saved, now),
-                "status": "running" if saved.status is RunStatus.RUNNING else "terminal",
-                "checkpoint": "present" if info.has_checkpoint else "missing",
-                "attemptsAfterCheckpoint": info.model_attempt_count - info.checkpoint_attempt_count if info.has_checkpoint else None,
-                "unknownToolReceipts": sum(key[0] == run_id for key in adapters.claims),
-                "receiptScope": "run",
-                "lease": "active" if lease and lease.owner_id and (lease.expires_at_ms or 0) > now else "inactive",
-                "configuration": configuration,
-                "cancellation": "requested" if saved.status is RunStatus.CANCELED or (lease and lease.cancellation_requested_at_ms is not None) else "clear",
-                "deadline": "expired" if saved.deadline_at_ms is not None and saved.deadline_at_ms <= now else "open",
-            })
+            return await self._inspect_recovery_session(adapters, run_id, expected_preset)
+
+    async def inspect_recovery_many(self, run_ids):
+        """Diagnose up to 100 requested Runs in one committed snapshot."""
+        if not isinstance(run_ids, (list, tuple)) or len(run_ids) > 100:
+            raise ValueError("inspection batch must contain at most 100 Run ids")
+        if any(not isinstance(key, str) or not key for key in run_ids):
+            raise ValueError("inspection requires nonempty Run ids")
+        if not run_ids:
+            return {}
+        async with self._transaction(read_only=True, with_journal=False) as adapters:
+            return {key: await self._inspect_recovery_session(adapters, key, None)
+                    for key in dict.fromkeys(run_ids)}
+
+    async def _inspect_recovery_session(self, adapters, run_id, expected_preset):
+        from purra.observability.inspection import build_recovery_inspection
+        saved = await adapters.runs.get(run_id)
+        info = adapters.get_run_info(run_id)
+        lease = adapters.leases.get(run_id)
+        now = int(time.time() * 1000)
+        configuration = "unknown"
+        if expected_preset and saved.agent_preset_snapshot:
+            configuration = "matched" if saved.agent_preset_snapshot == expected_preset else "mismatch"
+        from .approvals import inspect_approval_state
+        return build_recovery_inspection({
+            **inspect_approval_state(self, adapters, saved, now),
+            "status": "running" if saved.status is RunStatus.RUNNING else "terminal",
+            "checkpoint": "present" if info.has_checkpoint else "missing",
+            "attemptsAfterCheckpoint": info.model_attempt_count - info.checkpoint_attempt_count if info.has_checkpoint else None,
+            "unknownToolReceipts": sum(key[0] == run_id for key in adapters.claims),
+            "receiptScope": "run",
+            "lease": "active" if lease and lease.owner_id and (lease.expires_at_ms or 0) > now else "inactive",
+            "configuration": configuration,
+            "cancellation": "requested" if saved.status is RunStatus.CANCELED or (lease and lease.cancellation_requested_at_ms is not None) else "clear",
+            "deadline": "expired" if saved.deadline_at_ms is not None and saved.deadline_at_ms <= now else "open",
+        })
 
     def close(self):
         if self._lock.locked(): raise RuntimeError("storage transaction is active")

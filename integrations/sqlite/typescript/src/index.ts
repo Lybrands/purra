@@ -308,28 +308,40 @@ export class SqliteAgentAdapters {
 
   /** Read one committed snapshot. No lease claim, reconciliation or external execution. */
   async inspectRecovery(runId: string, options: { expectedPreset?: AgentPresetSnapshot } = {}): Promise<RecoveryInspection> {
+    return this.#transaction((all, extra) => this.#inspectRecoverySnapshot(all, extra, runId, options), true, "all", runId);
+  }
+
+  async inspectRecoveryMany(runIds: readonly string[]): Promise<Readonly<Record<string, RecoveryInspection>>> {
+    if (!Array.isArray(runIds) || runIds.length > 100 || runIds.some(id => typeof id !== "string" || !id)) throw new TypeError("inspection batch requires at most 100 nonempty Run ids");
+    if (runIds.length === 0) return Object.freeze({});
     return this.#transaction(async (all, extra) => {
-      const saved = await all.runs.get(runId);
-      const events = await all.runs.listEvents(runId, 0, Number.MAX_SAFE_INTEGER);
-      const lastCheckpoint = events.reduce((last, event, index) => event.kind === "agent.execution_checkpoint" ? index : last, -1);
-      const lease = extra.leases[runId];
-      const approval = await inspectApprovalState(this.#db, this.#scope, saved, extra, (this.#approvalRuntimeClock ?? Date.now)());
-      return buildRecoveryInspection({
-        ...approval,
-        status: saved.status === "running" ? "running" : "terminal",
-        checkpoint: saved.executionCheckpoint === undefined && saved.toolExecutionCheckpoint === undefined ? "missing" : "present",
-        attemptsAfterCheckpoint: saved.executionCheckpoint === undefined && saved.toolExecutionCheckpoint === undefined ? null
-          : events.slice(lastCheckpoint + 1).filter(event => event.kind === "invocation.started").length,
-        // Legacy opaque claims remain storage-wide; proven approval claims are reported separately.
-        unknownToolReceipts: Object.values(extra.tools).filter(receipt => receipt.state === "claimed").length - (approval.approvalUnknownReceipts ?? 0),
-        receiptScope: "storage",
-        lease: lease?.owner && lease.expires > Date.now() ? "active" : "inactive",
-        configuration: options.expectedPreset === undefined ? "unknown"
-          : await jsonIdentityDigest(saved.preset) === await jsonIdentityDigest(options.expectedPreset) ? "matched" : "mismatch",
-        cancellation: saved.status === "canceled" ? "requested" : "clear",
-        deadline: saved.deadlineAt !== null && Date.parse(saved.deadlineAt) <= Date.now() ? "expired" : "open",
-      });
-    }, true, "all", runId);
+      const result: Record<string, RecoveryInspection> = Object.create(null);
+      for (const id of new Set(runIds)) result[id] = await this.#inspectRecoverySnapshot(all, extra, id, {});
+      return Object.freeze(result);
+    }, true);
+  }
+
+  async #inspectRecoverySnapshot(all: Stores, extra: { tools: Record<string, any>; [key: string]: any }, runId: string, options: { expectedPreset?: AgentPresetSnapshot }): Promise<RecoveryInspection> {
+    const saved = await all.runs.get(runId);
+    const events = await all.runs.listEvents(runId, 0, Number.MAX_SAFE_INTEGER);
+    const lastCheckpoint = events.reduce((last, event, index) => event.kind === "agent.execution_checkpoint" ? index : last, -1);
+    const lease = extra.leases[runId];
+    const approval = await inspectApprovalState(this.#db, this.#scope, saved, extra, (this.#approvalRuntimeClock ?? Date.now)());
+    return buildRecoveryInspection({
+      ...approval,
+      status: saved.status === "running" ? "running" : "terminal",
+      checkpoint: saved.executionCheckpoint === undefined && saved.toolExecutionCheckpoint === undefined ? "missing" : "present",
+      attemptsAfterCheckpoint: saved.executionCheckpoint === undefined && saved.toolExecutionCheckpoint === undefined ? null
+        : events.slice(lastCheckpoint + 1).filter(event => event.kind === "invocation.started").length,
+      // Legacy opaque claims remain storage-wide; proven approval claims are reported separately.
+      unknownToolReceipts: Object.values(extra.tools).filter(receipt => receipt.state === "claimed").length - (approval.approvalUnknownReceipts ?? 0),
+      receiptScope: "storage",
+      lease: lease?.owner && lease.expires > Date.now() ? "active" : "inactive",
+      configuration: options.expectedPreset === undefined ? "unknown"
+        : await jsonIdentityDigest(saved.preset) === await jsonIdentityDigest(options.expectedPreset) ? "matched" : "mismatch",
+      cancellation: saved.status === "canceled" ? "requested" : "clear",
+      deadline: saved.deadlineAt !== null && Date.parse(saved.deadlineAt) <= Date.now() ? "expired" : "open",
+    });
   }
 
   close(): void { if (this.#active) throw new Error("storage transaction is active"); this.#db.close(); }

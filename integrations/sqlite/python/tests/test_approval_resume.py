@@ -744,6 +744,7 @@ async def test_candidate_page_can_feed_worker_without_resuming_terminal_run(tmp_
     host, options, record = await approved_host(tmp_path / 'candidate.db')
     try:
         assert (await (await host.core.resume(record.intent.run_id, host.request, options=options)).wait()).status.value == 'done'
+        assert (await host.storage.inspect_recovery_many([record.intent.run_id]))[record.intent.run_id] == await host.storage.inspect_recovery(record.intent.run_id)
         page = await host.storage.list_run_candidates(limit=1)
         assert page['runIds'] == (record.intent.run_id,)
         async def discover(): return (await host.storage.list_run_candidates(limit=1))['runIds']
