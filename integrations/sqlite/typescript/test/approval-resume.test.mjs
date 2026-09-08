@@ -437,3 +437,43 @@ for(const completed of [true,false])for(const gate of ['allowed','revoked','expi
  assert.equal((await (await final.agent.resume(id,request)).result).output,'done');
  assert.equal(final.counts.tool,completed?0:1);assert.equal(effects,1);
 });
+
+test('recovery worker rediscovers approval after reopen and never polls the model while waiting', async t => {
+  const { RecoveryWorker } = await import('purra');
+  const open = setup(t), first = open(), id = await paused(first), host = open();
+  const worker = new RecoveryWorker({
+    discover: () => host.storage.listRunning(),
+    inspect: id => host.storage.inspectRecovery(id),
+    resume: async id => (await host.agent.resume(id, request)).result,
+  });
+  for (let i = 0; i < 2; i++) {
+    const [result] = await worker.runOnce();
+    assert.equal(result.action, 'blocked');
+    assert.ok(result.reasons.includes('approval_required'));
+  }
+  assert.deepEqual(host.counts, { model: 0, tool: 0 });
+  await approve(host, id);
+  assert.deepEqual(await worker.runOnce(), [{ runId: id, action: 'settled', reasons: [] }]);
+  assert.equal(host.counts.tool, 1);
+  assert.deepEqual(await worker.runOnce(), []);
+});
+
+test('worker clean diagnosis cannot bypass scope changed before public resume', async t => {
+  const { RecoveryWorker } = await import('purra');
+  const open = setup(t), first = open(), id = await paused(first);
+  let allowed = true;
+  const host = open({ scope: () => allowed });
+  await approve(host, id);
+  const worker = new RecoveryWorker({
+    discover: () => host.storage.listRunning(),
+    inspect: async id => {
+      const report = await host.storage.inspectRecovery(id);
+      assert.deepEqual(report.blockers, []);
+      allowed = false;
+      return report;
+    },
+    resume: async id => (await host.agent.resume(id, request)).result,
+  });
+  assert.deepEqual(await worker.runOnce(), [{ runId: id, action: 'failed', reasons: ['resume_failed'] }]);
+  assert.deepEqual(host.counts, { model: 0, tool: 0 });
+});

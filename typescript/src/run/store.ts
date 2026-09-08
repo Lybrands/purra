@@ -201,6 +201,10 @@ export class InMemoryRunRepository implements RunRepository {
     return encodeStorageState("purra.run-state/v1", { runs: new Map([...this.#runs].map(([id, run]) => [id, storageRun(run)])), rootEvents: this.#rootEvents, rootEventsBySourceKey: this.#rootEventsBySourceKey });
   }
 
+  public runningRunIds(): readonly string[] {
+    return Object.freeze([...this.#runs].filter(([, run]) => run.snapshot.status === "running").map(([id]) => id));
+  }
+
   public hasActiveRuns(): boolean {
     return [...this.#runs.values()].some(run => run.snapshot.status === "running");
   }

@@ -568,3 +568,61 @@ async def test_running_tool_checkpoint_resumes_after_host_reconciliation(tmp_pat
         assert getattr(host, 'effects', 0) == (0 if completed else 1)
     finally:
         await host.close()
+
+
+@pytest.mark.asyncio
+async def test_recovery_worker_rediscovers_approval_after_reopen(tmp_path):
+    from purra.api import RecoveryWorker
+    path = tmp_path / 'worker.db'
+    host = ApprovalHost(path)
+    expiry = int(time.time() * 1000) + 60000
+    host.expiry = expiry
+    try:
+        await host.storage.enable_approvals()
+        handle = await host.core.submit(host.request, options=AgentCoreRunOptions(tool_checkpoint_handler=host.boundary))
+        with pytest.raises(ApprovalRequired):
+            await handle.wait()
+        run_id = handle.run_id
+        await host.close()
+        host = ApprovalHost(path)
+        host.expiry = expiry
+        async def resume(run_id):
+            resumed = await host.core.resume(run_id, host.request, options=AgentCoreRunOptions(tool_checkpoint_handler=host.boundary))
+            return await resumed.wait()
+        worker = RecoveryWorker(discover=host.storage.list_running, inspect=host.storage.inspect_recovery, resume=resume)
+        for _ in range(2):
+            report = await worker.run_once()
+            assert report[0].action == 'blocked'
+            assert 'approval_required' in report[0].reasons
+        assert (host.model_calls, host.tool_calls) == (0, 0)
+        record = (await host.approvals.list_pending())[0]
+        await host.approvals.decide(ApprovalDecisionCommand(record.approval_id, record.revision, record.intent.digest, 'worker-approve', 'approve'), principal_id='host')
+        report = await worker.run_once()
+        assert [(item.run_id, item.action) for item in report] == [(run_id, 'settled')]
+        assert host.tool_calls == 1
+        assert await worker.run_once() == ()
+    finally:
+        await host.close()
+
+
+@pytest.mark.asyncio
+async def test_worker_clean_diagnosis_cannot_bypass_changed_scope(tmp_path):
+    from purra.api import RecoveryWorker
+    host, options, record = await approved_host(tmp_path / 'race.db')
+    outcomes = []
+    try:
+        async def inspect(run_id):
+            report = await host.storage.inspect_recovery(run_id)
+            assert not report['blockers']
+            host.deny_scope = True
+            return report
+        async def resume(run_id):
+            handle = await host.core.resume(run_id, host.request, options=AgentCoreRunOptions(tool_checkpoint_handler=host.boundary))
+            outcomes.append(await handle.wait())
+        before = host.model_calls
+        report = await RecoveryWorker(discover=host.storage.list_running, inspect=inspect, resume=resume).run_once()
+        assert report[0].action == 'settled'
+        assert outcomes[0].status.value == 'failed'
+        assert host.tool_calls == 0 and host.model_calls == before
+    finally:
+        await host.close()

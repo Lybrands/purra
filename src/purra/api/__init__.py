@@ -5,6 +5,8 @@ packages, but complete execution is entered through this module.  Runtime
 implementation modules are not application entry points.
 """
 
+from purra.worker import RecoveryWorker, RecoveryWorkerResult
+
 from purra.engine import (
     AgentCore,
     AgentCoreRunOptions,
@@ -83,6 +85,8 @@ from purra.run_control import (
 from purra.run_state import canonicalize_execution_plan
 
 __all__ = [
+    "RecoveryWorker",
+    "RecoveryWorkerResult",
     "AgentCore",
     "AgentExecutionCheckpoint",
     "AgentCapabilityGrant",

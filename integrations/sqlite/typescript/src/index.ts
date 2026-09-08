@@ -267,6 +267,10 @@ export class SqliteAgentAdapters {
     });
   }
 
+  async listRunning(): Promise<readonly string[]> {
+    return this.#transaction(async all => all.runs.runningRunIds(), true);
+  }
+
   /** Read one committed snapshot. No lease claim, reconciliation or external execution. */
   async inspectRecovery(runId: string, options: { expectedPreset?: AgentPresetSnapshot } = {}): Promise<RecoveryInspection> {
     return this.#transaction(async (all, extra) => {
