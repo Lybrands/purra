@@ -560,3 +560,19 @@ wake plus settlement 75.98 ms, and discovery plus acknowledgement 57.30 ms
 (previous local baseline: 33.88, 121.71 and 97.98 ms). Inspection remained on the
 full path at 36.97 ms. These local measurements demonstrate the bounded warm-path
 change; they do not establish cold-start improvement or multi-worker capacity.
+
+The optimized Python path also passed the six-wave, three-worker scenario in
+separate sequential source and installed-wheel runs. Both completed all 24 Runs
+with exactly one effect per Run, completed receipts, and no remaining claims or
+active lease owners after shutdown. One worker restarted under its existing cursor
+name between waves. Source recorded 127.97 seconds / 1341 scans / 10 lease-conflict
+rejections; installed wheels recorded 135.44 seconds / 1326 scans / six such
+rejections. Neither run observed overlapping handler intervals. All reported
+failures were expected ownership conflicts; the checks rejected unexpected errors.
+
+Both durations include 60 seconds of configured inter-wave waiting. The earlier
+139.37-second source run had other validation jobs running alongside it, so these
+observations do not establish a percentage improvement in throughput or latency.
+They validate multi-worker correctness of the metadata optimization. Actual host
+request/binding reconstruction, service supervision and capacity remain separate
+acceptance gates.
