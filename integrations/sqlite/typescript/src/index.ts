@@ -1,5 +1,6 @@
 import { OutputJournal } from "./journal.js";
-import { storageVersion, enableApprovals } from "./approval-format.js";
+export type { ApprovalUpgradeInspection } from "./approval-format.js";
+import { storageVersion, enableApprovals, inspectApprovalUpgrade, type ApprovalUpgradeInspection } from "./approval-format.js";
 import { inspectApprovalState, checkApprovalDispatch, requireApprovalOwner, SqliteApprovalStore, type ApprovalAuthorizer } from "./approvals.js";
 export { SqliteApprovalStore } from "./approvals.js";
 export type { ApprovalAuthorizer, ApprovalDecisionReceipt } from "./approvals.js";
@@ -171,6 +172,10 @@ export class SqliteAgentAdapters {
 
   async transaction<T>(operation: (all: Stores, extra: { tools: Record<string, any>; [key: string]: any }) => Promise<T>): Promise<T> {
     return this.#transaction(operation);
+  }
+
+  async inspectApprovalUpgrade(): Promise<ApprovalUpgradeInspection> {
+    return this.#withConnection(async () => inspectApprovalUpgrade(this.#db), true);
   }
 
   async enableApprovals(): Promise<void> {

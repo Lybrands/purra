@@ -170,3 +170,23 @@ and Run-associated unknown approval claims. Reads do not expire or alter decisio
 Current host binding/permission checks remain unknown and required at execution.
 Reports retain `diagnosis_only` authority and omit private approval data. Legacy v4
 reports retain their existing shape. See the [approval inspection contract](../../../conformance/durable-approval.md#read-only-approval-inspection-implemented).
+
+## Offline approval upgrade preflight
+
+`await storage.inspectApprovalUpgrade()` reads a consistent database snapshot and returns
+`schemaVersion: 1`, `authority: diagnosis_only`, `storageVersion`, `targetVersion: 5`,
+`status` (`ready`, `blocked`, `already_enabled`) and `blockers`. It does not create
+schema objects, migrate rows, refresh decisions, or acquire a writer transaction.
+As with other inspections, initial adapter construction is separate and can initialize
+its normal schema. Use preflight on an already open adapter, not as a raw-file validator.
+
+For v4, preflight validates same-SDK metadata and journals across every scope and
+reports the first encountered foreign-SDK or unsettled-execution blocker. Corrupt
+state and unsupported formats raise instead of reporting readiness. Results omit
+scope names, Run IDs and stored content. `already_enabled` reports the format only,
+not the health of all v5 execution state.
+
+A `ready` result can become stale immediately. Stop writers, back up and use the
+existing explicit activation method; activation repeats the checks inside its write
+transaction. Preflight is not an upgrade permit, backup, automatic migration or
+v5-to-v4 rollback API. Never point a validation fixture at production data.

@@ -227,3 +227,47 @@ async def test_pending_list_reads_records_once_and_preserves_validation(tmp_path
         assert error.value.code == 'approval_record_conflict'
     finally:
         storage.close()
+
+UPGRADE_CASES = json.loads((Path(__file__).parents[4] / 'conformance/fixtures/approval_upgrade.json').read_text())['cases']
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('case', UPGRADE_CASES, ids=lambda case: case['name'])
+async def test_upgrade_preflight_is_read_only_and_database_wide(tmp_path, case):
+    path = tmp_path / 'db'
+    storage = SqliteAgentAdapters(path, scope='fixture')
+    other = SqliteAgentAdapters(path, scope='other')
+    try:
+        if case['name'] == 'active':
+            await begin(other)
+        elif case['name'] == 'foreign':
+            storage._db.execute("INSERT INTO purra_state VALUES('foreign','typescript',4,'{}')")
+        elif case['name'] == 'enabled':
+            await storage.enable_approvals()
+        before = list(storage._db.iterdump())
+        storage._db.execute('PRAGMA query_only=ON')
+        try:
+            report = await storage.inspect_approval_upgrade()
+        finally:
+            storage._db.execute('PRAGMA query_only=OFF')
+        assert report == dict(schemaVersion=1, authority='diagnosis_only', targetVersion=5,
+                              storageVersion=case['storageVersion'], status=case['status'], blockers=case['blockers'])
+        assert list(storage._db.iterdump()) == before
+        if case['name'] == 'ready':
+            # A ready observation never permits activation after another scope starts work.
+            await begin(other)
+            with pytest.raises(ValueError, match='approval_activation_execution_pending'):
+                await storage.enable_approvals()
+    finally:
+        other.close()
+        storage.close()
+
+@pytest.mark.asyncio
+async def test_upgrade_preflight_does_not_turn_corrupt_state_into_ready(tmp_path):
+    storage = SqliteAgentAdapters(tmp_path / 'db', scope='fixture')
+    try:
+        await begin(storage)
+        storage._db.execute("UPDATE purra_state SET body='{}'")
+        with pytest.raises(Exception):
+            await storage.inspect_approval_upgrade()
+    finally:
+        storage.close()

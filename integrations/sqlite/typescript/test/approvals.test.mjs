@@ -131,3 +131,23 @@ test('pending listing reads records once and preserves validation', async t => {
  db.prepare('UPDATE purra_approvals SET call_id=? WHERE approval_id=?').run('corrupt',expected[0]);
  await assert.rejects(store.listPending(),{code:'approval_record_conflict'});
 });
+
+const upgradeCases=JSON.parse(readFileSync(new URL('../../../../conformance/fixtures/approval_upgrade.json',import.meta.url))).cases;
+for(const c of upgradeCases)test(`upgrade preflight is read only and database wide: ${c.name}`,async t=>{
+ const f=setup(t),s=f.open(),other=f.open('other'),db=new DatabaseSync(f.path);t.after(()=>db.close());
+ if(c.name==='active')await begin(other);
+ else if(c.name==='foreign')db.exec("INSERT INTO purra_state VALUES('foreign','python',4,'{}')");
+ else if(c.name==='enabled')await s.enableApprovals();
+ const before=db.prepare('SELECT * FROM purra_state').all(),schema=db.prepare('SELECT * FROM sqlite_master').all();
+ const exec=DatabaseSync.prototype.exec,prepare=DatabaseSync.prototype.prepare;
+ const guardExec=t.mock.method(DatabaseSync.prototype,'exec',function(sql){assert.match(sql,/^(BEGIN|COMMIT|ROLLBACK)\b/i);assert.doesNotMatch(sql,/IMMEDIATE/);return exec.call(this,sql);});
+ const guardPrepare=t.mock.method(DatabaseSync.prototype,'prepare',function(sql){assert.match(sql,/^SELECT\b/i);return prepare.call(this,sql);});
+ let report;try{report=await s.inspectApprovalUpgrade();}finally{guardExec.mock.restore();guardPrepare.mock.restore();}
+ assert.deepEqual(report,{schemaVersion:1,authority:'diagnosis_only',targetVersion:5,storageVersion:c.storageVersion,status:c.status,blockers:c.blockers});
+ assert.deepEqual(db.prepare('SELECT * FROM purra_state').all(),before);assert.deepEqual(db.prepare('SELECT * FROM sqlite_master').all(),schema);
+ if(c.name==='ready'){await begin(other);await assert.rejects(s.enableApprovals(),/approval_activation_execution_pending/);}
+});
+test('upgrade preflight rejects corrupt state',async t=>{
+ const f=setup(t),s=f.open();await begin(s);const db=new DatabaseSync(f.path);t.after(()=>db.close());
+ db.exec("UPDATE purra_state SET body='{}'");await assert.rejects(s.inspectApprovalUpgrade());
+});

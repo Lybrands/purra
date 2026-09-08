@@ -10,14 +10,34 @@ export function storageVersion(db: DatabaseSync): 4 | 5 {
   return version;
 }
 
+export interface ApprovalUpgradeInspection {
+  readonly schemaVersion: 1;
+  readonly authority: "diagnosis_only";
+  readonly storageVersion: 4 | 5;
+  readonly targetVersion: 5;
+  readonly status: "ready" | "blocked" | "already_enabled";
+  readonly blockers: readonly string[];
+}
+function activationBlocker(db: DatabaseSync): string | undefined {
+  for (const row of db.prepare("SELECT scope,sdk,body FROM purra_state ORDER BY scope,sdk").all()) {
+    if (row.sdk !== "typescript") return "approval_activation_foreign_sdk";
+    const journal = new OutputJournal(db, String(row.scope), false);
+    const session = new StorageSession(String(row.body), "all", journal.restore());
+    if (session.hasUnsettledExecution()) return "approval_activation_execution_pending";
+  }
+  return undefined;
+}
+export function inspectApprovalUpgrade(db: DatabaseSync): ApprovalUpgradeInspection {
+  const version = storageVersion(db);
+  const blocker = version === 5 ? undefined : activationBlocker(db);
+  return Object.freeze({schemaVersion: 1, authority: "diagnosis_only", storageVersion: version,
+    targetVersion: 5, status: version === 5 ? "already_enabled" : blocker ? "blocked" : "ready",
+    blockers: Object.freeze(blocker ? [blocker] : [])});
+}
 export function enableApprovals(db: DatabaseSync): void {
   if (storageVersion(db) === 5) return;
-  for (const row of db.prepare("SELECT scope,sdk,body FROM purra_state").all()) {
-    if (row.sdk !== "typescript") throw new Error("approval_activation_foreign_sdk");
-    const journal = new OutputJournal(db, String(row.scope));
-    const session = new StorageSession(String(row.body), "all", journal.restore());
-    if (session.hasUnsettledExecution()) throw new Error("approval_activation_execution_pending");
-  }
+  const blocker = activationBlocker(db);
+  if (blocker) throw new Error(blocker);
   db.exec(`UPDATE purra_state SET version=5;
     INSERT INTO purra_state VALUES('', 'purra.approvals', 5, '{}');
     CREATE TABLE purra_approvals (

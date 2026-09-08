@@ -13,7 +13,7 @@ from purra.contracts import ToolHandlerResult, RunExecutionLease, RunStatus
 from purra.execution.ownership import execution_owner, execution_claim
 from purra.errors import ContractViolationError
 from .journal import OutputJournal
-from .approval_format import storage_version, enable_approvals
+from .approval_format import storage_version, enable_approvals, inspect_approval_upgrade
 
 
 _READ_METHODS = {
@@ -169,6 +169,11 @@ class SqliteAgentAdapters:
 
     def transaction(self):
         return self._transaction()
+
+    async def inspect_approval_upgrade(self):
+        """Read-only v4-to-v5 readiness; activation rechecks under a writer lock."""
+        async with self._connection(read_only=True):
+            return inspect_approval_upgrade(self._db)
 
     async def enable_approvals(self):
         """Explicitly activate v5 while all scopes have no unsettled execution."""

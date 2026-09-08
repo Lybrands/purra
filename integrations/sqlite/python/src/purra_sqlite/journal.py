@@ -24,8 +24,10 @@ def _load_rows(rows):
 
 
 class OutputJournal:
-    def __init__(self, db, scope):
+    def __init__(self, db, scope, *, initialize=True):
         self.db, self.scope = db, scope
+        if not initialize:
+            return
         db.execute("""CREATE TABLE IF NOT EXISTS purra_journal_runs (
             scope TEXT NOT NULL, sdk TEXT NOT NULL, run_id TEXT NOT NULL,
             root_run_id TEXT NOT NULL, PRIMARY KEY(scope,sdk,run_id),

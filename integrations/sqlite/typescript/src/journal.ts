@@ -25,7 +25,8 @@ function decodeRow(row: Record<string, unknown>): OutputEvent {
 }
 
 export class OutputJournal {
-  constructor(private readonly db: DatabaseSync, private readonly scope: string) {
+  constructor(private readonly db: DatabaseSync, private readonly scope: string, initialize = true) {
+    if (!initialize) return;
     db.exec(`CREATE TABLE IF NOT EXISTS purra_journal_runs (
       scope TEXT NOT NULL, sdk TEXT NOT NULL, run_id TEXT NOT NULL,
       root_run_id TEXT NOT NULL, PRIMARY KEY(scope,sdk,run_id),

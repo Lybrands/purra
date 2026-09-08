@@ -2,6 +2,9 @@
 
 ## 1.1.0 — Unreleased development
 
+- Add read-only, database-wide SQLite approval-upgrade preflight in both SDKs.
+  Activation revalidates under its writer transaction; a ready report grants no permission.
+
 - Read pending approval records with one table query in both SQLite adapters,
   preserving identity validation, ordering, state filtering and read-only behavior.
 

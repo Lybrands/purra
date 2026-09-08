@@ -18,19 +18,33 @@ def storage_version(db):
     return version
 
 
+def _activation_blocker(db):
+    for scope, sdk, body in db.execute("SELECT scope,sdk,body FROM purra_state ORDER BY scope,sdk").fetchall():
+        if sdk != "python":
+            return "approval_activation_foreign_sdk"
+        session = StorageSession(body)
+        OutputJournal(db, scope, initialize=False).restore(session)
+        if session.has_unsettled_execution():
+            return "approval_activation_execution_pending"
+    return None
+
+
+def inspect_approval_upgrade(db):
+    """Observe upgrade readiness in the caller's read transaction; never authorize it."""
+    version = storage_version(db)
+    blocker = None if version == 5 else _activation_blocker(db)
+    return {"schemaVersion": 1, "authority": "diagnosis_only", "storageVersion": version,
+            "targetVersion": 5, "status": "already_enabled" if version == 5 else "blocked" if blocker else "ready",
+            "blockers": [] if blocker is None else [blocker]}
+
+
 async def enable_approvals(storage):
     async with storage._connection():
         if storage_version(storage._db) == 5:
             return
-        rows = storage._db.execute("SELECT scope,sdk,body FROM purra_state").fetchall()
-        for scope, sdk, body in rows:
-            if sdk != "python":
-                raise ValueError("approval_activation_foreign_sdk")
-            session = StorageSession(body)
-            # Validate the original journal as well as the metadata; do not rewrite it.
-            OutputJournal(storage._db, scope).restore(session)
-            if session.has_unsettled_execution():
-                raise ValueError("approval_activation_execution_pending")
+        blocker = _activation_blocker(storage._db)
+        if blocker:
+            raise ValueError(blocker)
         storage._db.execute("UPDATE purra_state SET version=5")
         storage._db.execute("INSERT INTO purra_state VALUES('', ?, 5, '{}')", (MARKER_SDK,))
         storage._db.execute("""CREATE TABLE purra_approvals (
