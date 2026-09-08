@@ -42,3 +42,37 @@ test('route survives reopen, rejects missing/changed binding, and resumes once',
     assert.equal((await host.storage.runs.get(id)).status, 'completed');
   } finally { host?.storage.close(); rmSync(dir, {recursive:true, force:true}); }
 });
+
+test('two routed Runs overlap without sharing binding state', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'purra-route-concurrent-')), path = join(dir, 'db');
+  const hosts = [], entered = [];
+  let release;
+  const both = new Promise(resolve => {release = resolve;});
+  const create = async route => {
+    const host = createApprovalHost(path, {modelRoute:route, script:async () => {
+      entered.push(route.bindingId);
+      if (entered.length === 2) release();
+      await both;
+      return {message:{role:'assistant', content:route.bindingId}, finishReason:'stop'};
+    }});
+    hosts.push(host); return host;
+  };
+  const registry = new ModelRouteRegistry(['model-a','model-b'].map(bindingId => ({
+    candidate:{bindingId, revision:'1', configIdentity:bindingId, capabilities:testGateway({}).capabilities}, create,
+  })));
+  try {
+    const [a,b] = await Promise.all(['model-a','model-b'].map(id => registry.createNew([id], {reasoningMode:'default'})));
+    const handles = await Promise.all([a,b].map(host => host.agent.submit({...request, enabledTools:[]}, {budgets:{maxRunGenerationTokens:null}})));
+    const results = await Promise.all(handles.map(handle => handle.result));
+    assert.deepEqual(entered.sort(), ['model-a','model-b']);
+    assert.notEqual(handles[0].runId, handles[1].runId);
+    for (const [index, host] of [a,b].entries()) {
+      const id = ['model-a','model-b'][index];
+      const saved = await host.storage.runs.get(handles[index].runId);
+      assert.equal(saved.preset.modelRoute.bindingId,id);
+      assert.equal(saved.status,'completed');
+      assert.equal(results[index].messages.at(-1).content,id);
+      assert.deepEqual(host.counts,{model:1,tool:0});
+    }
+  } finally { for (const host of hosts) host.storage.close(); rmSync(dir,{recursive:true,force:true}); }
+});

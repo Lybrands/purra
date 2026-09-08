@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { Agent, ApprovalIntent, ApprovalRequired, jsonIdentityDigest } from 'purra';
-import { SqliteAgentAdapters } from '../dist/index.js';
+import { SqliteAgentAdapters } from 'purra-sqlite';
 import { testGateway } from '../../../../typescript/test/support/model-gateway.mjs';
 
 export const request = { messages: [{ role: 'user', content: 'Write the fixture' }], planningMode: 'reactive' };

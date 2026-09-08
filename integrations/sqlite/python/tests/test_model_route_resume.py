@@ -1,5 +1,6 @@
 from dataclasses import replace
 import time
+import asyncio
 import pytest
 from purra.api import ModelRouteCandidate, AgentCoreRunOptions, resolve_model_route
 from purra.api import ModelRouteBinding, ModelRouteRegistry
@@ -58,3 +59,43 @@ async def test_route_reopen_preserves_identity_and_rejects_drift(tmp_path):
         assert (await resumed.wait()).status.value == 'done'
         assert host.tool_calls == 1
     finally: await host.close()
+
+
+@pytest.mark.asyncio
+async def test_two_routed_runs_overlap_without_model_identity_leak(tmp_path):
+    entered = []
+    both = asyncio.Event()
+    hosts = []
+
+    class ConcurrentHost(ApprovalHost):
+        async def stream(self, messages, invocation, signal=None):
+            entered.append(invocation.request.model)
+            if len(entered) == 2: both.set()
+            await asyncio.wait_for(both.wait(), 5)
+            assert invocation.request.model == self.request.model.model
+            return await super().stream(messages, invocation, signal)
+
+    async def create(route):
+        host = ConcurrentHost(tmp_path / 'shared.db', model_route=route)
+        host.request = replace(host.request, tools_enabled=False,
+            model=replace(host.request.model, model=route.binding_id))
+        hosts.append(host)
+        return host
+
+    capabilities = replace(generic_capability_snapshot(), max_generation_tokens=128)
+    registry = ModelRouteRegistry([ModelRouteBinding(ModelRouteCandidate(name, '1', name, capabilities), create)
+                                   for name in ['model-a', 'model-b']])
+    try:
+        first, second = await asyncio.gather(*[registry.create_new([name], TaskCapabilityRequirements('default'))
+                                              for name in ['model-a', 'model-b']])
+        handles = await asyncio.gather(first.core.submit(first.request), second.core.submit(second.request))
+        results = await asyncio.gather(*(handle.wait() for handle in handles))
+        assert all(result.status.value == 'done' for result in results)
+        assert sorted(entered) == ['model-a', 'model-b']
+        assert handles[0].run_id != handles[1].run_id
+        for host, handle in zip([first, second], handles):
+            saved = await host.storage.runs.get(handle.run_id)
+            assert saved.agent_preset_snapshot['composition']['modelRoute']['bindingId'] == host.request.model.model
+            assert (host.model_calls, host.tool_calls) == (1, 0)
+    finally:
+        for host in hosts: await host.close()

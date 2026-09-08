@@ -139,9 +139,17 @@ and resource cleanup if its factory fails partway through construction.
 The SQLite route tests now use the registry to construct both the submitting and
 reopened host. Deterministic concurrent-factory tests cover separate selections,
 registration mutation, revoked authorization and failure without fallback. Current
-isolated wheel checks cover selection/factories plus Python SQLite approval
-recovery; npm tarball checks cover selection/factories. TypeScript SQLite installed
-recovery, broader concurrent execution and full R01 acceptance remain open.
+isolated wheel and npm tarball checks cover selection/factories, SQLite approval
+recovery and two overlapping routed Runs in both SDKs. Test SDK imports resolve
+from temporary installed packages. Full R01 contract closeout remains open.
+
+The concurrent Run checks use separate factory-created hosts sharing one temporary
+SQLite database. A barrier keeps both model calls active until both have entered.
+They verify distinct Run IDs, separate persisted binding identities and exactly
+one model call per host without tools. Python observes the actual invocation model
+name; TypeScript observes the selected host gateway's distinct output. This is
+synthetic overlap/isolation evidence, not a real Provider test or a throughput
+measurement. The recovery fixture separately verifies approval-linked dispatch.
 
 ### Remaining acceptance
 
