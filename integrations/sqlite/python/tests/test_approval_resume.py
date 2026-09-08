@@ -736,3 +736,20 @@ async def test_terminal_schedule_prune_fences_old_scans(tmp_path):
         assert not await schedule.settle(run_id, stale, True)
         assert (await host.storage.runs.get(run_id)).status.value != 'running'
     finally: await host.close()
+
+
+@pytest.mark.asyncio
+async def test_candidate_page_can_feed_worker_without_resuming_terminal_run(tmp_path):
+    from purra.api import RecoveryWorker
+    host, options, record = await approved_host(tmp_path / 'candidate.db')
+    try:
+        assert (await (await host.core.resume(record.intent.run_id, host.request, options=options)).wait()).status.value == 'done'
+        page = await host.storage.list_run_candidates(limit=1)
+        assert page['runIds'] == (record.intent.run_id,)
+        async def discover(): return (await host.storage.list_run_candidates(limit=1))['runIds']
+        calls = []
+        async def resume(run_id): calls.append(run_id)
+        result = await RecoveryWorker(discover=discover, inspect=host.storage.inspect_recovery, resume=resume).run_once()
+        assert result[0].action == 'blocked' and 'run_terminal' in result[0].reasons
+        assert calls == []
+    finally: await host.close()

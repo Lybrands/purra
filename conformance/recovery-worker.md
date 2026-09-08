@@ -180,3 +180,54 @@ failure belongs to the service boundary, not the already completed scan outcome.
 These observations contain no Run identifiers, tool arguments, request contents or
 exception messages. They describe this worker instance, not fleet health or Run
 success, and never authorize a resume. Reading diagnostics performs no I/O.
+
+## Indexed candidate pages
+
+SQLite exposes `list_run_candidates(after_run_id=None, limit=100)` /
+`listRunCandidates({afterRunId, limit})`. Limits are integers 1–1000. The result has
+`authority: candidate_only`, `runIds` and `nextAfterRunId` (null at the observed end).
+It reads at most limit+1 IDs from the existing scoped, SDK-specific journal Run
+index using keyset ordering. Apart from the small approval-format marker check, it reads no Run state body or output event bodies and
+uses a read transaction. The old `list_running` / `listRunning` APIs retain their
+running-only contract and implementation.
+
+Candidates include terminal Runs and may include Child Runs. They are not runnable
+work. Hosts must filter to registered bindings and use existing inspection/public
+resume; a terminal candidate is skipped. Index observation does not validate state
+or journal integrity. No new permission, lease, status mirror or schema migration
+is introduced. Do not use this API as a health check or proof of recovery readiness.
+
+For a worker that processes one page per scan, keep the cursor in its discovery
+callback and reset it to null after the last page. Use an unlimited worker scan or
+a worker batch limit at least as large as the page; otherwise advancing the page
+would discard unvisited candidates when the next discovery list replaces it.
+
+```python
+def candidate_discovery(storage):
+    cursor = None
+    async def discover():
+        nonlocal cursor
+        page = await storage.list_run_candidates(after_run_id=cursor, limit=100)
+        cursor = page['nextAfterRunId']
+        return page['runIds']
+    return discover
+```
+
+```ts
+let cursor: string | null = null;
+const discover = async () => {
+  const page = await storage.listRunCandidates({
+    ...(cursor === null ? {} : {afterRunId: cursor}), limit: 100,
+  });
+  cursor = page.nextAfterRunId;
+  return page.runIds;
+};
+```
+
+Each page observes a committed snapshot, not a snapshot spanning the whole traversal.
+New IDs inserted before the cursor are found after wraparound; an existing candidate
+can become terminal before inspection. A new worker may restart traversal from the
+beginning. The host owns cursor persistence and filtering. This bounds discovery
+read volume per page but still traverses retained terminal history, and subsequent
+inspection/Run recovery can restore full state and history. An indexed running-only
+projection, persistent fair cursor and mixed-load capacity evidence remain open.

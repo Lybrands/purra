@@ -286,6 +286,22 @@ export class SqliteAgentAdapters {
     return new SqliteRecoverySchedule((operation, readOnly) => this.#transaction((_all, extra) => operation(extra), readOnly, "extra"), options);
   }
 
+  async listRunCandidates(options: { afterRunId?: string; limit?: number } = {}) {
+    const limit = options.limit ?? 100, after = options.afterRunId;
+    if (!Number.isInteger(limit) || limit < 1 || limit > 1000) throw new TypeError("candidate page limit must be between 1 and 1000");
+    if (after !== undefined && (typeof after !== "string" || !after)) throw new TypeError("candidate cursor must be a nonempty Run id");
+    return this.#withConnection(async () => {
+      storageVersion(this.#db);
+      const query = this.#db.prepare("SELECT run_id FROM purra_journal_runs WHERE scope=? AND sdk='typescript'"
+        + (after === undefined ? "" : " AND run_id>?") + " ORDER BY run_id LIMIT ?");
+      const rows = after === undefined ? query.all(this.#scope, limit + 1) : query.all(this.#scope, after, limit + 1);
+      if (rows.some(row => typeof row.run_id !== "string" || !row.run_id)) throw new TypeError("invalid Run candidate identity");
+      const runIds = Object.freeze(rows.slice(0, limit).map(row => row.run_id as string));
+      return Object.freeze({ authority: "candidate_only" as const, runIds,
+        nextAfterRunId: rows.length > limit ? runIds[runIds.length - 1]! : null });
+    }, true);
+  }
+
   async listRunning(): Promise<readonly string[]> {
     return this.#transaction(async all => all.runs.runningRunIds(), true);
   }

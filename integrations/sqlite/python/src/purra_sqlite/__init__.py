@@ -278,6 +278,26 @@ class SqliteAgentAdapters:
         from .recovery_schedule import SqliteRecoverySchedule
         return SqliteRecoverySchedule(self, **options)
 
+    async def list_run_candidates(self, *, after_run_id=None, limit=100):
+        """Read a bounded index page; candidates may be terminal or Child Runs."""
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise ValueError("candidate page limit must be between 1 and 1000")
+        if after_run_id is not None and (not isinstance(after_run_id, str) or not after_run_id):
+            raise ValueError("candidate cursor must be a nonempty Run id")
+        async with self._connection(read_only=True):
+            storage_version(self._db)
+            rows = self._db.execute(
+                "SELECT run_id FROM purra_journal_runs WHERE scope=? AND sdk='python'"
+                + (" AND run_id>?" if after_run_id is not None else "")
+                + " ORDER BY run_id LIMIT ?",
+                (self.scope, after_run_id, limit + 1) if after_run_id is not None else (self.scope, limit + 1),
+            ).fetchall()
+            ids = tuple(row[0] for row in rows[:limit])
+            if any(not isinstance(row[0], str) or not row[0] for row in rows):
+                raise ValueError("invalid Run candidate identity")
+            return {"authority": "candidate_only", "runIds": ids,
+                    "nextAfterRunId": ids[-1] if len(rows) > limit else None}
+
     async def list_running(self):
         async with self._transaction(read_only=True, with_journal=False) as adapters:
             return adapters.running_run_ids()

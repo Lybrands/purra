@@ -547,3 +547,18 @@ test('terminal schedule pruning fences old scans before and after reopen', async
   assert.equal(await next.settle(id, stale, true), false);
   assert.equal((await reopened.storage.runs.get(id)).status, 'completed');
 });
+
+test('candidate page can feed worker without resuming a terminal Run', async t => {
+  const { RecoveryWorker } = await import('purra');
+  const open = setup(t), host = open(), id = await paused(host);
+  await approve(host, id); await (await host.agent.resume(id, request)).result;
+  assert.deepEqual((await host.storage.listRunCandidates({ limit: 1 })).runIds, [id]);
+  const calls = [];
+  const worker = new RecoveryWorker({
+    discover: async () => (await host.storage.listRunCandidates({ limit: 1 })).runIds,
+    inspect: id => host.storage.inspectRecovery(id), resume: async id => { calls.push(id); },
+  });
+  const [result] = await worker.runOnce();
+  assert.equal(result.action, 'blocked'); assert.ok(result.reasons.includes('run_terminal'));
+  assert.deepEqual(calls, []);
+});
