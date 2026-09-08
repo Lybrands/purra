@@ -14,7 +14,7 @@ export function createApprovalHost(path, settings = {}) {
     return target[key];
   } });
   const agent = new Agent({
-    runRepository: repository, outputPublisher: storage.publisher, preset: { id: 'approval', revision: '1' },
+    runRepository: repository, outputPublisher: storage.publisher, preset: { id: 'approval', revision: '1', ...(settings.modelRoute ? {modelRoute: settings.modelRoute} : {}) },
     ...(settings.planner ? { planning: { planner: settings.planner } } : {}),
     ...(settings.tree ? { agentTree: { repository: storage.runTree } } : {}),
     toolCheckpointNames: ['write'],
@@ -55,4 +55,3 @@ export async function approve(host, id) {
     commandKey: 'approve', decision: 'approve' }, { principalId: 'host' });
   return record;
 }
-

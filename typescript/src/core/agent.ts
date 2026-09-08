@@ -533,6 +533,11 @@ export class Agent {
     treeScope?: AgentTreeRunScope,
     resumeCheckpoint?: AgentRuntimeCheckpoint,
   ): Promise<RunHandle> {
+    if (this.#preset.modelRoute !== undefined &&
+      await stableFingerprint(copyJsonValue(this.#preset.modelRoute.capabilities as unknown as JsonValue)) !==
+      await stableFingerprint(copyJsonValue(this.#capabilities as unknown as JsonValue))) {
+      throw new AgentError('model_route_mismatch', 'Model route capabilities differ from configured model');
+    }
     const callerMessages = copyMessages(request.messages);
     if (callerMessages.length === 0) throw new TypeError("Run requires at least one caller message");
     const enabledTools = request.enabledTools === undefined
@@ -563,9 +568,13 @@ export class Agent {
         agentTree: agentTreeSnapshot,
         recovery: this.#recoveryPolicy.snapshot(),
         toolExecution: this.#tools.executionSnapshotFor(enabledTools),
+        ...(this.#preset.modelRoute === undefined ? {} : {
+          modelRouteRequest: { maxGenerationTokens: request.maxGenerationTokens ?? null },
+        }),
       })),
     ]);
     const preset: AgentPresetSnapshot = Object.freeze({
+      ...(this.#preset.modelRoute === undefined ? {} : { modelRoute: this.#preset.modelRoute }),
       schemaVersion: 5,
       presetId: this.#preset.id,
       presetRevision: this.#preset.revision,
@@ -2333,7 +2342,17 @@ function copyPreset(value: AgentPreset): AgentPreset & { readonly promptSections
     }
     return Object.freeze({ id: sectionId, role: section.role, content: copyJsonValue(section.content) });
   }));
-  return Object.freeze({ id, revision, promptSections });
+  let modelRoute;
+  if (value.modelRoute !== undefined) {
+    for (const key of ['bindingId', 'revision', 'configIdentity'] as const) {
+      const text = value.modelRoute[key];
+      if (typeof text !== 'string' || !text.trim() || text !== text.trim()) throw new TypeError('Invalid model route identity');
+    }
+    modelRoute = Object.freeze({ bindingId: value.modelRoute.bindingId,
+      revision: value.modelRoute.revision, configIdentity: value.modelRoute.configIdentity,
+      capabilities: copyCapabilitySnapshot(value.modelRoute.capabilities) });
+  }
+  return Object.freeze({ id, revision, promptSections, ...(modelRoute === undefined ? {} : {modelRoute}) });
 }
 
 function copyEvidence(value: readonly ContextEvidenceReceipt[]): readonly ContextEvidenceReceipt[] {

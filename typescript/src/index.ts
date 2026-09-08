@@ -472,3 +472,5 @@ export { copyToolHandlerResult } from "./tools/catalog.js";
 
 export { RecoveryWorker } from "./worker.js";
 export type { RecoveryWorkerResult, RecoverySchedule } from "./worker.js";
+export { selectModelRoute } from './model/routing.js';
+export type { ModelRouteCandidate, ModelRouteRequirements } from './model/routing.js';

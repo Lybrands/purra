@@ -32,6 +32,7 @@ from purra.ports import (
     ToolRegistration,
 )
 from purra.recovery import RecoveryPolicy
+from purra.model_routing import ModelRouteCandidate
 
 
 ContextProviderFactory = Callable[[AgentModelTaskRunner], ContextProvider]
@@ -207,8 +208,11 @@ class AgentPreset:
     )
     agent_tree_policy: AgentTreePolicy | None = None
     recovery_policy: RecoveryPolicy = RecoveryPolicy()
+    model_route: ModelRouteCandidate | None = None
 
     def __post_init__(self) -> None:
+        if self.model_route is not None and not isinstance(self.model_route, ModelRouteCandidate):
+            raise TypeError("model_route must be a ModelRouteCandidate")
         object.__setattr__(self, "id", required_text(self.id, "agent preset id"))
         object.__setattr__(
             self,
@@ -359,6 +363,8 @@ class AgentPreset:
         """Freeze the complete host-declared capability surface for this run."""
 
         effective_catalog = tool_catalog or self.tool_catalog
+        if self.model_route is not None and self.model_route.capabilities != request.model.capability_snapshot:
+            raise ValueError("model route capabilities differ from request")
         enabled = effective_catalog.enabled_names(request)
         registrations = {
             registration.schema.name: registration
@@ -370,6 +376,18 @@ class AgentPreset:
                 "agent preset enabled unknown tools: " + ", ".join(sorted(unknown))
             )
         composition = {
+            **({"modelRoute": {
+                "bindingId": self.model_route.binding_id,
+                "revision": self.model_route.revision,
+                "configIdentity": self.model_route.config_identity,
+                "capabilities": self.model_route.capabilities.to_mapping(),
+                "requestIdentity": sha256(json.dumps({
+                    "provider": request.model.provider,
+                    "model": request.model.model,
+                    "options": thaw_json_mapping(request.model.options),
+                    "maxGenerationTokens": request.model.max_generation_tokens,
+                }, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode()).hexdigest(),
+            }} if self.model_route is not None else {}),
             "toolExecutionLimits": {
                 "maxConcurrency": tool_execution_limits.max_concurrency,
                 "maxCallsPerBatch": tool_execution_limits.max_calls_per_batch,

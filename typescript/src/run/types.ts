@@ -32,6 +32,7 @@ export interface AgentPreset {
   readonly id: string;
   readonly revision: string;
   readonly promptSections?: readonly PromptSection[];
+  readonly modelRoute?: import('../model/routing.js').ModelRouteCandidate;
 }
 
 export interface RunRequest {
@@ -97,6 +98,7 @@ export interface ContinuationRunOptions extends RunOptionBase {
 export type RunOptions = NewRunOptions | ContinuationRunOptions;
 
 interface AgentPresetSnapshotBase {
+  readonly modelRoute?: import('../model/routing.js').ModelRouteCandidate;
   readonly presetId: string;
   readonly presetRevision: string;
   readonly promptFingerprint: string;

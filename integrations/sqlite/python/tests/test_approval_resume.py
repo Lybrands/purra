@@ -28,7 +28,7 @@ from purra.structured import json_identity_digest
 import time
 import asyncio
 class ApprovalHost:
-    def __init__(self, path, *, revision="1", leased=True, tree=False, first_snapshot=None, planner=None):
+    def __init__(self, path, *, revision="1", leased=True, tree=False, first_snapshot=None, planner=None, model_route=None):
         self.storage = SqliteAgentAdapters(path, scope="resume")
         self.approvals = self.storage.approval_store(authorize=lambda *_: True)
         self.model_calls = 0
@@ -46,6 +46,7 @@ class ApprovalHost:
             output_repository=self.storage.outputs, output_publisher=self.storage.publisher,
             execution_lease_store=self.storage.leases if leased else None,
             preset=AgentPreset(id="resume", revision=revision,
+                model_route=model_route,
                 execution_profile=ExecutionProfile(planner=planner),
                 component_bindings={"planner": AgentComponentBinding("approval.planner", "1")} if planner is not None else {},
                 agent_tree_policy=AgentTreePolicy() if tree else None,

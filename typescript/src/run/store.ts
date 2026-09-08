@@ -1,7 +1,7 @@
 import { encodeStorageState, decodeStorageState, requireStorageFields } from "../shared/storage-state.js";
 import { PLANNING_STREAM_SCHEMA, PlanningStreamParser } from "../planning/stream.js";
 import type { JsonValue, ModelTokenUsage } from "../model/types.js";
-import { copyJsonValue, copyMessages } from "../model/validation.js";
+import { copyJsonValue, copyMessages, copyCapabilitySnapshot } from "../model/validation.js";
 import { copyPreparedContextSnapshot } from "../context/coordinator.js";
 import type { OutputEvent, OutputEventDraft } from "../output/types.js";
 import { AgentError } from "../shared/errors.js";
@@ -1297,7 +1297,14 @@ function freezeSnapshot(snapshot: RunSnapshot): RunSnapshot {
     ...snapshot,
     budgets: normalizeRunBudgets(snapshot.budgets),
     usage: Object.freeze({ ...snapshot.usage }),
-    preset: Object.freeze({ ...snapshot.preset }),
+    preset: Object.freeze({ ...snapshot.preset,
+      ...(snapshot.preset.modelRoute === undefined ? {} : {modelRoute: Object.freeze({
+        bindingId: routeText(snapshot.preset.modelRoute.bindingId),
+        revision: routeText(snapshot.preset.modelRoute.revision),
+        configIdentity: routeText(snapshot.preset.modelRoute.configIdentity),
+        capabilities: copyCapabilitySnapshot(snapshot.preset.modelRoute.capabilities),
+      })}),
+    }),
     ...(snapshot.toolExecutionCheckpoint === undefined
       ? {} : { toolExecutionCheckpoint: copyToolExecutionCheckpoint(snapshot.toolExecutionCheckpoint) }),
     ...(snapshot.executionCheckpoint === undefined
@@ -1311,6 +1318,11 @@ export function normalizeRunSnapshot(snapshot: RunSnapshot): RunSnapshot {
     throw new TypeError("Run snapshot must be an object");
   }
   return freezeSnapshot(snapshot);
+}
+
+function routeText(value: string): string {
+  if (typeof value !== 'string' || !value.trim() || value !== value.trim()) throw new TypeError('Invalid persisted model route identity');
+  return value;
 }
 
 export function normalizeRunBudgets(value: RunBudgets): RunBudgets {
