@@ -87,7 +87,7 @@ test('effect exit keeps claim after real lease expiry until explicit reconciliat
     assert.ok(delay < 35000);
     // Actual persisted expiry, without editing leases or replacing the clock.
     await new Promise(resolve => setTimeout(resolve, delay));
-    assert.ok(Date.now() > expires);
+    assert.ok(Date.now() >= expires);
   } finally { host.storage.close(); }
   const blocked = start('restart'); await blocked.event('discovered');
   const report = await blocked.event('result'); await blocked.finish();

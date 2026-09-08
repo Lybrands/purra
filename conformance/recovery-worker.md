@@ -83,12 +83,13 @@ cancellation is distinct from graceful stop and propagates. Await `run` before
 closing storage. Concurrent `run`/single-scan calls on the same worker are rejected;
 a completed/stopped service can be started again with a fresh stop signal.
 
-W01 remains incomplete: broader wakeup subscriptions and maximum retry policy,
-bounded batches/fairness, lifecycle diagnostics and capacity measurements remain
-open. SQLite discovery currently restores Core state and journal data; it is not a
-cheap metadata-only queue query. Configure polling for the actual database size;
-do not infer capacity from synthetic tests. Process supervision and business
-Provider/MCP/downstream operation remain unvalidated.
+The complete W01 implementation is described by the additive sections below:
+persistent scheduling, bounded scans, diagnostics, indexed candidate pages,
+batch inspection, retry ceilings, durable cursors, process-fault checks,
+multi-worker arrivals and host lifecycle wiring. Configure polling for the actual
+database size; no production capacity follows from the synthetic measurements.
+Process supervision and business Provider/MCP/downstream operation remain external
+and unvalidated.
 
 ## Persistent per-Run schedule
 
@@ -139,10 +140,10 @@ counter survives pruning, fencing pre-prune scan tokens even before re-registrat
 or after reopen. Revisions are opaque comparison tokens, not per-Run counts.
 Registration/settlement/pruning retain that counter; do not manually delete it.
 
-Pruning is explicit. Bounded fair metadata discovery, maximum retry policy,
-additional subscriptions and lifecycle diagnostics remain W01 work. Do not clear
-execution claims to force a retry. SQLite scopes still bound the amount of state
-restored per scheduling transaction; these changes do not establish capacity limits.
+Pruning is explicit. Bounded discovery, retry ceilings, durable cursors and
+lifecycle diagnostics are described below. Periodic scanning remains the fallback
+for host changes without an atomic wake integration. Do not clear execution claims
+to force a retry. These changes do not establish capacity limits.
 
 ## Bounded scans and local diagnostics
 
@@ -162,8 +163,8 @@ This bounds candidate processing and report size, not database discovery or memo
 rotation. SQLite's full state/journal discovery costs are unchanged. Rotation is
 not persisted; a new worker instance starts with discovery order. Fairness applies
 to successive scans of a live worker and assumes host callbacks finish; one hung
-callback can still hold up serial work. Database pagination, durable fair cursors
-and load/capacity acceptance remain open.
+callback can still hold up serial work. The indexed page and durable-cursor paths
+below bound database traversal. Saturated-load capacity remains unclaimed.
 
 `worker.diagnostics()` returns a detached/read-only snapshot with schema version 1
 and `authority: diagnosis_only`. It includes `serving`, configured batch limit,
@@ -230,7 +231,9 @@ can become terminal before inspection. A new worker may restart traversal from t
 beginning. The host owns cursor persistence and filtering. This bounds discovery
 read volume per page but still traverses retained terminal history, and subsequent
 inspection/Run recovery can restore full state and history. An indexed running-only
-projection, persistent fair cursor and mixed-load capacity evidence remain open.
+projection is intentionally absent. Persistent traversal cursors and bounded
+mixed-arrival evidence are described below; retained terminal history can still
+affect latency.
 
 ## Shared-snapshot batch diagnosis
 
@@ -262,8 +265,8 @@ One local run with 100 Runs measured candidate pages at 0.019 ms / 0.032 ms
 (Python / TypeScript). In that same post-change measurement, 20 individual diagnoses
 cost 90.284 ms / 48.321 ms, and batch diagnosis cost 4.429 ms / 3.035 ms.
 These small-history observations justify an optional batch path, not a universal
-speedup claim. Terminal-history filtering, large-journal/mixed-load measurement,
-persistent fair cursors and maximum retry policy remain open.
+speedup claim. Large-journal probes, persistent cursors and retry ceilings are
+described below. The measurements do not establish production capacity.
 
 ## Large unrelated history and independent writer probe
 
@@ -300,8 +303,9 @@ That historical result showed that whole-scope batch restoration cost much more
 than five Root-scoped reads, motivating the selected-Root fix below. Batching remains
 opt-in. Python's journal-free batch path did not have that specific cost. A running-only candidate
 index would not remove this batch-restoration cost, so it is not justified by this
-probe alone. It motivated the selected-Root implementation below. Sustained mixed-load coverage
-remains open; these benchmark results do not establish production capacity.
+probe alone. It motivated the selected-Root implementation below. Bounded
+mixed-arrival coverage is described below; these benchmark results do not establish
+production capacity.
 
 ## Selected-Root batch restoration
 
@@ -324,8 +328,9 @@ medians of 3.116 / 0.767 ms (five Runs). The independent-process mixed probe mea
 reader/writer medians of 1.113 / 1.306 ms and verified all 20 unique writes with
 unchanged diagnosis. Compared with the historical ~97 ms batch read, the specific
 unrelated-history cost is removed. These are local synthetic timings, not a stable
-speed guarantee. Histories within selected Roots, full scoped state decoding,
-maximum retry policy and sustained mixed-load capacity still need evaluation.
+speed guarantee. Histories within selected Roots and full scoped state decoding
+still contribute cost. The retry ceiling and bounded arrival-wave tests below close
+the W01 policy/correctness checks without claiming sustained-load capacity.
 
 ## Consecutive failure ceiling
 
@@ -494,8 +499,9 @@ A local six-wave run with 10-second gaps completed 24 Runs per SDK: Python
 63.86 seconds / 6104 scans / six overlapping handler pairs. Both retained exactly
 24 effects and completed receipts after restart and shutdown. These are observations
 from synthetic fixtures while other validation jobs also ran, not controlled SDK
-performance comparisons. Python scanning/metadata costs under multiple workers
-still need profiling before making a capacity or latency claim.
+performance comparisons. Python scanning/metadata costs under multiple workers are
+profiled in the following section; neither result supports a capacity or latency
+guarantee.
 
 ### Python metadata cost isolation
 
@@ -601,3 +607,28 @@ host must persist and validate its own configuration schema, reject missing or
 changed current bindings before resume, and connect shutdown to its process/service
 manager. These checks close PurrA-local lifecycle wiring only; downstream and OS
 service-supervision acceptance remain separate.
+
+## W01 completion decision
+
+The PurrA-local W01 contract is complete for same-host Root recovery. Both SDKs
+provide the public worker loop, process-local wake plus periodic fallback,
+persistent per-Run backoff and optional exhaustion, bounded scans, diagnosis-only
+lifecycle snapshots, indexed candidate pages, batch inspection, durable traversal
+cursors, and public-resume execution gating. SQLite approval decisions and effect
+reconciliation atomically wake already registered schedules. Existing 1.0 callers
+remain valid because all worker and storage entry points are additive and opt-in.
+
+Deterministic and installed-package checks cover approval waiting, restart without
+model replay before decision, stale inspection races, cursor replay after exit,
+exit after a synthetic effect before its receipt, natural lease expiry, explicit
+reconciliation, three competing worker processes, a worker restart between arrival
+waves, host configuration reconstruction, changed binding rejection, and graceful
+shutdown. The effect fixture has no deduplication that could hide repeat dispatch.
+
+W01 does not include a cross-machine coordinator, distributed ownership, Child
+write approval, arbitrary nested interaction recovery, an OS service manager,
+business authentication/resource policy, or a universal capacity target. The
+first two belong to W02; the others require their owning feature or downstream
+host acceptance. Their unvalidated status remains visible, but it does not keep
+the same-host PurrA worker contract open. Bounded synthetic timing is evidence of
+correct operation at that fixture size, not a production capacity claim.
