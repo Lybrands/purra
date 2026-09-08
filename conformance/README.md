@@ -47,28 +47,28 @@ For package installation and consumer checks, see
 
 ## Capability contracts and tests
 
-- [Planning chunk delivery](../ARCHITECTURE.md#planning-output): `planning_stream.json`.
-- [Structured output](structured-output.md): `structured_output.json`,
+- [Planning chunk delivery](../docs/planning-output.md): `planning_stream.json`.
+- [Structured output](../docs/structured-output.md): `structured_output.json`,
   `structured_model_task.json`, and `native_output_schema.json`.
-- [Safe read concurrency](../ARCHITECTURE.md#read-only-tool-concurrency): `tool_concurrency.json`.
-- [Integration checks and read-only diagnosis](../ARCHITECTURE.md#integration-reports-and-recovery-inspection):
+- [Safe read concurrency](../docs/tool-concurrency.md): `tool_concurrency.json`.
+- [Integration checks and read-only diagnosis](../docs/integration-inspection.md):
   `recovery_inspection.json`.
 - MCP protocol and selected-schema rejection vectors live in
   `integrations/mcp/fixtures/tools.json` and run in both optional package suites.
 
 Protocol fixtures and SDK transport tests do not certify a live model or remote
 server. Record deterministic, installed-artifact, real-service and downstream
-results separately. See the architecture and structured-output reference for capability boundaries.
+results separately. See the linked capability guides for their supported behavior.
 
-Runtime behavior lives in the architecture document. This directory retains shared
-fixtures, their test guide, the detailed schema reference and the version-specific
-[upgrade notes](../CHANGELOG.md#upgrading-from-0x).
+This directory contains shared fixtures and test instructions. Public capability
+guides live in `docs/`; version migration steps live in
+[the upgrade guide](../docs/migrations/1.0.md).
 
 ## Repository documentation
 
 Keep installation guides, public contracts, reproducible test instructions and
 license notices in Git. Keep implementation plans, one-off validation evidence,
-release checklists and local environment notes in ignored `docs/` or
+release checklists and local environment notes in ignored `docs/plans/`, `docs/prd/` or
 `conformance/reports/`. Do not force-add these directories. Removing a tracked
 file from the current tree does not remove it from earlier commits.
 

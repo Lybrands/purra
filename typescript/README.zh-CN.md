@@ -9,7 +9,7 @@
 ## 1.0.0 候选状态
 
 当前源码为尚未发布的 1.0.0 候选。请按候选清单安装准确本地产物；注册表安装命令不保证获取本候选。
-0.x 升级要求见[升级说明](../CHANGELOG.md#从-0x-升级)。
+0.x 升级要求见[升级说明](../docs/migrations/1.0.zh-CN.md)。
 
 ## 安装
 
@@ -78,7 +78,7 @@ Run 请求通过 `planningMode` 选择模式：
 
 Planner 要求网关支持流式输出。订阅 Run 事件可逐片段接收 `planning.delta`，无需等待完整 JSON；
 `planning.progress` 保留完整进度记录的语义。原始预览可能包含无效计划片段，执行仍须通过校验，推理保持私有。
-契约见[计划输出](../ARCHITECTURE.md#planning-output)，订阅与重放用法见[规划示例](examples/planner-streaming.ts)。
+契约见[计划输出](../docs/planning-output.md)，订阅与重放用法见[规划示例](examples/planner-streaming.ts)。
 
 ## 预算与持久化
 

@@ -146,4 +146,4 @@ stay unknown. Reconciling a tool does not clear post-checkpoint model attempts.
 Permissions, complete usage, effects outside this adapter and Agent Tree ownership
 remain unknown. `authority` is always `diagnosis_only`; execution must revalidate.
 The current reader loads the selected Root journal to count model attempts.
-See the Core [inspection contract](../../../ARCHITECTURE.md#integration-reports-and-recovery-inspection).
+See the Core [inspection contract](../../../docs/integration-inspection.md).

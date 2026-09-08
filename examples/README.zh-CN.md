@@ -41,4 +41,4 @@ npm --prefix typescript run example
 - [Python 接入报告](python/integration_check.py) / [TS 接入报告](../typescript/examples/integration-check.ts)：复用已有 conformance 检查，报告已执行/未执行覆盖，只读查询缺少的恢复证据保留 unknown。
 - 安装 Core 和可选 MCP 包后，可运行 [Python stdio 消费者](../integrations/mcp/python/scripts/check_installed.py) / [TS stdio 消费者](../integrations/mcp/typescript/scripts/check-installed.mjs)。使用官方 SDK 启动并关闭本地 fixture server，不代表第三方 MCP 服务验证。
 
-所有 Core TS 示例均纳入 `npm --prefix typescript run example`。Python 示例可直接用安装了 Core 的解释器运行。诊断的边界见[公开契约](../ARCHITECTURE.md#integration-reports-and-recovery-inspection)。
+所有 Core TS 示例均纳入 `npm --prefix typescript run example`。Python 示例可直接用安装了 Core 的解释器运行。诊断的边界见[公开契约](../docs/integration-inspection.md)。

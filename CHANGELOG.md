@@ -6,7 +6,7 @@
   before complete JSON records arrive. Persist and validate exact source evidence
   in memory and SQLite; preserve final plan admission and private reasoning.
   Planning content is now publicly previewable, including invalid/retried fragments.
-  See [chunk streaming contract](ARCHITECTURE.md#planning-output).
+  See [chunk streaming contract](docs/planning-output.md).
 
 - Add versioned strict object output contracts, shared JSON identity, and Run-bound
   structured model tasks with local/native-required modes and explicit bounded repairs.
@@ -22,49 +22,11 @@
   Unknown usage, permissions and effects remain unknown; diagnosis grants no
   execution authority. Include public examples and external package consumers.
 
-### Upgrading from 0.x
+### Upgrade notes
 
-There are no 0.x aliases, fallback codecs, or automatic migrations promised by
-this candidate. Do not upgrade an active production Run in place.
-
-1. Inventory the installed SDK and optional-package versions, storage formats,
-   invocation receipts, presets, model/tool bindings, and active Runs. Retain a
-   backup and an environment capable of reading the original data.
-2. Finish or explicitly cancel active Runs in the old runtime and reconcile
-   external effects. A canceled local wait does not prove a remote effect stopped.
-3. Install the exact candidate in a separate environment. Start with a new
-   database, or a disposable backup copy when assessing historical readability.
-   Do not point a validation harness at the only production copy.
-4. Check historical reads and new Run execution independently. Restart the host,
-   verify a new persisted Run and its usage/output, and keep rollback data intact.
-
-SQLite storage is v4 and rejects other storage versions; Python and TypeScript
-snapshots are not interchangeable. New invocation receipts use schema v3.
-TypeScript imports reject unsupported receipt versions. Matching SQLite v4 alone
-therefore does not establish that a 0.x history or active checkpoint is compatible.
-No general 0.x history migration is supplied here; using a new database does not
-authorize deleting the old one. Recovery inspection never grants resume authority.
-
-For future 1.x storage changes, release notes must distinguish historical reads,
-validated offline migration, and continuation of active Runs. Requiring active
-Runs to drain is explicit; silently discarding them or their history is not an
-upgrade policy. Any migration must be verified before it is described as supported.
-
-
-### 从 0.x 升级
-
-本候选不承诺 0.x 别名、兼容编解码或自动迁移。不要原地切换正在执行的生产 Run。
-
-1. 盘点 SDK／可选包版本、存储格式、调用回执、preset、模型／工具绑定和活跃 Run，保留备份及能读取原数据的环境。
-2. 在旧运行时完成或明确取消活跃 Run，并对账外部效果。取消本地等待不等于远端效果已停止。
-3. 在独立环境安装准确候选；优先使用新数据库。评估历史读取时使用可丢弃的备份副本，不把唯一生产数据交给验证脚本。
-4. 分别验证历史读取和新 Run。重启宿主后检查新的持久 Run、用量和输出，保留回滚数据。
-
-SQLite 存储为 v4，拒绝其他存储版本；Python 与 TypeScript 快照不能互换。新的 invocation receipt 为 schema v3，TypeScript 状态导入拒绝不支持的回执版本。因此，同为 SQLite v4 不等于 0.x 历史或活跃 checkpoint 一定兼容。本候选没有通用 0.x 历史迁移工具；选择新数据库也不授权删除旧数据。恢复诊断不授予 resume 权限。
-
-未来 1.x 存储变更的发布说明必须分别声明历史读取、已验证的离线迁移和活跃 Run 续跑能力。可以明确要求排空活跃 Run，但不能静默遗弃任务和历史。迁移经过验证后才能声明支持。
-
-
+SQLite storage moves from v3 to v4 without automatic migration. Complete or cancel
+active Runs before upgrading and retain the old data and runtime for rollback.
+See the [upgrade guide](docs/migrations/1.0.md) / [升级指南](docs/migrations/1.0.zh-CN.md).
 
 ## 0.5.0 — 2026-09-06
 
