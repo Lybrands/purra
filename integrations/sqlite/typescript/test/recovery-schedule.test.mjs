@@ -51,3 +51,29 @@ test('worker preserves a wake received during a failing callback', async t => {
   assert.deepEqual(calls, ['one', 'two', 'one']);
   assert.deepEqual(report[1].reasons, ['retry_not_due']);
 });
+
+test('failure limit survives reopen, skips the exhausted Run, and wakes explicitly', async t => {
+  const open = fixture(t), first = open('limit');
+  let now = 100;
+  const initial = first.recoverySchedule({ intervalMs:1, maxBackoffMs:2, maxFailures:2, clockMs:()=>now });
+  for(let i=0;i<2;i++) {
+    const token = await initial.ready('bad'); assert.notEqual(token,null);
+    assert.equal(await initial.settle('bad',token,true),true); now+=10;
+  }
+  const store = open('limit'), schedule = store.recoverySchedule({ maxFailures:2, clockMs:()=>now+1000000 });
+  assert.deepEqual(await schedule.check('bad'),{revision:null,reason:'retry_exhausted'});
+  const called=[];
+  const worker = new RecoveryWorker({ schedule, discover:async()=>['bad','good'],
+    inspect:async id=>{called.push(['inspect',id]);return buildRecoveryInspection({});},
+    resume:async id=>{called.push(['resume',id]);},
+  });
+  const result=await worker.runOnce();
+  assert.deepEqual(result[0].reasons,['retry_exhausted']);
+  assert.deepEqual(called,[['inspect','good'],['resume','good']]);
+  await schedule.wake('bad');
+  const token=await schedule.ready('bad');assert.notEqual(token,null);
+  await schedule.settle('bad',token,true);
+  assert.equal((await schedule.check('bad')).reason,'retry_not_due');
+  assert.notEqual(await store.recoverySchedule({clockMs:()=>now+2000000}).ready('bad'),null);
+  for(const maxFailures of [true,0,-1,32,1.5]) assert.throws(()=>store.recoverySchedule({maxFailures}));
+});

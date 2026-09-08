@@ -58,3 +58,52 @@ async def test_worker_schedule_preserves_wake_during_failure(tmp_path):
         assert calls == ['one', 'two', 'one']
         assert result[1].reasons == ('retry_not_due',)
     finally: store.close()
+
+
+@pytest.mark.asyncio
+async def test_failure_limit_survives_reopen_and_worker_skips_exhausted_run(tmp_path):
+    path = tmp_path / 'limit.db'
+    now = [100]
+    store = SqliteAgentAdapters(path, scope='limit')
+    schedule = store.recovery_schedule(interval_ms=1, max_backoff_ms=2, max_failures=2, clock_ms=lambda: now[0])
+    for _ in range(2):
+        token = await schedule.ready('bad')
+        assert token is not None
+        assert await schedule.settle('bad', token, True)
+        now[0] += 10
+    store.close()
+    store = SqliteAgentAdapters(path, scope='limit')
+    try:
+        schedule = store.recovery_schedule(max_failures=2, clock_ms=lambda: now[0] + 1000000)
+        assert await schedule.check('bad') == {'revision': None, 'reason': 'retry_exhausted'}
+        called = []
+        async def discover(): return ['bad', 'good']
+        async def inspect(run_id):
+            called.append(('inspect', run_id))
+            return build_recovery_inspection({})
+        async def resume(run_id): called.append(('resume', run_id))
+        worker = RecoveryWorker(discover=discover, inspect=inspect, resume=resume, schedule=schedule)
+        result = await worker.run_once()
+        assert result[0].reasons == ('retry_exhausted',)
+        assert called == [('inspect', 'good'), ('resume', 'good')]
+        await schedule.wake('bad')
+        token = await schedule.ready('bad')
+        assert token is not None
+        await schedule.settle('bad', token, True)
+        assert (await schedule.check('bad'))['reason'] == 'retry_not_due'
+        # Compatibility: omission does not turn old scheduling data into a hard limit.
+        compatible = store.recovery_schedule(max_failures=2, clock_ms=lambda: now[0]+2000000)
+        token = await compatible.ready('bad')
+        assert token is not None
+        await compatible.settle('bad', token, False)
+        assert await store.recovery_schedule(clock_ms=lambda: now[0]+3000000).ready('bad') is not None
+    finally: store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('limit', [True, 0, -1, 32, 1.5])
+async def test_invalid_failure_limit(tmp_path, limit):
+    store = SqliteAgentAdapters(tmp_path / 'db', scope='limit')
+    try:
+        with pytest.raises(ValueError): store.recovery_schedule(max_failures=limit)
+    finally: store.close()

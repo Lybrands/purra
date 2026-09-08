@@ -1,6 +1,7 @@
 import type { RecoveryInspection } from "./observability/inspection.js";
 
 export interface RecoverySchedule {
+  check?(runId: string): Promise<Readonly<{ revision: number | null; reason: "retry_exhausted" | "retry_not_due" | null }>>;
   ready(runId: string): Promise<number | null>;
   settle(runId: string, revision: number, failed: boolean): Promise<boolean>;
 }
@@ -125,9 +126,10 @@ export class RecoveryWorker {
         if (stopped()) break;
         visited++;
         this.#phase = "scheduling";
-        const revision = this.#schedule === undefined ? 0 : await this.#schedule.ready(runId);
+        const eligibility = this.#schedule?.check === undefined ? undefined : await this.#schedule.check(runId);
+        const revision = eligibility === undefined ? (this.#schedule === undefined ? 0 : await this.#schedule.ready(runId)) : eligibility.revision;
         if (revision === null) {
-          results.push(Object.freeze({ runId, action: "blocked", reasons: Object.freeze(["retry_not_due"]) }));
+          results.push(Object.freeze({ runId, action: "blocked", reasons: Object.freeze([eligibility?.reason ?? "retry_not_due"]) }));
           continue;
         }
         let stage = "inspection_failed";

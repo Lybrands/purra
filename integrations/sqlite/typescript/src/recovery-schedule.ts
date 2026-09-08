@@ -7,7 +7,8 @@ function integer(value: number): number {
 }
 export class SqliteRecoverySchedule {
   constructor(private readonly transaction: Transaction,
-    private readonly options: { intervalMs?: number; maxBackoffMs?: number; clockMs?: () => number } = {}) {
+    private readonly options: { intervalMs?: number; maxBackoffMs?: number; clockMs?: () => number; maxFailures?: number } = {}) {
+    if (options.maxFailures !== undefined && !(integer(options.maxFailures) >= 1 && options.maxFailures <= 31)) throw new TypeError("maxFailures must be between 1 and 31");
     this.options = Object.freeze({ ...options });
     const interval = integer(options.intervalMs ?? 1000), maximum = integer(options.maxBackoffMs ?? 30000);
     if (!(interval > 0 && interval <= maximum && maximum <= 2147483647)) throw new TypeError('invalid recovery schedule intervals');
@@ -25,11 +26,16 @@ export class SqliteRecoverySchedule {
     const rows = Object.assign(Object.create(null), extra.recoverySchedule ?? {});
     rows[runId] = row; extra.recoverySchedule = rows;
   }
-  async ready(runId: string): Promise<number | null> {
+  async check(runId: string): Promise<Readonly<{ revision: number | null; reason: "retry_exhausted" | "retry_not_due" | null }>> {
     return this.transaction(async extra => {
       const row = SqliteRecoverySchedule.row(extra, runId);
-      return row.notBeforeMs <= integer((this.options.clockMs ?? Date.now)()) ? row.revision : null;
+      const reason = this.options.maxFailures !== undefined && row.failures >= this.options.maxFailures ? "retry_exhausted"
+        : row.notBeforeMs > integer((this.options.clockMs ?? Date.now)()) ? "retry_not_due" : null;
+      return Object.freeze({ revision: reason === null ? row.revision : null, reason });
     }, true);
+  }
+  async ready(runId: string): Promise<number | null> {
+    return (await this.check(runId)).revision;
   }
   async wake(runId: string): Promise<number> {
     return this.transaction(async extra => {

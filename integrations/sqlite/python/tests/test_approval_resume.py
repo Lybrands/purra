@@ -698,10 +698,11 @@ async def test_decision_and_registered_wake_commit_atomically(tmp_path, decision
         handle = await host.core.submit(host.request, options=AgentCoreRunOptions(tool_checkpoint_handler=host.boundary))
         with pytest.raises(ApprovalRequired): await handle.wait()
         record = (await host.approvals.list_pending())[0]
-        schedule = host.storage.recovery_schedule(clock_ms=lambda: 100)
+        schedule = host.storage.recovery_schedule(clock_ms=lambda: 100, max_failures=1)
         await schedule.wake(handle.run_id)
         token = await schedule.ready(handle.run_id)
         await schedule.settle(handle.run_id, token, True)
+        assert (await schedule.check(handle.run_id))['reason'] == 'retry_exhausted'
         command = ApprovalDecisionCommand(record.approval_id, record.revision, record.intent.digest, 'atomic', decision)
         host.storage._db.execute("CREATE TRIGGER fail_decision BEFORE UPDATE ON purra_state BEGIN SELECT RAISE(ABORT, 'fixture rollback'); END")
         with pytest.raises(Exception): await host.approvals.decide(command, principal_id='host')

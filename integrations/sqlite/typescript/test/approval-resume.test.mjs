@@ -517,8 +517,9 @@ test('worker service wakes after committed approval', { timeout: 5000 }, async t
 for (const decision of ['approve', 'reject']) test(`decision and registered wake commit atomically: ${decision}`, async t => {
   const open = setup(t), host = open(), id = await paused(host);
   const record = (await host.approvals.listPending({ runId: id }))[0];
-  const schedule = host.storage.recoverySchedule({ clockMs: () => 100 });
+  const schedule = host.storage.recoverySchedule({ clockMs: () => 100, maxFailures: 1 });
   await schedule.wake(id); await schedule.settle(id, await schedule.ready(id), true);
+  assert.equal((await schedule.check(id)).reason, "retry_exhausted");
   const command = { approvalId: record.approvalId, expectedRevision: record.revision, intentDigest: record.intentDigest, commandKey: 'atomic', decision };
   const db = new DatabaseSync(host.path); t.after(() => db.close());
   db.exec("CREATE TRIGGER fixture_decision_failure BEFORE UPDATE ON purra_state BEGIN SELECT RAISE(ABORT, 'fixture rollback'); END");

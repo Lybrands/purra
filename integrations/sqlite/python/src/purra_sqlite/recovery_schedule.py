@@ -9,9 +9,12 @@ def _integer(value):
 
 
 class SqliteRecoverySchedule:
-    def __init__(self, storage, *, interval_ms=1000, max_backoff_ms=30000, clock_ms=None):
+    def __init__(self, storage, *, interval_ms=1000, max_backoff_ms=30000, clock_ms=None, max_failures=None):
         if not 0 < _integer(interval_ms) <= _integer(max_backoff_ms) <= 2147483647:
             raise ValueError('invalid recovery schedule intervals')
+        if max_failures is not None and not 1 <= _integer(max_failures) <= 31:
+            raise ValueError("max_failures must be between 1 and 31")
+        self._max_failures = max_failures
         self._storage = storage
         self._interval = interval_ms
         self._maximum = max_backoff_ms
@@ -29,10 +32,16 @@ class SqliteRecoverySchedule:
         for value in row.values(): _integer(value)
         return row
 
-    async def ready(self, run_id):
+    async def check(self, run_id):
+        """Observe scheduling eligibility, not permission to execute."""
         async with self._storage._transaction(read_only=True, with_journal=False) as session:
             row = self._row(session.extra, run_id)
-            return row['revision'] if row['notBeforeMs'] <= _integer(self._clock()) else None
+            reason = ("retry_exhausted" if self._max_failures is not None and row['failures'] >= self._max_failures
+                      else "retry_not_due" if row['notBeforeMs'] > _integer(self._clock()) else None)
+            return {"revision": row['revision'] if reason is None else None, "reason": reason}
+
+    async def ready(self, run_id):
+        return (await self.check(run_id))["revision"]
 
     async def wake(self, run_id):
         async with self._storage._transaction(with_journal=False) as session:

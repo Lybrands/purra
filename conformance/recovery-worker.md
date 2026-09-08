@@ -326,3 +326,40 @@ unchanged diagnosis. Compared with the historical ~97 ms batch read, the specifi
 unrelated-history cost is removed. These are local synthetic timings, not a stable
 speed guarantee. Histories within selected Roots, full scoped state decoding,
 maximum retry policy and sustained mixed-load capacity still need evaluation.
+
+## Consecutive failure ceiling
+
+SQLite schedule construction accepts optional `max_failures` / `maxFailures`, an
+integer from 1 to 31. Omission preserves unlimited retry cycles with capped delay.
+The upper bound matches the existing saturated consecutive-failure counter; no
+storage migration or change to Run execution budgets is introduced.
+
+With a ceiling, `schedule.check(runId)` returns `{revision: null, reason:
+"retry_exhausted"}` when the persisted counter reaches it. Time passing does not
+clear exhaustion. Otherwise the result is a due revision with null reason, or
+`retry_not_due`. `ready` preserves its existing revision-or-null contract. Worker
+uses the optional `check` method when available and reports the specific blocker;
+older schedule implementations with only `ready`/`settle` remain supported. An
+exhausted Run gets neither inspection nor resume, and other candidates still run.
+
+This limits consecutive *settled scheduling failures*, not model/tool calls or
+all lifetime attempts. Inspection/resume exceptions counted as failed results
+increment the counter; blocked or normally returned callbacks reset it. A returned
+Run may itself be failed (especially Python); its canonical terminal state still
+governs discovery. A scheduling-storage failure cannot reliably persist a new
+count and stops the scan. Competing stale settlements still fail revision checks;
+this is not a distributed exactly-N execution budget.
+
+The counter persists; the ceiling is host policy supplied when constructing the
+schedule. Recreate the same policy after restart and across cooperating workers.
+Omitting or increasing it intentionally changes policy and may allow retries. A
+new host wake, including registered atomic approval/reconciliation wake, resets
+the counter; repeated approval command replay does not. Waking an exhausted Run
+requires a meaningful host decision, not a timer loop that bypasses its ceiling.
+Approval, unknown effects, terminal state and execution lease checks still apply.
+
+Persistent fair traversal remains open. Its cursor must be acknowledged after
+visited candidates, preserve unvisited work on graceful stop or scan failure, and
+reject stale acknowledgements. Discovery alone must not commit progress. Crashes
+may replay an unacknowledged page through existing execution gates; no cursor may
+be treated as permission to dispatch a tool or reset its claim.

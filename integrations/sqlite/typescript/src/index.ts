@@ -288,7 +288,7 @@ export class SqliteAgentAdapters {
     });
   }
 
-  recoverySchedule(options: { intervalMs?: number; maxBackoffMs?: number; clockMs?: () => number } = {}): SqliteRecoverySchedule {
+  recoverySchedule(options: { intervalMs?: number; maxBackoffMs?: number; clockMs?: () => number; maxFailures?: number } = {}): SqliteRecoverySchedule {
     return new SqliteRecoverySchedule((operation, readOnly) => this.#transaction((_all, extra) => operation(extra), readOnly, "extra"), options);
   }
 

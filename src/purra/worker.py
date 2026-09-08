@@ -123,9 +123,15 @@ class RecoveryWorker:
                     break
                 visited += 1
                 self._phase = "scheduling"
-                revision = await self._schedule.ready(run_id) if self._schedule is not None else 0
+                checker = getattr(self._schedule, "check", None)
+                if callable(checker):
+                    eligibility = await checker(run_id)
+                    revision, reason = eligibility["revision"], eligibility["reason"]
+                else:
+                    revision = await self._schedule.ready(run_id) if self._schedule is not None else 0
+                    reason = "retry_not_due"
                 if revision is None:
-                    results.append(RecoveryWorkerResult(run_id, "blocked", ("retry_not_due",)))
+                    results.append(RecoveryWorkerResult(run_id, "blocked", (reason or "retry_not_due",)))
                     continue
                 stage = "inspection_failed"
                 try:
