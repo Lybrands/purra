@@ -17,6 +17,7 @@ export interface RecoveryWorkerResult {
  * The host reconstructs requests/bindings and schedules subsequent scans.
  */
 export class RecoveryWorker {
+  readonly #acknowledge: ((processedIds: readonly string[]) => Promise<void>) | undefined;
   readonly #limit: number | undefined;
   #queue: string[] = [];
   #phase = "idle";
@@ -33,11 +34,13 @@ export class RecoveryWorker {
   constructor(options: {
     schedule?: RecoverySchedule;
     maxRunsPerScan?: number;
+    acknowledge?: (processedIds: readonly string[]) => Promise<void>;
     discover: () => Promise<readonly string[]>;
     inspect: (runId: string) => Promise<RecoveryInspection>;
     resume: (runId: string) => Promise<unknown>;
   }) {
     if (options.maxRunsPerScan !== undefined && (!Number.isInteger(options.maxRunsPerScan) || options.maxRunsPerScan <= 0 || options.maxRunsPerScan > 2147483647)) throw new TypeError("maxRunsPerScan must be a positive 32-bit integer");
+    this.#acknowledge = options.acknowledge;
     this.#limit = options.maxRunsPerScan;
     this.#schedule = options.schedule;
     this.#discover = options.discover;
@@ -112,6 +115,8 @@ export class RecoveryWorker {
   async #scan(stopped: () => boolean): Promise<readonly RecoveryWorkerResult[]> {
     this.#active = true;
     const results: RecoveryWorkerResult[] = [];
+    const processed: string[] = [];
+    let discoveredOk = false;
     let candidates = 0, visited = 0, outcome = "interrupted";
     try {
       this.#phase = "discovering";
@@ -120,6 +125,8 @@ export class RecoveryWorker {
       this.#queue = this.#queue.filter(id => present.has(id));
       const queued = new Set(this.#queue);
       this.#queue = this.#queue.concat(discovered.filter(id => !queued.has(id)));
+      if (this.#acknowledge !== undefined) this.#queue = discovered;
+      discoveredOk = true;
       candidates = this.#queue.length;
       const batch = this.#queue.slice(0, this.#limit);
       for (const runId of batch) {
@@ -130,6 +137,7 @@ export class RecoveryWorker {
         const revision = eligibility === undefined ? (this.#schedule === undefined ? 0 : await this.#schedule.ready(runId)) : eligibility.revision;
         if (revision === null) {
           results.push(Object.freeze({ runId, action: "blocked", reasons: Object.freeze([eligibility?.reason ?? "retry_not_due"]) }));
+          processed.push(runId);
           continue;
         }
         let stage = "inspection_failed";
@@ -151,6 +159,7 @@ export class RecoveryWorker {
         }
         this.#phase = "settling";
         await this.#schedule?.settle(runId, revision, results[results.length - 1]!.action === "failed");
+        processed.push(runId);
       }
       outcome = stopped() ? "stopped" : "complete";
       return Object.freeze(results);
@@ -158,6 +167,21 @@ export class RecoveryWorker {
       outcome = "failed";
       throw error;
     } finally {
+      try {
+        if (discoveredOk && this.#acknowledge !== undefined) {
+          this.#phase = "acknowledging";
+          await this.#acknowledge(Object.freeze([...processed]));
+        }
+      } catch (error) {
+        outcome = "failed";
+        throw error;
+      } finally {
+        this.#finishScan(outcome, candidates, visited, results);
+      }
+    }
+  }
+
+  #finishScan(outcome: string, candidates: number, visited: number, results: readonly RecoveryWorkerResult[]): void {
       this.#queue = this.#queue.slice(visited).concat(this.#queue.slice(0, visited));
       this.#lastScan = Object.freeze({ outcome, candidates, visited, deferred: candidates - visited,
         blocked: results.filter(r => r.action === "blocked").length,
@@ -165,6 +189,5 @@ export class RecoveryWorker {
         failed: results.filter(r => r.action === "failed").length });
       this.#active = false;
       this.#phase = "idle";
-    }
   }
 }

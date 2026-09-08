@@ -168,7 +168,7 @@ and load/capacity acceptance remain open.
 `worker.diagnostics()` returns a detached/read-only snapshot with schema version 1
 and `authority: diagnosis_only`. It includes `serving`, configured batch limit,
 current phase (`idle`, `discovering`, `scheduling`, `inspecting`, `resuming`,
-`settling`, `observing`, `waiting`) and `lastScan`. The last scan reports outcome
+`settling`, `acknowledging`, `observing`, `waiting`) and `lastScan`. The last scan reports outcome
 (`complete`, `stopped`, `failed`, or Python cancellation `interrupted`), distinct
 candidate count, visits, unvisited/deferred count, and blocked/settled/failed result
 counts. A visit interrupted by stop or infrastructure failure may have no result;
@@ -358,8 +358,70 @@ the counter; repeated approval command replay does not. Waking an exhausted Run
 requires a meaningful host decision, not a timer loop that bypasses its ceiling.
 Approval, unknown effects, terminal state and execution lease checks still apply.
 
-Persistent fair traversal remains open. Its cursor must be acknowledged after
-visited candidates, preserve unvisited work on graceful stop or scan failure, and
-reject stale acknowledgements. Discovery alone must not commit progress. Crashes
+The persistent fair traversal implementation below acknowledges progress after
+processed candidates, preserves unvisited work on graceful stop or scan failure, and
+rejects stale acknowledgements. Discovery alone must not commit progress. Crashes
 may replay an unacknowledged page through existing execution gates; no cursor may
 be treated as permission to dispatch a tool or reset its claim.
+
+## Persistent traversal with processed-prefix acknowledgement
+
+Use one cursor instance per worker: `storage.recovery_cursor(name, page_size=100)` /
+`storage.recoveryCursor(name, {pageSize: 100})`. Names are host-owned scheduling
+identities within the SQLite scope and SDK; they do not confer Run ownership.
+Cursor discovery reads its durable position and returns an indexed candidate page
+without advancing that position. Candidates retain the existing terminal/Child
+semantics and still require host bindings, inspection and public resume.
+
+```python
+cursor = storage.recovery_cursor('host-worker', page_size=100)
+worker = RecoveryWorker(
+    discover=cursor.discover, acknowledge=cursor.acknowledge,
+    inspect=storage.inspect_recovery, resume=resume,
+    schedule=storage.recovery_schedule(max_failures=3),
+    max_runs_per_scan=20,
+)
+```
+
+```ts
+const cursor = storage.recoveryCursor('host-worker', {pageSize: 100});
+const worker = new RecoveryWorker({
+  discover: () => cursor.discover(),
+  acknowledge: ids => cursor.acknowledge(ids),
+  inspect: id => storage.inspectRecovery(id), resume,
+  schedule: storage.recoverySchedule({maxFailures: 3}), maxRunsPerScan: 20,
+});
+```
+
+The optional worker `acknowledge` callback receives the processed prefix after a
+scan, including on partial stop/failure. Processing means a scheduling blocker was
+observed, or inspection/resume returned a result and schedule settlement completed.
+A candidate interrupted during inspection or whose settlement threw is excluded.
+With acknowledgement enabled, discovery order controls traversal rather than the
+worker's in-memory rotation. This makes a page size larger than the per-scan limit
+safe: unprocessed IDs appear on the next discovery. Existing callback-free workers
+retain their process-local rotation.
+
+The SQLite cursor validates the prefix against its last discovered page, compares
+its saved revision/position in a writer transaction, then advances after the last
+processed ID. Completing the observed final page wraps to the start. An empty page
+at a non-null position wraps; an empty database at the start needs no write.
+Conflicting acknowledgements fail with `recovery_cursor_conflict`; a failed write
+leaves the old position intact. Worker diagnostics return to idle and mark the scan
+failed if acknowledgement fails. Acknowledgement errors propagate; if another scan
+error was already pending, the acknowledgement failure may be the surfaced error.
+
+A crash before acknowledgement can replay processed candidates; lease, approval,
+claim and receipt gates remain authoritative. Do not use progress as an execution
+receipt. A newer explicit wake may be seen on the next traversal, not immediately
+if the cursor is elsewhere. Finite stable candidate sets receive round-robin visits
+across restarts; continuous insertion, retained terminal history and callback
+liveness still affect latency. Per-worker cursor names avoid unnecessary conflicts;
+sharing a name provides optimistic progress fencing, not a multi-worker scheduler.
+
+Cursor state is a small extension in the existing scoped snapshot. Reading/writing
+it still decodes that state (and writes reserialize it); it is not a separate cheap
+cursor table. Candidate page reads remain indexed. No deletion/reset API is provided,
+so revision reuse is avoided. Sustained-load and actual host/downstream acceptance
+remain W01 requirements; deterministic restart tests are not production supervision
+or crash-fault acceptance.

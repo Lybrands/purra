@@ -678,7 +678,8 @@ async def test_worker_service_wakes_after_committed_approval(tmp_path):
                 worker.wake()
             else:
                 stop.set()
-        worker = RecoveryWorker(discover=host.storage.list_running, inspect=host.storage.inspect_recovery, resume=resume, schedule=schedule)
+        cursor = host.storage.recovery_cursor('service')
+        worker = RecoveryWorker(discover=cursor.discover, acknowledge=cursor.acknowledge, inspect=host.storage.inspect_recovery, resume=resume, schedule=schedule)
         await asyncio.wait_for(worker.run(stop=stop, poll_interval_ms=60000, max_backoff_ms=60000, on_scan=observed), 5)
         assert len(reports) == 2 and reports[1][0].action == 'settled'
         assert host.tool_calls == 1

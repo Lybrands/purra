@@ -492,7 +492,8 @@ test('worker service wakes after committed approval', { timeout: 5000 }, async t
   const open = setup(t), host = open(), id = await paused(host);
   const stop = new AbortController(), reports = [];
   const schedule = host.storage.recoverySchedule();
-  const worker = new RecoveryWorker({ schedule, discover: () => host.storage.listRunning(),
+  const cursor = host.storage.recoveryCursor('service');
+  const worker = new RecoveryWorker({ schedule, discover: () => cursor.discover(), acknowledge: ids => cursor.acknowledge(ids),
     inspect: id => host.storage.inspectRecovery(id),
     resume: async id => (await host.agent.resume(id, request)).result,
   });

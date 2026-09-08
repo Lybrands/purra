@@ -34,6 +34,7 @@ class RecoveryWorker:
         resume: Callable[[str], Awaitable[object]],
         schedule: RecoverySchedule | None = None,
         max_runs_per_scan: int | None = None,
+        acknowledge: Callable[[Sequence[str]], Awaitable[None]] | None = None,
     ) -> None:
         if max_runs_per_scan is not None and (type(max_runs_per_scan) is not int or not 0 < max_runs_per_scan <= 2147483647):
             raise ValueError("max_runs_per_scan must be a positive 32-bit integer")
@@ -41,6 +42,7 @@ class RecoveryWorker:
         self._queue = []
         self._phase = "idle"
         self._last_scan = None
+        self._acknowledge = acknowledge
         self._discover = discover
         self._inspect = inspect
         self._resume = resume
@@ -107,6 +109,8 @@ class RecoveryWorker:
     async def _scan(self, stopped: Callable[[], bool]) -> tuple[RecoveryWorkerResult, ...]:
         self._active = True
         results = []
+        processed = []
+        discovered_ok = False
         candidates = visited = 0
         outcome = "interrupted"
         try:
@@ -116,6 +120,9 @@ class RecoveryWorker:
             self._queue = [key for key in self._queue if key in present]
             queued = set(self._queue)
             self._queue.extend(key for key in discovered if key not in queued)
+            if self._acknowledge is not None:
+                self._queue = discovered
+            discovered_ok = True
             candidates = len(self._queue)
             batch = self._queue[:self._limit] if self._limit is not None else list(self._queue)
             for run_id in batch:
@@ -132,6 +139,7 @@ class RecoveryWorker:
                     reason = "retry_not_due"
                 if revision is None:
                     results.append(RecoveryWorkerResult(run_id, "blocked", (reason or "retry_not_due",)))
+                    processed.append(run_id)
                     continue
                 stage = "inspection_failed"
                 try:
@@ -153,15 +161,27 @@ class RecoveryWorker:
                 if self._schedule is not None:
                     self._phase = "settling"
                     await self._schedule.settle(run_id, revision, results[-1].action == "failed")
+                processed.append(run_id)
             outcome = "stopped" if stopped() else "complete"
             return tuple(results)
         except Exception:
             outcome = "failed"
             raise
         finally:
-            self._queue = self._queue[visited:] + self._queue[:visited]
-            self._last_scan = {"outcome": outcome, "candidates": candidates, "visited": visited,
-                               "deferred": candidates - visited,
-                               **{action: sum(r.action == action for r in results) for action in ("blocked", "settled", "failed")}}
-            self._active = False
-            self._phase = "idle"
+            try:
+                if discovered_ok and self._acknowledge is not None:
+                    self._phase = "acknowledging"
+                    await self._acknowledge(tuple(processed))
+            except BaseException:
+                outcome = "failed"
+                raise
+            finally:
+                self._finish_scan(outcome, candidates, visited, results)
+
+    def _finish_scan(self, outcome, candidates, visited, results):
+        self._queue = self._queue[visited:] + self._queue[:visited]
+        self._last_scan = {"outcome": outcome, "candidates": candidates, "visited": visited,
+                           "deferred": candidates - visited,
+                           **{action: sum(r.action == action for r in results) for action in ("blocked", "settled", "failed")}}
+        self._active = False
+        self._phase = "idle"

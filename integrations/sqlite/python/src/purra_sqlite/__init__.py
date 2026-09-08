@@ -274,6 +274,10 @@ class SqliteAgentAdapters:
                     removed.append(run_id)
         return tuple(removed)
 
+    def recovery_cursor(self, name, *, page_size=100):
+        from .recovery_cursor import SqliteRecoveryCursor
+        return SqliteRecoveryCursor(self, name, page_size=page_size)
+
     def recovery_schedule(self, **options):
         from .recovery_schedule import SqliteRecoverySchedule
         return SqliteRecoverySchedule(self, **options)

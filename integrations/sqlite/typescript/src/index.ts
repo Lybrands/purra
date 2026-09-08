@@ -1,3 +1,5 @@
+import { SqliteRecoveryCursor } from "./recovery-cursor.js";
+export { SqliteRecoveryCursor } from "./recovery-cursor.js";
 import { SqliteRecoverySchedule, wakeRecoverySchedule, removeRecoverySchedule } from "./recovery-schedule.js";
 export { SqliteRecoverySchedule } from "./recovery-schedule.js";
 import { OutputJournal } from "./journal.js";
@@ -286,6 +288,11 @@ export class SqliteAgentAdapters {
       }
       return Object.freeze(removed);
     });
+  }
+
+  recoveryCursor(name: string, options: { pageSize?: number } = {}): SqliteRecoveryCursor {
+    return new SqliteRecoveryCursor((operation, readOnly) => this.#transaction((_all, extra) => operation(extra), readOnly, "extra"),
+      (after, limit) => this.listRunCandidates({ ...(after === null ? {} : {afterRunId: after}), limit }), name, options.pageSize);
   }
 
   recoverySchedule(options: { intervalMs?: number; maxBackoffMs?: number; clockMs?: () => number; maxFailures?: number } = {}): SqliteRecoverySchedule {
