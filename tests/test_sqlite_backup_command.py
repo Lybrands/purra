@@ -73,3 +73,49 @@ def test_publication_race_preserves_other_writer_file(tmp_path, monkeypatch):
         module.backup_sqlite(source, target)
     assert target.read_bytes() == b'other writer'
     assert not list(tmp_path.glob('.purra-backup-*'))
+
+
+@pytest.mark.parametrize('timeout', [0, -1, float('inf'), float('nan'), True])
+def test_invalid_timeout_has_no_filesystem_effect(tmp_path, timeout):
+    with pytest.raises(ValueError, match='timeout'):
+        module.backup_sqlite(tmp_path/'missing.db', tmp_path/'backup.db', timeout_seconds=timeout)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_busy_source_times_out_without_publication(tmp_path):
+    source, target = tmp_path/'source.db', tmp_path/'backup.db'
+    db = sqlite3.connect(source)
+    try:
+        db.execute('CREATE TABLE purra_state(scope TEXT,sdk TEXT,version INTEGER,body TEXT)')
+        db.commit()
+        db.execute('BEGIN EXCLUSIVE')
+        import time
+        started = time.monotonic()
+        with pytest.raises(TimeoutError, match='deadline'):
+            module.backup_sqlite(source, target, timeout_seconds=0.05)
+        assert time.monotonic() - started < 1.0
+        assert not target.exists()
+        assert not list(tmp_path.glob('.purra-backup-*'))
+    finally:
+        db.rollback()
+        db.close()
+    # The timeout released both connections; a fresh backup can succeed.
+    assert module.backup_sqlite(source, target)['storageVersion'] == 4
+
+
+def test_expiration_before_publication_preserves_source(tmp_path, monkeypatch):
+    source, target = tmp_path/'source.db', tmp_path/'backup.db'
+    with sqlite3.connect(source) as db:
+        db.execute('CREATE TABLE purra_state(scope TEXT,sdk TEXT,version INTEGER,body TEXT)')
+    before=source.read_bytes()
+    clock=[0.0]
+    monkeypatch.setattr(module.time,'monotonic',lambda:clock[0])
+    original_fsync=module.os.fsync
+    def expire_after_sync(fd):
+        original_fsync(fd)
+        clock[0]=2.0
+    monkeypatch.setattr(module.os,'fsync',expire_after_sync)
+    with pytest.raises(TimeoutError):
+        module.backup_sqlite(source,target,timeout_seconds=1)
+    assert source.read_bytes()==before and not target.exists()
+    assert not list(tmp_path.glob('.purra-backup-*'))

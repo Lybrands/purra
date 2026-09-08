@@ -20,6 +20,13 @@ state. A successful copy does not certify semantic Run validity or resume safety
    Source is opened read-only. The destination must not exist, even as a symlink.
    A private staging file is validated and fsynced, then published with a hard link
    that cannot overwrite an existing path. The containing directory is fsynced.
+   `--timeout-seconds 30` sets the default cooperative deadline for copying,
+   validation and hashing before publication. Busy sources do not wait indefinitely.
+   Expiration closes SQLite connections and removes staging without publishing a
+   destination. Individual filesystem calls (including fsync) cannot be forcibly
+   interrupted; this is not a hard real-time deadline. After publication, a directory
+   fsync error can leave the completed destination present; preserve and inspect it
+   rather than overwriting it on retry.
    The JSON report contains the format, size and SHA-256, with `resumeAuthority: none`.
    It contains no database rows or source paths. Protect the backup itself: it
    contains the original private data and is not encrypted by this utility.

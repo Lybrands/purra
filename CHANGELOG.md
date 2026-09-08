@@ -2,6 +2,9 @@
 
 ## 1.1.0 — Unreleased development
 
+- Bound offline SQLite backup waiting, validation and hashing with a configurable
+  cooperative deadline; pre-publication timeout leaves no destination or staging file.
+
 - Add a standalone SQLite snapshot command with WAL-aware copying, integrity checks,
   private staging and no-overwrite publication, plus offline rollback guidance.
 
