@@ -483,3 +483,6 @@ Completing or removing a claim does not reopen a terminal Run. Both SDKs verify
 that after reopening storage, a reconciled terminal Run still rejects resume without
 model or tool execution. This is a constraint of the current recovery path, not a
 complete general recovery workflow or automatic permission to create a replacement Run.
+
+The [effect recovery matrix](effect-recovery.md) distinguishes reconciled running
+Runs from terminal Runs and defines the current worker integration constraints.

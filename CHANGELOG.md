@@ -2,6 +2,9 @@
 
 ## 1.1.0 — Unreleased development
 
+- Verify approval-linked running Run recovery after host reconciliation in both SDKs,
+  including receipt reuse, non-execution retry gates and scope revocation after reopen.
+
 - Revalidate TypeScript approval-linked claims against the persisted approval identity
   and approved revision before host reconciliation; mismatches retain the unknown claim.
 

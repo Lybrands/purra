@@ -411,3 +411,29 @@ for(const proof of [{result:{content:'verified',effectState:'committed'}},{notEx
  await assert.rejects(reopened.agent.resume(id,request),{code:'run_terminal'});
  assert.deepEqual(reopened.counts,{model:0,tool:0});
 });
+
+for(const completed of [true,false])for(const gate of ['allowed','revoked','expired'])test(`running tool checkpoint resumes after host reconciliation: ${completed?'completed':'not executed'} ${gate}`,async t=>{
+ const open=setup(t),first=open(),id=await paused(first),db=new DatabaseSync(first.path);t.after(()=>db.close());
+ let effects=0;
+ const owner=open({run:()=>{
+  db.exec("CREATE TRIGGER fixture_receipt_failure BEFORE UPDATE ON purra_state BEGIN SELECT RAISE(ABORT, 'fixture receipt failure'); END");
+  if(!completed)throw Error('synthetic handler stopped before effect');
+  effects++;return {content:'written',effectState:'committed'};
+ }});
+ const record=await approve(owner,id);
+ await assert.rejects((await owner.agent.resume(id,request)).result);
+ assert.equal(effects,Number(completed));db.exec('DROP TRIGGER fixture_receipt_failure');
+ await owner.storage.transaction(async(_,extra)=>{extra.leases[id].expires=0;});
+ const restored=open({expiry:record.expiresAtMs});assert.equal((await restored.storage.runs.get(id)).status,'running');
+ const key=await restored.storage.transaction(async(_,extra)=>Object.keys(extra.tools)[0]);
+ await restored.storage.reconcileTool(key,completed?{result:{content:'written',effectState:'committed'}}:{notExecuted:true});
+ const final=open({expiry:record.expiresAtMs,...(gate==='expired'?{clockMs:()=>record.expiresAtMs+1}:{}),scope:()=>gate!=='revoked',
+  script:input=>{assert.ok(input.messages.some(m=>m.role==='tool')||input.tools.length===0);return {message:{role:'assistant',content:'done'},finishReason:'stop'};},
+  run:()=>{effects++;return {content:'written',effectState:'committed'};}});
+ if(gate==='revoked'||(gate==='expired'&&!completed)){
+  await assert.rejects(async()=>{await (await final.agent.resume(id,request)).result;});
+  assert.deepEqual(final.counts,{model:0,tool:0});assert.equal(effects,Number(completed));return;
+ }
+ assert.equal((await (await final.agent.resume(id,request)).result).output,'done');
+ assert.equal(final.counts.tool,completed?0:1);assert.equal(effects,1);
+});

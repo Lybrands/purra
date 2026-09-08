@@ -57,6 +57,8 @@ class ApprovalHost:
         )
 
     async def scope(self, state, arguments, signal=None):
+        if getattr(self, "deny_scope", False):
+            raise PermissionError("fixture scope revoked")
         self.scope_calls = getattr(self, "scope_calls", 0) + 1
         if getattr(self, "cancel_after_approval", False) and self.scope_calls == 2:
             await self.storage.leases.request_cancellation(self.active_run_id)
@@ -70,6 +72,9 @@ class ApprovalHost:
             return ToolHandlerResult(content="uncertain", effect_state="unknown")
         if getattr(self, "fail_receipt", False):
             self.storage._db.execute("CREATE TRIGGER fail_receipt BEFORE UPDATE ON purra_state BEGIN SELECT RAISE(ABORT, 'fixture receipt failure'); END")
+        if getattr(self, "fail_before_effect", False):
+            raise RuntimeError("synthetic handler stopped before effect")
+        self.effects = getattr(self, "effects", 0) + 1
         return ToolHandlerResult(content="42", effect_state="committed")
 
     async def complete(self, *args, **kwargs):
@@ -77,6 +82,8 @@ class ApprovalHost:
 
     async def stream(self, messages, invocation, signal=None):
         self.model_calls += 1
+        if getattr(self, "require_tool_history", False):
+            assert any(m.role.value == "tool" for m in messages) or not invocation.tools
         async def chunks():
             if getattr(self, "script", None) is not None:
                 output = self.script(messages, invocation)
@@ -519,5 +526,45 @@ async def test_host_reconciliation_preserves_terminal_run_after_reopen(tmp_path,
             await (await host.core.resume(record.intent.run_id, host.request, options=options)).wait()
         assert error.value.code == 'run_terminal'
         assert host.model_calls == host.tool_calls == 0
+    finally:
+        await host.close()
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('completed', [True, False])
+@pytest.mark.parametrize('gate', ['allowed', 'revoked'])
+async def test_running_tool_checkpoint_resumes_after_host_reconciliation(tmp_path, completed, gate):
+    path = tmp_path/'db'
+    host, options, record = await approved_host(path)
+    host.fail_receipt = True
+    host.fail_before_effect = not completed
+    key = (record.intent.run_id, record.intent.tool_call_id)
+    try:
+        with pytest.raises(Exception):
+            await (await host.core.resume(record.intent.run_id, host.request, options=options)).wait()
+        assert getattr(host, 'effects', 0) == int(completed)
+        host.storage._db.execute('DROP TRIGGER fail_receipt')
+        await host.close()
+        host = ApprovalHost(path)
+        host.expiry = record.expires_at_ms
+        saved = await host.storage.runs.get(record.intent.run_id)
+        assert saved.status.value == 'running'
+        async with host.storage.transaction() as session:
+            call = session.claims[key]
+        proof = {'result': ToolHandlerResult('42', effect_state='committed')} if completed else {'not_executed': True}
+        await host.storage.reconcile_tool(record.intent.run_id, call, **proof)
+        await host.close()
+        host = ApprovalHost(path)
+        host.expiry = record.expires_at_ms
+        host.require_tool_history = True
+        host.deny_scope = gate == 'revoked'
+        resumed = await host.core.resume(record.intent.run_id, host.request, options=AgentCoreRunOptions(tool_checkpoint_handler=host.boundary))
+        result = await resumed.wait()
+        if gate == 'revoked':
+            assert result.status.value == 'failed'
+            assert host.tool_calls == host.model_calls == 0
+            return
+        assert result.status.value == 'done'
+        assert host.tool_calls == (0 if completed else 1)
+        assert getattr(host, 'effects', 0) == (0 if completed else 1)
     finally:
         await host.close()
