@@ -423,5 +423,29 @@ Cursor state is a small extension in the existing scoped snapshot. Reading/writi
 it still decodes that state (and writes reserialize it); it is not a separate cheap
 cursor table. Candidate page reads remain indexed. No deletion/reset API is provided,
 so revision reuse is avoided. Sustained-load and actual host/downstream acceptance
-remain W01 requirements; deterministic restart tests are not production supervision
-or crash-fault acceptance.
+remain W01 requirements; the bounded process probes below do not establish
+production supervision or coverage of every crash point.
+
+### Independent-process ownership and exit probes
+
+The Python `test_worker_process.py` and TypeScript `worker-process.test.mjs`
+exercise two bounded scenarios against isolated databases and synthetic append-only
+files. The effect fixture has no deduplication of its own.
+
+- A competitor inspects an approved Run before another process acquires it. The
+  owner then enters the write handler and waits on an explicit IPC barrier. Despite
+  its earlier clean inspection, the competitor's public resume fails with
+  `run_lease_conflict`, with zero model/tool calls. Releasing the owner completes
+  the Run with exactly one effect append. Each worker uses a separate cursor name.
+- A process completes the approved write and canonical Run, then exits with code
+  73 before acknowledging its cursor, bypassing normal storage cleanup. A fresh
+  process rediscovers the same candidate, blocks the terminal Run without any
+  model/tool calls, and acknowledges traversal. The persisted effect remains a
+  single append; the cursor revision advances only in the restarted process.
+
+These tests also run against installed packages. They establish the specified
+same-host process boundaries, not a universal exactly-once guarantee. Abrupt exit
+inside a handler before its effect receipt, lease-expiry recovery, OS/power failure,
+sustained multi-writer load and actual downstream service supervision remain
+separate acceptance requirements. Child processes have bounded waits and are
+terminated/reaped on test failure; fixture databases and effect files are temporary.
