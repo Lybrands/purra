@@ -265,3 +265,42 @@ cost 90.284 ms / 48.321 ms, and batch diagnosis cost 4.429 ms / 3.035 ms.
 These small-history observations justify an optional batch path, not a universal
 speedup claim. Terminal-history filtering, large-journal/mixed-load measurement,
 persistent fair cursors and maximum retry policy remain open.
+
+## Large unrelated history and independent writer probe
+
+The companion `benchmark_recovery_load.py` / `benchmark-recovery-load.mjs` scripts
+create 20 Runs, select five for diagnosis, and put 5,000 output events on an
+unselected Root. Set `PURRA_BENCHMARK_EVENTS=50000` for the larger probe (accepted
+range 1–100,000). Run them with the same Python source paths / built TypeScript
+packages as the earlier benchmark. Temporary data is removed and child writer
+processes are awaited or terminated on failure. No host/business database is opened.
+
+A separate interpreter/process writes 20 uniquely keyed events to a selected Run
+while the reader performs 20 batch diagnoses. Both processes record monotonic
+operation intervals; the probe requires overlap, successful child exit, all 20
+unique committed events, and unchanged diagnostic reports. Overlapping intervals
+show concurrent processes were active, not that individual SQL statements executed
+simultaneously. This is one bounded WAL read/write probe, not a sustained throughput,
+many-writer, crash recovery or Provider test. Read-only phases use two warmups plus
+five measured reads; timings include SDK work and are machine-specific.
+
+Observed read-only medians for five selected Runs (milliseconds):
+
+| Unrelated events | Python individual / batch | TypeScript individual / batch |
+| --- | --- | --- |
+| 5,000 | 4.208 / 0.969 | 2.935 / 10.176 |
+| 50,000 | 4.165 / 0.864 | 3.458 / 97.316 |
+
+In the 50,000-event mixed probe, Python reader/writer medians were 0.943 / 1.875 ms,
+and TypeScript 89.834 / 1.241 ms. Both verified all 20 writes. These are separate SDK
+fixtures, not a fair language/runtime ranking. No maximum capacity follows from
+these results.
+
+The large-history result confirms that TypeScript's whole-scope batch restoration
+can cost much more than five Root-scoped reads. Keep batching opt-in; use individual
+inspection for a small selection with substantial unrelated history. Python's
+journal-free batch path does not have that specific cost. A running-only candidate
+index would not remove this batch-restoration cost, so it is not justified by this
+probe alone. Selected-Root batch restoration and sustained mixed-load coverage are
+more direct next investigations. Production runtime and default behavior are
+unchanged by these benchmark additions.
