@@ -258,7 +258,7 @@ export class InMemoryRunRepository implements RunRepository {
     };
   }
 
-  public importState(text: string, outputEvents?: readonly OutputEvent[], options: { readonly rootRunId?: string; readonly deferredJournal?: DeferredOutputJournal } = {}): void {
+  public importState(text: string, outputEvents?: readonly OutputEvent[], options: { readonly rootRunId?: string; readonly rootRunIds?: readonly string[]; readonly deferredJournal?: DeferredOutputJournal } = {}): void {
     const shape = { runs: this.#runs, rootEvents: this.#rootEvents, rootEventsBySourceKey: this.#rootEventsBySourceKey };
     const saved = decodeStorageState(text, "purra.run-state/v1", shape, { journalCounts: new Map<string, number>() }) as typeof shape & { journalCounts?: Map<string, number> };
     for (const [id, run] of saved.runs) {
@@ -270,6 +270,18 @@ export class InMemoryRunRepository implements RunRepository {
       run.snapshot = freezeSnapshot(run.snapshot);
       for (const receipt of run.invocationReceipts.values()) validateStructuredReceipt(receipt);
       for (const value of run.invocationSettlements.values()) requireStorageFields(value, ["input", "event"], ["budgetError"]);
+    }
+    if (options.rootRunIds !== undefined && (options.rootRunId !== undefined || options.deferredJournal !== undefined
+      || !Array.isArray(options.rootRunIds) || options.rootRunIds.length === 0
+      || options.rootRunIds.some(id => typeof id !== "string" || !id) || outputEvents === undefined)) {
+      throw new TypeError("Root set selection requires detached events and no other selection");
+    }
+    const selectedRoots = options.rootRunIds === undefined
+      ? (options.rootRunId === undefined ? undefined : new Set([options.rootRunId]))
+      : new Set(options.rootRunIds);
+    const storedRoots = new Set([...saved.runs.values()].map(run => run.rootRunId));
+    if (selectedRoots !== undefined && [...selectedRoots].some(id => !storedRoots.has(id))) {
+      throw new TypeError("Root journal selection requires existing Roots");
     }
     const deferred = options.deferredJournal;
     if (deferred !== undefined && (options.rootRunId === undefined || outputEvents !== undefined || saved.journalCounts === undefined)) {
@@ -284,7 +296,7 @@ export class InMemoryRunRepository implements RunRepository {
     this.#unloadedRoots.clear();
     this.#journalCounts = saved.journalCounts ?? new Map();
     for (const run of saved.runs.values()) {
-      if (options.rootRunId !== undefined && run.rootRunId !== options.rootRunId) this.#unloadedRoots.add(run.rootRunId);
+      if (selectedRoots !== undefined && !selectedRoots.has(run.rootRunId)) this.#unloadedRoots.add(run.rootRunId);
     }
     this.#runs.clear(); for (const [key, value] of saved.runs) this.#runs.set(key, value);
     this.#rootEvents.clear(); for (const [key, value] of saved.rootEvents) this.#rootEvents.set(key, value);

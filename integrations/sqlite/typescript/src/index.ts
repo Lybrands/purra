@@ -227,18 +227,24 @@ export class SqliteAgentAdapters {
     return this.#transaction(async (_all, extra) => operation(extra), false, "extra");
   }
 
-  async #transaction<T>(operation: (all: Stores, extra: { tools: Record<string, any>; [key: string]: any }) => Promise<T>, readOnly = false, selection: StateSelection = "all", journalRunId?: string): Promise<T> {
+  async #transaction<T>(operation: (all: Stores, extra: { tools: Record<string, any>; [key: string]: any }) => Promise<T>, readOnly = false, selection: StateSelection = "all", journalRunId?: string, journalRunIds?: readonly string[]): Promise<T> {
     return this.#withConnection(async () => {
       const version = storageVersion(this.#db);
       const row = this.#db.prepare("SELECT version,body FROM purra_state WHERE scope=? AND sdk='typescript'").get(this.#scope);
       if (row && row.version !== version) throw new Error("unsupported SQLite storage version");
       const rootRunId = row && journalRunId !== undefined ? this.#journal.rootForRun(journalRunId) : undefined;
+      if (journalRunIds !== undefined && (!readOnly || selection !== "all" || journalRunId !== undefined)) throw new TypeError("Batch Root selection requires a read-only transaction");
+      const rootRunIds = journalRunIds === undefined ? undefined : [...new Set(journalRunIds.map(id => {
+        const root = this.#journal.rootForRun(id);
+        if (root === undefined) throw new AgentError("run_not_found", "Run journal index is missing");
+        return root;
+      }))];
       const deferredJournal = row && selection === "all" && !readOnly && rootRunId !== undefined ? this.#journal.deferred(rootRunId) : undefined;
-      const events = row && selection === "all" && deferredJournal === undefined ? this.#journal.restore(rootRunId) : [];
+      const events = row && selection === "all" && deferredJournal === undefined ? (rootRunIds === undefined ? this.#journal.restore(rootRunId) : rootRunIds.flatMap(root => this.#journal.restore(root))) : [];
       const prior = new Map<string, number>(deferredJournal?.counts);
       for (const event of events) prior.set(event.runId, event.sequence);
       const session = new StorageSession(row ? String(row.body) : undefined, selection, events,
-        { ...(rootRunId === undefined ? {} : { rootRunId }), ...(deferredJournal === undefined ? {} : { deferredJournal }) });
+        { ...(rootRunIds === undefined ? {} : { rootRunIds }), ...(rootRunId === undefined ? {} : { rootRunId }), ...(deferredJournal === undefined ? {} : { deferredJournal }) });
       const result = await operation(session.stores, session.extra);
       if (!readOnly) {
         if (version !== 5 && selection === "all" && session.hasToolExecutionCheckpoint()) throw new AgentError("approval_storage_not_enabled", "Tool checkpoints require explicit approval storage activation");
@@ -318,7 +324,7 @@ export class SqliteAgentAdapters {
       const result: Record<string, RecoveryInspection> = Object.create(null);
       for (const id of new Set(runIds)) result[id] = await this.#inspectRecoverySnapshot(all, extra, id, {});
       return Object.freeze(result);
-    }, true);
+    }, true, "all", undefined, [...new Set(runIds)]);
   }
 
   async #inspectRecoverySnapshot(all: Stores, extra: { tools: Record<string, any>; [key: string]: any }, runId: string, options: { expectedPreset?: AgentPresetSnapshot }): Promise<RecoveryInspection> {

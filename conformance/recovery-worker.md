@@ -243,9 +243,8 @@ Reports use the same builder as single-Run inspection, with configuration unknow
 public resume must still revalidate current state after this snapshot.
 
 Python decodes the scoped state once and does not load the journal. TypeScript
-restores scoped state and the entire scoped journal once. That can reduce repeated
-state decoding for small histories, but can be more expensive than single-Run
-Root-scoped inspection for large unrelated histories. Batch size caps report work,
+restores scoped state once and only the journals of Roots containing the requested
+Runs. Each selected Root is restored once, including its siblings. Batch size caps report work,
 not state/journal size. Existing single-Run APIs remain unchanged. Use batches only
 when the measured workload benefits; do not use a cached report as execution permission.
 
@@ -284,7 +283,8 @@ simultaneously. This is one bounded WAL read/write probe, not a sustained throug
 many-writer, crash recovery or Provider test. Read-only phases use two warmups plus
 five measured reads; timings include SDK work and are machine-specific.
 
-Observed read-only medians for five selected Runs (milliseconds):
+Historical medians before selected-Root batch restoration (commit `1152001`),
+for five selected Runs (milliseconds):
 
 | Unrelated events | Python individual / batch | TypeScript individual / batch |
 | --- | --- | --- |
@@ -296,11 +296,33 @@ and TypeScript 89.834 / 1.241 ms. Both verified all 20 writes. These are separat
 fixtures, not a fair language/runtime ranking. No maximum capacity follows from
 these results.
 
-The large-history result confirms that TypeScript's whole-scope batch restoration
-can cost much more than five Root-scoped reads. Keep batching opt-in; use individual
-inspection for a small selection with substantial unrelated history. Python's
-journal-free batch path does not have that specific cost. A running-only candidate
+That historical result showed that whole-scope batch restoration cost much more
+than five Root-scoped reads, motivating the selected-Root fix below. Batching remains
+opt-in. Python's journal-free batch path did not have that specific cost. A running-only candidate
 index would not remove this batch-restoration cost, so it is not justified by this
-probe alone. Selected-Root batch restoration and sustained mixed-load coverage are
-more direct next investigations. Production runtime and default behavior are
-unchanged by these benchmark additions.
+probe alone. It motivated the selected-Root implementation below. Sustained mixed-load coverage
+remains open; these benchmark results do not establish production capacity.
+
+## Selected-Root batch restoration
+
+TypeScript `inspectRecoveryMany` resolves requested Runs to journal Roots within
+its read transaction, deduplicates those Roots, and restores only their histories.
+Missing Run index entries fail without a whole-scope fallback. State still decodes
+once for the scope. A selected Root includes all sibling Runs; sequence and saved
+journal-count validation remain active. Missing sibling events or corrupt selected
+history reject the batch. Unselected journal corruption is not examined, consistent
+with single-Root inspection; batch results are not a whole-database health check.
+
+Core's additive `importState` option `rootRunIds` accepts a nonempty Root set with
+detached events and cannot be combined with `rootRunId` or deferred loading. Access
+to unloaded Roots remains fenced, and full export remains disallowed while their
+journals are unloaded. Existing single-Root and full restore APIs retain their
+behavior. SQLite uses the new selection only for read-only batch diagnosis.
+
+A local rerun of the same 50,000-unrelated-event probe measured individual/batch
+medians of 3.116 / 0.767 ms (five Runs). The independent-process mixed probe measured
+reader/writer medians of 1.113 / 1.306 ms and verified all 20 unique writes with
+unchanged diagnosis. Compared with the historical ~97 ms batch read, the specific
+unrelated-history cost is removed. These are local synthetic timings, not a stable
+speed guarantee. Histories within selected Roots, full scoped state decoding,
+maximum retry policy and sustained mixed-load capacity still need evaluation.
