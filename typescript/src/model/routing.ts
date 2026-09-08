@@ -3,6 +3,11 @@ import { copyCapabilitySnapshot, copyJsonValue } from './validation.js';
 import { stableFingerprint } from '../shared/fingerprint.js';
 import { AgentError } from '../shared/errors.js';
 
+function copyAllowedIds(value: readonly string[]): readonly string[] {
+  if (!Array.isArray(value) || value.some(id => typeof id !== 'string' || !id.trim() || id !== id.trim())) throw new TypeError('Authorized bindings must be an array of nonempty canonical IDs');
+  return Object.freeze([...value]);
+}
+
 export interface ModelRouteCandidate {
   readonly bindingId: string;
   readonly revision: string;
@@ -35,6 +40,7 @@ export interface ModelRouteRequirements {
 
 /** Pure registration-order selection. The result is not execution authority. */
 export function selectModelRoute(candidates: readonly ModelRouteCandidate[], allowedBindingIds: readonly string[], requirements: ModelRouteRequirements, policy?: {readonly id: string; readonly revision: string}): ModelRouteCandidate {
+  const allowed = copyAllowedIds(allowedBindingIds);
   if (policy !== undefined && [policy.id, policy.revision].some(value => typeof value !== 'string' || !value.trim() || value !== value.trim())) throw new TypeError('Invalid route policy identity');
   const levels = { none: 0, unknown: 0, json_object: 1, json_schema: 2 };
   if (!['default', 'enabled', 'disabled'].includes(requirements.reasoningMode)
@@ -43,16 +49,16 @@ export function selectModelRoute(candidates: readonly ModelRouteCandidate[], all
     || [requirements.streamingRequired, requirements.cancellationRequired].some(v => v !== undefined && typeof v !== 'boolean')) throw new TypeError('Invalid model route requirements');
   const rows = candidates.map(copyModelRouteCandidate);
   const ids = new Set(rows.map(row => row.bindingId));
-  if (ids.size !== rows.length || allowedBindingIds.some(id => !ids.has(id))) throw new TypeError('Duplicate candidate or unknown allowed binding');
+  if (ids.size !== rows.length || allowed.some(id => !ids.has(id))) throw new TypeError('Duplicate candidate or unknown allowed binding');
   for (const row of rows) {
     const c = row.capabilities, p = c.protocol;
-    if (!allowedBindingIds.includes(row.bindingId) || c.actionable === false || c.maxGenerationTokens === null
+    if (!allowed.includes(row.bindingId) || c.actionable === false || c.maxGenerationTokens === null
       || (requirements.reasoningMode === 'enabled' && p.reasoningControl === 'unavailable')
       || (requirements.reasoningMode === 'disabled' && p.reasoningControl === 'always_enabled')
       || (requirements.toolCalling === 'required' && p.toolCalling !== 'supported')
       || (requirements.streamingRequired && p.streaming !== 'supported')
       || (requirements.cancellationRequired && p.cancellation !== 'supported')
-      || (levels[p.jsonSchemaLevel as keyof typeof levels] ?? 0) < levels[requirements.structuredOutputLevel ?? 'none']) continue;
+      || (Object.hasOwn(levels, p.jsonSchemaLevel) ? levels[p.jsonSchemaLevel as keyof typeof levels] : 0) < levels[requirements.structuredOutputLevel ?? 'none']) continue;
     return policy === undefined ? row : copyModelRouteCandidate({...row, policyId:policy.id, policyRevision:policy.revision});
   }
   throw new AgentError('model_route_unavailable', 'No authorized compatible model binding');
@@ -60,10 +66,11 @@ export function selectModelRoute(candidates: readonly ModelRouteCandidate[], all
 
 /** Resolve saved canonical identity; never select again or authorize dispatch. */
 export async function resolveModelRoute(candidates: readonly ModelRouteCandidate[], saved: ModelRouteCandidate, allowedBindingIds: readonly string[]): Promise<ModelRouteCandidate> {
+  const allowed = copyAllowedIds(allowedBindingIds);
   const rows = candidates.map(copyModelRouteCandidate);
   const value = copyModelRouteCandidate(saved);
   if (new Set(rows.map(row => row.bindingId)).size !== rows.length) throw new TypeError('Duplicate model route candidate');
-  const row = rows.find(row => row.bindingId === value.bindingId && allowedBindingIds.includes(row.bindingId));
+  const row = rows.find(row => row.bindingId === value.bindingId && allowed.includes(row.bindingId));
   if (row !== undefined) {
     const {policyId: _policyId, policyRevision: _policyRevision, ...binding} = row;
     const resolved = copyModelRouteCandidate({...binding,

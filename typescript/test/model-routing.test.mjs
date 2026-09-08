@@ -76,3 +76,18 @@ test('registry isolates concurrent factories, snapshots registration and never f
   await assert.rejects(failing.createNew(['a','b'], req), /factory failed/);
   assert.equal(entered.length,count);
 });
+
+test('unknown structured levels cannot inherit an object property as a capability', () => {
+  for (const level of ['toString','constructor','__proto__','future-format']) {
+    const a = candidate('a'); a.capabilities.protocol.jsonSchemaLevel = level;
+    assert.throws(() => selectModelRoute([a], ['a'], {...req,structuredOutputLevel:'json_schema'}), {code:'model_route_unavailable'});
+  }
+});
+
+test('recovery rejects malformed authorization lists before resolving a binding', async () => {
+  const a = candidate('a');
+  for (const allowed of ['prefix-a-suffix', null, [1], ['']]) {
+    await assert.rejects(resolveModelRoute([a], a, allowed), TypeError);
+    assert.throws(() => selectModelRoute([a], allowed, req), TypeError);
+  }
+});

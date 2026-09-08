@@ -87,3 +87,21 @@ async def test_registry_concurrent_factories_and_fail_closed_resolution():
     with pytest.raises(RuntimeError, match='factory failed'):
         await failing.create_new(['a', 'b'], TaskCapabilityRequirements('default'))
     assert len(entered) == count  # no fallback to another factory
+
+
+@pytest.mark.parametrize('allowed', ['prefix-a-suffix', None, [1], ['']])
+def test_recovery_rejects_malformed_authorization(allowed):
+    row = candidate('a')
+    with pytest.raises((TypeError, ValueError)):
+        resolve_model_route([row], row.to_mapping(), allowed)
+    with pytest.raises((TypeError, ValueError)):
+        select_model_route([row], allowed, TaskCapabilityRequirements('default'))
+
+
+@pytest.mark.parametrize('level', ['toString', 'constructor', '__proto__', 'future-format'])
+def test_unknown_structured_level_never_meets_schema_requirement(level):
+    row = candidate('a')
+    row = replace(row, capabilities=replace(row.capabilities,
+        protocol=replace(row.capabilities.protocol, json_schema_level=level)))
+    with pytest.raises(ContractViolationError):
+        select_model_route([row], ['a'], TaskCapabilityRequirements('default', structured_output_level='json_schema'))

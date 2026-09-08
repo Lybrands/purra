@@ -3,7 +3,9 @@
 Status: pure candidate selection and opt-in preset-bound route persistence are
 implemented in both SDKs. Saved binding resolution and optional policy identity
 are also implemented. Host factory registries now construct per-call hosts from
-the selected/resolved route. Complete R01 acceptance remains open.
+the selected/resolved route. The PurrA-local R01 contract is complete for Root
+selection before Run creation. Real Provider and downstream acceptance remain
+separate and are not claimed by these deterministic checks.
 
 Python exports `ModelRouteCandidate` and `select_model_route` from `purra.api`;
 TypeScript exports `ModelRouteCandidate`, `ModelRouteRequirements` and
@@ -33,7 +35,7 @@ profile ID. A profile ID alone is insufficient to identify all endpoint, model,
 reasoning and capability changes. R01 must explicitly bind those choices without
 changing the meaning of existing 1.0 snapshots.
 
-## Proposed additive contract
+## Additive contract
 
 The host registers a finite set of named model bindings with revisions. Each
 binding resolves a gateway/model implementation, its verified capability snapshot,
@@ -55,9 +57,7 @@ different selections must not mutate a shared Agent or gateway configuration.
 Durable selection must be committed with the Run identity before dispatch. A
 post-submit side record is insufficient: process exit between Run creation and
 that write would leave a recoverable Run with no authoritative selection. The
-implementation must choose a backward-compatible optional canonical field or an
-existing atomic extension boundary after verifying both storage codecs. This
-storage choice is now implemented through the existing atomic preset snapshot.
+implementation uses the existing atomic preset snapshot in both storage codecs.
 Python accepts `AgentPreset.model_route`; TypeScript accepts `preset.modelRoute`.
 The host passes the selected candidate when constructing its bound Agent. No
 route field is emitted when this opt-in is absent, preserving legacy identities.
@@ -141,7 +141,7 @@ reopened host. Deterministic concurrent-factory tests cover separate selections,
 registration mutation, revoked authorization and failure without fallback. Current
 isolated wheel and npm tarball checks cover selection/factories, SQLite approval
 recovery and two overlapping routed Runs in both SDKs. Test SDK imports resolve
-from temporary installed packages. Full R01 contract closeout remains open.
+from temporary installed packages.
 
 The concurrent Run checks use separate factory-created hosts sharing one temporary
 SQLite database. A barrier keeps both model calls active until both have entered.
@@ -151,18 +151,29 @@ name; TypeScript observes the selected host gateway's distinct output. This is
 synthetic overlap/isolation evidence, not a real Provider test or a throughput
 measurement. The recovery fixture separately verifies approval-linked dispatch.
 
-### Remaining acceptance
+### Completion decision and boundaries
 
-1. Add dual-SDK selection contracts and capability filtering; verify unknown IDs,
-   authorization, no eligible candidate and mutable-input isolation.
-2. Integrate new-Run dispatch and atomic persisted selection; verify no Run or
-   calls on rejection and isolation of concurrent selections.
-3. Integrate checkpoint and SQLite restart recovery; verify selection policy is
-   not called again and changed binding/configuration/capabilities are rejected.
-   Preserve approval expiry, consumed budgets and unknown-effect blocking.
-4. Check legacy snapshot import/resume, public exports, installed consumers and
-   documentation. Record deterministic, installed, real-service and downstream
-   evidence separately. A synthetic selection test is not real Provider evidence.
+Both SDKs implement candidate filtering, host authorization, optional policy
+identity, factory construction, atomic preset identity and exact saved-route
+resolution. Selection rejects malformed authorization lists: a string is never
+interpreted as a list or matched by substring. Unknown structured-output levels,
+including names inherited from JavaScript Object prototypes, cannot satisfy a
+required structured-output capability.
+
+Deterministic and installed-package tests cover registration mutation, concurrent
+factory calls, actual overlapping Runs, SQLite reopen, binding/request changes,
+original policy preservation and approval-linked single dispatch. Existing
+unrouted approval/recovery tests exercise the unchanged entry points; omission
+of the route adds no field to their preset identity. Broader Core and SQLite
+regression checks passed after the boundary repairs. No routing-specific storage
+migration or change to existing checkpoint, lease or receipt authority is needed.
+
+Host factories remain responsible for applying the selected route and accurately
+identifying opaque gateway configuration. The API provides deterministic ordered
+selection, not an adaptive model-ranking service. Provider interoperability,
+business authorization, downstream adoption and production capacity require
+their own evidence. The local completion decision does not claim those checks
+passed and does not close the remaining 1.1.0 expansion items.
 
 Run-internal switching belongs to R02. Child model selection and continuation
 semantics require explicit follow-up analysis; this first Root routing contract

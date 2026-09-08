@@ -10,6 +10,15 @@ from purra.errors import ContractViolationError, UnsupportedModelFeatureError
 from purra.model_protocol import ModelCapabilitySnapshot, TaskCapabilityRequirements, preflight_capabilities
 
 
+def _allowed_ids(value: Sequence[str]) -> tuple[str, ...]:
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise TypeError('authorized bindings must be a sequence of IDs')
+    ids = tuple(value)
+    if any(not isinstance(key, str) or not key.strip() or key != key.strip() for key in ids):
+        raise ValueError('authorized binding IDs must be nonempty canonical text')
+    return ids
+
+
 @dataclass(frozen=True, slots=True)
 class ModelRouteCandidate:
     binding_id: str
@@ -59,7 +68,7 @@ def select_model_route(
     if not all(isinstance(row, ModelRouteCandidate) for row in rows):
         raise TypeError("invalid model route candidate")
     ids = [row.binding_id for row in rows]
-    allowed = tuple(allowed_binding_ids)
+    allowed = _allowed_ids(allowed_binding_ids)
     if len(set(ids)) != len(ids) or any(not isinstance(key, str) or key not in ids for key in allowed):
         raise ValueError("duplicate candidate or unknown allowed binding")
     if not isinstance(requirements, TaskCapabilityRequirements):
@@ -87,9 +96,10 @@ def resolve_model_route(candidates: Sequence[ModelRouteCandidate], saved: Mappin
         raise TypeError("invalid model route candidate")
     if len({row.binding_id for row in rows}) != len(rows):
         raise ValueError("duplicate model route candidate")
+    allowed = _allowed_ids(allowed_binding_ids)
     value = thaw_json_mapping(saved)
     for row in rows:
-        if row.binding_id == value.get('bindingId') and row.binding_id in allowed_binding_ids:
+        if row.binding_id == value.get('bindingId') and row.binding_id in allowed:
             resolved = replace(row, policy_id=value.get('policyId'), policy_revision=value.get('policyRevision'))
             expected = resolved.to_mapping()
             # Python presets also carry requestIdentity, checked by public resume.
