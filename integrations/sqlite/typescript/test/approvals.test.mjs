@@ -108,3 +108,26 @@ test('creation replay distinguishes JSON boolean and number arguments',async t=>
  await store.create(await ApprovalIntent.create({...base.value,arguments:{value:1}}),{expiresAtMs:2000});
  await assert.rejects(store.create(await ApprovalIntent.create({...base.value,arguments:{value:true}}),{expiresAtMs:2000}),{code:'approval_intent_conflict'});
 });
+
+test('pending listing reads records once and preserves validation', async t => {
+ const f=setup(t),s=f.open();await s.enableApprovals();await begin(s);
+ const store=s.approvalStore({authorize:()=>true,clockMs:()=>1000}),expected=[];
+ const base=await intent();
+ for(let i=0;i<12;i++){
+  const record=await store.create(await ApprovalIntent.create({...base.value,toolCallId:`call-${i}`}),{expiresAtMs:2000});
+  if(i%2)await store.decide(command(record,'reject',`reject-${i}`),{principalId:'host'});
+  else expected.push(record.approvalId);
+ }
+ const db=new DatabaseSync(f.path);t.after(()=>db.close());
+ const before=db.prepare('SELECT * FROM purra_approvals').all();
+ for(const options of [{},{runId:'run-1'}]){
+  const statements=[],original=DatabaseSync.prototype.prepare;
+  const capture=t.mock.method(DatabaseSync.prototype,'prepare',function(query){statements.push(query);return original.call(this,query);});
+  let records;try{records=await store.listPending(options);}finally{capture.mock.restore();}
+  assert.deepEqual(records.map(r=>r.approvalId),expected.toSorted());
+  assert.equal(statements.filter(q=>q.startsWith('SELECT')&&q.includes('FROM purra_approvals')).length,1);
+  assert.deepEqual(db.prepare('SELECT * FROM purra_approvals').all(),before);
+ }
+ db.prepare('UPDATE purra_approvals SET call_id=? WHERE approval_id=?').run('corrupt',expected[0]);
+ await assert.rejects(store.listPending(),{code:'approval_record_conflict'});
+});

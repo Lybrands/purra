@@ -54,6 +54,10 @@ class SqliteApprovalStore:
         ).fetchone()
         if row is None:
             _fail("approval_not_found")
+        return self._decode(approval_id, row)
+
+    @staticmethod
+    def _decode(approval_id, row):
         record = ApprovalRecord.from_mapping(json.loads(row[2]))
         if record.approval_id != approval_id or (record.intent.run_id, record.intent.tool_call_id) != row[:2]:
             _fail("approval_record_conflict")
@@ -224,11 +228,11 @@ class SqliteApprovalStore:
         async with self._storage._connection(read_only=True):
             self._enabled()
             rows = self._storage._db.execute(
-                "SELECT approval_id FROM purra_approvals WHERE scope=? AND sdk='python'"
+                "SELECT approval_id,run_id,call_id,body FROM purra_approvals WHERE scope=? AND sdk='python'"
                 + (" AND run_id=?" if run_id is not None else "") + " ORDER BY approval_id",
                 (self._storage.scope, run_id) if run_id is not None else (self._storage.scope,),
             ).fetchall()
-            return tuple(record for (identifier,) in rows if (record := self._load(identifier)).status in {"pending", "approved"})
+            return tuple(record for row in rows if (record := self._decode(row[0], row[1:])).status in {"pending", "approved"})
 
     async def _refresh(self, session, record, now):
         canceled, deadline, fingerprint = await self._run_state(session, record.intent)

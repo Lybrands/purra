@@ -34,6 +34,9 @@ async function load(db: DatabaseSync, scope: string, id: string): Promise<Approv
   text(id); enabled(db);
   const row = db.prepare("SELECT run_id,call_id,body FROM purra_approvals WHERE scope=? AND sdk='typescript' AND approval_id=?").get(scope, id);
   if (!row) fail("approval_not_found");
+  return decode(id, row);
+}
+async function decode(id: string, row: Record<string, unknown>): Promise<ApprovalRecord> {
   const record = await copyApprovalRecord(JSON.parse(String(row.body)));
   if (record.approvalId !== id || record.intent.runId !== row.run_id || record.intent.toolCallId !== row.call_id) fail("approval_record_conflict");
   return record;
@@ -133,10 +136,10 @@ export class SqliteApprovalStore {
     if (runId !== undefined) text(runId);
     return this.access.read(async (db, scope) => {
       enabled(db);
-      const query = db.prepare("SELECT approval_id FROM purra_approvals WHERE scope=? AND sdk='typescript'"
+      const query = db.prepare("SELECT approval_id,run_id,call_id,body FROM purra_approvals WHERE scope=? AND sdk='typescript'"
         + (runId === undefined ? "" : " AND run_id=?") + " ORDER BY approval_id");
       const rows = runId === undefined ? query.all(scope) : query.all(scope, runId);
-      const records = await Promise.all(rows.map(row => load(db, scope, String(row.approval_id))));
+      const records = await Promise.all(rows.map(row => decode(String(row.approval_id), row)));
       return Object.freeze(records.filter(record => ["pending", "approved"].includes(record.status)));
     });
   }

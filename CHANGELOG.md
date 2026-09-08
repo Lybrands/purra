@@ -2,6 +2,9 @@
 
 ## 1.1.0 — Unreleased development
 
+- Read pending approval records with one table query in both SQLite adapters,
+  preserving identity validation, ordering, state filtering and read-only behavior.
+
 - Emit provisional `planning.delta` events for each nonempty planning content chunk,
   before complete JSON records arrive. Persist and validate exact source evidence
   in memory and SQLite; preserve final plan admission and private reasoning.

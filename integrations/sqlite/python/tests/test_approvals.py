@@ -194,3 +194,36 @@ async def test_creation_replay_uses_json_identity_not_python_value_equality(tmp_
         with pytest.raises(Exception) as conflict:await store.create(boolean,expires_at_ms=2000)
         assert conflict.value.code=='approval_intent_conflict'
     finally:storage.close()
+
+@pytest.mark.asyncio
+async def test_pending_list_reads_records_once_and_preserves_validation(tmp_path):
+    storage = SqliteAgentAdapters(tmp_path / 'db', scope='fixture')
+    try:
+        await storage.enable_approvals()
+        await begin(storage)
+        store = storage.approval_store(authorize=lambda *args: True, clock_ms=lambda: 1000)
+        expected = []
+        for index in range(12):
+            record = await store.create(replace(intent(), tool_call_id=f'call-{index}'), expires_at_ms=2000)
+            if index % 2:
+                await store.decide(command(record, key=f'reject-{index}', decision='reject'), principal_id='host')
+            else:
+                expected.append(record.approval_id)
+        before = storage._db.execute('SELECT * FROM purra_approvals').fetchall()
+        for run_id in (None, 'run-1'):
+            statements = []
+            storage._db.set_trace_callback(statements.append)
+            try:
+                records = await store.list_pending(run_id=run_id)
+            finally:
+                storage._db.set_trace_callback(None)
+            assert [r.approval_id for r in records] == sorted(expected)
+            reads = [q for q in statements if q.startswith('SELECT') and 'FROM purra_approvals' in q]
+            assert len(reads) == 1, reads
+            assert storage._db.execute('SELECT * FROM purra_approvals').fetchall() == before
+        storage._db.execute('UPDATE purra_approvals SET call_id=? WHERE approval_id=?', ('corrupt', expected[0]))
+        with pytest.raises(Exception) as error:
+            await store.list_pending()
+        assert error.value.code == 'approval_record_conflict'
+    finally:
+        storage.close()
