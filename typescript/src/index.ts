@@ -474,3 +474,5 @@ export { RecoveryWorker } from "./worker.js";
 export type { RecoveryWorkerResult, RecoverySchedule } from "./worker.js";
 export { selectModelRoute, resolveModelRoute } from './model/routing.js';
 export type { ModelRouteCandidate, ModelRouteRequirements } from './model/routing.js';
+export { ModelRouteRegistry } from './model/routing.js';
+export type { ModelRouteBinding } from './model/routing.js';

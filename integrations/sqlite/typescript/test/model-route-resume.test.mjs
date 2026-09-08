@@ -5,15 +5,17 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createApprovalHost, paused, approve, request } from './approval-host.mjs';
 import { testGateway } from '../../../../typescript/test/support/model-gateway.mjs';
-import { resolveModelRoute } from 'purra';
+import { resolveModelRoute, ModelRouteRegistry } from 'purra';
 
 test('route survives reopen, rejects missing/changed binding, and resumes once', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'purra-route-')), path = join(dir, 'db');
   const route = {bindingId:'host-model', revision:'1', configIdentity:'config-1', capabilities:testGateway({}).capabilities,
     policyId:'ordered', policyRevision:'1'};
   let host;
+  const create = async selected => createApprovalHost(path, {modelRoute:selected});
+  const registry = new ModelRouteRegistry([{candidate:route, create}]);
   try {
-    host = createApprovalHost(path, {modelRoute:route});
+    host = await registry.createNew(['host-model'], {reasoningMode:'default'});
     const id = await paused(host);
     assert.equal((await host.storage.runs.get(id)).preset.modelRoute.bindingId, 'host-model');
     host.storage.close(); host = undefined;
@@ -28,7 +30,8 @@ test('route survives reopen, rejects missing/changed binding, and resumes once',
     const resolved = await resolveModelRoute([{...route, policyRevision:'2'}], savedRoute, ['host-model']);
     assert.equal(resolved.policyRevision, '1');
     host.storage.close(); host = undefined;
-    host = createApprovalHost(path, {modelRoute:resolved});
+    const rebuiltRegistry = new ModelRouteRegistry([{candidate:{...route,policyRevision:'2'}, create}]);
+    host = await rebuiltRegistry.createRecovery(savedRoute, ['host-model']);
     const restored = await host.storage.runs.get(id);
     assert.throws(() => {restored.preset.modelRoute.capabilities.protocol.toolCalling = 'unavailable';});
     await assert.rejects(host.agent.resume(id, {...request, maxGenerationTokens:128}), {code:'agent_preset_mismatch'});

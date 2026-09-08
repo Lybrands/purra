@@ -1,6 +1,8 @@
 """Pure ordered selection of host-authorized model bindings; no Run dispatch."""
 from dataclasses import dataclass, replace
-from collections.abc import Sequence, Mapping
+from collections.abc import Sequence, Mapping, Callable, Awaitable
+from typing import Generic, TypeVar
+from types import MappingProxyType
 from purra.json_values import thaw_json_mapping
 import json
 
@@ -95,3 +97,43 @@ def resolve_model_route(candidates: Sequence[ModelRouteCandidate], saved: Mappin
             if json.dumps(expected, sort_keys=True, allow_nan=False) == json.dumps(actual, sort_keys=True, allow_nan=False):
                 return resolved
     raise ContractViolationError("Saved model route is missing, revoked or changed", code="model_route_mismatch")
+
+
+Host = TypeVar('Host')
+
+
+@dataclass(frozen=True, slots=True)
+class ModelRouteBinding(Generic[Host]):
+    candidate: ModelRouteCandidate
+    create: Callable[[ModelRouteCandidate], Awaitable[Host]]
+
+    def __post_init__(self):
+        if not isinstance(self.candidate, ModelRouteCandidate) or not callable(self.create):
+            raise TypeError('Model route binding requires a candidate and async host factory')
+
+
+class ModelRouteRegistry(Generic[Host]):
+    """Snapshot host factories; construct per-call hosts without shared selection state.
+
+    Factories must apply the supplied route to the Agent preset. The caller owns
+    the returned host's lifetime and invokes public submit/resume itself.
+    """
+
+    def __init__(self, bindings: Sequence[ModelRouteBinding[Host]]):
+        rows = tuple(bindings)
+        if not all(isinstance(row, ModelRouteBinding) for row in rows):
+            raise TypeError('Invalid model route binding')
+        if len({row.candidate.binding_id for row in rows}) != len(rows):
+            raise ValueError('Duplicate model route binding')
+        self._bindings = MappingProxyType({row.candidate.binding_id: row for row in rows})
+        self._candidates = tuple(row.candidate for row in rows)
+
+    async def create_new(self, allowed_binding_ids: Sequence[str], requirements: TaskCapabilityRequirements,
+                         *, policy_id: str | None = None, policy_revision: str | None = None) -> Host:
+        route = select_model_route(self._candidates, allowed_binding_ids, requirements,
+                                   policy_id=policy_id, policy_revision=policy_revision)
+        return await self._bindings[route.binding_id].create(route)
+
+    async def create_recovery(self, saved: Mapping[str, object], allowed_binding_ids: Sequence[str]) -> Host:
+        route = resolve_model_route(self._candidates, saved, allowed_binding_ids)
+        return await self._bindings[route.binding_id].create(route)

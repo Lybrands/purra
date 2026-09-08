@@ -2,8 +2,8 @@
 
 Status: pure candidate selection and opt-in preset-bound route persistence are
 implemented in both SDKs. Saved binding resolution and optional policy identity
-are also implemented. Automatic Agent construction, installed-package acceptance
-and complete R01 acceptance remain open.
+are also implemented. Host factory registries now construct per-call hosts from
+the selected/resolved route. Complete R01 acceptance remains open.
 
 Python exports `ModelRouteCandidate` and `select_model_route` from `purra.api`;
 TypeScript exports `ModelRouteCandidate`, `ModelRouteRequirements` and
@@ -117,6 +117,33 @@ An unavailable binding does not authorize fallback to another model. Unrouted
 legacy Runs continue through the existing APIs without a synthetic route record.
 
 ## Required implementation and acceptance slices
+
+### Host factory registry
+
+Python exports `ModelRouteBinding(candidate, create)` and `ModelRouteRegistry`.
+TypeScript exports the equivalent binding interface and registry class. `create`
+is an async factory accepting the immutable route and returning a host-owned
+Agent or host wrapper. It must attach that route to the preset and bind the
+corresponding gateway/request configuration. Factories are trusted host code;
+the registry cannot detect a dishonest factory or a factory reusing mutable state.
+
+`create_new` / `createNew` selects then invokes exactly one registered factory.
+`create_recovery` / `createRecovery` resolves the saved canonical route then
+invokes its factory, retaining the original policy identity. Registry construction
+copies registrations and rejects duplicate binding IDs. Selection/resolution
+failure calls no factory; a factory failure propagates without model fallback.
+Concurrent calls have separate selected route values and no shared current-model
+slot. The caller owns closing returned hosts, submit/resume options, credentials,
+and resource cleanup if its factory fails partway through construction.
+
+The SQLite route tests now use the registry to construct both the submitting and
+reopened host. Deterministic concurrent-factory tests cover separate selections,
+registration mutation, revoked authorization and failure without fallback. Current
+isolated wheel checks cover selection/factories plus Python SQLite approval
+recovery; npm tarball checks cover selection/factories. TypeScript SQLite installed
+recovery, broader concurrent execution and full R01 acceptance remain open.
+
+### Remaining acceptance
 
 1. Add dual-SDK selection contracts and capability filtering; verify unknown IDs,
    authorization, no eligible candidate and mutable-input isolation.

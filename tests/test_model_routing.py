@@ -1,6 +1,8 @@
 from dataclasses import replace
 import pytest
 from purra.api import ModelRouteCandidate, select_model_route, resolve_model_route
+from purra.api import ModelRouteBinding, ModelRouteRegistry
+import asyncio
 from purra.errors import ContractViolationError
 from purra.model_protocol import generic_capability_snapshot, TaskCapabilityRequirements
 
@@ -56,3 +58,32 @@ def test_saved_policy_survives_new_selection_policy_and_order():
         assert error.value.code == 'model_route_mismatch'
     with pytest.raises(ValueError): resolve_model_route([a, a], saved, ['a'])
     with pytest.raises(ValueError): replace(a, policy_id='partial')
+
+
+@pytest.mark.asyncio
+async def test_registry_concurrent_factories_and_fail_closed_resolution():
+    entered = []
+    both = asyncio.Event()
+    async def create(route):
+        entered.append(route.binding_id)
+        if len(entered) == 2: both.set()
+        await asyncio.wait_for(both.wait(), 2)
+        return {'route': route}
+    bindings = [ModelRouteBinding(candidate(name), create) for name in ['a', 'b']]
+    registry = ModelRouteRegistry(bindings)
+    bindings.clear()
+    a, b = await asyncio.gather(*[registry.create_new([name], TaskCapabilityRequirements('default'),
+        policy_id='ordered', policy_revision='1') for name in ['a', 'b']])
+    assert a is not b
+    assert [a['route'].binding_id, b['route'].binding_id] == ['a', 'b']
+    recovered = await registry.create_recovery(a['route'].to_mapping(), ['a'])
+    assert recovered['route'] == a['route']
+    count = len(entered)
+    with pytest.raises(ContractViolationError): await registry.create_recovery(a['route'].to_mapping(), [])
+    with pytest.raises(ContractViolationError): await registry.create_new([], TaskCapabilityRequirements('default'))
+    assert len(entered) == count
+    async def fail(route): raise RuntimeError('factory failed')
+    failing = ModelRouteRegistry([ModelRouteBinding(candidate('a'), fail), ModelRouteBinding(candidate('b'), create)])
+    with pytest.raises(RuntimeError, match='factory failed'):
+        await failing.create_new(['a', 'b'], TaskCapabilityRequirements('default'))
+    assert len(entered) == count  # no fallback to another factory

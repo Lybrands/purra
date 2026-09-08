@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { selectModelRoute, resolveModelRoute } from 'purra';
+import { ModelRouteRegistry } from 'purra';
 
 function candidate(bindingId) {
   return { bindingId, revision: '1', configIdentity: 'cfg', capabilities: {
@@ -49,4 +50,29 @@ test('saved route ignores current ordering/policy and rejects missing, revoked o
   }
   await assert.rejects(resolveModelRoute([a,a], saved, ['a']));
   assert.throws(() => selectModelRoute([a], ['a'], req, {id:'partial'}));
+});
+
+test('registry isolates concurrent factories, snapshots registration and never falls back', async () => {
+  const entered = [];
+  let release;
+  const both = new Promise(resolve => {release = resolve;});
+  const create = async route => {
+    entered.push(route.bindingId);
+    if (entered.length === 2) release();
+    await both;
+    return {route};
+  };
+  const bindings = ['a','b'].map(id => ({candidate:candidate(id), create}));
+  const registry = new ModelRouteRegistry(bindings);
+  bindings[0].candidate.revision = 'changed'; bindings[0].create = () => {throw Error('mutated');}; bindings.length = 0;
+  const [a,b] = await Promise.all(['a','b'].map(id => registry.createNew([id], req, {id:'ordered', revision:'1'})));
+  assert.notEqual(a,b); assert.deepEqual([a.route.bindingId,b.route.bindingId], ['a','b']);
+  assert.equal(a.route.revision,'1');
+  assert.deepEqual((await registry.createRecovery(a.route, ['a'])).route, a.route);
+  const count = entered.length;
+  await assert.rejects(registry.createRecovery(a.route, []), {code:'model_route_mismatch'});
+  await assert.rejects(registry.createNew([], req), {code:'model_route_unavailable'});
+  const failing = new ModelRouteRegistry([{candidate:candidate('a'), create:async () => {throw Error('factory failed');}}, {candidate:candidate('b'), create}]);
+  await assert.rejects(failing.createNew(['a','b'], req), /factory failed/);
+  assert.equal(entered.length,count);
 });

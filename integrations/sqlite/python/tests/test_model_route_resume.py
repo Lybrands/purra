@@ -2,6 +2,8 @@ from dataclasses import replace
 import time
 import pytest
 from purra.api import ModelRouteCandidate, AgentCoreRunOptions, resolve_model_route
+from purra.api import ModelRouteBinding, ModelRouteRegistry
+from purra.model_protocol import TaskCapabilityRequirements
 from purra.model_protocol import generic_capability_snapshot
 from purra.approvals import ApprovalRequired, ApprovalDecisionCommand
 from test_approval_resume import ApprovalHost
@@ -12,7 +14,9 @@ async def test_route_reopen_preserves_identity_and_rejects_drift(tmp_path):
     route = ModelRouteCandidate('host-model', '1', 'config-1', replace(generic_capability_snapshot(), max_generation_tokens=128),
                                 policy_id='ordered', policy_revision='1')
     path = tmp_path / 'route.db'
-    host = ApprovalHost(path, model_route=route)
+    async def create(selected): return ApprovalHost(path, model_route=selected)
+    registry = ModelRouteRegistry([ModelRouteBinding(route, create)])
+    host = await registry.create_new(['host-model'], TaskCapabilityRequirements('default'))
     expiry = int(time.time() * 1000) + 60000
     host.expiry = expiry
     try:
@@ -39,7 +43,8 @@ async def test_route_reopen_preserves_identity_and_rejects_drift(tmp_path):
         resolved = resolve_model_route([replace(route, policy_revision='2')], saved_route, ['host-model'])
         assert resolved.policy_revision == '1'
     finally: await probe.close()
-    host = ApprovalHost(path, model_route=resolved); host.expiry = expiry
+    rebuilt_registry = ModelRouteRegistry([ModelRouteBinding(replace(route, policy_revision='2'), create)])
+    host = await rebuilt_registry.create_recovery(saved_route, ['host-model']); host.expiry = expiry
     try:
         with pytest.raises(Exception) as rejected:
             changed = replace(host.request, model=replace(host.request.model, model='other'))

@@ -72,3 +72,35 @@ export async function resolveModelRoute(candidates: readonly ModelRouteCandidate
   }
   throw new AgentError('model_route_mismatch', 'Saved model route is missing, revoked or changed');
 }
+
+export interface ModelRouteBinding<Host> {
+  readonly candidate: ModelRouteCandidate;
+  readonly create: (route: ModelRouteCandidate) => Promise<Host>;
+}
+
+/** Factories apply the route to the preset; callers own host disposal and public execution. */
+export class ModelRouteRegistry<Host> {
+  readonly #bindings: ReadonlyMap<string, ModelRouteBinding<Host>>;
+  readonly #candidates: readonly ModelRouteCandidate[];
+
+  constructor(bindings: readonly ModelRouteBinding<Host>[]) {
+    const rows = bindings.map(binding => {
+      if (typeof binding.create !== 'function') throw new TypeError('Model route binding requires a host factory');
+      return Object.freeze({candidate:copyModelRouteCandidate(binding.candidate), create:binding.create});
+    });
+    if (new Set(rows.map(row => row.candidate.bindingId)).size !== rows.length) throw new TypeError('Duplicate model route binding');
+    this.#bindings = new Map(rows.map(row => [row.candidate.bindingId, row]));
+    this.#candidates = Object.freeze(rows.map(row => row.candidate));
+  }
+
+  async createNew(allowedBindingIds: readonly string[], requirements: ModelRouteRequirements,
+    policy?: {readonly id: string; readonly revision: string}): Promise<Host> {
+    const route = selectModelRoute(this.#candidates, allowedBindingIds, requirements, policy);
+    return this.#bindings.get(route.bindingId)!.create(route);
+  }
+
+  async createRecovery(saved: ModelRouteCandidate, allowedBindingIds: readonly string[]): Promise<Host> {
+    const route = await resolveModelRoute(this.#candidates, saved, allowedBindingIds);
+    return this.#bindings.get(route.bindingId)!.create(route);
+  }
+}
