@@ -1,5 +1,10 @@
 import type { RecoveryInspection } from "./observability/inspection.js";
 
+export interface RecoverySchedule {
+  ready(runId: string): Promise<number | null>;
+  settle(runId: string, revision: number, failed: boolean): Promise<boolean>;
+}
+
 export interface RecoveryWorkerResult {
   readonly runId: string;
   readonly action: "blocked" | "settled" | "failed";
@@ -11,6 +16,7 @@ export interface RecoveryWorkerResult {
  * The host reconstructs requests/bindings and schedules subsequent scans.
  */
 export class RecoveryWorker {
+  readonly #schedule: RecoverySchedule | undefined;
   #active = false;
   #serving = false;
   #wakePending = false;
@@ -20,10 +26,12 @@ export class RecoveryWorker {
   readonly #resume: (runId: string) => Promise<unknown>;
 
   constructor(options: {
+    schedule?: RecoverySchedule;
     discover: () => Promise<readonly string[]>;
     inspect: (runId: string) => Promise<RecoveryInspection>;
     resume: (runId: string) => Promise<unknown>;
   }) {
+    this.#schedule = options.schedule;
     this.#discover = options.discover;
     this.#inspect = options.inspect;
     this.#resume = options.resume;
@@ -90,21 +98,27 @@ export class RecoveryWorker {
       const results: RecoveryWorkerResult[] = [];
       for (const runId of new Set(await this.#discover())) {
         if (stopped()) break;
+        const revision = this.#schedule === undefined ? 0 : await this.#schedule.ready(runId);
+        if (revision === null) {
+          results.push(Object.freeze({ runId, action: "blocked", reasons: Object.freeze(["retry_not_due"]) }));
+          continue;
+        }
         let stage = "inspection_failed";
         try {
           const report = await this.#inspect(runId);
           if (report.blockers.length > 0) {
             results.push(Object.freeze({ runId, action: "blocked", reasons: Object.freeze([...report.blockers]) }));
-            continue;
+          } else {
+            if (stopped()) break;
+            stage = "resume_failed";
+            await this.#resume(runId);
+            results.push(Object.freeze({ runId, action: "settled", reasons: Object.freeze([]) }));
           }
-          if (stopped()) break;
-          stage = "resume_failed";
-          await this.#resume(runId);
-          results.push(Object.freeze({ runId, action: "settled", reasons: Object.freeze([]) }));
         } catch {
           // Do not expose exception messages containing host/tool data.
           results.push(Object.freeze({ runId, action: "failed", reasons: Object.freeze([stage]) }));
         }
+        await this.#schedule?.settle(runId, revision, results[results.length - 1]!.action === "failed");
       }
       return Object.freeze(results);
     } finally {

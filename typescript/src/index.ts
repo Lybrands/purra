@@ -471,4 +471,4 @@ export { ApprovalRequired } from "./approvals.js";
 export { copyToolHandlerResult } from "./tools/catalog.js";
 
 export { RecoveryWorker } from "./worker.js";
-export type { RecoveryWorkerResult } from "./worker.js";
+export type { RecoveryWorkerResult, RecoverySchedule } from "./worker.js";

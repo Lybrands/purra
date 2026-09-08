@@ -482,7 +482,8 @@ test('worker service wakes after committed approval', { timeout: 5000 }, async t
   const { RecoveryWorker } = await import('purra');
   const open = setup(t), host = open(), id = await paused(host);
   const stop = new AbortController(), reports = [];
-  const worker = new RecoveryWorker({ discover: () => host.storage.listRunning(),
+  const schedule = host.storage.recoverySchedule();
+  const worker = new RecoveryWorker({ schedule, discover: () => host.storage.listRunning(),
     inspect: id => host.storage.inspectRecovery(id),
     resume: async id => (await host.agent.resume(id, request)).result,
   });
@@ -494,6 +495,7 @@ test('worker service wakes after committed approval', { timeout: 5000 }, async t
           assert.equal(report[0].action, 'blocked');
           assert.deepEqual(host.counts, { model: 1, tool: 0 });
           await approve(host, id);
+          await schedule.wake(id);
           worker.wake();
         } else stop.abort();
       },

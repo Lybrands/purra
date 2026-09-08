@@ -1,3 +1,5 @@
+import { SqliteRecoverySchedule } from "./recovery-schedule.js";
+export { SqliteRecoverySchedule } from "./recovery-schedule.js";
 import { OutputJournal } from "./journal.js";
 export type { ApprovalUpgradeInspection } from "./approval-format.js";
 import { storageVersion, enableApprovals, inspectApprovalUpgrade, type ApprovalUpgradeInspection } from "./approval-format.js";
@@ -265,6 +267,10 @@ export class SqliteAgentAdapters {
       else if (proof.notExecuted === true) delete extra.tools[key];
       else throw new TypeError("invalid tool reconciliation proof");
     });
+  }
+
+  recoverySchedule(options: { intervalMs?: number; maxBackoffMs?: number; clockMs?: () => number } = {}): SqliteRecoverySchedule {
+    return new SqliteRecoverySchedule((operation, readOnly) => this.#transaction((_all, extra) => operation(extra), readOnly, "extra"), options);
   }
 
   async listRunning(): Promise<readonly string[]> {

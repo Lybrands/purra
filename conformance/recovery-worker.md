@@ -89,3 +89,39 @@ open. SQLite discovery currently restores Core state and journal data; it is not
 cheap metadata-only queue query. Configure polling for the actual database size;
 do not infer capacity from synthetic tests. Process supervision and business
 Provider/MCP/downstream operation remain unvalidated.
+
+## Persistent per-Run schedule
+
+Create `schedule = storage.recovery_schedule(...)` in Python or
+`const schedule = storage.recoverySchedule(...)` in TypeScript, and pass it as the
+worker's optional `schedule` constructor argument. Existing callers are unchanged.
+The configured interval and maximum use the same names/defaults as the service
+loop; `clock_ms` / `clockMs` is injectable for deterministic testing. Use a stable
+host wall clock in operation. Clock jumps can change how long a retry waits.
+
+This adapter stores scheduling hints in the scoped, SDK-specific SQLite state
+extension. Each Run has a revision, consecutive failure count, and `notBeforeMs`.
+It adds no new lease or execution permit. `ready` returns a revision or no token
+when not due; the worker reports `blocked` with `retry_not_due` in the latter case.
+After inspection/resume, `settle` conditionally advances that revision and writes
+the next eligible time. Failure delays double up to the configured cap; a blocked
+or settled callback resets failures and waits one interval. Read/write failures in
+the scheduling adapter propagate and stop the scan, rather than silently disabling
+persistence. The service's scan-wide delay remains independent; polling cadence can
+make the actual retry later than its eligible time. These are scheduling delays,
+not a retry count limit or proof that a failed operation is safe to repeat.
+
+After committing an approval or reconciliation, call `await schedule.wake(runId)`
+then `worker.wake()`. The first commits a new revision with no delay, the second is
+only a prompt local hint. An old scan cannot overwrite a newer wake: its conditional
+settlement returns false. Competing scanners still acquire execution ownership
+through public resume. `ready` does not reserve a Run. A restart reads the same
+persisted schedule; no process-local failure counter needs reconstruction.
+
+Approval/effect commits and schedule notifications currently use separate
+transactions. If the process dies between them, normal interval/backoff expiry
+still triggers reinspection. This is not yet an atomic durable subscription or
+outbox. Only host-registered Run IDs should receive notifications; schedule entries
+currently persist after terminal Runs leave discovery. Pruning, bounded fair
+metadata discovery, atomic subscriptions, maximum retry policy and diagnostics
+remain W01 work. Do not clear execution claims to force a retry.

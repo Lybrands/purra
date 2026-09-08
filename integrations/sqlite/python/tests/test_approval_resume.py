@@ -636,6 +636,7 @@ async def test_worker_service_wakes_after_committed_approval(tmp_path):
     host.expiry = int(time.time() * 1000) + 60000
     stop = asyncio.Event()
     reports = []
+    schedule = host.storage.recovery_schedule()
     try:
         await host.storage.enable_approvals()
         options = AgentCoreRunOptions(tool_checkpoint_handler=host.boundary)
@@ -650,10 +651,11 @@ async def test_worker_service_wakes_after_committed_approval(tmp_path):
                 assert (host.model_calls, host.tool_calls) == (1, 0)
                 record = (await host.approvals.list_pending())[0]
                 await host.approvals.decide(ApprovalDecisionCommand(record.approval_id, record.revision, record.intent.digest, 'wake', 'approve'), principal_id='host')
+                await schedule.wake(handle.run_id)
                 worker.wake()
             else:
                 stop.set()
-        worker = RecoveryWorker(discover=host.storage.list_running, inspect=host.storage.inspect_recovery, resume=resume)
+        worker = RecoveryWorker(discover=host.storage.list_running, inspect=host.storage.inspect_recovery, resume=resume, schedule=schedule)
         await asyncio.wait_for(worker.run(stop=stop, poll_interval_ms=60000, max_backoff_ms=60000, on_scan=observed), 5)
         assert len(reports) == 2 and reports[1][0].action == 'settled'
         assert host.tool_calls == 1

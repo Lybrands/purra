@@ -3,7 +3,7 @@ import asyncio
 
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
 
 @dataclass(frozen=True, slots=True)
@@ -11,6 +11,11 @@ class RecoveryWorkerResult:
     run_id: str
     action: Literal["blocked", "settled", "failed"]
     reasons: tuple[str, ...] = ()
+
+
+class RecoverySchedule(Protocol):
+    async def ready(self, run_id: str) -> int | None: ...
+    async def settle(self, run_id: str, revision: int, failed: bool) -> bool: ...
 
 
 class RecoveryWorker:
@@ -27,10 +32,12 @@ class RecoveryWorker:
         discover: Callable[[], Awaitable[Sequence[str]]],
         inspect: Callable[[str], Awaitable[Mapping[str, Any]]],
         resume: Callable[[str], Awaitable[object]],
+        schedule: RecoverySchedule | None = None,
     ) -> None:
         self._discover = discover
         self._inspect = inspect
         self._resume = resume
+        self._schedule = schedule
         self._active = False
         self._serving = False
         self._wake = asyncio.Event()
@@ -87,21 +94,27 @@ class RecoveryWorker:
             for run_id in dict.fromkeys(await self._discover()):
                 if stopped():
                     break
+                revision = await self._schedule.ready(run_id) if self._schedule is not None else 0
+                if revision is None:
+                    results.append(RecoveryWorkerResult(run_id, "blocked", ("retry_not_due",)))
+                    continue
                 stage = "inspection_failed"
                 try:
                     report = await self._inspect(run_id)
                     reasons = tuple(report["blockers"])
                     if reasons:
                         results.append(RecoveryWorkerResult(run_id, "blocked", reasons))
-                        continue
-                    if stopped():
-                        break
-                    stage = "resume_failed"
-                    await self._resume(run_id)
-                    results.append(RecoveryWorkerResult(run_id, "settled"))
+                    else:
+                        if stopped():
+                            break
+                        stage = "resume_failed"
+                        await self._resume(run_id)
+                        results.append(RecoveryWorkerResult(run_id, "settled"))
                 except Exception:
                     # Exception text may contain host credentials or tool arguments.
                     results.append(RecoveryWorkerResult(run_id, "failed", (stage,)))
+                if self._schedule is not None:
+                    await self._schedule.settle(run_id, revision, results[-1].action == "failed")
             return tuple(results)
         finally:
             self._active = False

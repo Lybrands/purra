@@ -261,6 +261,10 @@ class SqliteAgentAdapters:
                 del adapters.extra["approvalExecutions"][approval.approval_id]
             del self._claims[key]
 
+    def recovery_schedule(self, **options):
+        from .recovery_schedule import SqliteRecoverySchedule
+        return SqliteRecoverySchedule(self, **options)
+
     async def list_running(self):
         async with self._transaction(read_only=True, with_journal=False) as adapters:
             return adapters.running_run_ids()
