@@ -2,6 +2,9 @@
 
 ## 1.1.0 — Unreleased development
 
+- Add a standalone SQLite snapshot command with WAL-aware copying, integrity checks,
+  private staging and no-overwrite publication, plus offline rollback guidance.
+
 - Add read-only, database-wide SQLite approval-upgrade preflight in both SDKs.
   Activation revalidates under its writer transaction; a ready report grants no permission.
 

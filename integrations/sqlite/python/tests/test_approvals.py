@@ -271,3 +271,29 @@ async def test_upgrade_preflight_does_not_turn_corrupt_state_into_ready(tmp_path
             await storage.inspect_approval_upgrade()
     finally:
         storage.close()
+
+@pytest.mark.asyncio
+async def test_offline_backup_retains_pre_upgrade_history_in_new_path(tmp_path):
+    import subprocess
+    import sys
+    source, backup = tmp_path/'db', tmp_path/'backup.db'
+    storage = SqliteAgentAdapters(source, scope='fixture')
+    try:
+        await begin(storage)
+        await storage.runs.commit('run-1', RunCommit(terminal_status='done', final_response='done', events=(AgentEvent('run.completed', {}, 'run-1'),)))
+        history = await storage.outputs.list_events('run-1', after_sequence=0)
+        assert (await storage.inspect_approval_upgrade())['status'] == 'ready'
+        script = Path(__file__).parents[4] / 'scripts/backup_sqlite.py'
+        result = subprocess.run([sys.executable, '-I', str(script), str(source), str(backup)], check=True, capture_output=True, text=True)
+        assert json.loads(result.stdout)['storageVersion'] == 4
+        await storage.enable_approvals()
+        restored = SqliteAgentAdapters(backup, scope='fixture')
+        try:
+            assert (await restored.inspect_approval_upgrade())['storageVersion'] == 4
+            assert await restored.outputs.list_events('run-1', after_sequence=0) == history
+            assert (await restored.runs.get('run-1')).status.value == 'done'
+            assert (await storage.inspect_approval_upgrade())['storageVersion'] == 5
+        finally:
+            restored.close()
+    finally:
+        storage.close()

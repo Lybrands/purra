@@ -151,3 +151,21 @@ test('upgrade preflight rejects corrupt state',async t=>{
  const f=setup(t),s=f.open();await begin(s);const db=new DatabaseSync(f.path);t.after(()=>db.close());
  db.exec("UPDATE purra_state SET body='{}'");await assert.rejects(s.inspectApprovalUpgrade());
 });
+
+test('offline backup retains pre-upgrade history in a new path',async t=>{
+ const {execFileSync,spawnSync}=await import('node:child_process');
+ if(process.platform==='win32'||spawnSync('python3',['--version']).status!==0){t.skip('POSIX Python 3.11+ backup utility unavailable');return;}
+ const {fileURLToPath}=await import('node:url');
+ const f=setup(t),s=f.open();await assertRunRepositoryConforms(s.runs);
+ const history=await s.runs.listEvents('conformance-run-1',0),backup=f.path+'.backup';
+ const script=fileURLToPath(new URL('../../../../scripts/backup_sqlite.py',import.meta.url));
+ const result=JSON.parse(execFileSync('python3',['-I',script,f.path,backup],{encoding:'utf8'}));
+ assert.equal(result.storageVersion,4);await s.enableApprovals();
+ const restored=new SqliteAgentAdapters(backup,{scope:'fixture'});
+ try{
+  assert.equal((await restored.inspectApprovalUpgrade()).storageVersion,4);
+  assert.deepEqual(await restored.runs.listEvents('conformance-run-1',0),history);
+  assert.equal((await restored.runs.get('conformance-run-1')).status,'completed');
+  assert.equal((await s.inspectApprovalUpgrade()).storageVersion,5);
+ }finally{restored.close();}
+});

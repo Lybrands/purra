@@ -194,3 +194,6 @@ A `ready` result can become stale immediately. Stop writers, back up and use the
 existing explicit activation method; activation repeats the checks inside its write
 transaction. Preflight is not an upgrade permit, backup, automatic migration or
 v5-to-v4 rollback API. Never point a validation fixture at production data.
+
+For WAL-safe backup and restoration to a new path, see the
+[offline upgrade procedure](../../../conformance/sqlite-upgrade.md).
