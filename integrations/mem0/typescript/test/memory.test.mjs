@@ -662,6 +662,12 @@ test("links preserve visibility and audit stale or revoked endpoints", async t =
   assert.equal(operation.usage.embeddingCalls, 0); assert.equal(operation.usage.llmCalls, 0);
   assert.equal((await memory.get(a)).version, 1); assert.deepEqual(client.histories, before);
   assert.equal((await memory.links(a)).items[0].valid, true);
+  assert.deepEqual((await memory.links(a, {direction:"incoming"})).items, []);
+  assert.equal((await memory.links(b, {direction:"incoming", relation:"supports", validOnly:true})).items[0].key,"link");
+  assert.deepEqual((await memory.links(a, {relation:"unrelated"})).items, []);
+  for (const options of [{direction:"sideways"}, {relation:""}, {validOnly:"false"}]) {
+    await assert.rejects(memory.links(a, options), TypeError);
+  }
   memory.close();
   const restored = create();
   assert.deepEqual(await restored.link(from, to, "supports", { key: "link", note: "人工确认" }), operation);
@@ -674,9 +680,15 @@ test("links preserve visibility and audit stale or revoked endpoints", async t =
   await restored.link({ id: a, version: 2 }, to, "relates_to", { key: "link-2" });
   const page = await restored.links(a, { limit: 1 });
   assert.equal(page.next, "link"); assert.equal(page.items[0].valid, false);
+  const filtered = await restored.links(a, {limit:1, validOnly:true, relation:"relates_to", direction:"outgoing"});
+  assert.deepEqual(filtered.items, []); assert.equal(filtered.next,"link");
+  const nextPage = await restored.links(a, {limit:1, after:filtered.next, validOnly:true, relation:"relates_to", direction:"outgoing"});
+  assert.equal(nextPage.items[0].key,"link-2"); assert.equal(nextPage.next,null);
+  assert.deepEqual((await outsider.links(a, {validOnly:true,direction:"outgoing"})).items, []);
   assert.equal((await restored.links(a, { limit: 1, after: page.next })).items[0].valid, true);
   await restored.revokeSource(source.id, { key: "withdraw" });
   assert.ok((await restored.links(a)).items.every(link => !link.valid));
+  assert.deepEqual((await restored.links(a, {validOnly:true})).items, []);
 });
 
 test("explicit context reports whole deferred and missing records without search", async t => {

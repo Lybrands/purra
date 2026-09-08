@@ -292,15 +292,24 @@ export class Mem0Memory implements Retriever {
       return this.operation(key)!;
     }, options.signal);
   }
-  async links(id: string, options: { limit?: number; after?: string; signal?: AbortSignal } = {}): Promise<MemoryLinkPage> {
+  async links(id: string, options: { limit?: number; after?: string; direction?: "both" | "incoming" | "outgoing"; relation?: string; validOnly?: boolean; signal?: AbortSignal } = {}): Promise<MemoryLinkPage> {
     requiredText(id, "memory id", 512);
     const limit = positiveInteger(options.limit ?? 20, "limit", this.#maxResults);
     const after = options.after === undefined ? undefined : requiredText(options.after, "cursor", 512);
+    const direction = options.direction === undefined ? "both" : options.direction;
+    if (!["both", "incoming", "outgoing"].includes(direction)) throw new TypeError("Invalid relation direction");
+    const relation = options.relation === undefined ? undefined : requiredText(options.relation, "relation", 64);
+    const validOnly = options.validOnly === undefined ? false : options.validOnly;
+    if (typeof validOnly !== "boolean") throw new TypeError("validOnly must be boolean");
     return this.#call(async () => {
       const epoch = this.epoch, rows = this.#journal.links(id, after, limit + 1), items: MemoryLink[] = [];
       for (const { key, data } of rows.slice(0, limit)) {
+        if (relation !== undefined && data.relation !== relation
+          || direction === "incoming" && data.to.id !== id
+          || direction === "outgoing" && data.from.id !== id) continue;
         const from = await this.#read(data.from.id), to = await this.#read(data.to.id);
         const valid = from !== undefined && to !== undefined && from.version === data.from.version && to.version === data.to.version;
+        if (validOnly && !valid) continue;
         items.push(Object.freeze({ ...data, from: Object.freeze(data.from), to: Object.freeze(data.to), key, valid }));
       }
       this.assertEpoch(epoch);

@@ -97,6 +97,11 @@ async def test_links_preserve_visibility_and_audit_stale_or_revoked_endpoints(se
     assert (await memory.get(a)).version == 1
     assert {item_id: len(rows) for item_id, rows in sdk.histories.items()} == before
     assert (await memory.links(a)).items[0].valid
+    assert not (await memory.links(a, direction="incoming")).items
+    assert (await memory.links(b, direction="incoming", relation="supports", valid_only=True)).items[0].key == "link"
+    assert not (await memory.links(a, relation="unrelated")).items
+    for options in ({"direction": "sideways"}, {"relation": ""}, {"valid_only": "false"}):
+        with pytest.raises(ValueError): await memory.links(a, **options)
     memory.close()
     restored = create()
     assert await restored.link(*refs, "supports", key="link", note="人工确认") == operation
@@ -111,9 +116,15 @@ async def test_links_preserve_visibility_and_audit_stale_or_revoked_endpoints(se
     await restored.link(MemoryRef(a, 2), refs[1], "relates_to", key="link-2")
     page = await restored.links(a, limit=1)
     assert page.next == "link" and not page.items[0].valid
+    filtered = await restored.links(a, limit=1, valid_only=True, relation="relates_to", direction="outgoing")
+    assert not filtered.items and filtered.next == "link"
+    next_page = await restored.links(a, limit=1, after=filtered.next, valid_only=True, relation="relates_to", direction="outgoing")
+    assert next_page.items[0].key == "link-2" and next_page.next is None
+    assert not (await outsider.links(a, valid_only=True, direction="outgoing")).items
     assert (await restored.links(a, limit=1, after=page.next)).items[0].valid
     await restored.revoke_source(SOURCE.id, key="withdraw")
     assert all(not item.valid for item in (await restored.links(a)).items)
+    assert not (await restored.links(a, valid_only=True)).items
 
 
 @pytest.mark.asyncio

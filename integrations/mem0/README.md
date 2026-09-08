@@ -55,6 +55,13 @@ or record versions fail before activation. SDK examples are in the usage guides.
 | `revoke_source` / `revokeSource` | Withdraw a source or one of its revisions |
 | `validate_evidence` / `validateEvidence` | Check whether saved memory evidence remains usable |
 
+`links` optionally filters `direction` (`both`, `incoming`, `outgoing`), exact
+`relation`, and `valid_only` / `validOnly`. Its limit bounds scanned links, so
+an empty filtered page may still have a continuation cursor. Continue until
+`next` is null, keep filters fixed during traversal, and restart if the epoch
+changes. Validity concerns endpoint versions and visibility, not relation truth
+or a context evidence receipt. See [K01/K02 contract](../../conformance/memory-capture-relations.md).
+
 `list` returns `items`, `next`, and `epoch`. Continue with `next` even when a page
 is empty; `null` marks the end. Restart the view if its epoch changes. Its `query`
 filter is literal text matching; use `retrieve` for semantic search. Metadata

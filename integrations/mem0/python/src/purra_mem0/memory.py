@@ -444,10 +444,18 @@ class Mem0Memory:
             return self.operation(key)
         return await self._call(apply, signal)
 
-    async def links(self, item_id: str, *, limit: int = 20, after: str | None = None, signal=None) -> MemoryLinkPage:
+    async def links(self, item_id: str, *, limit: int = 20, after: str | None = None,
+                    direction: str = "both", relation: str | None = None,
+                    valid_only: bool = False, signal=None) -> MemoryLinkPage:
         """Audit bounded links; only matching, active endpoint versions are valid for use."""
         _text(item_id, "memory id", 512)
         _integer(limit, "limit", self._max_results)
+        if direction not in ("both", "incoming", "outgoing"):
+            raise ValueError("invalid relation direction")
+        if relation is not None:
+            _text(relation, "relation", 64)
+        if type(valid_only) is not bool:
+            raise ValueError("valid_only must be boolean")
         if after is not None:
             _text(after, "cursor", 512)
         def read():
@@ -455,9 +463,15 @@ class Mem0Memory:
             rows = self._journal.links(item_id, after, limit + 1)
             items = []
             for key, data in rows[:limit]:
+                if (relation is not None and data["relation"] != relation
+                        or direction == "incoming" and data["to"]["id"] != item_id
+                        or direction == "outgoing" and data["from"]["id"] != item_id):
+                    continue
                 refs = (MemoryRef(**data["from"]), MemoryRef(**data["to"]))
                 records = [self._read(ref.id) for ref in refs]
                 valid = all(record is not None and record.version == ref.version for record, ref in zip(records, refs))
+                if valid_only and not valid:
+                    continue
                 items.append(MemoryLink(key, *refs, data["relation"], data["note"], valid))
             self.assert_epoch(epoch)
             return MemoryLinkPage(tuple(items), rows[limit - 1][0] if len(rows) > limit else None, epoch)
