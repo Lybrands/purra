@@ -143,3 +143,40 @@ Pruning is explicit. Bounded fair metadata discovery, maximum retry policy,
 additional subscriptions and lifecycle diagnostics remain W01 work. Do not clear
 execution claims to force a retry. SQLite scopes still bound the amount of state
 restored per scheduling transaction; these changes do not establish capacity limits.
+
+## Bounded scans and local diagnostics
+
+Set `max_runs_per_scan=N` / `maxRunsPerScan: N` on the worker constructor to visit at
+most N distinct candidates per scan (positive 32-bit integer). Omission preserves
+the previous unlimited scan behavior. A visit includes checking persistent retry
+time, so waiting approvals and `retry_not_due` entries consume a slot and move to
+the back of the rotation. They cannot permanently occupy the first batch. Survivors
+retain their order across discovery reordering; vanished IDs are removed and newly
+seen IDs join the tail. Duplicates are collapsed. A scheduling failure or stop after
+a visit advances that candidate, so restarting the same worker loop does not keep
+selecting a failing first candidate. A stopped-before-visit candidate retains its
+place. The service still waits between batches using its configured polling policy.
+
+This bounds candidate processing and report size, not database discovery or memory:
+`discover` still returns the full list, and the worker keeps an O(N) process-local
+rotation. SQLite's full state/journal discovery costs are unchanged. Rotation is
+not persisted; a new worker instance starts with discovery order. Fairness applies
+to successive scans of a live worker and assumes host callbacks finish; one hung
+callback can still hold up serial work. Database pagination, durable fair cursors
+and load/capacity acceptance remain open.
+
+`worker.diagnostics()` returns a detached/read-only snapshot with schema version 1
+and `authority: diagnosis_only`. It includes `serving`, configured batch limit,
+current phase (`idle`, `discovering`, `scheduling`, `inspecting`, `resuming`,
+`settling`, `observing`, `waiting`) and `lastScan`. The last scan reports outcome
+(`complete`, `stopped`, `failed`, or Python cancellation `interrupted`), distinct
+candidate count, visits, unvisited/deferred count, and blocked/settled/failed result
+counts. A visit interrupted by stop or infrastructure failure may have no result;
+result counts need not sum to visits. An empty completed scan reports zeros.
+`lastScan` remains null before the first scan. Discovery failure has no candidate
+count evidence and reports zero; it is not evidence of an empty queue. Observer
+failure belongs to the service boundary, not the already completed scan outcome.
+
+These observations contain no Run identifiers, tool arguments, request contents or
+exception messages. They describe this worker instance, not fleet health or Run
+success, and never authorize a resume. Reading diagnostics performs no I/O.

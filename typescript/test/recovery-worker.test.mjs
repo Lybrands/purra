@@ -104,3 +104,46 @@ test('failed scans back off to cap and success resets', async t => {
     }
   } finally { stop.abort(); await task; }
 });
+
+test('bounded fair scans survive reorder, waiting and churn', async () => {
+  let ids = ['pending', 'deferred', 'ready', 'ready'];
+  const calls = [];
+  const worker = new RecoveryWorker({ maxRunsPerScan: 1,
+    schedule: { ready: async id => id === 'deferred' ? null : 0, settle: async () => true },
+    discover: async () => ids,
+    inspect: async id => buildRecoveryInspection(id === 'pending' ? { approvalState: 'pending' } : {}),
+    resume: async id => { calls.push(id); },
+  });
+  assert.equal((await worker.runOnce())[0].runId, 'pending');
+  ids = ['new', 'ready', 'deferred', 'pending'];
+  assert.equal((await worker.runOnce())[0].runId, 'deferred');
+  assert.equal((await worker.runOnce())[0].runId, 'ready');
+  assert.deepEqual(calls, ['ready']);
+  ids = ids.filter(id => id !== 'pending');
+  assert.equal((await worker.runOnce())[0].runId, 'new');
+  assert.deepEqual(worker.diagnostics().lastScan, { outcome: 'complete', candidates: 3, visited: 1, deferred: 2, blocked: 0, settled: 1, failed: 0 });
+  assert.equal(Object.isFrozen(worker.diagnostics().lastScan), true);
+  assert.equal(worker.diagnostics().authority, 'diagnosis_only');
+});
+
+test('schedule failure advances fair cursor without exposing exception text', async () => {
+  const seen = [];
+  const worker = new RecoveryWorker({ maxRunsPerScan: 1,
+    schedule: { ready: async id => {
+      seen.push(worker.diagnostics().phase);
+      if (id === 'bad') throw new Error('private');
+      return 0;
+    }, settle: async () => true },
+    discover: async () => ['bad', 'good'], inspect: async () => buildRecoveryInspection({}), resume: async () => {},
+  });
+  await assert.rejects(worker.runOnce(), /private/);
+  assert.equal(worker.diagnostics().lastScan.outcome, 'failed');
+  assert.equal(worker.diagnostics().lastScan.visited, 1);
+  assert.doesNotMatch(JSON.stringify(worker.diagnostics()), /private/);
+  assert.equal((await worker.runOnce())[0].runId, 'good');
+  assert.deepEqual(seen, ['scheduling', 'scheduling']);
+});
+
+for (const maxRunsPerScan of [true, 0, -1, 1.5, 2147483648]) test(`invalid batch limit ${maxRunsPerScan}`, () => {
+  assert.throws(() => new RecoveryWorker({ maxRunsPerScan }), /positive 32-bit integer/);
+});

@@ -134,3 +134,56 @@ async def test_idle_stop_and_observer_failure_release_lifecycle():
     with pytest.raises(ValueError, match='observer'):
         await worker.run(stop=stop, on_scan=fail)
     assert await worker.run_once() == ()
+
+
+@pytest.mark.asyncio
+async def test_bounded_fair_scans_survive_reorder_waiting_and_churn():
+    ids = ['pending', 'deferred', 'ready', 'ready']
+    calls = []
+    class Schedule:
+        async def ready(self, run_id): return None if run_id == 'deferred' else 0
+        async def settle(self, *args): return True
+    async def discover(): return ids
+    async def inspect(run_id):
+        return build_recovery_inspection({'approvalState': 'pending'} if run_id == 'pending' else {})
+    async def resume(run_id): calls.append(run_id)
+    worker = RecoveryWorker(discover=discover, inspect=inspect, resume=resume, schedule=Schedule(), max_runs_per_scan=1)
+    assert (await worker.run_once())[0].run_id == 'pending'
+    ids[:] = ['new', 'ready', 'deferred', 'pending']
+    assert (await worker.run_once())[0].run_id == 'deferred'
+    assert (await worker.run_once())[0].run_id == 'ready'
+    assert calls == ['ready']
+    ids.remove('pending')
+    assert (await worker.run_once())[0].run_id == 'new'
+    snapshot = worker.diagnostics()
+    assert snapshot['lastScan'] == {'outcome': 'complete', 'candidates': 3, 'visited': 1, 'deferred': 2, 'blocked': 0, 'settled': 1, 'failed': 0}
+    snapshot['lastScan']['visited'] = 999
+    assert worker.diagnostics()['lastScan']['visited'] == 1
+    assert worker.diagnostics()['authority'] == 'diagnosis_only'
+
+
+@pytest.mark.asyncio
+async def test_schedule_failure_advances_fair_cursor_and_reports_stage():
+    seen = []
+    class Schedule:
+        async def ready(self, run_id):
+            seen.append(worker.diagnostics()['phase'])
+            if run_id == 'bad': raise ValueError('private')
+            return 0
+        async def settle(self, *args): return True
+    async def discover(): return ['bad', 'good']
+    async def inspect(_): return build_recovery_inspection({})
+    async def resume(_): pass
+    worker = RecoveryWorker(discover=discover, inspect=inspect, resume=resume, schedule=Schedule(), max_runs_per_scan=1)
+    with pytest.raises(ValueError): await worker.run_once()
+    assert worker.diagnostics()['lastScan']['outcome'] == 'failed'
+    assert worker.diagnostics()['lastScan']['visited'] == 1
+    assert 'private' not in repr(worker.diagnostics())
+    assert (await worker.run_once())[0].run_id == 'good'
+    assert seen == ['scheduling', 'scheduling']
+
+
+@pytest.mark.parametrize('value', [True, 0, -1, 1.5, 2147483648])
+def test_invalid_batch_limit_rejected(value):
+    with pytest.raises(ValueError):
+        RecoveryWorker(discover=None, inspect=None, resume=None, max_runs_per_scan=value)
