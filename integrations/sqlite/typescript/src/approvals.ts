@@ -226,6 +226,19 @@ export async function checkApprovalDispatch(db: DatabaseSync, scope: string, all
 }
 
 
+/** Bind host reconciliation to the persisted approval; it grants no new dispatch. */
+export async function checkApprovalReconciliation(db: DatabaseSync, scope: string, claim: Record<string, any>): Promise<void> {
+  enabled(db);
+  if (typeof claim.approvalId !== "string" || !claim.approvalId) fail("approval_claim_conflict");
+  const row = db.prepare("SELECT approval_id,run_id,call_id,body FROM purra_approvals WHERE scope=? AND sdk='typescript' AND approval_id=?")
+    .get(scope, claim.approvalId);
+  if (!row || row.run_id !== claim.runId || row.call_id !== claim.callId) fail("approval_claim_conflict");
+  const record = await decode(String(row.approval_id), row);
+  const audit = record.decisionAudit as Partial<ApprovalDecisionAudit>;
+  if (claim.state !== "claimed" || claim.intentDigest !== record.intentDigest
+    || claim.approvalRevision !== audit.revision || audit.command?.decision !== "approve") fail("approval_claim_conflict");
+}
+
 /** Snapshot-only observations. Never refreshes approval state or acquires ownership. */
 export async function inspectApprovalState(db: DatabaseSync, scope: string, saved: Awaited<ReturnType<StorageStores["runs"]["get"]>>, extra: Record<string, any>, now: number) {
   if (storageVersion(db) !== 5) return {};

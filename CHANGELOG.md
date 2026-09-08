@@ -2,6 +2,9 @@
 
 ## 1.1.0 — Unreleased development
 
+- Revalidate TypeScript approval-linked claims against the persisted approval identity
+  and approved revision before host reconciliation; mismatches retain the unknown claim.
+
 - Bound offline SQLite backup waiting, validation and hashing with a configurable
   cooperative deadline; pre-publication timeout leaves no destination or staging file.
 

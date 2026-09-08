@@ -387,3 +387,27 @@ for (const fault of ['expired','replaced-owner','advanced-epoch']) test(`late ap
     assert.ok((await reopened.storage.inspectRecovery(id)).blockers.includes('tool_effect_unknown'));
   } finally {release();await outcome;}
 });
+
+for(const field of ['intentDigest','runId','callId','approvalRevision','approvalId','missingApprovalId'])test(`reconciliation rejects corrupted approval claim ${field}`,async t=>{
+ const open=setup(t),first=open(),id=await paused(first),owner=open({run:()=>({content:'uncertain',effectState:'unknown'})});
+ await approve(owner,id);await assert.rejects((await owner.agent.resume(id,request)).result,{code:'tool_effect_unknown'});
+ const key=await owner.storage.transaction(async(_,extra)=>{
+  const [key,claim]=Object.entries(extra.tools)[0];if(field==='missingApprovalId')delete claim.approvalId;else claim[field]=field==='approvalRevision'?999:'corrupt';return key;
+ });
+ const before=await owner.storage.transaction(async(_,extra)=>structuredClone(extra.tools));
+ await assert.rejects(owner.storage.reconcileTool(key,{result:{content:'verified',effectState:'committed'}}),{code:'approval_claim_conflict'});
+ assert.deepEqual(await owner.storage.transaction(async(_,extra)=>structuredClone(extra.tools)),before);
+});
+for(const proof of [{result:{content:'verified',effectState:'committed'}},{notExecuted:true}])test(`host reconciliation retains terminal run: ${'result' in proof?'completed':'not executed'}`,async t=>{
+ const open=setup(t),first=open(),id=await paused(first),owner=open({run:()=>({content:'uncertain',effectState:'unknown'})});
+ await approve(owner,id);await assert.rejects((await owner.agent.resume(id,request)).result,{code:'tool_effect_unknown'});
+ const key=await owner.storage.transaction(async(_,extra)=>Object.keys(extra.tools)[0]);
+ await owner.storage.reconcileTool(key,proof);
+ const reopened=open();
+ await reopened.storage.transaction(async(_,extra)=>{
+  if('result' in proof){assert.equal(extra.tools[key].state,'complete');assert.equal(extra.tools[key].result.effectState,'committed');}
+  else assert.equal(extra.tools[key],undefined);
+ });
+ await assert.rejects(reopened.agent.resume(id,request),{code:'run_terminal'});
+ assert.deepEqual(reopened.counts,{model:0,tool:0});
+});

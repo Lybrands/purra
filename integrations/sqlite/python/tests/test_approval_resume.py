@@ -494,3 +494,30 @@ async def test_late_approved_result_cannot_cross_lease_fence(tmp_path, fault):
         assert 'tool_effect_unknown' in (await other.storage.inspect_recovery(run_id))['blockers']
     finally:
         host.release.set();await other.close();await host.close()
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('completed', [True, False])
+async def test_host_reconciliation_preserves_terminal_run_after_reopen(tmp_path, completed):
+    path = tmp_path/'db'
+    host, options, record = await approved_host(path)
+    host.unknown_effect = True
+    try:
+        result = await (await host.core.resume(record.intent.run_id, host.request, options=options)).wait()
+        assert result.status.value == 'failed'
+        key = (record.intent.run_id, record.intent.tool_call_id)
+        async with host.storage.transaction() as session:
+            call = session.claims[key]
+        proof = {'result': ToolHandlerResult('verified', effect_state='committed')} if completed else {'not_executed': True}
+        await host.storage.reconcile_tool(record.intent.run_id, call, **proof)
+        await host.close()
+        host = ApprovalHost(path)
+        async with host.storage.transaction() as session:
+            assert key not in session.claims
+            receipt = session.get_tool_receipt(key)
+            assert (receipt is not None) == completed
+        with pytest.raises(ContractViolationError) as error:
+            await (await host.core.resume(record.intent.run_id, host.request, options=options)).wait()
+        assert error.value.code == 'run_terminal'
+        assert host.model_calls == host.tool_calls == 0
+    finally:
+        await host.close()

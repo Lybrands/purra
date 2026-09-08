@@ -470,3 +470,16 @@ Reproducible commands are in the MCP READMEs and CI installed-consumer steps.
 These checks use a scripted model and a controlled server. Real Provider capabilities,
 third-party business MCP services and downstream enablement remain separate and
 are not passed by these checks. Updating CI does not claim remote CI execution.
+
+## Host reconciliation identity checks
+
+TypeScript reconciliation now rechecks the persisted approval, Run/call identity,
+intent digest and original approved revision before accepting a known result or
+non-execution proof. Mismatches retain the unknown claim. Python retains its existing
+approval association checks. Both SDKs require an idle Run for approval-linked
+reconciliation; the host must supply independent evidence.
+
+Completing or removing a claim does not reopen a terminal Run. Both SDKs verify
+that after reopening storage, a reconciled terminal Run still rejects resume without
+model or tool execution. This is a constraint of the current recovery path, not a
+complete general recovery workflow or automatic permission to create a replacement Run.

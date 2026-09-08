@@ -1,7 +1,7 @@
 import { OutputJournal } from "./journal.js";
 export type { ApprovalUpgradeInspection } from "./approval-format.js";
 import { storageVersion, enableApprovals, inspectApprovalUpgrade, type ApprovalUpgradeInspection } from "./approval-format.js";
-import { inspectApprovalState, checkApprovalDispatch, requireApprovalOwner, SqliteApprovalStore, type ApprovalAuthorizer } from "./approvals.js";
+import { checkApprovalReconciliation, inspectApprovalState, checkApprovalDispatch, requireApprovalOwner, SqliteApprovalStore, type ApprovalAuthorizer } from "./approvals.js";
 export { SqliteApprovalStore } from "./approvals.js";
 export type { ApprovalAuthorizer, ApprovalDecisionReceipt } from "./approvals.js";
 import { DatabaseSync } from "node:sqlite";
@@ -252,7 +252,8 @@ export class SqliteAgentAdapters {
     await this.#extraTransaction(async (extra) => {
       const claim = extra.tools[key];
       if (claim?.state !== "claimed") throw new Error("tool_claim_conflict");
-      if (claim.approvalId !== undefined) {
+      if ("approvalId" in claim || "intentDigest" in claim || "approvalRevision" in claim) {
+        await checkApprovalReconciliation(this.#db, this.#scope, claim);
         const lease = extra.leases[claim.runId];
         if (lease?.owner && lease.expires > Date.now()) throw new AgentError("run_lease_conflict", "Reconciliation requires an idle Run");
         if ("result" in proof) {
