@@ -1,4 +1,4 @@
-import { SqliteRecoverySchedule } from "./recovery-schedule.js";
+import { SqliteRecoverySchedule, wakeRecoverySchedule, removeRecoverySchedule } from "./recovery-schedule.js";
 export { SqliteRecoverySchedule } from "./recovery-schedule.js";
 import { OutputJournal } from "./journal.js";
 export type { ApprovalUpgradeInspection } from "./approval-format.js";
@@ -254,6 +254,7 @@ export class SqliteAgentAdapters {
     await this.#extraTransaction(async (extra) => {
       const claim = extra.tools[key];
       if (claim?.state !== "claimed") throw new Error("tool_claim_conflict");
+      const wakeRunId = claim.runId;
       if ("approvalId" in claim || "intentDigest" in claim || "approvalRevision" in claim) {
         await checkApprovalReconciliation(this.#db, this.#scope, claim);
         const lease = extra.leases[claim.runId];
@@ -266,6 +267,18 @@ export class SqliteAgentAdapters {
       } else if ("result" in proof) extra.tools[key] = { state: "complete", result: proof.result };
       else if (proof.notExecuted === true) delete extra.tools[key];
       else throw new TypeError("invalid tool reconciliation proof");
+      if (typeof wakeRunId === "string") wakeRecoverySchedule(extra, wakeRunId, true);
+    });
+  }
+
+  async pruneRecoverySchedule(runIds: readonly string[]): Promise<readonly string[]> {
+    return this.#transaction(async (all, extra) => {
+      const removed: string[] = [];
+      for (const runId of new Set(runIds)) {
+        const saved = await all.runs.get(runId);
+        if (saved.status !== "running" && removeRecoverySchedule(extra, runId)) removed.push(runId);
+      }
+      return Object.freeze(removed);
     });
   }
 

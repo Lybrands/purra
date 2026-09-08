@@ -515,7 +515,19 @@ async def test_host_reconciliation_preserves_terminal_run_after_reopen(tmp_path,
         async with host.storage.transaction() as session:
             call = session.claims[key]
         proof = {'result': ToolHandlerResult('verified', effect_state='committed')} if completed else {'not_executed': True}
+        schedule = host.storage.recovery_schedule(clock_ms=lambda: 100)
+        await schedule.wake(record.intent.run_id)
+        token = await schedule.ready(record.intent.run_id)
+        await schedule.settle(record.intent.run_id, token, True)
+        host.storage._db.execute("CREATE TRIGGER fail_reconcile BEFORE UPDATE ON purra_state BEGIN SELECT RAISE(ABORT, 'fixture rollback'); END")
+        with pytest.raises(Exception):
+            await host.storage.reconcile_tool(record.intent.run_id, call, **proof)
+        host.storage._db.execute('DROP TRIGGER fail_reconcile')
+        assert await schedule.ready(record.intent.run_id) is None
+        async with host.storage.transaction() as session:
+            assert key in session.claims
         await host.storage.reconcile_tool(record.intent.run_id, call, **proof)
+        assert await schedule.ready(record.intent.run_id) is not None
         await host.close()
         host = ApprovalHost(path)
         async with host.storage.transaction() as session:
@@ -551,7 +563,19 @@ async def test_running_tool_checkpoint_resumes_after_host_reconciliation(tmp_pat
         async with host.storage.transaction() as session:
             call = session.claims[key]
         proof = {'result': ToolHandlerResult('42', effect_state='committed')} if completed else {'not_executed': True}
+        schedule = host.storage.recovery_schedule(clock_ms=lambda: 100)
+        await schedule.wake(record.intent.run_id)
+        token = await schedule.ready(record.intent.run_id)
+        await schedule.settle(record.intent.run_id, token, True)
+        host.storage._db.execute("CREATE TRIGGER fail_reconcile BEFORE UPDATE ON purra_state BEGIN SELECT RAISE(ABORT, 'fixture rollback'); END")
+        with pytest.raises(Exception):
+            await host.storage.reconcile_tool(record.intent.run_id, call, **proof)
+        host.storage._db.execute('DROP TRIGGER fail_reconcile')
+        assert await schedule.ready(record.intent.run_id) is None
+        async with host.storage.transaction() as session:
+            assert key in session.claims
         await host.storage.reconcile_tool(record.intent.run_id, call, **proof)
+        assert await schedule.ready(record.intent.run_id) is not None
         await host.close()
         host = ApprovalHost(path)
         host.expiry = record.expires_at_ms
@@ -651,7 +675,6 @@ async def test_worker_service_wakes_after_committed_approval(tmp_path):
                 assert (host.model_calls, host.tool_calls) == (1, 0)
                 record = (await host.approvals.list_pending())[0]
                 await host.approvals.decide(ApprovalDecisionCommand(record.approval_id, record.revision, record.intent.digest, 'wake', 'approve'), principal_id='host')
-                await schedule.wake(handle.run_id)
                 worker.wake()
             else:
                 stop.set()
@@ -663,3 +686,53 @@ async def test_worker_service_wakes_after_committed_approval(tmp_path):
     finally:
         stop.set()
         await host.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('decision', ['approve', 'reject'])
+async def test_decision_and_registered_wake_commit_atomically(tmp_path, decision):
+    host = ApprovalHost(tmp_path / 'atomic.db')
+    host.expiry = int(time.time() * 1000) + 60000
+    try:
+        await host.storage.enable_approvals()
+        handle = await host.core.submit(host.request, options=AgentCoreRunOptions(tool_checkpoint_handler=host.boundary))
+        with pytest.raises(ApprovalRequired): await handle.wait()
+        record = (await host.approvals.list_pending())[0]
+        schedule = host.storage.recovery_schedule(clock_ms=lambda: 100)
+        await schedule.wake(handle.run_id)
+        token = await schedule.ready(handle.run_id)
+        await schedule.settle(handle.run_id, token, True)
+        command = ApprovalDecisionCommand(record.approval_id, record.revision, record.intent.digest, 'atomic', decision)
+        host.storage._db.execute("CREATE TRIGGER fail_decision BEFORE UPDATE ON purra_state BEGIN SELECT RAISE(ABORT, 'fixture rollback'); END")
+        with pytest.raises(Exception): await host.approvals.decide(command, principal_id='host')
+        host.storage._db.execute('DROP TRIGGER fail_decision')
+        assert (await host.approvals.get(record.approval_id)).status == 'pending'
+        assert await schedule.ready(handle.run_id) is None
+        receipt = await host.approvals.decide(command, principal_id='host')
+        token = await schedule.ready(handle.run_id)
+        assert token is not None
+        await schedule.settle(handle.run_id, token, True)
+        assert await host.approvals.decide(command, principal_id='host') == receipt
+        assert await schedule.ready(handle.run_id) is None
+    finally: await host.close()
+
+
+@pytest.mark.asyncio
+async def test_terminal_schedule_prune_fences_old_scans(tmp_path):
+    host, options, record = await approved_host(tmp_path / 'prune.db')
+    run_id = record.intent.run_id
+    try:
+        schedule = host.storage.recovery_schedule(clock_ms=lambda: 100)
+        await schedule.wake(run_id)
+        stale = await schedule.ready(run_id)
+        assert await host.storage.prune_recovery_schedule([run_id]) == ()
+        assert (await (await host.core.resume(run_id, host.request, options=options)).wait()).status.value == 'done'
+        assert await host.storage.prune_recovery_schedule([run_id, run_id]) == (run_id,)
+        assert not await schedule.settle(run_id, stale, True)
+        await host.close()
+        host = ApprovalHost(tmp_path / 'prune.db')
+        schedule = host.storage.recovery_schedule(clock_ms=lambda: 100)
+        await schedule.wake(run_id)
+        assert not await schedule.settle(run_id, stale, True)
+        assert (await host.storage.runs.get(run_id)).status.value != 'running'
+    finally: await host.close()

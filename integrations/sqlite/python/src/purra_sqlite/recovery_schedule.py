@@ -17,12 +17,13 @@ class SqliteRecoverySchedule:
         self._maximum = max_backoff_ms
         self._clock = clock_ms or (lambda: int(time.time() * 1000))
 
-    def _row(self, extra, run_id):
+    @staticmethod
+    def _row(extra, run_id):
         if not isinstance(run_id, str) or not run_id.strip():
             raise ValueError('run id required')
         rows = extra.get('recoverySchedule', {})
         if not isinstance(rows, dict): raise ValueError('invalid recovery schedule')
-        row = rows.get(run_id, {'revision': 0, 'failures': 0, 'notBeforeMs': 0})
+        row = rows.get(run_id, {'revision': _integer(extra.get('recoveryScheduleRevision', 0)), 'failures': 0, 'notBeforeMs': 0})
         if not isinstance(row, dict) or set(row) != {'revision', 'failures', 'notBeforeMs'}:
             raise ValueError('invalid recovery schedule')
         for value in row.values(): _integer(value)
@@ -35,10 +36,7 @@ class SqliteRecoverySchedule:
 
     async def wake(self, run_id):
         async with self._storage._transaction(with_journal=False) as session:
-            row = self._row(session.extra, run_id)
-            revision = _integer(row['revision'] + 1)
-            session.extra.setdefault('recoverySchedule', {})[run_id] = {'revision': revision, 'failures': 0, 'notBeforeMs': 0}
-            return revision
+            return wake_recovery_schedule(session.extra, run_id)
 
     async def settle(self, run_id, revision, failed):
         _integer(revision)
@@ -49,7 +47,34 @@ class SqliteRecoverySchedule:
             failures = min(row['failures'] + 1, 31) if failed else 0
             delay = min(self._maximum, self._interval * 2 ** failures)
             session.extra.setdefault('recoverySchedule', {})[run_id] = {
-                'revision': _integer(revision + 1), 'failures': failures,
+                'revision': next_revision(session.extra, revision), 'failures': failures,
                 'notBeforeMs': _integer(_integer(self._clock()) + delay),
             }
             return True
+
+
+def wake_recovery_schedule(extra, run_id, *, existing_only=False):
+    """Mutate the caller's transaction; replayed commands must not call this."""
+    row = SqliteRecoverySchedule._row(extra, run_id)
+    if existing_only and run_id not in extra.get('recoverySchedule', {}):
+        return None
+    revision = next_revision(extra, row['revision'])
+    extra.setdefault('recoverySchedule', {})[run_id] = {
+        'revision': revision, 'failures': 0, 'notBeforeMs': 0,
+    }
+    return revision
+
+
+def next_revision(extra, current):
+    revision = _integer(max(_integer(extra.get('recoveryScheduleRevision', 0)), current) + 1)
+    extra['recoveryScheduleRevision'] = revision
+    return revision
+
+
+def remove_recovery_schedule(extra, run_id):
+    row = SqliteRecoverySchedule._row(extra, run_id)
+    if run_id not in extra.get('recoverySchedule', {}):
+        return False
+    next_revision(extra, row['revision'])
+    del extra['recoverySchedule'][run_id]
+    return True

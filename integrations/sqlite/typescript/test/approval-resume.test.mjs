@@ -426,7 +426,16 @@ for(const completed of [true,false])for(const gate of ['allowed','revoked','expi
  await owner.storage.transaction(async(_,extra)=>{extra.leases[id].expires=0;});
  const restored=open({expiry:record.expiresAtMs});assert.equal((await restored.storage.runs.get(id)).status,'running');
  const key=await restored.storage.transaction(async(_,extra)=>Object.keys(extra.tools)[0]);
- await restored.storage.reconcileTool(key,completed?{result:{content:'written',effectState:'committed'}}:{notExecuted:true});
+ const schedule=restored.storage.recoverySchedule({clockMs:()=>100});
+ await schedule.wake(id);await schedule.settle(id,await schedule.ready(id),true);
+ const proof=completed?{result:{content:'written',effectState:'committed'}}:{notExecuted:true};
+ db.exec("CREATE TRIGGER fixture_reconcile_failure BEFORE UPDATE ON purra_state BEGIN SELECT RAISE(ABORT, 'fixture rollback'); END");
+ await assert.rejects(restored.storage.reconcileTool(key,proof));
+ db.exec('DROP TRIGGER fixture_reconcile_failure');
+ assert.equal(await schedule.ready(id),null);
+ assert.equal(await restored.storage.transaction(async(_,extra)=>extra.tools[key].state),'claimed');
+ await restored.storage.reconcileTool(key,proof);
+ assert.notEqual(await schedule.ready(id),null);
  const final=open({expiry:record.expiresAtMs,...(gate==='expired'?{clockMs:()=>record.expiresAtMs+1}:{}),scope:()=>gate!=='revoked',
   script:input=>{assert.ok(input.messages.some(m=>m.role==='tool')||input.tools.length===0);return {message:{role:'assistant',content:'done'},finishReason:'stop'};},
   run:()=>{effects++;return {content:'written',effectState:'committed'};}});
@@ -495,7 +504,6 @@ test('worker service wakes after committed approval', { timeout: 5000 }, async t
           assert.equal(report[0].action, 'blocked');
           assert.deepEqual(host.counts, { model: 1, tool: 0 });
           await approve(host, id);
-          await schedule.wake(id);
           worker.wake();
         } else stop.abort();
       },
@@ -504,4 +512,38 @@ test('worker service wakes after committed approval', { timeout: 5000 }, async t
     assert.equal(host.counts.tool, 1);
     assert.deepEqual(await host.storage.listRunning(), []);
   } finally { stop.abort(); }
+});
+
+for (const decision of ['approve', 'reject']) test(`decision and registered wake commit atomically: ${decision}`, async t => {
+  const open = setup(t), host = open(), id = await paused(host);
+  const record = (await host.approvals.listPending({ runId: id }))[0];
+  const schedule = host.storage.recoverySchedule({ clockMs: () => 100 });
+  await schedule.wake(id); await schedule.settle(id, await schedule.ready(id), true);
+  const command = { approvalId: record.approvalId, expectedRevision: record.revision, intentDigest: record.intentDigest, commandKey: 'atomic', decision };
+  const db = new DatabaseSync(host.path); t.after(() => db.close());
+  db.exec("CREATE TRIGGER fixture_decision_failure BEFORE UPDATE ON purra_state BEGIN SELECT RAISE(ABORT, 'fixture rollback'); END");
+  await assert.rejects(host.approvals.decide(command, { principalId: 'host' }));
+  db.exec('DROP TRIGGER fixture_decision_failure');
+  assert.equal((await host.approvals.get(record.approvalId)).status, 'pending');
+  assert.equal(await schedule.ready(id), null);
+  const receipt = await host.approvals.decide(command, { principalId: 'host' });
+  const token = await schedule.ready(id); assert.notEqual(token, null);
+  await schedule.settle(id, token, true);
+  assert.deepEqual(await host.approvals.decide(command, { principalId: 'host' }), receipt);
+  assert.equal(await schedule.ready(id), null);
+});
+
+test('terminal schedule pruning fences old scans before and after reopen', async t => {
+  const open = setup(t), host = open(), id = await paused(host);
+  await approve(host, id);
+  const schedule = host.storage.recoverySchedule({ clockMs: () => 100 });
+  await schedule.wake(id); const stale = await schedule.ready(id);
+  assert.deepEqual(await host.storage.pruneRecoverySchedule([id]), []);
+  await (await host.agent.resume(id, request)).result;
+  assert.deepEqual(await host.storage.pruneRecoverySchedule([id, id]), [id]);
+  assert.equal(await schedule.settle(id, stale, true), false);
+  const reopened = open(), next = reopened.storage.recoverySchedule({ clockMs: () => 100 });
+  await next.wake(id);
+  assert.equal(await next.settle(id, stale, true), false);
+  assert.equal((await reopened.storage.runs.get(id)).status, 'completed');
 });

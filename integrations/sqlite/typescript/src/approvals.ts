@@ -1,3 +1,4 @@
+import { wakeRecoverySchedule } from "./recovery-schedule.js";
 import type { DatabaseSync } from "node:sqlite";
 import { AgentError, ApprovalIntent, ApprovalRequired, copyToolExecutionCheckpoint, copyApprovalDecisionCommand, copyApprovalRecord, jsonIdentityDigest,
   type AgentToolExecutionCheckpoint, type ToolApprovalGateway, type ToolIdempotencyGateway, type ToolDispatchContext, type ApprovalRecord, type ApprovalDecisionCommand, type ApprovalDecisionAudit, type StorageStores } from "purra";
@@ -183,6 +184,7 @@ export class SqliteApprovalStore {
       record = await copyApprovalRecord({ ...record, status: command.decision === "approve" ? "approved" : "rejected", revision: record.revision + 1,
         decisionAudit: { command, principalId, decidedAtMs: now, revision: record.revision + 1 } });
       save(db, scope, record);
+      wakeRecoverySchedule(extra, record.intent.runId, true);
       return { receipt: receipt(record) };
     });
     if (result.error) fail(result.error);

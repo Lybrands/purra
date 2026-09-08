@@ -260,6 +260,19 @@ class SqliteAgentAdapters:
             elif approval is not None:
                 del adapters.extra["approvalExecutions"][approval.approval_id]
             del self._claims[key]
+            from .recovery_schedule import wake_recovery_schedule
+            wake_recovery_schedule(adapters.extra, run_id, existing_only=True)
+
+    async def prune_recovery_schedule(self, run_ids):
+        """Remove hints only for supplied canonical terminal Runs."""
+        from .recovery_schedule import remove_recovery_schedule
+        removed = []
+        async with self._transaction(with_journal=False) as session:
+            for run_id in dict.fromkeys(run_ids):
+                saved = await session.runs.get(run_id)
+                if saved.status is not RunStatus.RUNNING and remove_recovery_schedule(session.extra, run_id):
+                    removed.append(run_id)
+        return tuple(removed)
 
     def recovery_schedule(self, **options):
         from .recovery_schedule import SqliteRecoverySchedule

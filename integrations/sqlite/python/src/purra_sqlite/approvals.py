@@ -282,6 +282,8 @@ class SqliteApprovalStore:
                     revision=record.revision + 1, decision_audit={"command": command.to_mapping(),
                         "principalId": principal_id, "decidedAtMs": now, "revision": record.revision + 1})
                 self._save(record)
+                from .recovery_schedule import wake_recovery_schedule
+                wake_recovery_schedule(session.extra, record.intent.run_id, existing_only=True)
         if error:
             _fail(error)
         return _receipt(record)

@@ -83,7 +83,7 @@ cancellation is distinct from graceful stop and propagates. Await `run` before
 closing storage. Concurrent `run`/single-scan calls on the same worker are rejected;
 a completed/stopped service can be started again with a fresh stop signal.
 
-W01 remains incomplete: persisted wakeup subscriptions and per-Run retry policy,
+W01 remains incomplete: broader wakeup subscriptions and maximum retry policy,
 bounded batches/fairness, lifecycle diagnostics and capacity measurements remain
 open. SQLite discovery currently restores Core state and journal data; it is not a
 cheap metadata-only queue query. Configure polling for the actual database size;
@@ -111,17 +111,35 @@ persistence. The service's scan-wide delay remains independent; polling cadence 
 make the actual retry later than its eligible time. These are scheduling delays,
 not a retry count limit or proof that a failed operation is safe to repeat.
 
-After committing an approval or reconciliation, call `await schedule.wake(runId)`
-then `worker.wake()`. The first commits a new revision with no delay, the second is
-only a prompt local hint. An old scan cannot overwrite a newer wake: its conditional
+Register a Run with `await schedule.wake(runId)` before relying on atomic wake
+notifications (a settled worker scan also creates its schedule entry). For registered
+Runs, approval decisions and tool reconciliation now advance the wake revision in
+their own SQLite transaction. Call `worker.wake()` after the operation returns for
+a prompt local hint. Explicit `schedule.wake` remains available for other host changes. An old scan cannot overwrite a newer wake: its conditional
 settlement returns false. Competing scanners still acquire execution ownership
 through public resume. `ready` does not reserve a Run. A restart reads the same
 persisted schedule; no process-local failure counter needs reconstruction.
 
-Approval/effect commits and schedule notifications currently use separate
-transactions. If the process dies between them, normal interval/backoff expiry
-still triggers reinspection. This is not yet an atomic durable subscription or
-outbox. Only host-registered Run IDs should receive notifications; schedule entries
-currently persist after terminal Runs leave discovery. Pruning, bounded fair
-metadata discovery, atomic subscriptions, maximum retry policy and diagnostics
-remain W01 work. Do not clear execution claims to force a retry.
+For registered Runs, a successful new approval decision (approve or reject) and a
+successful tool reconciliation commit the schedule wake atomically with their
+canonical changes. A persistence failure rolls both back. Approval command replay
+returns its original receipt without advancing the schedule, so repeated requests
+do not clear subsequent backoff. Unregistered Runs gain no schedule entries from
+these operations. Terminal Run status is unchanged by a reconciliation wake.
+Refresh-only expiry/cancellation, other interactions and external host mutations
+are not subscribed; periodic rescans remain necessary. This is scoped durable
+notification state, not a general event bus or execution permission.
+
+`storage.prune_recovery_schedule(run_ids)` / `storage.pruneRecoverySchedule(runIds)`
+removes entries only for supplied canonical terminal Runs, in one transaction;
+running Runs are skipped and missing/corrupt Runs reject the transaction. It returns
+the removed IDs. Supply a bounded host-selected batch. Run history, approvals,
+claims, receipts and execution leases are untouched. A scoped monotonic revision
+counter survives pruning, fencing pre-prune scan tokens even before re-registration
+or after reopen. Revisions are opaque comparison tokens, not per-Run counts.
+Registration/settlement/pruning retain that counter; do not manually delete it.
+
+Pruning is explicit. Bounded fair metadata discovery, maximum retry policy,
+additional subscriptions and lifecycle diagnostics remain W01 work. Do not clear
+execution claims to force a retry. SQLite scopes still bound the amount of state
+restored per scheduling transaction; these changes do not establish capacity limits.
