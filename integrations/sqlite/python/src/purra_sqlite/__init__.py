@@ -8,7 +8,7 @@ import sqlite3
 import time
 from uuid import uuid4
 
-from purra.storage import StorageSession, STORAGE_PORT_METHODS
+from purra.storage import StorageMetadataCache, StorageSession, STORAGE_PORT_METHODS
 from purra.contracts import ToolHandlerResult, RunExecutionLease, RunStatus
 from purra.execution.ownership import execution_owner, execution_claim
 from purra.errors import ContractViolationError
@@ -148,6 +148,7 @@ class SqliteAgentAdapters:
         self._db.execute("PRAGMA foreign_keys=ON")
         self._db.execute("CREATE TABLE IF NOT EXISTS purra_state (scope TEXT NOT NULL, sdk TEXT NOT NULL, version INTEGER NOT NULL, body TEXT NOT NULL, PRIMARY KEY(scope,sdk))")
         self._journal = OutputJournal(self._db, scope)
+        self._metadata_cache = StorageMetadataCache()
         self._claims = {}
         self._leases = {}
         self.extra = {}
@@ -200,6 +201,22 @@ class SqliteAgentAdapters:
             except BaseException:
                 self._db.execute("ROLLBACK")
                 raise
+
+    @asynccontextmanager
+    async def _metadata_transaction(self, *, read_only=False):
+        async with self._connection(read_only=read_only):
+            version = storage_version(self._db)
+            row = self._db.execute("SELECT version,body FROM purra_state WHERE scope=? AND sdk='python'", (self.scope,)).fetchone()
+            if row and row[0] != version:
+                raise ValueError("unsupported SQLite storage version")
+            session = self._metadata_cache.open(row[1] if row else None)
+            yield session
+            if not read_only:
+                if version == 4 and session.has_tool_ready_checkpoint():
+                    raise ValueError("approval_storage_not_enabled")
+                body = session.export_snapshot()
+                if row is None or row[1] != body:
+                    self._db.execute("INSERT INTO purra_state VALUES(?, 'python', ?, ?) ON CONFLICT(scope,sdk) DO UPDATE SET version=excluded.version,body=excluded.body", (self.scope, version, body))
 
     @asynccontextmanager
     async def _transaction(self, *, read_only=False, with_journal=True, journal_run_id=None, journal_stream_id=None, lazy_journal=False):

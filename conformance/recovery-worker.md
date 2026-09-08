@@ -420,8 +420,9 @@ liveness still affect latency. Per-worker cursor names avoid unnecessary conflic
 sharing a name provides optimistic progress fencing, not a multi-worker scheduler.
 
 Cursor state is a small extension in the existing scoped snapshot. Reading/writing
-it still decodes that state (and writes reserialize it); it is not a separate cheap
-cursor table. Candidate page reads remain indexed. No deletion/reset API is provided,
+it still parses that state and writes reserialize it; it is not a separate cheap
+cursor table. Python now reuses validation for unchanged canonical encoded state
+as described below. Candidate page reads remain indexed. No deletion/reset API is provided,
 so revision reuse is avoided. Sustained-load and actual host/downstream acceptance
 remain W01 requirements; the bounded process probes below do not establish
 production supervision or coverage of every crash point.
@@ -527,3 +528,35 @@ for metadata access. Any implementation must keep Core responsible for its encod
 state, preserve revision fencing and atomic writes, and retain canonical validation
 before execution. These measurements do not justify a schema migration or a weaker
 approval/lease/effect check.
+
+### Validated Python metadata access
+
+Python schedule and cursor operations now use Core's additive
+`StorageMetadataCache.open(body)` boundary. The SQLite adapter reads the latest
+body under its normal transaction and passes it to a cache owned by that adapter
+instance. This cache stores one validation key, not current database state or
+execution authority. Each call parses the current encoded envelope and decodes its
+`extra` value into fresh objects. If the encoded schema, groups, claims or leases
+change, Core constructs and validates a full `StorageSession` again. Exact JSON
+encoding distinguishes values such as `false` and `0` when comparing validation
+keys. The cached tool-checkpoint flag is renewed with the same full validation.
+
+Metadata mutations re-encode the extension while preserving all other encoded
+values. Existing SQLite transactions, version checks, v4 tool-checkpoint rejection,
+revision comparisons and rollback behavior remain in force. Approval decisions,
+reconciliation, execution ownership and recovery inspection still use their
+existing canonical paths. A failed write cannot make the cache a source of current
+state: the next operation reads the database again. A new process starts with an
+empty cache.
+
+This avoids repeated Core record reconstruction for unchanged canonical state,
+not JSON parsing or whole-row serialization. The validation key retains one
+scope-sized encoded string per adapter; a first access or changed canonical state
+pays for full validation plus envelope processing. It adds no SQLite schema,
+storage-format migration or persisted cache.
+
+In the same 24-Run warmed microbenchmark, schedule check measured 29.51 ms,
+wake plus settlement 75.98 ms, and discovery plus acknowledgement 57.30 ms
+(previous local baseline: 33.88, 121.71 and 97.98 ms). Inspection remained on the
+full path at 36.97 ms. These local measurements demonstrate the bounded warm-path
+change; they do not establish cold-start improvement or multi-worker capacity.

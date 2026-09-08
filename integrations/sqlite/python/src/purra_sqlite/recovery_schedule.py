@@ -34,7 +34,7 @@ class SqliteRecoverySchedule:
 
     async def check(self, run_id):
         """Observe scheduling eligibility, not permission to execute."""
-        async with self._storage._transaction(read_only=True, with_journal=False) as session:
+        async with self._storage._metadata_transaction(read_only=True) as session:
             row = self._row(session.extra, run_id)
             reason = ("retry_exhausted" if self._max_failures is not None and row['failures'] >= self._max_failures
                       else "retry_not_due" if row['notBeforeMs'] > _integer(self._clock()) else None)
@@ -44,13 +44,13 @@ class SqliteRecoverySchedule:
         return (await self.check(run_id))["revision"]
 
     async def wake(self, run_id):
-        async with self._storage._transaction(with_journal=False) as session:
+        async with self._storage._metadata_transaction() as session:
             return wake_recovery_schedule(session.extra, run_id)
 
     async def settle(self, run_id, revision, failed):
         _integer(revision)
         if type(failed) is not bool: raise ValueError('failed must be boolean')
-        async with self._storage._transaction(with_journal=False) as session:
+        async with self._storage._metadata_transaction() as session:
             row = self._row(session.extra, run_id)
             if row['revision'] != revision: return False
             failures = min(row['failures'] + 1, 31) if failed else 0

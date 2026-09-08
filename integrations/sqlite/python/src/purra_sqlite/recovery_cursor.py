@@ -20,7 +20,7 @@ class SqliteRecoveryCursor:
 
     async def discover(self):
         self._page = None
-        async with self._storage._transaction(read_only=True, with_journal=False) as session:
+        async with self._storage._metadata_transaction(read_only=True) as session:
             row = dict(self._row(session.extra))
         page = await self._storage.list_run_candidates(after_run_id=row['afterRunId'], limit=self._size)
         self._page = (row, page)
@@ -35,7 +35,7 @@ class SqliteRecoveryCursor:
         if not processed and (page['runIds'] or row['afterRunId'] is None): return
         after = (None if len(processed) == len(page['runIds']) and page['nextAfterRunId'] is None
                  else processed[-1])
-        async with self._storage._transaction(with_journal=False) as session:
+        async with self._storage._metadata_transaction() as session:
             if self._row(session.extra) != row: raise ValueError('recovery_cursor_conflict')
             session.extra.setdefault('recoveryCursors', {})[self._name] = {
                 'revision': _integer(row['revision'] + 1), 'afterRunId': after,
