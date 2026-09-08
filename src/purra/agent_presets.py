@@ -377,10 +377,7 @@ class AgentPreset:
             )
         composition = {
             **({"modelRoute": {
-                "bindingId": self.model_route.binding_id,
-                "revision": self.model_route.revision,
-                "configIdentity": self.model_route.config_identity,
-                "capabilities": self.model_route.capabilities.to_mapping(),
+                **self.model_route.to_mapping(),
                 "requestIdentity": sha256(json.dumps({
                     "provider": request.model.provider,
                     "model": request.model.model,

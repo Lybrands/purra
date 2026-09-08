@@ -1,8 +1,9 @@
 # R01: selection before Run creation
 
 Status: pure candidate selection and opt-in preset-bound route persistence are
-implemented in both SDKs. Automatic host binding resolution, policy identity,
-installed-package acceptance and complete R01 acceptance remain open.
+implemented in both SDKs. Saved binding resolution and optional policy identity
+are also implemented. Automatic Agent construction, installed-package acceptance
+and complete R01 acceptance remain open.
 
 Python exports `ModelRouteCandidate` and `select_model_route` from `purra.api`;
 TypeScript exports `ModelRouteCandidate`, `ModelRouteRequirements` and
@@ -73,6 +74,40 @@ identity. This does not itself resolve a binding from a registry: the host must
 read the saved route and construct the matching Agent. No selector is invoked by
 public resume. SQLite reopen tests cover missing route, changed revision/config,
 request drift and successful approval-linked single dispatch with the same route.
+
+## Resolving a saved binding
+
+New selections may supply `policy_id` / `policy_revision` keyword arguments to
+Python `select_model_route`, or `{id, revision}` as the fourth argument to
+TypeScript `selectModelRoute`. Both identity fields must be supplied together.
+They describe the host policy used for the registration-order choice, not an
+executable policy callback. They are persisted within the selected route.
+
+Python `resolve_model_route(candidates, saved, allowed_binding_ids)` and async
+TypeScript `resolveModelRoute(candidates, saved, allowedBindingIds)` match the
+saved binding against the current host registry and current authorization.
+Read `saved` from the canonical Run's preset, never from user input. Python's
+path is `snapshot.agent_preset_snapshot['composition']['modelRoute']`;
+TypeScript's is `snapshot.preset.modelRoute`. An unrouted legacy Run continues
+through the original API instead of supplying an invented route.
+
+The resolver returns a detached/immutable candidate retaining the original
+policy identity. Current registry order and current selection-policy identity
+do not reroute a waiting Run. Missing/revoked bindings and changed binding
+revision, configuration identity or capabilities raise `model_route_mismatch`.
+Duplicate registry IDs reject resolution. A host intentionally invalidating an
+old policy must revoke its binding authorization; merely changing the policy
+used for new Runs does not revoke existing Runs.
+
+Use the returned binding ID to retrieve the host-owned gateway/request factory,
+construct its Agent with the returned route, then invoke public resume. These
+helpers resolve identity, not opaque implementation objects or credentials.
+The host must keep its actual factory configuration consistent with the declared
+revision/configuration identity. Public resume still verifies the full canonical
+preset and request, approval and execution ownership. Python's request identity
+is checked there, rather than by the registry resolver. SQLite tests rebuild a
+host after reopen using this resolver, reject directly substituting a new policy
+revision, then finish the original approved write exactly once.
 
 Resume reads the persisted selection and resolves that exact binding. It never
 invokes the selection policy again. Missing or changed bindings, capabilities or

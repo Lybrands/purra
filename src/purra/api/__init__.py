@@ -178,5 +178,5 @@ __all__ += ["IntegrationCheck", "check_integration"]
 from purra.approvals import ApprovalRequired
 __all__ += ["AgentToolExecutionCheckpoint", "ApprovalRequired"]
 
-from purra.model_routing import ModelRouteCandidate, select_model_route
-__all__ += ["ModelRouteCandidate", "select_model_route"]
+from purra.model_routing import ModelRouteCandidate, select_model_route, resolve_model_route
+__all__ += ["ModelRouteCandidate", "select_model_route", "resolve_model_route"]

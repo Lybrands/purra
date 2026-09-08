@@ -1,6 +1,8 @@
 """Pure ordered selection of host-authorized model bindings; no Run dispatch."""
-from dataclasses import dataclass
-from collections.abc import Sequence
+from dataclasses import dataclass, replace
+from collections.abc import Sequence, Mapping
+from purra.json_values import thaw_json_mapping
+import json
 
 from purra.errors import ContractViolationError, UnsupportedModelFeatureError
 from purra.model_protocol import ModelCapabilitySnapshot, TaskCapabilityRequirements, preflight_capabilities
@@ -12,6 +14,8 @@ class ModelRouteCandidate:
     revision: str
     config_identity: str
     capabilities: ModelCapabilitySnapshot
+    policy_id: str | None = None
+    policy_revision: str | None = None
 
     def __post_init__(self):
         for name in ("binding_id", "revision", "config_identity"):
@@ -20,18 +24,36 @@ class ModelRouteCandidate:
                 raise ValueError(f"{name} must be nonempty canonical text")
         if not isinstance(self.capabilities, ModelCapabilitySnapshot):
             raise TypeError("capabilities must be a ModelCapabilitySnapshot")
+        if (self.policy_id is None) != (self.policy_revision is None):
+            raise ValueError("policy identity requires both id and revision")
+        for value in (self.policy_id, self.policy_revision):
+            if value is not None and (not isinstance(value, str) or not value.strip() or value != value.strip()):
+                raise ValueError("invalid policy identity")
+
+    def to_mapping(self):
+        return {"bindingId": self.binding_id, "revision": self.revision,
+                "configIdentity": self.config_identity, "capabilities": self.capabilities.to_mapping(),
+                **({"policyId": self.policy_id, "policyRevision": self.policy_revision}
+                   if self.policy_id is not None else {})}
 
 
 def select_model_route(
     candidates: Sequence[ModelRouteCandidate],
     allowed_binding_ids: Sequence[str],
     requirements: TaskCapabilityRequirements,
+    *, policy_id: str | None = None, policy_revision: str | None = None,
 ) -> ModelRouteCandidate:
     """Select the first compatible allowed candidate in registration order.
 
     The result is selection data only, never execution or recovery authority.
     """
     rows = tuple(candidates)
+    # Validate policy even when there are no eligible candidates.
+    if (policy_id is None) != (policy_revision is None) or any(
+        value is not None and (not isinstance(value, str) or not value.strip() or value != value.strip())
+        for value in (policy_id, policy_revision)
+    ):
+        raise ValueError("invalid policy identity")
     if not all(isinstance(row, ModelRouteCandidate) for row in rows):
         raise TypeError("invalid model route candidate")
     ids = [row.binding_id for row in rows]
@@ -48,5 +70,28 @@ def select_model_route(
         except UnsupportedModelFeatureError:
             continue
         if row.capabilities.max_generation_tokens is not None:
-            return row
+            return replace(row, policy_id=policy_id, policy_revision=policy_revision) if policy_id is not None else row
     raise ContractViolationError("No authorized compatible model binding", code="model_route_unavailable")
+
+
+def resolve_model_route(candidates: Sequence[ModelRouteCandidate], saved: Mapping[str, object],
+                        allowed_binding_ids: Sequence[str]) -> ModelRouteCandidate:
+    """Resolve canonical saved selection without rerunning current selection policy.
+
+    Host must read saved from the Run preset, and still call public resume.
+    """
+    rows = tuple(candidates)
+    if not all(isinstance(row, ModelRouteCandidate) for row in rows):
+        raise TypeError("invalid model route candidate")
+    if len({row.binding_id for row in rows}) != len(rows):
+        raise ValueError("duplicate model route candidate")
+    value = thaw_json_mapping(saved)
+    for row in rows:
+        if row.binding_id == value.get('bindingId') and row.binding_id in allowed_binding_ids:
+            resolved = replace(row, policy_id=value.get('policyId'), policy_revision=value.get('policyRevision'))
+            expected = resolved.to_mapping()
+            # Python presets also carry requestIdentity, checked by public resume.
+            actual = {key: item for key, item in value.items() if key != 'requestIdentity'}
+            if json.dumps(expected, sort_keys=True, allow_nan=False) == json.dumps(actual, sort_keys=True, allow_nan=False):
+                return resolved
+    raise ContractViolationError("Saved model route is missing, revoked or changed", code="model_route_mismatch")

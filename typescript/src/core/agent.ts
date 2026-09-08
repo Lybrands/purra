@@ -27,6 +27,7 @@ import {
 } from "../model/validation.js";
 import { AgentCanceledError, AgentError } from "../shared/errors.js";
 import { stableFingerprint } from "../shared/fingerprint.js";
+import { copyModelRouteCandidate } from '../model/routing.js';
 import {
   isPrivatePresentationMessage,
   publicPresentationMessages,
@@ -2344,13 +2345,7 @@ function copyPreset(value: AgentPreset): AgentPreset & { readonly promptSections
   }));
   let modelRoute;
   if (value.modelRoute !== undefined) {
-    for (const key of ['bindingId', 'revision', 'configIdentity'] as const) {
-      const text = value.modelRoute[key];
-      if (typeof text !== 'string' || !text.trim() || text !== text.trim()) throw new TypeError('Invalid model route identity');
-    }
-    modelRoute = Object.freeze({ bindingId: value.modelRoute.bindingId,
-      revision: value.modelRoute.revision, configIdentity: value.modelRoute.configIdentity,
-      capabilities: copyCapabilitySnapshot(value.modelRoute.capabilities) });
+    modelRoute = copyModelRouteCandidate(value.modelRoute);
   }
   return Object.freeze({ id, revision, promptSections, ...(modelRoute === undefined ? {} : {modelRoute}) });
 }
