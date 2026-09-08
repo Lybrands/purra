@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import time
 
 import pytest
 
@@ -31,6 +32,9 @@ async def child(path, effect_path, expiry, mode):
                 effect.write('write\n')
                 effect.flush()
                 os.fsync(effect.fileno())
+            if mode == 'exit_after_effect':
+                emit(stage='effect')
+                os._exit(74)
             if mode == 'owner':
                 emit(stage='effect')
                 await release_barrier()
@@ -48,6 +52,8 @@ async def child(path, effect_path, expiry, mode):
 
     async def inspect(run_id):
         report = await host.storage.inspect_recovery(run_id)
+        if mode == 'force_resume':
+            return {'blockers': []}
         if mode == 'competitor':
             emit(stage='inspected', blockers=report['blockers'])
             await release_barrier()
@@ -174,6 +180,69 @@ async def test_process_exit_before_ack_replays_terminal_candidate_without_execut
     finally:
         await cleanup(children)
 
+
+
+@pytest.mark.asyncio
+async def test_effect_exit_retains_claim_after_real_lease_expiry_and_reconciles(tmp_path):
+    path, effect = tmp_path / 'db', tmp_path / 'effects'
+    host, _, record = await approved_host(path)
+    expiry = host.expiry
+    await host.close()
+    children = []
+    key = (record.intent.run_id, record.intent.tool_call_id)
+    try:
+        crashed = await start(path, effect, expiry, 'exit_after_effect'); children.append(crashed)
+        await event(crashed, 'discovered'); await event(crashed, 'effect'); await finish(crashed, 74)
+        host = ApprovalHost(path)
+        try:
+            lease = await host.storage.leases.get(record.intent.run_id)
+            assert lease.owner_id is not None
+            async with host.storage.transaction() as session:
+                claim = session.claims[key]
+                assert session.get_tool_receipt(key) is None
+            with pytest.raises(ValueError, match='approval_reconciliation_requires_idle_run'):
+                await host.storage.reconcile_tool(record.intent.run_id, claim,
+                    result=ToolHandlerResult('42', effect_state='committed'))
+            delay = max(0, (lease.expires_at_ms - time.time() * 1000) / 1000) + 0.05
+            assert delay < 35
+            # Wait for the actual persisted lease; do not rewrite expiry or fake time.
+            await asyncio.sleep(delay)
+            assert (await host.storage.leases.get(record.intent.run_id)).expires_at_ms < time.time() * 1000
+        finally:
+            await host.close()
+        blocked = await start(path, effect, expiry, 'restart'); children.append(blocked)
+        await event(blocked, 'discovered'); report = await event(blocked, 'result'); await finish(blocked)
+        assert report['actions'] == ['blocked'] and 'tool_effect_unknown' in report['reasons'][0]
+        assert report['tools'] == report['models'] == 0
+        forced = await start(path, effect, expiry, 'force_resume'); children.append(forced)
+        await event(forced, 'discovered'); report = await event(forced, 'result'); await finish(forced)
+        assert report['errors'] == ['tool_effect_unknown']
+        assert report['tools'] == report['models'] == 0
+        host = ApprovalHost(path)
+        try:
+            async with host.storage.transaction() as session:
+                assert session.claims[key] == claim
+                assert session.get_tool_receipt(key) is None
+            # This synthetic file is independent evidence of the committed effect.
+            assert effect.read_text() == 'write\n'
+            await host.storage.reconcile_tool(record.intent.run_id, claim,
+                result=ToolHandlerResult('42', effect_state='committed'))
+        finally:
+            await host.close()
+        recovered = await start(path, effect, expiry, 'restart'); children.append(recovered)
+        await event(recovered, 'discovered'); report = await event(recovered, 'result'); await finish(recovered)
+        assert report['actions'] == ['settled'] and report['tools'] == 0
+        assert effect.read_text() == 'write\n'
+        host = ApprovalHost(path)
+        try:
+            assert (await host.storage.runs.get(record.intent.run_id)).status.value == 'done'
+            async with host.storage.transaction() as session:
+                assert key not in session.claims
+                assert session.get_tool_receipt(key) is not None
+        finally:
+            await host.close()
+    finally:
+        await cleanup(children)
 
 if __name__ == '__main__':
     asyncio.run(child(*sys.argv[1:]))

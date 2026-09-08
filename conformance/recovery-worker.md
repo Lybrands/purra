@@ -429,7 +429,7 @@ production supervision or coverage of every crash point.
 ### Independent-process ownership and exit probes
 
 The Python `test_worker_process.py` and TypeScript `worker-process.test.mjs`
-exercise two bounded scenarios against isolated databases and synthetic append-only
+exercise three bounded scenarios against isolated databases and synthetic append-only
 files. The effect fixture has no deduplication of its own.
 
 - A competitor inspects an approved Run before another process acquires it. The
@@ -443,9 +443,20 @@ files. The effect fixture has no deduplication of its own.
   model/tool calls, and acknowledges traversal. The persisted effect remains a
   single append; the cursor revision advances only in the restarted process.
 
+- A process fsyncs the synthetic write and exits with code 74 inside the handler,
+  before returning a result or persisting its effect receipt. Reconciliation is
+  rejected while the persisted lease is active. After waiting for its actual
+  30-second expiry (without changing the clock or stored expiry), a fresh worker
+  reports `tool_effect_unknown` and makes no model/tool calls. A separate process
+  also attempts public resume while deliberately bypassing the diagnostic hint:
+  Python rejects with `tool_effect_unknown`; TypeScript rejects with
+  `run_recovery_requires_reconciliation`. The claim remains unchanged and no
+  receipt is fabricated. The host checks the independent synthetic effect file,
+  explicitly reconciles the committed result, and a fresh process completes the
+  Run without another write. Lease expiry alone never proves non-execution.
+
 These tests also run against installed packages. They establish the specified
-same-host process boundaries, not a universal exactly-once guarantee. Abrupt exit
-inside a handler before its effect receipt, lease-expiry recovery, OS/power failure,
-sustained multi-writer load and actual downstream service supervision remain
+same-host process boundaries, not a universal exactly-once guarantee. Other exit windows, OS/power failure, sustained multi-writer load and actual
+downstream service supervision remain
 separate acceptance requirements. Child processes have bounded waits and are
 terminated/reaped on test failure; fixture databases and effect files are temporary.

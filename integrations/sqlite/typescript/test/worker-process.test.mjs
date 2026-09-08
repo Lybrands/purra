@@ -69,3 +69,47 @@ test('exit before cursor acknowledgement rediscovers terminal Run without execut
   try { await final.storage.transaction((_, extra) => assert.equal(extra.recoveryCursors.worker.revision, 1)); }
   finally { final.storage.close(); }
 });
+
+test('effect exit keeps claim after real lease expiry until explicit reconciliation', async t => {
+  const { start, effect, id, path } = await setup(t);
+  const crashed = start('exit_after_effect');
+  await crashed.event('discovered'); await crashed.event('effect'); await crashed.finish(74);
+  const host = createApprovalHost(path);
+  let key, claim;
+  try {
+    const expires = await host.storage.transaction((_, extra) => {
+      [key] = Object.keys(extra.tools); claim = structuredClone(extra.tools[key]);
+      assert.equal(claim.state, 'claimed'); assert.equal(claim.result, undefined);
+      assert.ok(extra.leases[id].owner); return extra.leases[id].expires;
+    });
+    await assert.rejects(host.storage.reconcileTool(key, { result: { content: 'written', effectState: 'committed' } }), { code: 'run_lease_conflict' });
+    const delay = Math.max(0, expires - Date.now()) + 50;
+    assert.ok(delay < 35000);
+    // Actual persisted expiry, without editing leases or replacing the clock.
+    await new Promise(resolve => setTimeout(resolve, delay));
+    assert.ok(Date.now() > expires);
+  } finally { host.storage.close(); }
+  const blocked = start('restart'); await blocked.event('discovered');
+  const report = await blocked.event('result'); await blocked.finish();
+  assert.deepEqual(report.actions, ['blocked']); assert.ok(report.reasons[0].includes('tool_effect_unknown'));
+  assert.equal(report.tool, 0); assert.equal(report.model, 0);
+  const forced = start('force_resume'); await forced.event('discovered');
+  const rejected = await forced.event('result'); await forced.finish();
+  assert.deepEqual(rejected.errors, ['run_recovery_requires_reconciliation']);
+  assert.equal(rejected.tool, 0); assert.equal(rejected.model, 0);
+  const reconciler = createApprovalHost(path);
+  try {
+    await reconciler.storage.transaction((_, extra) => assert.deepEqual(extra.tools[key], claim));
+    assert.equal(readFileSync(effect, 'utf8'), 'write\n');
+    await reconciler.storage.reconcileTool(key, { result: { content: 'written', effectState: 'committed' } });
+  } finally { reconciler.storage.close(); }
+  const recovered = start('restart'); await recovered.event('discovered');
+  const result = await recovered.event('result'); await recovered.finish();
+  assert.deepEqual(result.actions, ['settled']); assert.equal(result.tool, 0);
+  assert.equal(readFileSync(effect, 'utf8'), 'write\n');
+  const final = createApprovalHost(path);
+  try {
+    assert.equal((await final.storage.runs.get(id)).status, 'completed');
+    await final.storage.transaction((_, extra) => assert.equal(extra.tools[key].state, 'complete'));
+  } finally { final.storage.close(); }
+});

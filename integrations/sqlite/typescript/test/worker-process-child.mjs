@@ -13,6 +13,10 @@ const host = createApprovalHost(path, { expiry: Number(expiry), run: async () =>
   // No fixture deduplication: the public Core gate must prevent a second append.
   appendFileSync(effect, 'write\n');
   const fd = openSync(effect, 'r+'); try { fsyncSync(fd); } finally { closeSync(fd); }
+  if (mode === 'exit_after_effect') {
+    await new Promise(resolve => process.stdout.write(`${JSON.stringify({ stage: 'effect' })}\n`, resolve));
+    process.exit(74);
+  }
   if (mode === 'owner') { emit({ stage: 'effect' }); await barrier(); }
   return { content: 'written', effectState: 'committed' };
 } });
@@ -23,6 +27,7 @@ try {
     discover: async () => { const ids = await cursor.discover(); emit({ stage: 'discovered', ids }); return ids; },
     inspect: async id => {
       const report = await host.storage.inspectRecovery(id);
+      if (mode === 'force_resume') return { blockers: [] };
       if (mode === 'competitor') { emit({ stage: 'inspected', blockers: report.blockers }); await barrier(); }
       return report;
     },
@@ -39,7 +44,7 @@ try {
       await cursor.acknowledge(ids);
     },
   }).runOnce();
-  emit({ stage: 'result', actions: results.map(r => r.action), errors, ...host.counts });
+  emit({ stage: 'result', actions: results.map(r => r.action), errors, reasons: results.map(r => r.reasons), ...host.counts });
 } finally {
   host.storage.close();
   process.stdin.destroy();
