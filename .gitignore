@@ -5,9 +5,9 @@ __pycache__/
 build/
 dist/
 # Local implementation plans and one-off verification/release evidence.
-docs/
+/docs/plans/
+/docs/prd/
 conformance/reports/
 node_modules/
-typescript/dist/
 typescript/.example-dist/
 typescript/*.tgz

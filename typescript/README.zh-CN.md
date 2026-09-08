@@ -12,7 +12,7 @@
 [持久化审批契约](../conformance/durable-approval.zh-CN.md)记录本版开发中的能力；Root 持久化审批恢复与宿主授权 MCP 写工具已具备确定性验证；真实 Provider、业务服务与下游验收仍需分别完成。
 已有能力及 1.x 兼容承诺见[1.0 支持说明](../conformance/release-1.0.zh-CN.md)。
 
-0.x 升级要求见[升级说明](../CHANGELOG.md#从-0x-升级)。
+0.x 升级要求见[升级说明](../docs/migrations/1.0.zh-CN.md)。
 
 ## 安装
 
@@ -81,7 +81,7 @@ Run 请求通过 `planningMode` 选择模式：
 
 Planner 要求网关支持流式输出。订阅 Run 事件可逐片段接收 `planning.delta`，无需等待完整 JSON；
 `planning.progress` 保留完整进度记录的语义。原始预览可能包含无效计划片段，执行仍须通过校验，推理保持私有。
-契约见[计划输出](../ARCHITECTURE.md#planning-output)，订阅与重放用法见[规划示例](examples/planner-streaming.ts)。
+契约见[计划输出](../docs/planning-output.md)，订阅与重放用法见[规划示例](examples/planner-streaming.ts)。
 
 ## 预算与持久化
 

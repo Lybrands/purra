@@ -19,7 +19,7 @@ service/downstream acceptance remain unfinished.
 Existing capabilities and 1.x compatibility are documented in the
 [1.0 support guide](conformance/release-1.0.md).
 
-See the [upgrade notes](CHANGELOG.md#upgrading-from-0x) and [public compatibility](ARCHITECTURE.md#public-compatibility) before upgrading.
+See the [upgrade notes](docs/migrations/1.0.md) and [public compatibility](ARCHITECTURE.md#public-compatibility) before upgrading.
 
 ## Install
 
@@ -111,6 +111,9 @@ same model and tool configuration and reconcile interrupted external writes
 before retrying them. Persistent storage alone does not make those writes replayable.
 
 ## Documentation
+
+- Capability guides: [planning output](docs/planning-output.md), [structured output](docs/structured-output.md), [tool concurrency](docs/tool-concurrency.md), [integration and recovery inspection](docs/integration-inspection.md).
+- [Upgrade from 0.x to 1.0](docs/migrations/1.0.md).
 
 - [TypeScript guide](typescript/README.md)
 - [Examples](examples/README.md)

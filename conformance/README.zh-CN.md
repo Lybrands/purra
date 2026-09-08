@@ -42,20 +42,20 @@ npm --prefix typescript run check
 
 ## 能力契约与测试
 
-- [结构化输出](structured-output.md)：`structured_output.json`、`structured_model_task.json`、`native_output_schema.json`。
-- [计划逐片段输出](../ARCHITECTURE.md#planning-output)：`planning_stream.json`。
-- [只读工具并发](../ARCHITECTURE.md#read-only-tool-concurrency)：`tool_concurrency.json`。
-- [接入报告与恢复诊断](../ARCHITECTURE.md#integration-reports-and-recovery-inspection)：`recovery_inspection.json`。
+- [结构化输出](../docs/structured-output.md)：`structured_output.json`、`structured_model_task.json`、`native_output_schema.json`。
+- [计划逐片段输出](../docs/planning-output.md)：`planning_stream.json`。
+- [只读工具并发](../docs/tool-concurrency.md)：`tool_concurrency.json`。
+- [接入报告与恢复诊断](../docs/integration-inspection.md)：`recovery_inspection.json`。
 - MCP 协议与 Schema 拒绝用例位于 `integrations/mcp/fixtures/tools.json`，由两端可选包测试读取。
 
-本目录保留共享测试数据、运行指南和需要独立查阅的结构化输出参考；
-运行时行为统一见架构文档，版本变化与升级边界见 [更新记录](../CHANGELOG.md#从-0x-升级)。
+本目录保留共享测试数据和测试运行指南；功能契约位于 `docs/`，
+升级步骤见[迁移指南](../docs/migrations/1.0.zh-CN.md)。
 确定性测试、安装包检查、真实服务验证和使用方验收应分别记录，不能互相替代。
 
 ## 仓库文档边界
 
 Git 保留安装指南、公开契约、可复现的测试用法及第三方许可声明。
-实施计划、单次验收证据、发布清单和本机环境记录放在已忽略的 `docs/` 或
+实施计划、单次验收证据、发布清单和本机环境记录放在已忽略的 `docs/plans/`、`docs/prd/` 或
 `conformance/reports/`，不要强制加入跟踪。删除当前文件不会清除旧提交中的副本。
 
 SQLite 多进程／负载检查使用临时合成数据库：

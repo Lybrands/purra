@@ -20,8 +20,8 @@ compaction, Mem0, and MCP.
 
 The application owns model capabilities, credentials, SDK clients, authorization,
 resource scope, persistence, budgets, and shutdown. Installing an adapter does
-not activate it on an Agent. See [structured output](structured-output.md),
-[tool concurrency](../ARCHITECTURE.md#read-only-tool-concurrency), and [inspection](../ARCHITECTURE.md#integration-reports-and-recovery-inspection).
+not activate it on an Agent. See [structured output](../docs/structured-output.md),
+[tool concurrency](../docs/tool-concurrency.md), and [inspection](../docs/integration-inspection.md).
 
 ## Service evidence and limits
 

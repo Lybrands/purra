@@ -16,7 +16,7 @@ coverage; real Provider, business-service and downstream acceptance remain separ
 Existing capabilities and 1.x compatibility are documented in the
 [1.0 support guide](../conformance/release-1.0.md).
 
-See the [upgrade notes](../CHANGELOG.md#upgrading-from-0x) and [public compatibility](../ARCHITECTURE.md#public-compatibility) before upgrading.
+See the [upgrade notes](../docs/migrations/1.0.md) and [public compatibility](../ARCHITECTURE.md#public-compatibility) before upgrading.
 
 ## Install
 
@@ -92,7 +92,7 @@ The planner requires a streaming gateway. Subscribe to Run events for public
 `planning.delta` for each nonempty raw planning content chunk, without waiting
 for complete JSON, and `planning.progress` for complete progress records. Raw
 previews may include invalid plan fragments; execution still requires validation.
-Reasoning remains private. See the [output contract](../ARCHITECTURE.md#planning-output) and
+Reasoning remains private. See the [output contract](../docs/planning-output.md) and
 [planning example](examples/planner-streaming.ts) for subscription and replay.
 
 ## Budgets and persistence

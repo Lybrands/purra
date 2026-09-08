@@ -12,7 +12,7 @@ PurrA 是面向 Python 和 TypeScript 的 Agent 运行时，负责在应用中�
 [持久化审批契约](conformance/durable-approval.zh-CN.md)记录本版开发中的能力；双端已通过 Reactive、Planned、Auto Root 审批恢复，以及宿主授权 MCP 写工具和持久回执的确定性验证。已提供只读审批诊断；扩展恢复、真实服务及下游验收仍未完成。
 已有能力及 1.x 兼容承诺见[1.0 支持说明](conformance/release-1.0.zh-CN.md)。
 
-0.x 升级要求见[升级说明](CHANGELOG.md#从-0x-升级)。
+0.x 升级要求见[升级说明](docs/migrations/1.0.zh-CN.md)。
 
 ## 安装
 
@@ -97,6 +97,9 @@ JavaScript 和 TypeScript 用法见 [TypeScript 指南](typescript/README.zh-CN.
 中断的外部写入是否已经执行。仅配置持久化存储，不能保证这类写入可以安全重放。
 
 ## 文档
+
+- 功能指南：[计划输出](docs/planning-output.md)、[结构化输出](docs/structured-output.md)、[工具并发](docs/tool-concurrency.md)、[接入与恢复诊断](docs/integration-inspection.md)。
+- [从 0.x 升级到 1.0](docs/migrations/1.0.zh-CN.md)。
 
 - [TypeScript 指南](typescript/README.zh-CN.md)
 - [示例](examples/README.zh-CN.md)

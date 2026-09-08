@@ -153,7 +153,7 @@ messages or raw tool receipts. Run-bound pending claims and post-checkpoint mode
 attempts are separate blockers; reconciling a tool does not clear the attempt.
 Permissions, complete usage, effects outside this adapter and Agent Tree ownership
 remain unknown. `authority` is always `diagnosis_only`; execution must revalidate.
-See the Core [inspection contract](../../../ARCHITECTURE.md#integration-reports-and-recovery-inspection).
+See the Core [inspection contract](../../../docs/integration-inspection.md).
 
 ## 1.1 approval storage foundation (unreleased)
 
