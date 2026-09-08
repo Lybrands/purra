@@ -477,3 +477,29 @@ test('worker clean diagnosis cannot bypass scope changed before public resume', 
   assert.deepEqual(await worker.runOnce(), [{ runId: id, action: 'failed', reasons: ['resume_failed'] }]);
   assert.deepEqual(host.counts, { model: 0, tool: 0 });
 });
+
+test('worker service wakes after committed approval', { timeout: 5000 }, async t => {
+  const { RecoveryWorker } = await import('purra');
+  const open = setup(t), host = open(), id = await paused(host);
+  const stop = new AbortController(), reports = [];
+  const worker = new RecoveryWorker({ discover: () => host.storage.listRunning(),
+    inspect: id => host.storage.inspectRecovery(id),
+    resume: async id => (await host.agent.resume(id, request)).result,
+  });
+  try {
+    await worker.run({ signal: stop.signal, pollIntervalMs: 60000, maxBackoffMs: 60000,
+      onScan: async report => {
+        reports.push(report);
+        if (reports.length === 1) {
+          assert.equal(report[0].action, 'blocked');
+          assert.deepEqual(host.counts, { model: 1, tool: 0 });
+          await approve(host, id);
+          worker.wake();
+        } else stop.abort();
+      },
+    });
+    assert.equal(reports.length, 2); assert.equal(reports[1][0].action, 'settled');
+    assert.equal(host.counts.tool, 1);
+    assert.deepEqual(await host.storage.listRunning(), []);
+  } finally { stop.abort(); }
+});

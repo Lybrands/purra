@@ -626,3 +626,38 @@ async def test_worker_clean_diagnosis_cannot_bypass_changed_scope(tmp_path):
         assert host.tool_calls == 0 and host.model_calls == before
     finally:
         await host.close()
+
+
+@pytest.mark.asyncio
+async def test_worker_service_wakes_after_committed_approval(tmp_path):
+    import asyncio
+    from purra.api import RecoveryWorker
+    host = ApprovalHost(tmp_path / 'service.db')
+    host.expiry = int(time.time() * 1000) + 60000
+    stop = asyncio.Event()
+    reports = []
+    try:
+        await host.storage.enable_approvals()
+        options = AgentCoreRunOptions(tool_checkpoint_handler=host.boundary)
+        handle = await host.core.submit(host.request, options=options)
+        with pytest.raises(ApprovalRequired): await handle.wait()
+        async def resume(run_id):
+            return await (await host.core.resume(run_id, host.request, options=options)).wait()
+        async def observed(report):
+            reports.append(report)
+            if len(reports) == 1:
+                assert report[0].action == 'blocked'
+                assert (host.model_calls, host.tool_calls) == (1, 0)
+                record = (await host.approvals.list_pending())[0]
+                await host.approvals.decide(ApprovalDecisionCommand(record.approval_id, record.revision, record.intent.digest, 'wake', 'approve'), principal_id='host')
+                worker.wake()
+            else:
+                stop.set()
+        worker = RecoveryWorker(discover=host.storage.list_running, inspect=host.storage.inspect_recovery, resume=resume)
+        await asyncio.wait_for(worker.run(stop=stop, poll_interval_ms=60000, max_backoff_ms=60000, on_scan=observed), 5)
+        assert len(reports) == 2 and reports[1][0].action == 'settled'
+        assert host.tool_calls == 1
+        assert await host.storage.list_running() == ()
+    finally:
+        stop.set()
+        await host.close()

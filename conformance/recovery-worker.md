@@ -53,10 +53,39 @@ one worker are rejected. Different workers still compete through Core's existing
 lease authority. Python task cancellation propagates; the host owns cancellation
 of active Runs and must not equate stopping a scheduler with canceling remote effects.
 
-This is the first W01 scheduling slice, not a completed daemon service. The host
-currently schedules scans explicitly. Durable wakeup subscriptions, retry/backoff
-policy, bounded batches/fairness, lifecycle/stop controls and capacity measurements
-remain open. SQLite discovery currently restores Core state and journal data; it
-is not a cheap metadata-only queue query. Do not run a tight polling loop over a
-large database. End-to-end service shutdown, process supervision and business
+## Service lifecycle
+
+`worker.run(stop=event, on_scan=observer)` in Python and
+`worker.run({signal, onScan: observer})` in TypeScript scan immediately, then wait.
+The polling interval defaults to 1000 ms. Scans containing `failed` results double
+the wait up to 30000 ms; scans without failures reset it. Configure these with
+`poll_interval_ms` / `pollIntervalMs` and `max_backoff_ms` / `maxBackoffMs` (positive
+32-bit integer milliseconds, maximum at least the polling interval). This is a
+scan-wide delay, not a persisted per-Run retry budget. A Python `settled` callback
+may still represent a failed canonical Run; terminal Runs leave SQLite discovery.
+Discovery and observer exceptions stop the service and propagate to the host.
+
+Call `worker.wake()` on its event loop after committing an approval decision or
+host reconciliation. Notifications coalesce; one received during scanning or in
+the observer is retained for the next scan. A notification bypasses the wait,
+including backoff, but never bypasses Core gates. Notifications are process-local
+hints, not durable queue entries. Periodic rescans and the immediate startup scan
+recover committed changes if a notification is lost or the process restarts.
+Cross-process changes are discovered by polling unless the host forwards a hint.
+
+Set the Python stop event or abort the TypeScript signal to stop scheduling. Idle
+waits end promptly and release their timers/listeners. During discovery or inspection,
+the worker waits for that callback and checks stop before starting a Run. During
+resume, it drains the current callback and does not start the next Run. It does not
+cancel the Run or remote tool. A hung host callback therefore prevents graceful
+shutdown; host Run cancellation/deadline policy remains necessary. Python task
+cancellation is distinct from graceful stop and propagates. Await `run` before
+closing storage. Concurrent `run`/single-scan calls on the same worker are rejected;
+a completed/stopped service can be started again with a fresh stop signal.
+
+W01 remains incomplete: persisted wakeup subscriptions and per-Run retry policy,
+bounded batches/fairness, lifecycle diagnostics and capacity measurements remain
+open. SQLite discovery currently restores Core state and journal data; it is not a
+cheap metadata-only queue query. Configure polling for the actual database size;
+do not infer capacity from synthetic tests. Process supervision and business
 Provider/MCP/downstream operation remain unvalidated.
