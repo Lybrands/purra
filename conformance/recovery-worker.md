@@ -576,3 +576,28 @@ observations do not establish a percentage improvement in throughput or latency.
 They validate multi-worker correctness of the metadata optimization. Actual host
 request/binding reconstruction, service supervision and capacity remain separate
 acceptance gates.
+
+### PurrA-local host lifecycle wiring
+
+The Python `check_host_lifecycle.py` and TypeScript `check-host-lifecycle.mjs`
+repository checks make the abstract `host.resolve_run` step executable with
+synthetic data. Host-owned storage records a request profile, preset revision,
+binding revision, scope revision and the original absolute approval expiry by Run
+ID. After closing the submitting host, a new host validates that record before
+calling public resume with the reconstructed request and checkpoint callback.
+
+The check starts the long-running worker with a durable named cursor and schedule,
+observes the pending approval without model/tool polling, submits an authorized
+decision, calls process-local `wake()`, waits for the canonical Run to finish, and
+then stops the worker. A final reopen verifies the completed approval-linked effect
+receipt and absence of unsettled claims or active lease owners. The synthetic tool
+executes once. The resumed lifecycle uses the model for the normal post-tool round;
+this is not replay of the pre-approval model attempt.
+
+The repository scripts deliberately reuse deterministic test hosts and are not
+shipped production host libraries. They do not define authentication, business
+resource scope, service managers, Provider configuration or MCP bindings. A real
+host must persist and validate its own configuration schema, reject missing or
+changed current bindings before resume, and connect shutdown to its process/service
+manager. These checks close PurrA-local lifecycle wiring only; downstream and OS
+service-supervision acceptance remain separate.

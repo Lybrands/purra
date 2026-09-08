@@ -120,3 +120,22 @@ TypeScript 支持 opt-in Reactive/Planned/Auto Root 审批等待、同 Run 恢�
 `idempotency`，旧模型续点类型保持不变。详见[运行入口](../../../conformance/durable-approval.zh-CN.md#typescript-工具续点运行入口开发中)。
 Root 在只读 Child 完成后等待审批的组合已验证；用 `toolCheckpointNames` 明确选择业务写工具。
 Child 写审批和 MCP 写验收仍未完成。
+
+## 合成宿主生命周期检查
+
+在仓库根目录执行：
+
+```sh
+npm run build --prefix typescript
+npm run build --prefix integrations/sqlite/typescript
+node integrations/sqlite/typescript/scripts/check-host-lifecycle.mjs
+```
+
+检查会把宿主管理的 Run 配置单独持久化，关闭首个宿主，再重建原请求配置、当前
+binding/scope revision 和原绝对审批期限。随后启动带持久游标及调度的
+`RecoveryWorker`；合成的已认证审批决定提交后显式唤醒 worker。检查等待规范 Run
+完成，停止服务，重开存储，并确认只有一个完成回执，没有遗留 claim 或活动 lease。
+
+这是仓库内的确定性检查，会导入测试宿主，不是生产宿主库。应用必须自行管理认证主体、
+配置注册表和当前资源范围解析器；配置缺失或不匹配必须在公共 resume 前失败。检查不调用
+Provider 或 MCP 服务，也不代表下游验收。

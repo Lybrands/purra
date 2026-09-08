@@ -197,3 +197,24 @@ v5-to-v4 rollback API. Never point a validation fixture at production data.
 
 For WAL-safe backup and restoration to a new path, see the
 [offline upgrade procedure](../../../conformance/sqlite-upgrade.md).
+
+## Synthetic host lifecycle check
+
+From the repository root, run:
+
+```sh
+PYTHONPATH=src:integrations/sqlite/python/src .venv/bin/python \
+  integrations/sqlite/python/scripts/check_host_lifecycle.py
+```
+
+The check persists host-owned Run configuration separately, closes the first host,
+reconstructs the request profile, current binding/scope revisions and absolute
+approval expiry, then starts `RecoveryWorker` with a durable cursor and schedule.
+An authenticated synthetic decision wakes the worker. The check waits for canonical
+completion, stops the service, reopens storage, and verifies one completed receipt
+with no claim or active lease.
+
+This repository check imports its deterministic test host; it is not a production
+host library. Applications must own the authenticated principal, configuration
+registry and current resource-scope resolver. Missing or mismatched configuration
+must fail before public resume. No Provider or MCP service is called.

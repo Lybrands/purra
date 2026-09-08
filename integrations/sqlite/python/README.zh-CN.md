@@ -120,3 +120,21 @@ PYTHONPATH=src:integrations/sqlite/python/src .venv/bin/python integrations/sqli
 
 应用负责数据库访问、备份和数据保留。检查点包含私有模型数据。
 先调用 `await core.close()`，再调用 `storage.close()`。
+
+## 合成宿主生命周期检查
+
+在仓库根目录执行：
+
+```sh
+PYTHONPATH=src:integrations/sqlite/python/src .venv/bin/python \
+  integrations/sqlite/python/scripts/check_host_lifecycle.py
+```
+
+检查会把宿主管理的 Run 配置单独持久化，关闭首个宿主，再重建原请求配置、当前
+binding/scope revision 和原绝对审批期限。随后启动带持久游标及调度的
+`RecoveryWorker`；合成的已认证审批决定提交后显式唤醒 worker。检查等待规范 Run
+完成，停止服务，重开存储，并确认只有一个完成回执，没有遗留 claim 或活动 lease。
+
+这是仓库内的确定性检查，会导入测试宿主，不是生产宿主库。应用必须自行管理认证主体、
+配置注册表和当前资源范围解析器；配置缺失或不匹配必须在公共 resume 前失败。检查不调用
+Provider 或 MCP 服务，也不代表下游验收。
