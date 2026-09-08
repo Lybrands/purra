@@ -495,3 +495,35 @@ A local six-wave run with 10-second gaps completed 24 Runs per SDK: Python
 from synthetic fixtures while other validation jobs also ran, not controlled SDK
 performance comparisons. Python scanning/metadata costs under multiple workers
 still need profiling before making a capacity or latency claim.
+
+### Python metadata cost isolation
+
+`integrations/sqlite/python/scripts/benchmark_worker_metadata.py` creates 24
+completed synthetic approval Runs in one temporary database, then measures each
+operation independently (two warmups, five measured samples). Timing samples run
+without cProfile; a separate pass profiles the same operations. It also records
+SQLite changed-row counts and asserts that schedule checks and inspections write
+nothing. The script uses the approval test host and requires the test dependencies.
+
+A local baseline on the existing implementation measured these median durations:
+
+| Operation | Median | Changed rows across seven calls |
+| --- | ---: | ---: |
+| Schedule check | 33.88 ms | 0 |
+| Wake followed by settlement | 121.71 ms | 14 |
+| Cursor discovery followed by prefix acknowledgement | 97.98 ms | 7 |
+| Single-Run recovery inspection | 37.64 ms | 0 |
+
+In the separate profiling pass, snapshot loading accounted for roughly 0.449 of
+0.602 profiled seconds. Six storage sessions were reconstructed for the four
+operation groups; three snapshots were exported. The schedule and cursor paths
+therefore incur whole-scope object reconstruction even though they use only small
+metadata fields. This is measured CPU work without competing writers, not a
+measurement of lock contention in the three-worker test or a complete explanation
+of its elapsed time.
+
+The remaining optimization target is reducing repeated full snapshot reconstruction
+for metadata access. Any implementation must keep Core responsible for its encoded
+state, preserve revision fencing and atomic writes, and retain canonical validation
+before execution. These measurements do not justify a schema migration or a weaker
+approval/lease/effect check.
