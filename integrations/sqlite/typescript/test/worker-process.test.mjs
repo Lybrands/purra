@@ -113,3 +113,52 @@ test('effect exit keeps claim after real lease expiry until explicit reconciliat
     await final.storage.transaction((_, extra) => assert.equal(extra.tools[key].state, 'complete'));
   } finally { final.storage.close(); }
 });
+
+test('three services drain waves and restart without duplicate effects', async t => {
+  const waves = Number(process.env.PURRA_WORKER_LOAD_WAVES ?? 3), gap = Number(process.env.PURRA_WORKER_LOAD_GAP_MS ?? 100);
+  assert.ok(Number.isInteger(waves) && waves >= 3 && waves <= 30 && Number.isInteger(gap) && gap >= 0 && gap <= 10000);
+  const { start, effect, id, path } = await setup(t), ids = [id], active = [], reports = [], started = performance.now();
+  async function launch(index) { const child = start(`service-${index}`); await child.event('ready'); child.release(); return child; }
+  async function stop(child) {
+    child.process.stdin.write('stop\n'); const result = await child.event('result'); await child.finish();
+    assert.ok(result.scans > 0); assert.equal(result.diagnostics.phase, 'idle'); assert.equal(result.diagnostics.serving, false);
+    assert.equal(result.failed, result.errors.length, JSON.stringify(result));
+    assert.ok(result.errors.every(code => ['run_lease_conflict', 'run_terminal', 'run_recovery_requires_reconciliation', 'tool_effect_unknown'].includes(code)), JSON.stringify(result));
+    reports.push(result);
+  }
+  for (let i = 0; i < 3; i++) active.push(await launch(i));
+  for (let wave = 0; wave < waves; wave++) {
+    for (let i = 0; i < (wave === 0 ? 3 : 4); i++) {
+      const seed = createApprovalHost(path);
+      try { const id = await paused(seed); await approve(seed, id); ids.push(id); }
+      finally { seed.storage.close(); }
+    }
+    const reader = createApprovalHost(path);
+    try {
+      const deadline = performance.now() + 30000;
+      while (true) {
+        const statuses = await Promise.all(ids.map(async id => (await reader.storage.runs.get(id)).status));
+        assert.ok(statuses.every(status => ['running', 'completed'].includes(status)), JSON.stringify(statuses));
+        if (statuses.every(status => status === 'completed')) break;
+        assert.ok(performance.now() < deadline, 'wave did not drain');
+        await new Promise(resolve => setTimeout(resolve, 50));
+      }
+    } finally { reader.storage.close(); }
+    if (wave === Math.floor(waves / 2)) { await stop(active[0]); active[0] = await launch(0); }
+    await new Promise(resolve => setTimeout(resolve, gap));
+  }
+  for (const child of active) await stop(child);
+  const effects = readFileSync(effect, 'utf8').trim().split('\n').map(JSON.parse);
+  assert.deepEqual(effects.map(row => row.runId).sort(), ids.sort());
+  assert.equal(reports.reduce((total, row) => total + row.tool, 0), ids.length);
+  assert.ok(new Set(effects.map(row => row.worker)).size >= 2);
+  const overlaps = effects.reduce((total, a, i) => total + effects.slice(i+1).filter(b => a.worker !== b.worker && BigInt(a.startNs) < BigInt(b.endNs) && BigInt(b.startNs) < BigInt(a.endNs)).length, 0);
+  const reader = createApprovalHost(path);
+  try { await reader.storage.transaction((_, extra) => {
+    assert.equal(Object.keys(extra.tools).length, ids.length);
+    assert.ok(Object.values(extra.tools).every(row => row.state === 'complete'));
+    assert.ok(Object.values(extra.leases).every(row => row.owner === null));
+    for (let i = 0; i < 3; i++) assert.ok(extra.recoveryCursors[`service-${i}`].revision > 0);
+  }); } finally { reader.storage.close(); }
+  console.log(JSON.stringify({ sdk: 'typescript', runs: ids.length, waves, elapsedSeconds: (performance.now()-started)/1000, overlappingHandlerPairs: overlaps, workerReports: reports }));
+});

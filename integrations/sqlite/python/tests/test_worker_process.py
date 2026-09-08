@@ -24,12 +24,17 @@ async def release_barrier():
 
 
 async def child(path, effect_path, expiry, mode):
+    service = mode.startswith("service-")
     class ProcessHost(ApprovalHost):
         async def lookup(self, state, arguments, signal=None):
             self.tool_calls += 1
+            started = time.monotonic_ns()
+            if service:
+                await asyncio.sleep(0.05)
             # The append deliberately has no deduplication: Core must prevent repeats.
             with open(effect_path, 'a') as effect:
-                effect.write('write\n')
+                effect.write(json.dumps({'runId': self.active_run_id, 'worker': mode,
+                    'startNs': started, 'endNs': time.monotonic_ns()}) + '\n' if service else 'write\n')
                 effect.flush()
                 os.fsync(effect.fileno())
             if mode == 'exit_after_effect':
@@ -42,12 +47,13 @@ async def child(path, effect_path, expiry, mode):
 
     host = ProcessHost(path)
     host.expiry = int(expiry)
-    cursor = host.storage.recovery_cursor('competitor' if mode == 'competitor' else 'worker')
+    cursor = host.storage.recovery_cursor(mode if service else ('competitor' if mode == 'competitor' else 'worker'), page_size=5)
     resume_errors = []
 
     async def discover():
         ids = await cursor.discover()
-        emit(stage='discovered', ids=ids)
+        if not service:
+            emit(stage='discovered', ids=ids)
         return ids
 
     async def inspect(run_id):
@@ -61,6 +67,10 @@ async def child(path, effect_path, expiry, mode):
 
     async def resume(run_id):
         try:
+            host.active_run_id = run_id
+            if service:
+                records = await host.approvals.list_pending(run_id=run_id)
+                host.expiry = records[0].expires_at_ms
             handle = await host.core.resume(run_id, host.request,
                 options=AgentCoreRunOptions(tool_checkpoint_handler=host.boundary))
             result = await handle.wait()
@@ -76,8 +86,31 @@ async def child(path, effect_path, expiry, mode):
         await cursor.acknowledge(ids)
 
     try:
-        result = await RecoveryWorker(discover=discover, inspect=inspect,
-            resume=resume, acknowledge=acknowledge).run_once()
+        worker = RecoveryWorker(discover=discover, inspect=inspect,
+            resume=resume, acknowledge=acknowledge, max_runs_per_scan=3 if service else None,
+            schedule=host.storage.recovery_schedule(interval_ms=50, max_backoff_ms=200) if service else None)
+        if service:
+            emit(stage='ready')
+            await release_barrier()
+            stop = asyncio.Event()
+            async def stopping():
+                assert await asyncio.to_thread(sys.stdin.readline) == 'stop\n'
+                stop.set()
+            monitor = asyncio.create_task(stopping())
+            counts = {'scans': 0, 'blocked': 0, 'settled': 0, 'failed': 0}
+            async def observe(results):
+                counts['scans'] += 1
+                for row in results:
+                    counts[row.action] += 1
+            try:
+                await worker.run(stop=stop, poll_interval_ms=20, max_backoff_ms=200, on_scan=observe)
+                await monitor
+            finally:
+                monitor.cancel()
+            emit(stage='result', **counts, errors=resume_errors, tools=host.tool_calls,
+                models=host.model_calls, diagnostics=worker.diagnostics())
+            return
+        result = await worker.run_once()
         emit(stage='result', actions=[r.action for r in result],
             reasons=[list(r.reasons) for r in result], errors=resume_errors,
             tools=host.tool_calls, models=host.model_calls)

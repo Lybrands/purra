@@ -460,3 +460,38 @@ same-host process boundaries, not a universal exactly-once guarantee. Other exit
 downstream service supervision remain
 separate acceptance requirements. Child processes have bounded waits and are
 terminated/reaped on test failure; fixture databases and effect files are temporary.
+
+### Bounded multi-worker arrival waves
+
+`test_worker_load.py` (Python) and the `three services` case in
+`worker-process.test.mjs` (TypeScript) keep three independent processes running the
+public worker service against one isolated SDK database. Each service uses its own
+persisted cursor, five-candidate pages, a three-candidate scan limit, and shared
+persisted scheduling. The producer adds four approved Runs per wave while scanning
+continues. One service stops and restarts under the same cursor name between waves.
+
+The fixture verifies every expected Run completes, every Run has exactly one
+synthetic effect record, at least two worker identities actually execute tools,
+all effect receipts complete, and no claims or active lease owners remain after
+shutdown. Unexpected inspection failures and resume errors fail the check; normal
+ownership/recovery races are counted. Handler interval overlap is reported as an
+observation, not required for correctness or treated as evidence of simultaneous
+SQLite writer transactions. No fixture-level deduplication masks repeated effects.
+
+Defaults are three waves (12 Runs) with 100 ms between drained waves. For a longer
+bounded probe, set `PURRA_WORKER_LOAD_WAVES=6` and
+`PURRA_WORKER_LOAD_GAP_MS=10000` on either test command. The accepted ranges are
+3–30 waves and 0–10000 ms. The JSON summary records actual elapsed time, scan counts,
+effect counts and overlap observations. The tests also run against installed SDKs.
+
+This is intermittent-arrival service continuity with a graceful restart between
+waves. It does not establish saturated throughput, a capacity limit, fairness under
+unbounded arrivals, OS service supervision, or actual downstream host acceptance.
+
+A local six-wave run with 10-second gaps completed 24 Runs per SDK: Python
+139.37 seconds / 881 scans / zero overlapping handler pairs, TypeScript
+63.86 seconds / 6104 scans / six overlapping handler pairs. Both retained exactly
+24 effects and completed receipts after restart and shutdown. These are observations
+from synthetic fixtures while other validation jobs also ran, not controlled SDK
+performance comparisons. Python scanning/metadata costs under multiple workers
+still need profiling before making a capacity or latency claim.
