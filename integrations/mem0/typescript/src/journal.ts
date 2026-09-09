@@ -39,6 +39,10 @@ export interface Plan {
   review_refs?: readonly MemoryRef[]; review?: Omit<MemoryReview, "proposal" | "key">; policy_hash?: string;
   changes?: Partial<ItemView>;
   link?: Omit<MemoryLink, "key" | "valid">;
+  capture_authorization?: {
+    intent_digest: string; policy_id: string; policy_revision: string;
+    principal_id: string; decision_id: string;
+  };
 }
 export interface OperationRow {
   key: string; fingerprint: string; state: "running" | "unknown" | "failed" | "complete" | "discarded";

@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
-import { Mem0Memory, requiredText, positiveInteger } from "./memory.js";
-import type { MemoryOperation, MemoryRecord, MemoryResolution, MemoryReview } from "./memory.js";
+import { Mem0Memory, memoryCaptureIntent, requiredText, positiveInteger } from "./memory.js";
+import { MemoryError } from "./journal.js";
+import type { MemoryCaptureAuthorization, MemoryOperation, MemoryRecord, MemoryResolution, MemoryReview } from "./memory.js";
 
 export type MemoryDecisionPolicy = (candidate: MemoryRecord, review: MemoryReview) => Promise<MemoryResolution | undefined> | MemoryResolution | undefined;
 export interface MemoryWorkflowResult {
@@ -16,15 +17,37 @@ export class MemoryWorkflow {
   readonly #policy: MemoryDecisionPolicy | undefined;
   readonly #revision: string;
   readonly #limit: number;
-  constructor(memory: Mem0Memory, options: { policy?: MemoryDecisionPolicy; policyRevision?: string; reviewLimit?: number } = {}) {
+  readonly #capturePolicy: { id: string; revision: string } | undefined;
+  constructor(memory: Mem0Memory, options: { policy?: MemoryDecisionPolicy; policyRevision?: string; reviewLimit?: number;
+    capturePolicyId?: string; capturePolicyRevision?: string } = {}) {
     this.#memory = memory;
     this.#policy = options.policy;
     if (this.#policy !== undefined && typeof this.#policy !== "function") throw new TypeError("policy must be callable");
     this.#revision = requiredText(options.policyRevision ?? "review-only", "policy revision", 512);
     this.#limit = positiveInteger(options.reviewLimit ?? 8, "review limit", 32);
+    if ((options.capturePolicyId === undefined) !== (options.capturePolicyRevision === undefined)) {
+      throw new TypeError("capture policy id and revision must be configured together");
+    }
+    this.#capturePolicy = options.capturePolicyId === undefined ? undefined : Object.freeze({
+      id: requiredText(options.capturePolicyId, "capture policy id", 512),
+      revision: requiredText(options.capturePolicyRevision, "capture policy revision", 512),
+    });
   }
   async capture(messages: Parameters<Mem0Memory["extract"]>[0], options: Parameters<Mem0Memory["extract"]>[1]): Promise<MemoryWorkflowResult> {
     const prefix = "workflow:" + digest(requiredText(options.key, "workflow key", 512));
+    if (!this.#capturePolicy) {
+      if (options.authorization !== undefined) throw new TypeError("capture authorization requires a configured capture policy");
+    } else {
+      if (options.authorization === undefined) throw new MemoryError("memory_capture_authorization_required");
+      const intentOptions = { source: options.source, maxInputChars: this.#memory.maxInputChars,
+        ...(options.metadata === undefined ? {} : { metadata: options.metadata }),
+        ...(options.expiresAt === undefined ? {} : { expiresAt: options.expiresAt }) };
+      const intent = memoryCaptureIntent(messages, intentOptions);
+      if (options.authorization.intentDigest !== intent || options.authorization.policyId !== this.#capturePolicy.id
+          || options.authorization.policyRevision !== this.#capturePolicy.revision) {
+        throw new MemoryError("memory_capture_authorization_mismatch");
+      }
+    }
     const extraction = await this.#memory.extract(messages, { ...options, key: prefix + ":extract" });
     const resolutions: MemoryOperation[] = [];
     const pendingIds: string[] = [];

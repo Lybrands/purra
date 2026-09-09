@@ -1,23 +1,47 @@
 # K01/K02 memory capture and relation queries
 
 Status: K02 is complete inside the optional `purra-mem0` integration for scoped,
-explicit relation queries and exact relationship evidence. K01 remains open. Core
-does not acquire a dependency on Mem0 or its journal.
+explicit relation queries and exact relationship evidence. K01 now has an
+opt-in pre-capture authorization binding; eligibility policy persistence,
+revocation and consumer acceptance remain open. Core does not acquire a
+dependency on Mem0 or its journal.
 
 ## Current capture boundary
 
 `add` writes host-selected text; `extract` invokes inference and produces pending
 candidates. `MemoryWorkflow.capture` composes extraction, review and host-approved
-resolution over stable operation keys. Its decision policy runs after extraction,
-so it does not implement a pre-capture permission check. K01 must separately define
-when content is eligible to leave the host, what content may be captured, and
-whose authorization applies before extraction/Embedding. A later refusal to
-activate a candidate cannot undo an earlier Provider disclosure or write.
+resolution over stable operation keys. Its resolution policy still runs after
+extraction and does not authorize Provider disclosure.
 
+Hosts that require capture admission configure `capture_policy_id` and
+`capture_policy_revision` (TypeScript: `capturePolicyId` and
+`capturePolicyRevision`). Each call must then supply `MemoryCaptureAuthorization`.
+`memory_capture_intent` / `memoryCaptureIntent` hashes the normalized messages,
+source ID/revision, host metadata and expiry under the
+`purra.mem0.capture-intent/v1` domain. The workflow checks that digest and the
+configured policy identity before opening a journal operation or calling Mem0,
+LLM or Embedding providers. Missing and mismatched grants fail closed.
+
+The extraction fingerprint and persisted operation plan bind the intent digest,
+policy identity, authorizing principal and host decision ID. An identical retry
+replays the existing operation; changing any bound authorization field under the
+same workflow key raises `memory_idempotency_conflict`. The control journal stores
+these identifiers and the digest, not the source messages. The Mem0 SDK still
+receives the source messages because extraction requires them.
+
+This grant is an authorization receipt supplied by the host, not a policy engine,
+identity proof or consent UI. PurrA validates its shape and binding; the host must
+authenticate the principal, decide content eligibility, audit issuance and keep
+decision IDs unique in its own authority boundary. A later refusal to activate a
+candidate cannot undo an earlier Provider disclosure or write.
+
+The opt-in configuration preserves existing 1.0 calls: workflows without a
+capture policy keep their former behavior, while supplying a grant without a
+configured policy is rejected to prevent silently ignored authorization data.
 Reuse existing scope, source revisions, operation identity and unknown-effect
-reconciliation. Do not automatically capture complete Run transcripts. Capture
-admission and retry/revocation semantics remain K01 work; no new capture gate is
-claimed by this query-only slice.
+reconciliation. Do not automatically capture complete Run transcripts. Policy
+decision persistence, time validity, revocation and revalidation before a first
+unresolved dispatch remain K01 work.
 
 ## Bounded relation filtering
 

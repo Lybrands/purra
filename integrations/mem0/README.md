@@ -27,6 +27,13 @@ configured Mem0 store.
 Without a policy, candidates stay pending. A policy may also leave individual
 candidates pending. Model similarity alone does not authorize activation.
 
+For an opt-in pre-capture gate, configure the workflow's capture policy ID and
+revision, create a `MemoryCaptureAuthorization` over
+`memory_capture_intent` / `memoryCaptureIntent`, and pass it with the capture.
+The exact content, source, metadata, expiry, policy, principal and decision are
+bound before Provider or Mem0 dispatch. This receipt is issued by the host; the
+integration does not authenticate principals or decide which content is eligible.
+
 | Resolution | Result |
 | --- | --- |
 | `independent` | Activate one candidate |
@@ -34,7 +41,8 @@ candidates pending. Model similarity alone does not authorize activation.
 | `supersede` | Keep the accepted replacement and disable older records |
 | `conflict` | Disable the group until it is resolved |
 
-For workflow retries, keep capture key, input and policy revision unchanged.
+For workflow retries, keep capture key, input, capture authorization and policy
+revision unchanged.
 Completed resolutions replay their receipts; they do not re-extract or reactivate
 withdrawn records. Running/unknown operations require inspection or reconciliation.
 Policy may run again before a resolution is persisted, so it must be free of

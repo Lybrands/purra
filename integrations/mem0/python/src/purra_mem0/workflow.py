@@ -4,7 +4,9 @@ from dataclasses import dataclass
 from hashlib import sha256
 from typing import Awaitable, Callable
 
-from .memory import Mem0Memory, MemoryOperation, MemoryRecord, MemoryRef, MemoryResolution, MemoryReview
+from ._journal import MemoryError
+from .memory import (Mem0Memory, MemoryCaptureAuthorization, MemoryOperation, MemoryRecord,
+                     MemoryRef, MemoryResolution, MemoryReview, memory_capture_intent)
 
 
 MemoryDecisionPolicy = Callable[[MemoryRecord, MemoryReview], Awaitable[MemoryResolution | None]]
@@ -27,23 +29,46 @@ class MemoryWorkflow:
     """
 
     def __init__(self, memory: Mem0Memory, *, policy: MemoryDecisionPolicy | None = None,
-                 policy_revision: str = "review-only", review_limit: int = 8):
+                 policy_revision: str = "review-only", review_limit: int = 8,
+                 capture_policy_id: str | None = None, capture_policy_revision: str | None = None):
         if not isinstance(policy_revision, str) or not policy_revision.strip() or len(policy_revision) > 512:
             raise ValueError("policy_revision must be non-empty and at most 512 characters")
         if policy is not None and not callable(policy):
             raise TypeError("policy must be callable")
         if type(review_limit) is not int or not 1 <= review_limit <= 32:
             raise ValueError("review_limit must be from 1 to 32")
+        if (capture_policy_id is None) != (capture_policy_revision is None):
+            raise ValueError("capture policy id and revision must be configured together")
+        if capture_policy_id is not None:
+            if not isinstance(capture_policy_id, str) or not capture_policy_id.strip() or len(capture_policy_id) > 512:
+                raise ValueError("capture_policy_id must be non-empty and at most 512 characters")
+            if not isinstance(capture_policy_revision, str) or not capture_policy_revision.strip() or len(capture_policy_revision) > 512:
+                raise ValueError("capture_policy_revision must be non-empty and at most 512 characters")
         self.memory, self.policy = memory, policy
         self.policy_revision, self.review_limit = policy_revision, review_limit
+        self.capture_policy_id, self.capture_policy_revision = capture_policy_id, capture_policy_revision
 
-    async def capture(self, messages, *, source, key: str, metadata=None, expires_at=None, signal=None):
+    async def capture(self, messages, *, source, key: str, metadata=None, expires_at=None,
+                      authorization: MemoryCaptureAuthorization | None = None, signal=None):
         if not isinstance(key, str) or not key.strip() or len(key) > 512:
             raise ValueError("workflow key must be non-empty and at most 512 characters")
+        if self.capture_policy_id is None:
+            if authorization is not None:
+                raise ValueError("capture authorization requires a configured capture policy")
+        else:
+            if not isinstance(authorization, MemoryCaptureAuthorization):
+                raise MemoryError("memory_capture_authorization_required")
+            intent = memory_capture_intent(messages, source=source, metadata=metadata, expires_at=expires_at,
+                                           max_input_chars=self.memory.max_input_chars)
+            if (authorization.intent_digest != intent
+                    or authorization.policy_id != self.capture_policy_id
+                    or authorization.policy_revision != self.capture_policy_revision):
+                raise MemoryError("memory_capture_authorization_mismatch")
         prefix = "workflow:" + sha256(key.encode()).hexdigest()
         # Re-submit the identical extraction input so the journal checks key reuse.
         extraction = await self.memory.extract(messages, source=source, key=prefix + ":extract",
-                                               metadata=metadata, expires_at=expires_at, signal=signal)
+                                               metadata=metadata, expires_at=expires_at,
+                                               authorization=authorization, signal=signal)
         if extraction.state != "complete":
             return MemoryWorkflowResult(extraction)
         resolutions, pending = [], []

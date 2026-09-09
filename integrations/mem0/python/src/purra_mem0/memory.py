@@ -155,6 +155,59 @@ class MemorySource:
 
 
 @dataclass(frozen=True, slots=True)
+class MemoryCaptureAuthorization:
+    """Host grant bound to one exact pre-extraction capture intent."""
+
+    intent_digest: str
+    policy_id: str
+    policy_revision: str
+    principal_id: str
+    decision_id: str
+
+    def __post_init__(self):
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", self.intent_digest):
+            raise ValueError("invalid capture intent digest")
+        _text(self.policy_id, "capture policy id", 512)
+        _text(self.policy_revision, "capture policy revision", 512)
+        _text(self.principal_id, "capture principal id", 512)
+        _text(self.decision_id, "capture decision id", 512)
+
+    def _data(self):
+        return {
+            "intent_digest": self.intent_digest,
+            "policy_id": self.policy_id,
+            "policy_revision": self.policy_revision,
+            "principal_id": self.principal_id,
+            "decision_id": self.decision_id,
+        }
+
+
+def _capture_input(messages, source, metadata, expires_at, max_input):
+    if not isinstance(source, MemorySource):
+        raise TypeError("source must be MemorySource")
+    if not isinstance(messages, Sequence) or isinstance(messages, (str, bytes)) or not 1 <= len(messages) <= 100:
+        raise ValueError("messages must contain 1 to 100 source messages")
+    copied = []
+    for message in messages:
+        if not isinstance(message, Mapping) or set(message) != {"role", "content"} or message["role"] not in ("user", "assistant"):
+            raise ValueError("source messages may contain only user/assistant text")
+        copied.append({"role": message["role"], "content": _text(message["content"], "message", max_input)})
+    if sum(len(message["content"]) for message in copied) > max_input:
+        raise ValueError("source messages exceed max_input_chars")
+    return copied, _metadata({} if metadata is None else metadata), _expiry(expires_at)
+
+
+def memory_capture_intent(messages, *, source: MemorySource, metadata=None, expires_at=None,
+                          max_input_chars=32_000):
+    """Digest the exact content and labels that would leave the host for extraction."""
+    _integer(max_input_chars, "max_input_chars", 10_000_000)
+    copied, metadata, expires = _capture_input(messages, source, metadata, expires_at, max_input_chars)
+    return "sha256:" + _digest([
+        "purra.mem0.capture-intent/v1", copied, [source.id, source.revision], metadata, expires,
+    ])
+
+
+@dataclass(frozen=True, slots=True)
 class MemoryRecord:
     id: str
     text: str
@@ -607,6 +660,10 @@ class Mem0Memory:
         return None if self._providers is None else MemoryUsage(**self._journal.usage(budget=self._providers.budget.key))
 
     @property
+    def max_input_chars(self) -> int:
+        return self._max_input
+
+    @property
     def epoch(self) -> int:
         return self._journal.epoch()
 
@@ -781,20 +838,20 @@ class Mem0Memory:
         return await self._write("add", text, source, key, expires_at=expires_at,
                                  metadata={} if metadata is None else metadata, state=state, reason=reason, signal=signal)
 
-    async def extract(self, messages: Sequence[Mapping[str, str]], *, source: MemorySource, key: str, expires_at=None, metadata=None, signal=None):
+    async def extract(self, messages: Sequence[Mapping[str, str]], *, source: MemorySource, key: str, expires_at=None,
+                      metadata=None, authorization: MemoryCaptureAuthorization | None = None, signal=None):
         if not self._allow_inference:
             raise MemoryError("memory_inference_disabled")
-        if not isinstance(messages, Sequence) or isinstance(messages, (str, bytes)) or not 1 <= len(messages) <= 100:
-            raise ValueError("messages must contain 1 to 100 source messages")
-        copied = []
-        for message in messages:
-            if not isinstance(message, Mapping) or set(message) != {"role", "content"} or message["role"] not in ("user", "assistant"):
-                raise ValueError("source messages may contain only user/assistant text")
-            copied.append({"role": message["role"], "content": _text(message["content"], "message", self._max_input)})
-        if sum(len(m["content"]) for m in copied) > self._max_input:
-            raise ValueError("source messages exceed max_input_chars")
+        copied, metadata, expires_at = _capture_input(messages, source, metadata, expires_at, self._max_input)
+        if authorization is not None and not isinstance(authorization, MemoryCaptureAuthorization):
+            raise TypeError("authorization must be MemoryCaptureAuthorization")
+        expected_intent = "sha256:" + _digest([
+            "purra.mem0.capture-intent/v1", copied, [source.id, source.revision], metadata, expires_at,
+        ])
+        if authorization is not None and authorization.intent_digest != expected_intent:
+            raise MemoryError("memory_capture_authorization_mismatch")
         return await self._write("extract", copied, source, key, expires_at=expires_at,
-                                 metadata={} if metadata is None else metadata, state="pending", signal=signal)
+                                 metadata=metadata, state="pending", authorization=authorization, signal=signal)
 
     async def update(self, item_id: str, text: str, *, version: int, source: MemorySource, key: str,
                      expires_at=_KEEP_EXPIRY, metadata=_KEEP_METADATA, signal=None):
@@ -843,7 +900,7 @@ class Mem0Memory:
         return await self._write("delete", None, None, key, item_id=item_id, version=version, signal=signal)
 
     async def _write(self, kind, content, source, key, *, item_id=None, version=None, expires_at=None,
-                     metadata=_KEEP_METADATA, state="active", reason=None, signal=None):
+                     metadata=_KEEP_METADATA, state="active", reason=None, authorization=None, signal=None):
         _text(key, "operation key", 512)
         if kind in ("add", "update"):
             _text(content, "memory text", self._max_input)
@@ -861,9 +918,15 @@ class Mem0Memory:
             _text(reason, "state reason", 128)
         expires = None if preserve_expiry else _expiry(expires_at)
         source_data = None if source is None else [source.id, source.revision]
-        fingerprint = _digest([kind, content, source_data, item_id, version, "preserve" if preserve_expiry else expires,
-                               "preserve" if preserve_metadata else metadata, state, reason])
+        authorization_data = None if authorization is None else authorization._data()
+        fingerprint_input = [kind, content, source_data, item_id, version, "preserve" if preserve_expiry else expires,
+                             "preserve" if preserve_metadata else metadata, state, reason]
+        if authorization_data is not None:
+            fingerprint_input.append(authorization_data)
+        fingerprint = _digest(fingerprint_input)
         plan = {"kind": kind, "target": item_id, "meta": None}
+        if authorization_data is not None:
+            plan["capture_authorization"] = authorization_data
         if self._providers is not None:
             plan["budget"] = self._providers.budget.key
 

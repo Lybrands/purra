@@ -123,6 +123,30 @@ async def capture(messages, source, operation_key):
 异步 `policy(candidate, review)` 和稳定的 `policy_revision`。
 策略返回已授权且保留审查键的 `MemoryResolution`，或返回 `None` 保持待处理。
 
+需要在消息到达 Mem0 或 Provider 前强制授权时，绑定宿主签发的准确捕获意图：
+
+```python
+from purra_mem0 import MemoryCaptureAuthorization, memory_capture_intent
+
+intent = memory_capture_intent(messages, source=source, metadata=metadata)
+authorization = MemoryCaptureAuthorization(
+    intent, capture_policy_id, capture_policy_revision,
+    authenticated_user_id, host_decision_id,
+)
+workflow = MemoryWorkflow(
+    memory,
+    capture_policy_id=capture_policy_id,
+    capture_policy_revision=capture_policy_revision,
+)
+result = await workflow.capture(
+    messages, source=source, key=operation_key,
+    metadata=metadata, authorization=authorization,
+)
+```
+
+宿主负责认证、内容适用性和决定审计。重试必须沿用相同授权；缺失或不匹配的授权会在
+操作日志及 Provider 调用前失败，同一 key 更换已绑定授权会触发幂等冲突。
+
 ## 生命周期
 
 关闭前调用 `await memory.drain()` 和 `memory.close()`，再关闭 SDK 与模型服务资源。

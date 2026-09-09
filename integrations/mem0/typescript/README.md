@@ -133,6 +133,32 @@ pass `policy(candidate, review)` and a stable `policyRevision` to `MemoryWorkflo
 Return an authorized `MemoryResolution` that retains the review key, or `undefined`
 to leave the candidate pending. The policy may be async.
 
+To require authorization before messages can reach Mem0 or its providers, bind a
+host-issued grant to the exact capture intent:
+
+```ts
+import { MemoryWorkflow, memoryCaptureIntent } from "purra-mem0";
+
+const capturePolicyId = "project-memory";
+const capturePolicyRevision = "2026-09-09";
+const authorization = {
+  intentDigest: memoryCaptureIntent(messages, { source, metadata }),
+  policyId: capturePolicyId,
+  policyRevision: capturePolicyRevision,
+  principalId: authenticatedUserId,
+  decisionId: hostDecisionId,
+};
+const workflow = new MemoryWorkflow(memory, { capturePolicyId, capturePolicyRevision });
+const result = await workflow.capture(messages, {
+  source, key: operationKey, metadata, authorization,
+});
+```
+
+The host owns authentication, eligibility and audit of the decision. Keep the
+authorization unchanged on retry. Missing or mismatched grants fail before the
+operation journal and Provider calls; changing a bound grant under the same key
+causes an idempotency conflict.
+
 ## Lifecycle
 
 Before shutdown, call `await memory.drain()` and `memory.close()`, then close SDK
