@@ -37,6 +37,13 @@ Model reasoning, provisional Provider data, user-visible commentary, final
 output, tool lifecycle, and Artifacts remain separate channels. Publication is
 downstream of persistence; subscribers are never the source of Run truth.
 
+## Host policies
+
+Hosts select business policy through public composition ports; Core validates
+the resulting execution. Built-in defaults are not universal business rules.
+See [host policies](docs/host-policies.md) for replaceable choices, binding and
+recovery obligations, and the current cross-SDK output-policy limits.
+
 ## Execution styles
 
 Auto execution is the default. Core adds the private, empty-argument

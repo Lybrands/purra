@@ -36,6 +36,7 @@ export interface ModelRouteRequirements {
   readonly structuredOutputLevel?: 'none' | 'unknown' | 'json_object' | 'json_schema';
   readonly streamingRequired?: boolean;
   readonly cancellationRequired?: boolean;
+  readonly imageInputRequired?: boolean;
 }
 
 /** Pure registration-order selection. The result is not execution authority. */
@@ -46,7 +47,7 @@ export function selectModelRoute(candidates: readonly ModelRouteCandidate[], all
   if (!['default', 'enabled', 'disabled'].includes(requirements.reasoningMode)
     || !['required', 'optional', 'disabled'].includes(requirements.toolCalling ?? 'optional')
     || !Object.hasOwn(levels, requirements.structuredOutputLevel ?? 'none')
-    || [requirements.streamingRequired, requirements.cancellationRequired].some(v => v !== undefined && typeof v !== 'boolean')) throw new TypeError('Invalid model route requirements');
+    || [requirements.streamingRequired, requirements.cancellationRequired, requirements.imageInputRequired].some(v => v !== undefined && typeof v !== 'boolean')) throw new TypeError('Invalid model route requirements');
   const rows = candidates.map(copyModelRouteCandidate);
   const ids = new Set(rows.map(row => row.bindingId));
   if (ids.size !== rows.length || allowed.some(id => !ids.has(id))) throw new TypeError('Duplicate candidate or unknown allowed binding');
@@ -58,6 +59,7 @@ export function selectModelRoute(candidates: readonly ModelRouteCandidate[], all
       || (requirements.toolCalling === 'required' && p.toolCalling !== 'supported')
       || (requirements.streamingRequired && p.streaming !== 'supported')
       || (requirements.cancellationRequired && p.cancellation !== 'supported')
+      || (requirements.imageInputRequired && p.imageInput !== 'supported')
       || (Object.hasOwn(levels, p.jsonSchemaLevel) ? levels[p.jsonSchemaLevel as keyof typeof levels] : 0) < levels[requirements.structuredOutputLevel ?? 'none']) continue;
     return policy === undefined ? row : copyModelRouteCandidate({...row, policyId:policy.id, policyRevision:policy.revision});
   }

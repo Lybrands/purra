@@ -376,6 +376,8 @@ class AgentPreset:
                 "agent preset enabled unknown tools: " + ", ".join(sorted(unknown))
             )
         composition = {
+            **({"imageInput": request.model.protocol_capabilities.image_input.value}
+               if request.model.protocol_capabilities.image_input.value != "unknown" else {}),
             **({"modelRoute": {
                 **self.model_route.to_mapping(),
                 "requestIdentity": sha256(json.dumps({

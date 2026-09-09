@@ -3,7 +3,7 @@ import OpenAI from "openai";
 import type { Stream } from "openai/core/streaming";
 import type { ChatCompletionChunk, ChatCompletionCreateParamsNonStreaming, ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import type { CompletionUsage } from "openai/resources/completions";
-import { AgentCanceledError, AgentError } from "purra";
+import { AgentCanceledError, AgentError, parseStaticImageContent } from "purra";
 import type { JsonValue, Message, ModelCapabilitySnapshot, ModelGateway, ModelRequest, ModelStream, ModelStreamItem, ModelTokenUsage, ModelTurn } from "purra";
 
 function text(value: JsonValue): string {
@@ -11,9 +11,16 @@ function text(value: JsonValue): string {
   if (typeof value !== "string") throw new TypeError("OpenAI Chat Completions accepts text content only");
   return value;
 }
-function messages(input: readonly Message[]): ChatCompletionMessageParam[] {
+function messages(input: readonly Message[], imageInput: boolean): ChatCompletionMessageParam[] {
   return input.map(m => {
     if (m.toolCalls?.length && m.role !== "assistant") throw new TypeError("Only assistant messages may carry tool calls");
+    const images = parseStaticImageContent(m.content);
+    if (images !== undefined) {
+      if (!imageInput || m.role !== "user") throw new TypeError("Static images require user role and host-enabled image input");
+      return { role: "user", content: [{ type: "text", text: images.text }, ...images.images.map(image => ({
+        type: "image_url" as const, image_url: { url: `data:${image.mediaType};base64,${image.dataBase64}` },
+      }))] };
+    }
     const content = text(m.content);
     if (m.role === "tool") {
       if (!m.toolCallId) throw new TypeError("Tool output requires a call id");
@@ -47,6 +54,7 @@ function failed(error: unknown, signal?: AbortSignal): never {
 }
 
 export interface OpenAIChatCompletionsOptions {
+  readonly imageInput?: boolean;
   readonly client?: OpenAI;
   readonly model: string;
   readonly capabilities: ModelCapabilitySnapshot;
@@ -61,6 +69,7 @@ export class OpenAIChatCompletionsGateway implements ModelGateway {
   readonly #client: OpenAI;
   readonly #options: OpenAIChatCompletionsOptions;
   constructor(options: OpenAIChatCompletionsOptions) {
+    if (options.imageInput !== undefined && typeof options.imageInput !== "boolean") throw new TypeError("imageInput must be boolean");
     if (!options.model.trim()) throw new TypeError("Model name is required");
     if (!Number.isFinite(options.timeoutMs ?? 60000) || (options.timeoutMs ?? 60000) <= 0) throw new TypeError("Timeout must be positive and finite");
     this.capabilities = options.capabilities;
@@ -72,9 +81,13 @@ export class OpenAIChatCompletionsGateway implements ModelGateway {
   }
   #request(request: ModelRequest): ChatCompletionCreateParamsNonStreaming {
     this.validateOutputContract(request);
+    if (request.messages.some(message => parseStaticImageContent(message.content) !== undefined)
+      && (this.capabilities.protocol?.imageInput !== "supported" || request.capabilitySnapshot?.protocol.imageInput !== "supported")) {
+      throw new AgentError("model_capability_incompatible", "Model profile does not declare image input support");
+    }
     if (!request.outputBudget) throw new TypeError("OpenAI gateway requires a resolved generation budget");
     const o = this.#options;
-    return { model: o.model, messages: messages(request.messages), store: false, max_completion_tokens: request.outputBudget.maxGenerationTokens,
+    return { model: o.model, messages: messages(request.messages, o.imageInput ?? false), store: false, max_completion_tokens: request.outputBudget.maxGenerationTokens,
       ...(request.outputContract?.mode === "native_required" ? { response_format: { type: "json_schema" as const, json_schema: {
         name: "purra_output", strict: true, schema: JSON.parse(JSON.stringify(request.outputContract.schema)) as Record<string, unknown>,
       } } } : {}),
@@ -126,7 +139,7 @@ export class OpenAIChatCompletionsGateway implements ModelGateway {
             ...(call.function?.name === undefined ? {} : { name: call.function.name }), argumentsFragment: call.function?.arguments ?? "" }));
           if (content || calls.length) yield { contentDelta: content, toolCallDeltas: calls };
           else yield { type: "activity", kind: "transport" };
-          if (c.finish_reason !== null) terminal = finish(c.finish_reason);
+          if (c.finish_reason != null) terminal = finish(c.finish_reason);
         }
         if (terminal === undefined) throw new AgentError("upstream_stream_interrupted", "OpenAI stream ended without a finish reason");
         yield { finishReason: refused ? "filtered" : terminal, ...(tokenUsage === undefined ? {} : { usage: tokenUsage }) };

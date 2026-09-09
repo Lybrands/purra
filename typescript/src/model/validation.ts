@@ -1,4 +1,5 @@
 import { AgentError } from "../shared/errors.js";
+import { parseStaticImageContent } from "./media.js";
 import type {
   ContinuationKind,
   ContinuationSafety,
@@ -207,6 +208,8 @@ export function copyCapabilitySnapshot(value: ModelCapabilitySnapshot): ModelCap
         protocol.publicProgress ?? "unknown",
         "public progress support",
       ),
+      ...(enumValue(FEATURE_SUPPORT, protocol.imageInput ?? "unknown", "image input support") === "unknown"
+        ? {} : { imageInput: protocol.imageInput! }),
       assistantContentWithToolCalls: enumValue(
         ASSISTANT_CONTENT_WITH_TOOL_CALLS,
         protocol.assistantContentWithToolCalls,
@@ -411,6 +414,7 @@ export function copyJsonValue(value: unknown, active = new WeakSet<object>()): J
 function copyMessage(message: Message): Message {
   if (!isObject(message)) throw new TypeError("Invalid message");
   if (!includes(MESSAGE_ROLES, message.role)) throw new TypeError("Invalid message role");
+  if (parseStaticImageContent(message.content) !== undefined && message.role !== "user") throw new TypeError("Static images require user role");
 
   const toolCallId = message.toolCallId === undefined
     ? undefined

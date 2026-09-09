@@ -162,6 +162,8 @@ export interface AgentOptions {
   readonly context?: ContextOptions;
   readonly planning?: PlanningOptions;
   readonly responseValidation?: ResponseValidationOptions;
+  /** `none` returns a host-only result without a public response presentation. */
+  readonly responsePresentation?: "model_live" | "none";
   readonly durable?: DurableOptions;
   readonly agentTree?: AgentTreeOptions;
   readonly recovery?: RecoveryPolicy;
@@ -191,7 +193,7 @@ export type AgentStreamEvent =
   | { readonly type: "model_delta"; readonly delta: string }
   | { readonly type: "agent_progress"; readonly text: string }
   | ToolExecutionEvent
-  | { readonly type: "final"; readonly result: AgentRunResult };
+  | { readonly type: "final"; readonly result: AgentRunResult; readonly visibility?: "private" };
 
 type Emit = (event: Exclude<AgentStreamEvent, { readonly type: "final" }>) => void;
 
@@ -228,6 +230,7 @@ export class Agent {
   readonly #runRepository: RunRepository;
   readonly #outputPublisher: OutputPublisher;
   readonly #outputPolicy: OutputPolicy;
+  readonly #responsePresentation: "model_live" | "none";
   readonly #context: ContextOptions | undefined;
   readonly #planning: PlanningOptions | undefined;
   readonly #responseValidationOptions: ResponseValidationOptions;
@@ -352,6 +355,11 @@ export class Agent {
     this.#runRepository = options.runRepository ?? new InMemoryRunRepository();
     this.#outputPublisher = options.outputPublisher ?? new InMemoryOutputPublisher();
     this.#outputPolicy = options.outputPolicy ?? allowAllOutput;
+    if (options.responsePresentation !== undefined
+      && options.responsePresentation !== "model_live" && options.responsePresentation !== "none") {
+      throw new TypeError("responsePresentation must be model_live or none");
+    }
+    this.#responsePresentation = options.responsePresentation ?? "model_live";
     this.#planning = copyPlanningOptions(options.planning);
     this.#durable = copyDurableOptions(options.durable, this.#planning, options.preset);
     this.#responseValidationOptions = copyResponseValidationOptions(options.responseValidation);
@@ -565,6 +573,8 @@ export class Agent {
         runtimeLimits: this.#runtimeLimits,
         contextStrategy: this.#context?.strategy ?? "single_pass",
         planningBinding: this.#planning?.binding ?? null,
+        ...(this.#capabilities.protocol.imageInput === undefined ? {} : { imageInput: this.#capabilities.protocol.imageInput }),
+        ...(this.#responsePresentation === "none" ? { responsePresentation: "none" } : {}),
         durableBinding: this.#durable?.binding ?? null,
         agentTree: agentTreeSnapshot,
         recovery: this.#recoveryPolicy.snapshot(),
@@ -1015,7 +1025,7 @@ export class Agent {
         );
       }
     }
-    await session.complete(result);
+    await session.complete(result, this.#responsePresentation);
   }
 
   public async *stream(input: AgentRunInput): AsyncIterable<AgentStreamEvent> {
@@ -1036,7 +1046,9 @@ export class Agent {
       wake = undefined;
     };
     void this.#executeTransient(runInput, emit).then(
-      (result) => emit({ type: "final", result }),
+      (result) => emit({ type: "final", result,
+        ...(this.#responsePresentation === "none" ? { visibility: "private" as const } : {}),
+      }),
       (error: unknown) => { failure = error; },
     ).finally(() => {
       settled = true;
@@ -1181,8 +1193,8 @@ export class Agent {
     let autoPlanningPhase: "initial" | "remaining" | undefined = (
       autoPlanning !== undefined && planning === undefined
     ) ? (resumeCheckpoint?.initialPlanningOpen === false ? "remaining" : "initial") : undefined;
-    const validatedResultMode = session !== undefined
-      && this.#agentTreeRoots.has(session.rootRunId);
+    const validatedResultMode = this.#responsePresentation === "none"
+      || (session !== undefined && this.#agentTreeRoots.has(session.rootRunId));
     const recovery = new RecoveryLedger(this.#recoveryPolicy);
     if (resumeCheckpoint !== undefined) {
       if (
@@ -1313,10 +1325,12 @@ export class Agent {
                 chunkIndex += 1;
               }
               if (!responseValidation.enabled && tools.length === 0) {
-                if (emit !== undefined && chunk.contentDelta !== undefined && chunk.contentDelta !== "") {
-                  visibleOutputEmitted = true;
+                if (this.#responsePresentation !== "none") {
+                  if (emit !== undefined && chunk.contentDelta !== undefined && chunk.contentDelta !== "") {
+                    visibleOutputEmitted = true;
+                  }
+                  emitModelDelta(chunk, emit);
                 }
-                emitModelDelta(chunk, emit);
                 emitAgentProgress(chunk, emit);
               }
             },

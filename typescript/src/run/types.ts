@@ -16,6 +16,7 @@ export type RunStatus = "running" | "completed" | "failed" | "canceled";
 export type PlanningMode = "auto" | "reactive" | "planned";
 
 export interface RunResult {
+  /** Host result. With responsePresentation=none this is not public response text. */
   readonly output: JsonValue;
   readonly messages: readonly Message[];
   readonly rounds: number;

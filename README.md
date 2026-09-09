@@ -125,3 +125,5 @@ before retrying them. Persistent storage alone does not make those writes replay
 ## License
 
 [MIT](LICENSE)
+
+Host policy composition and limits: [guide](docs/host-policies.md).

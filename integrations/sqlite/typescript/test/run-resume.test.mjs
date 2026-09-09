@@ -11,7 +11,7 @@ const { cases } = JSON.parse(readFileSync(new URL("../../../../conformance/fixtu
 const request = { messages: [{ role: "user", content: "Look up the value" }], planningMode: "reactive" };
 const options = { budgets: { maxRunGenerationTokens: null } };
 
-function host(path, { revision = "1", leased = true, pause = false, tree = false, firstSnapshot } = {}) {
+function host(path, { revision = "1", leased = true, pause = false, tree = false, firstSnapshot, responsePresentation } = {}) {
   const storage = new SqliteAgentAdapters(path, { scope: "resume" });
   const counts = { model: 0, tool: 0 };
   const model = testGateway({
@@ -36,6 +36,7 @@ function host(path, { revision = "1", leased = true, pause = false, tree = false
   });
   const agent = new Agent({
     model, preset: { id: "resume", revision }, runRepository: repository,
+    ...(responsePresentation === undefined ? {} : { responsePresentation }),
     outputPublisher: storage.publisher,
     ...(tree ? { agentTree: { repository: storage.runTree } } : {}),
     tools: [{ name: "lookup", description: "Read the value",
@@ -218,4 +219,39 @@ test('inspection is read-only and tool reconciliation preserves the model attemp
     assert.deepEqual(counts,previousCounts);
     await assert.rejects(storage.runs.executeOwned(id,async()=>{throw Error('must not execute');},saved.executionCheckpoint),{code:'run_recovery_requires_reconciliation'});
   } finally {reader?.close();current?.storage.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+
+test("host-only presentation survives SQLite reopen and rejects changed publication policy", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "purra-presentation-resume-"));
+  const path = join(dir, "agent.db");
+  let current;
+  try {
+    current = host(path, { pause: true, responsePresentation: "none" });
+    const handle = await current.agent.submit(request, options);
+    await assert.rejects(handle.result, UserInputRequired);
+    const before = await handle.snapshot();
+    assert.deepEqual(current.counts, { model: 1, tool: 1 });
+    current.storage.close();
+    current = host(path); // cannot upgrade a waiting private result into public output
+    await assert.rejects(current.agent.resume(handle.runId, request), { code: "agent_preset_mismatch" });
+    assert.deepEqual(current.counts, { model: 0, tool: 0 });
+    current.storage.close();
+    current = host(path, { responsePresentation: "none" });
+    const resumed = await current.agent.resume(handle.runId, request);
+    assert.equal((await resumed.result).output, "42");
+    assert.deepEqual(current.counts, { model: 1, tool: 0 });
+    const after = await resumed.snapshot();
+    assert.equal(after.deadlineAt, before.deadlineAt);
+    const publicEvents = [];
+    for await (const event of resumed.events()) publicEvents.push(event);
+    assert.ok(!publicEvents.some(event => event.kind === "final"));
+    assert.ok(publicEvents.some(event => event.kind === "run.completed"));
+    const all = [];
+    for await (const event of resumed.events({ visibility: "all" })) all.push(event);
+    assert.equal(all.find(event => event.kind === "final").visibility, "private");
+  } finally {
+    current?.storage.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

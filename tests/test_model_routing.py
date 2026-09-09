@@ -12,6 +12,16 @@ def candidate(name, **changes):
         generic_capability_snapshot(), max_generation_tokens=128, **changes))
 
 
+def test_image_route_is_explicit_and_changed_support_cannot_restore():
+    plain = candidate('plain')
+    vision = candidate('vision', protocol=replace(plain.capabilities.protocol, image_input='supported'))
+    selected = select_model_route([plain, vision], ['plain', 'vision'], TaskCapabilityRequirements('default', image_input_required=True))
+    assert selected == vision
+    changed = replace(vision, capabilities=replace(vision.capabilities, protocol=replace(vision.capabilities.protocol, image_input='unavailable')))
+    with pytest.raises(ContractViolationError):
+        resolve_model_route([changed], selected.to_mapping(), ['vision'])
+
+
 def test_authorization_and_order():
     a, b = candidate('a'), candidate('b')
     req = TaskCapabilityRequirements('default')

@@ -113,3 +113,5 @@ JavaScript 和 TypeScript 用法见 [TypeScript 指南](typescript/README.zh-CN.
 [MIT](LICENSE)
 
 长期公共接口约定见[兼容承诺](ARCHITECTURE.md#public-compatibility)。
+
+宿主策略、默认行为与替换边界见[接入指南](docs/host-policies.md)。

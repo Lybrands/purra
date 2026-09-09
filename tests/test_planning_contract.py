@@ -869,3 +869,125 @@ def test_execution_transition_is_the_only_current_tool_grant():
     assert transition.executor is StepExecutor.MODEL
     assert transition.allowed_tool_names == frozenset({"lookup"})
     assert transition.future_tool_names == frozenset({"lookupMore"})
+
+
+@pytest.mark.parametrize("minimum", [0, -1, True, 1.5, "2", 9_007_199_254_740_992])
+def test_initial_plan_preference_rejects_invalid_values(minimum):
+    with pytest.raises((TypeError, ValueError), match="min_initial_visible_steps"):
+        PlanningConstraints(min_initial_visible_steps=minimum)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("domain,minimum", [("incident-triage", 1), ("document-review", 2)])
+async def test_host_policy_selects_initial_plan_granularity(domain, minimum):
+    class HostPolicy:
+        def planning_constraints(self, request, capabilities):
+            return PlanningConstraints(min_initial_visible_steps=minimum)
+
+    request = replace(_request(), domain_context=DomainContext(namespace=domain))
+    constraints = HostPolicy().planning_constraints(request, PlanningCapabilities())
+    capabilities = PlanningCapabilities(constraints=constraints)
+    raw = {"needsTodos": True, "title": domain, "todos": [
+        {"id": f"work-{i}", "title": f"Review evidence {i}", "type": "review", "executor": "model"}
+        for i in range(minimum)
+    ]}
+    gateway = _ScriptedPlannerGateway([json.dumps(raw)])
+    result = await AgentPlanner(gateway).create_plan(request, capabilities)
+    assert len(result.work_plan.steps) == minimum
+    assert len(gateway.invocations) == 1
+    system, user = gateway.message_rounds[0]
+    assert f"at least {minimum}" in system.content
+    assert json.loads(user.content)["minVisiblePlanSteps"] == minimum
+    # Policy preferences do not grant tools or change compiler authority.
+    assert all(not step.capability_names for step in result.work_plan.steps)
+    assert len(compile_work_plan(result.work_plan, ()).execution_plan.steps) == minimum
+    with pytest.raises(ContractViolationError):
+        compile_work_plan(_tool_work_plan("unavailable"), ())
+
+
+def test_planning_checkpoint_keeps_host_preference_and_reads_older_state():
+    from purra.engine.dynamic_planning import DynamicPlanningOrchestrator
+
+    def coordinator(minimum):
+        return DynamicPlanningOrchestrator(
+            planner=_Planner(), request=_request(), controller=None,
+            capabilities=PlanningCapabilities(constraints=PlanningConstraints(min_initial_visible_steps=minimum)),
+            enabled_names=frozenset(), registrations=(),
+        )
+
+    saved = json.loads(json.dumps(coordinator(1).checkpoint_state()))
+    restored = coordinator(3)
+    restored.restore_checkpoint_state(saved)
+    assert restored.checkpoint_state()["constraints"]["min_initial_visible_steps"] == 1
+    del saved["constraints"]["min_initial_visible_steps"]
+    restored.restore_checkpoint_state(saved)
+    assert restored.checkpoint_state()["constraints"]["min_initial_visible_steps"] == 3
+
+
+def test_host_planning_policy_revision_cannot_resume_old_preset():
+    preset = AgentPreset(
+        id="review", revision="1", tool_catalog=InMemoryToolCatalog(()),
+        runtime_limits=RuntimeLimits(max_run_generation_tokens=None),
+        execution_profile=ExecutionProfile(planner=_Planner(), planning_policy=_AlwaysPlan()),
+        component_bindings={"planner": AgentComponentBinding("planner", "1"),
+                            "planningPolicy": AgentComponentBinding("review-policy", "1")},
+    )
+    saved = preset.snapshot(_request())
+    changed = replace(preset, component_bindings={
+        **preset.component_bindings, "planningPolicy": AgentComponentBinding("review-policy", "2"),
+    })
+    with pytest.raises(ValueError, match="persisted snapshot"):
+        changed.require_snapshot(saved, _request())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("domain,minimum", [("incident-triage", 1), ("document-review", 2)])
+async def test_submitted_host_run_uses_its_planning_preference(domain, minimum):
+    class Policy:
+        def planning_constraints(self, request, capabilities):
+            assert request.domain_context.namespace == domain
+            return PlanningConstraints(min_initial_visible_steps=minimum)
+
+    class Gateway:
+        def __init__(self):
+            self.plan_calls = 0
+
+        async def complete(self, messages, invocation, signal=None):
+            raise AssertionError("expected streamed invocation")
+
+        async def stream(self, messages, invocation, signal=None):
+            is_plan = any('"minVisiblePlanSteps"' in message.content for message in messages)
+            if is_plan:
+                self.plan_calls += 1
+                content = json.dumps({"v": 1, "type": "plan", "plan": {
+                    "needsTodos": True, "title": domain, "todos": [
+                        {"id": f"step-{i}", "title": f"Inspect evidence {i}", "type": "review", "executor": "model"}
+                        for i in range(minimum)
+                    ],
+                }}) + "\n"
+            else:
+                content = "done"
+            async def chunks():
+                yield ModelStreamChunk(content_delta=content)
+                yield ModelStreamChunk(finish_reason=ModelFinishReason.STOP)
+            return ModelStream(chunks=chunks(), model="test-model", applied_generation_limit=invocation.output_budget.max_generation_tokens)
+
+    gateway = Gateway()
+    storage = InMemoryAgentAdapters()
+    preset = AgentPreset(
+        id=domain, revision="1", tool_catalog=InMemoryToolCatalog(()),
+        runtime_limits=RuntimeLimits(max_run_generation_tokens=None),
+        execution_profile=ExecutionProfile(planner=AgentPlanner(gateway), planning_policy=Policy()),
+        component_bindings={"planner": AgentComponentBinding("planner", "1"),
+                            "planningPolicy": AgentComponentBinding(domain, str(minimum))},
+    )
+    core = AgentCore(model_gateway=gateway, preset=preset,
+                     run_repository=storage.runs, output_repository=storage.outputs,
+                     output_publisher=storage.publisher)
+    try:
+        handle = await core.submit(replace(_request(), domain_context=DomainContext(namespace=domain), context_window=32768))
+        result = await handle.wait()
+        assert result.final_response == "done"
+        assert gateway.plan_calls == 1
+    finally:
+        await core.close()

@@ -108,3 +108,11 @@ Core 会保留“未知”状态，而不会把它记成 0。
 - [MIT 许可证](LICENSE)
 
 长期公共接口约定见[兼容承诺](../ARCHITECTURE.md#public-compatibility)。
+
+### 仅返回宿主结果
+
+在 `Agent` 上设置 `responsePresentation: "none"`，可省略额外的公开回答呈现轮次。
+默认 `"model_live"` 保持原行为。已有结果校验、工具权限和 Run 预算仍然生效。
+此模式下 `result.output`、`snapshot().finalOutput` 是宿主私有结果，最终事件保持私有；
+生命周期、工具和进度事件保留原可见性。临时 stream 不输出回答文本增量，最终结果事件
+标记 `visibility: "private"`。呈现选择纳入 Run 配置身份，恢复时不能切换公开方式。

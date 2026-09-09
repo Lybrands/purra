@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { testGateway } from './support/model-gateway.mjs';
-import { InMemoryRunRepository, assertRunRepositoryConforms, copyToolExecutionCheckpoint } from 'purra';
+import { InMemoryRunRepository, assertRunRepositoryConforms, copyToolExecutionCheckpoint, staticImageContent, estimateMessagesTokens } from 'purra';
 const source = new InMemoryRunRepository();
 await assertRunRepositoryConforms(source);
 const { preset, budgets } = await source.get('conformance-run-1');
@@ -20,6 +20,20 @@ async function repository({ settle = true } = {}) {
   if (settle) await runs.settleInvocation('run', { invocationId: 'actual', status: 'completed' });
   return runs;
 }
+test('image bytes and budget survive repository export and import at the tool boundary', async () => {
+  const input = checkpoint();
+  const content = staticImageContent('Describe', [{ mediaType: 'image/png', dataBase64: 'YQ==', inputTokens: 2000 }]);
+  input.messages = [{ role: 'user', content }];
+  const runs = await repository();
+  await runs.saveToolExecutionCheckpoint('run', input);
+  const restored = new InMemoryRunRepository();
+  restored.importState(JSON.parse(JSON.stringify(runs.exportState())));
+  const saved = (await restored.get('run')).toolExecutionCheckpoint;
+  assert.deepEqual(saved.messages, input.messages);
+  assert.equal(estimateMessagesTokens(saved.messages), estimateMessagesTokens(input.messages));
+  assert.equal(saved.nextRound, 1);
+  assert.equal(saved.invocationId, 'actual');
+});
 test('tool continuation is immutable and round-trips without changing the v2 contract', async () => {
   const input = checkpoint(), copied = copyToolExecutionCheckpoint(input);
   input.assistant.toolCalls[0].arguments.value = 7;

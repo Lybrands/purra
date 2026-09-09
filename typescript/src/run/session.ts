@@ -610,7 +610,7 @@ export class RunSession {
     });
   }
 
-  public async complete(result: RunResult): Promise<void> {
+  public async complete(result: RunResult, presentation: "model_live" | "none" = "model_live"): Promise<void> {
     if (this.#deadlineExceeded) {
       throw new AgentError("run_deadline_exceeded", "Run deadline has elapsed");
     }
@@ -619,7 +619,7 @@ export class RunSession {
       sourceKey: `run:${this.#runId}:final`,
       kind: "final",
       channel: "final",
-      visibility: this.#outwardVisibility,
+      visibility: presentation === "none" ? "private" : this.#outwardVisibility,
       payload: { output: result.output, rounds: result.rounds },
     });
     if (finalEvent === null) {

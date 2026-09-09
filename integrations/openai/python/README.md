@@ -5,6 +5,10 @@ English | [简体中文](README.zh-CN.md)
 OpenAI model gateways for PurrA using the official Python SDK. Supports text,
 function tools, streaming, cancellation, and token usage. Requires Python 3.11+.
 
+In 1.1.0 development, Chat Completions also accepts the optional
+[static image contract](../../../docs/static-images.md) with `image_input=True`.
+Responses image input is not implemented in this slice.
+
 ## Install
 
 From the repository root:

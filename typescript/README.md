@@ -123,3 +123,14 @@ are constrained by the parent. See [Architecture](ARCHITECTURE.md).
 - [Examples](../examples/README.md)
 - [Optional packages](../integrations/README.md)
 - [MIT license](LICENSE)
+
+### Host-only results
+
+Set `responsePresentation: "none"` on `Agent` to return a result without a public
+response-presentation round. The default `"model_live"` is unchanged. Configured
+response validators, tool permissions and Run budgets still apply. `result.output`
+and `snapshot().finalOutput` are host-only data in this mode; the persisted final
+event is private, while lifecycle/tool/progress events retain their existing
+visibility. Transient stream final events carry `visibility: "private"` and no
+response-text deltas are emitted. The presentation mode is bound to the Run's
+composition and cannot be changed on resume.

@@ -7,7 +7,7 @@ export const AUTO_REMAINING_PLANNING_TOOL_NAME = "request_remaining_plan";
 
 export const AUTO_PLANNING_TOOL_SPEC: ToolSpec = Object.freeze({
   name: AUTO_PLANNING_TOOL_NAME,
-  description: "Request a governed execution plan before any business tool runs. Use only when the task needs at least three distinct user-visible semantic steps or must be validated for authority, budget, approval, or durable execution. Do not use for direct answers, work with fewer than three real steps, or ordinary read-only tool use.",
+  description: "Request a governed execution plan before any business tool runs. Use when the task needs a governed plan under the host's planning preferences or must be validated for authority, budget, approval, or durable execution. Do not use for direct answers or ordinary read-only tool use that does not need planning.",
   displayNames: Object.freeze({ en: "Plan execution", "zh-CN": "制定执行计划" }),
   inputSchema: Object.freeze({
     type: "object",

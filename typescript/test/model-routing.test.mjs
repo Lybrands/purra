@@ -14,6 +14,14 @@ function candidate(bindingId) {
   } };
 }
 const req = { reasoningMode: 'default' };
+test('image capability filters routing and changing it invalidates the saved binding', async () => {
+  const plain = candidate('plain'), vision = candidate('vision');
+  vision.capabilities.protocol.imageInput = 'supported';
+  const saved = selectModelRoute([plain, vision], ['plain', 'vision'], { ...req, imageInputRequired: true });
+  assert.equal(saved.bindingId, 'vision');
+  vision.capabilities.protocol.imageInput = 'unavailable';
+  await assert.rejects(resolveModelRoute([vision], saved, ['vision']), { code: 'model_route_mismatch' });
+});
 test('authorization, registration order and duplicate/unknown rejection', () => {
   const a = candidate('a'), b = candidate('b');
   assert.equal(selectModelRoute([a,b], ['b'], req).bindingId, 'b');

@@ -25,6 +25,9 @@ export function copyPlanningConstraints(value: PlanningConstraints = {}): Planni
   const maxSteps = value.maxSteps === undefined
     ? undefined
     : positiveInteger(value.maxSteps, "planning maxSteps");
+  const minInitialVisibleSteps = value.minInitialVisibleSteps === undefined
+    ? undefined
+    : positiveInteger(value.minInitialVisibleSteps, "planning minInitialVisibleSteps");
   const allowedCapabilityNames = copyNames(value.allowedCapabilityNames, "allowed capabilities");
   const excludedCapabilityNames = copyNames(value.excludedCapabilityNames, "excluded capabilities");
   if (
@@ -38,6 +41,7 @@ export function copyPlanningConstraints(value: PlanningConstraints = {}): Planni
   }
   return Object.freeze({
     ...(maxSteps === undefined ? {} : { maxSteps }),
+    ...(minInitialVisibleSteps === undefined ? {} : { minInitialVisibleSteps }),
     ...(allowedCapabilityNames === undefined ? {} : { allowedCapabilityNames }),
     ...(excludedCapabilityNames === undefined ? {} : { excludedCapabilityNames }),
   });

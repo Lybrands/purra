@@ -12,6 +12,7 @@ from purra.contracts import (AgentMessage, ModelCompletion, ModelFinishReason,
                             ToolCall, ToolCallDelta)
 from purra.errors import AgentCoreError, ModelGatewayError
 from purra.json_values import thaw_json_mapping
+from purra.media import parse_static_image_content
 
 
 def _text(value):
@@ -54,7 +55,10 @@ def _error(error):
 class OpenAIChatCompletionsGateway:
     """Text and function tools; the host supplies model selection and capabilities."""
 
-    def __init__(self, client: AsyncOpenAI | None = None, *, timeout_seconds: float = 60):
+    def __init__(self, client: AsyncOpenAI | None = None, *, timeout_seconds: float = 60, image_input: bool = False):
+        if type(image_input) is not bool:
+            raise ValueError("image_input must be boolean")
+        self._image_input = image_input
         if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive and finite")
         self._owns_client = client is None
@@ -89,7 +93,18 @@ class OpenAIChatCompletionsGateway:
         for message in messages:
             if message.tool_calls and message.role.value != "assistant":
                 raise ValueError("only assistant messages may carry tool calls")
-            row = {"role": message.role.value, "content": _text(message.content)}
+            images = parse_static_image_content(message.content)
+            if images is not None:
+                if invocation.request.protocol_capabilities.image_input.value != "supported":
+                    raise ModelGatewayError("Model profile does not declare image input support", code="model_capability_incompatible")
+                if not self._image_input or message.role.value != "user":
+                    raise ValueError("Static images require user role and host-enabled image input")
+                content = [{"type": "text", "text": images["text"]}, *[
+                    {"type": "image_url", "image_url": {"url": f'data:{image["mediaType"]};base64,{image["dataBase64"]}'}}
+                    for image in images["images"]]]
+            else:
+                content = _text(message.content)
+            row = {"role": message.role.value, "content": content}
             if message.role.value == "tool":
                 row["tool_call_id"] = message.tool_call_id
             if message.tool_calls:

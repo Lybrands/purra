@@ -2894,6 +2894,18 @@ class AgentCore:
             )
         except (UserInputRequired, ApprovalRequired):
             raise
+        except ContextOverflowError as error:
+            await _record_safe_exception(
+                controller, stage="runtime", outcome="overflow", error=error,
+            )
+            result = AgentRuntimeResult(
+                run_id=controller.run_id,
+                outcome=RuntimeOutcome.FAILED,
+                final_response="",
+                model=request.model.model,
+                round_count=0,
+                error_code=error.reason_code,
+            )
         except Exception as error:
             await _record_safe_exception(
                 controller,

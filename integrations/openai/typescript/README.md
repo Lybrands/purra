@@ -1,5 +1,9 @@
 # purra-openai · TypeScript
 
+In 1.1.0 development, Chat Completions accepts the optional
+[static image contract](../../../docs/static-images.md) with `imageInput: true`.
+Responses image input is not implemented in this slice.
+
 English | [简体中文](README.zh-CN.md)
 
 OpenAI model gateways for PurrA using the official SDK. Supports text, function

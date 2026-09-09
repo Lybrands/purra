@@ -11,6 +11,8 @@ from purra.runtime.model_round import ModelRoundAccumulator
 from purra.runtime.tool_round import continuation_messages
 from purra_openai import OpenAIChatCompletionsGateway
 from test_gateway import invocation
+from purra.media import static_image_content
+from dataclasses import replace
 
 FIXTURE = json.loads((Path(__file__).resolve().parents[2] / 'fixtures/chat.json').read_text())
 MESSAGES = (AgentMessage('developer', 'instructions'), AgentMessage('user','check'))
@@ -18,6 +20,38 @@ MESSAGES = (AgentMessage('developer', 'instructions'), AgentMessage('user','chec
 
 def sse(events): return ''.join('data: '+json.dumps(e)+'\n\n' for e in events)+'data: [DONE]\n\n'
 def gateway(http): return OpenAIChatCompletionsGateway(AsyncOpenAI(api_key='fixture-not-a-key', http_client=http, max_retries=5))
+
+
+@pytest.mark.asyncio
+async def test_inline_image_wire_complete_stream_and_disabled_rejection():
+    data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aE9sAAAAASUVORK5CYII="
+    content = static_image_content("Describe", [{"mediaType": "image/png", "dataBase64": data, "inputTokens": 2000}])
+    messages = (AgentMessage("user", content),)
+    call = invocation()
+    profile = call.request.capability_snapshot
+    call = replace(call, request=replace(call.request, capability_snapshot=replace(profile, protocol=replace(profile.protocol, image_input="supported"))))
+    bodies = []
+    def respond(request):
+        body = json.loads(request.content)
+        bodies.append(body)
+        assert body["messages"][0]["content"] == [
+            {"type": "text", "text": "Describe"},
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{data}"}},
+        ]
+        assert "inputTokens" not in request.content.decode()
+        return httpx2.Response(200, headers={"content-type": "text/event-stream"}, text=sse(FIXTURE["events"])) if body.get("stream") else httpx2.Response(200, json=FIXTURE["response"])
+    async with httpx2.AsyncClient(transport=httpx2.MockTransport(respond)) as http:
+        disabled = gateway(http)
+        with pytest.raises(ValueError, match="host-enabled"):
+            await disabled.complete(messages, call)
+        with pytest.raises(ValueError, match="host-enabled"):
+            await disabled.stream(messages, call)
+        assert bodies == []
+        model = OpenAIChatCompletionsGateway(AsyncOpenAI(api_key="fixture-not-a-key", http_client=http), image_input=True)
+        await model.complete(messages, call)
+        async for _ in (await model.stream(messages, call)).chunks:
+            pass
+        assert len(bodies) == 2
 
 
 @pytest.mark.asyncio
