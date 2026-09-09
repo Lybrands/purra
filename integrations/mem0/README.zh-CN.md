@@ -57,6 +57,11 @@ Mem0 保存文本与向量，适配器管理归属、状态、版本、操作回
 有效性仅表示端点版本与可见性符合要求，不代表关系真实，也不是上下文证据回执。
 详见 [K01/K02 契约](../../conformance/memory-capture-relations.md)。
 
+使用 `relation_evidence` / `relationEvidence` 为两个精确端点签发关系回执，并在复用
+关系上下文前调用 `validate_relation_evidence` / `validateRelationEvidence`。端点变化、
+过期、撤销、删除以及存储或作用域不匹配都会使回执失效。回执证明当前可用性，不证明
+关系语义真实。
+
 `list` 返回 `items`、`next` 和 `epoch`。即使当前页为空，也应继续使用 `next` 翻页，
 直到它为 `null`；若 epoch 改变，应重新读取。`query` 过滤器按文本字面匹配，语义搜索使用 `retrieve`。
 元数据的值为 JSON 标量，编辑元数据不会调用 Embedding。

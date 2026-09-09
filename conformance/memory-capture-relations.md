@@ -1,7 +1,8 @@
 # K01/K02 memory capture and relation queries
 
-Status: in progress. Existing memory behavior lives in the optional `purra-mem0`
-integration; Core does not acquire a dependency on Mem0 or its journal.
+Status: K02 is complete inside the optional `purra-mem0` integration for scoped,
+explicit relation queries and exact relationship evidence. K01 remains open. Core
+does not acquire a dependency on Mem0 or its journal.
 
 ## Current capture boundary
 
@@ -43,11 +44,36 @@ results retain it with `valid=False`.
 
 `valid` describes current endpoint eligibility, not the truth of the relationship
 or permission to insert it into a prompt. `MemoryLink` is not a context evidence
-receipt. K02 still needs explicit relationship evidence/invalidation semantics
-and consumer acceptance. Model-assisted relationship extraction, graph/vector
-combination and memory migration remain K03/K04/K05.
+receipt.
 
-Deterministic tests cover direction, relation filtering, invalid options, empty
+## Relationship evidence and invalidation
+
+Python `relation_evidence` / `validate_relation_evidence` and TypeScript
+`relationEvidence` / `validateRelationEvidence` use `MemoryRelationEvidence`.
+A receipt binds the integration store, immutable scope, link operation key, exact
+endpoint IDs/versions, relation and note. Issuance rereads the complete link plan
+and active endpoints and checks that the journal epoch did not change. A caller
+cannot turn a stale or forged `MemoryLink` into evidence merely by setting
+`valid=True`.
+
+Validation rereads the exact operation and both endpoints. It fails with
+`memory_relation_stale` after endpoint version changes, expiry, source withdrawal,
+deletion, scope changes, link mismatch or store mismatch. It performs no model or
+Embedding call and does not rewrite checkpoints. Validate all host-persisted
+relation receipts immediately before reusing relationship-derived context or
+resuming a checkpoint. Validation of several receipts is sequential and does not
+create a cross-receipt database snapshot; an epoch check protects each receipt.
+
+This relation receipt intentionally differs from `ContextEvidenceReceipt`, whose
+single item/version shape cannot attest a link and two exact endpoints. It is
+evidence that the explicit stored relation and endpoint versions are currently
+eligible, not evidence that its semantic claim is true. A host that projects a
+relationship into model context must retain this receipt beside that context and
+define its own trusted presentation. Consumer acceptance remains open.
+Model-assisted relationship extraction, graph/vector combination and memory
+migration remain K03/K04/K05.
+
+Deterministic and installed-package tests cover direction, relation filtering, invalid options, empty
 filtered pages followed by matching pages, reopened journals, stale versions,
 source withdrawal and foreign scopes. They use synthetic SDK fixtures and do
 not establish real Embedding, semantic retrieval quality or downstream adoption.

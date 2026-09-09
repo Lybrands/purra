@@ -62,6 +62,12 @@ an empty filtered page may still have a continuation cursor. Continue until
 changes. Validity concerns endpoint versions and visibility, not relation truth
 or a context evidence receipt. See [K01/K02 contract](../../conformance/memory-capture-relations.md).
 
+Use `relation_evidence` / `relationEvidence` to issue an exact two-endpoint
+relationship receipt, and `validate_relation_evidence` /
+`validateRelationEvidence` immediately before reusing relationship-derived
+context. Endpoint changes, expiry, withdrawal, deletion, store or scope mismatch
+invalidate the receipt. It attests current eligibility, not semantic truth.
+
 `list` returns `items`, `next`, and `epoch`. Continue with `next` even when a page
 is empty; `null` marks the end. Restart the view if its epoch changes. Its `query`
 filter is literal text matching; use `retrieve` for semantic search. Metadata

@@ -38,6 +38,10 @@ export interface MemoryLink {
   readonly relation: string; readonly note: string; readonly valid: boolean;
 }
 export interface MemoryLinkPage { readonly items: readonly MemoryLink[]; readonly next: string | null; readonly epoch: number }
+export interface MemoryRelationEvidence {
+  readonly evidenceId: string; readonly source: string; readonly linkKey: string;
+  readonly from: MemoryRef; readonly to: MemoryRef; readonly relation: string; readonly note: string;
+}
 export type MemoryResolution = { readonly items: readonly MemoryRef[]; readonly reviewKey?: string } & (
   { readonly kind: "independent" | "duplicate" | "supersede"; readonly keep: string }
   | { readonly kind: "conflict"; readonly keep?: never }
@@ -315,6 +319,34 @@ export class Mem0Memory implements Retriever {
       this.assertEpoch(epoch);
       return Object.freeze({ items: Object.freeze(items), next: rows.length > limit ? rows[limit - 1]!.key : null, epoch });
     }, options.signal);
+  }
+  async relationEvidence(link: MemoryLink, options: { signal?: AbortSignal } = {}): Promise<MemoryRelationEvidence> {
+    if (!link?.valid) throw new MemoryError("memory_relation_stale");
+    const expected = {from:{id:requiredText(link.from.id,"from id",512),version:positiveInteger(link.from.version,"from version",2**31-2)},
+      to:{id:requiredText(link.to.id,"to id",512),version:positiveInteger(link.to.version,"to version",2**31-2)},
+      relation:requiredText(link.relation,"relation",64), note:typeof link.note === "string" ? link.note : ""};
+    const key = requiredText(link.key,"link key",512);
+    return this.#call(async () => {
+      const epoch = this.epoch;
+      const operation = this.#journal.operation(key);
+      if (!operation || operation.state !== "complete" || operation.plan.kind !== "link"
+        || !isDeepStrictEqual(operation.plan.link,expected)) throw new MemoryError("memory_relation_stale");
+      const [from,to] = await Promise.all([this.#read(expected.from.id),this.#read(expected.to.id)]);
+      if (!from || !to || from.version !== expected.from.version || to.version !== expected.to.version) throw new MemoryError("memory_relation_stale");
+      this.assertEpoch(epoch);
+      return Object.freeze({evidenceId:`mem0-relation:${this.#journal.store}:${digest([key,expected])}`,
+        source:"mem0-relation/"+this.#scope, linkKey:key, from:Object.freeze(expected.from),
+        to:Object.freeze(expected.to), relation:expected.relation, note:expected.note});
+    },options.signal);
+  }
+  async validateRelationEvidence(receipts: readonly MemoryRelationEvidence[], options: {signal?:AbortSignal} = {}): Promise<void> {
+    if (!Array.isArray(receipts) || receipts.length > this.#maxResults) throw new TypeError("relation receipts must be a bounded array");
+    for (const receipt of receipts) {
+      if (receipt?.source !== "mem0-relation/"+this.#scope) throw new MemoryError("memory_relation_stale");
+      const link = Object.freeze({key:receipt.linkKey,from:receipt.from,to:receipt.to,
+        relation:receipt.relation,note:receipt.note,valid:true});
+      if (!isDeepStrictEqual(await this.relationEvidence(link,options),receipt)) throw new MemoryError("memory_relation_stale");
+    }
   }
   async review(candidate: MemoryRef, options: WriteOptions & { limit?: number; instructions?: string }): Promise<MemoryOperation> {
     if (!this.#providers) throw new MemoryError("memory_review_requires_managed");

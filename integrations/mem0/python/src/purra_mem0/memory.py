@@ -205,6 +205,17 @@ class MemoryLinkPage:
 
 
 @dataclass(frozen=True, slots=True)
+class MemoryRelationEvidence:
+    evidence_id: str
+    source: str
+    link_key: str
+    from_ref: MemoryRef
+    to_ref: MemoryRef
+    relation: str
+    note: str
+
+
+@dataclass(frozen=True, slots=True)
 class MemoryResolution:
     """Host decision about a bounded group, not a model similarity verdict."""
     kind: str
@@ -476,6 +487,49 @@ class Mem0Memory:
             self.assert_epoch(epoch)
             return MemoryLinkPage(tuple(items), rows[limit - 1][0] if len(rows) > limit else None, epoch)
         return await self._call(read, signal)
+
+    async def relation_evidence(self, link: MemoryLink, *, signal=None) -> MemoryRelationEvidence:
+        """Issue evidence for one currently valid, exact persisted relation."""
+        if not isinstance(link, MemoryLink) or not link.valid:
+            raise MemoryError("memory_relation_stale")
+        expected = {"from": {"id": link.from_ref.id, "version": link.from_ref.version},
+                    "to": {"id": link.to_ref.id, "version": link.to_ref.version},
+                    "relation": link.relation, "note": link.note}
+        def read():
+            epoch = self.epoch
+            operation = self._journal.operation(link.key)
+            if (operation is None or operation["state"] != "complete"
+                    or operation["plan"].get("kind") != "link"
+                    or operation["plan"].get("link") != expected):
+                raise MemoryError("memory_relation_stale")
+            records = (self._read(link.from_ref.id), self._read(link.to_ref.id))
+            if any(record is None or record.version != ref.version
+                   for record, ref in zip(records, (link.from_ref, link.to_ref))):
+                raise MemoryError("memory_relation_stale")
+            self.assert_epoch(epoch)
+            source = "mem0-relation/" + self._scope
+            evidence_id = "mem0-relation:" + self._journal.store + ":" + _digest([link.key, expected])
+            return MemoryRelationEvidence(evidence_id, source, link.key,
+                                          link.from_ref, link.to_ref, link.relation, link.note)
+        return await self._call(read, signal)
+
+    async def validate_relation_evidence(self, receipts: Sequence[MemoryRelationEvidence], *, signal=None) -> None:
+        if (not isinstance(receipts, Sequence) or isinstance(receipts, (str, bytes))
+                or len(receipts) > self._max_results):
+            raise ValueError("relation receipts must be a bounded sequence")
+        copied = tuple(receipts)
+        if any(not isinstance(receipt, MemoryRelationEvidence) for receipt in copied):
+            raise TypeError("invalid relation evidence")
+        async def validate_one(receipt):
+            if receipt.source != "mem0-relation/" + self._scope:
+                raise MemoryError("memory_relation_stale")
+            current = await self.relation_evidence(MemoryLink(
+                receipt.link_key, receipt.from_ref, receipt.to_ref,
+                receipt.relation, receipt.note, True), signal=signal)
+            if current != receipt:
+                raise MemoryError("memory_relation_stale")
+        for receipt in copied:
+            await validate_one(receipt)
 
     async def review(self, candidate: MemoryRef, *, key: str, limit: int = 8, instructions: str = "", signal=None) -> MemoryOperation:
         """Bounded semantic advice for a pending candidate. Never activates memory."""
