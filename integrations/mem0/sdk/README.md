@@ -14,3 +14,24 @@ An SDK update requires reviewing the input hash, transformation, dependencies, l
 TypeScript creation waits for storage initialization. Failed initialization releases its history handle and SDK-owned local vector handle where the SDK exposes one. Python releases history and owned Qdrant handles; caller-supplied Qdrant clients remain caller-owned. Constructors of third-party backends remain responsible for handles they allocate before throwing. Successful SDK instances remain host-owned; this change does not add a general cross-backend shutdown API.
 
 Deterministic SDK fixtures use local Qdrant/SQLite and substitute model callbacks. They do not validate live model providers, remote vector backends or downstream applications.
+
+## TypeScript installed-package acceptance
+
+Use an empty temporary consumer directory outside the checkout. Install locally
+built Core and Mem0 tarballs together with TypeScript and Node types using normal
+`npm install`; do not copy development `node_modules`, link workspace packages or
+disable peer dependency resolution. Keep the resulting lockfile and `npm ls`
+output with the acceptance evidence. Download caches may be reused.
+
+Copy `typescript/test/consumer.ts` and its `tsconfig.json` into the consumer and
+compile with its installed compiler (`skipLibCheck: false`). This covers public
+selection and relation proposal types, immutable extraction inputs and explicit
+host adoption through `memory.link`. Confirm `import.meta.resolve` for both
+packages resolves inside the consumer's `node_modules`.
+
+Run copies of `check-sdk.mjs` and `check-native-sdk.mjs` with `deny-langchain.mjs`
+from the consumer. Preserve their relative script and fixture layout, including
+`evaluate.mjs` and `../../fixtures/evaluation.json`. Run the memory regression
+suite against the installed Mem0 implementation as well; copying test fixtures
+must not replace package implementation files. A successful installation does
+not establish compatibility of every optional backend or real-model quality.

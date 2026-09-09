@@ -407,3 +407,184 @@ async def test_cancelling_drain_does_not_release_a_running_worker(setup):
         sdk.gate.set()
         await memory.drain()
     assert memory.operation("add").state == "complete"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('scenario', ['valid', 'empty', 'invented_quote', 'unknown_id', 'unknown_relation', 'extra_field', 'too_many', 'duplicate', 'stale', 'revoked', 'cancelled', 'oversize'])
+async def test_relation_proposals_are_bounded_read_only_and_revalidated(setup, scenario):
+    from purra_mem0 import MemoryRef, propose_memory_relations
+    sdk, create = setup
+    memory = create()
+    a = (await memory.add('Alice maintains PURRA.', source=SOURCE, key='a')).ids[0]
+    b = (await memory.add('PURRA is a framework.', source=SOURCE, key='b')).ids[0]
+    refs = [MemoryRef(a, 1), MemoryRef(b, 1)]
+    signal = asyncio.Event()
+    epoch = memory.epoch
+    entered = []
+
+    async def extract(payload, received_signal):
+        entered.append(payload)
+        assert received_signal is signal
+        assert payload['relations'] == ('maintains',)
+        with pytest.raises(TypeError):
+            payload['records'][0]['text'] = 'changed'
+        item = {'from': a, 'to': b, 'relation': 'maintains', 'fromQuote': 'Alice', 'toQuote': 'PURRA'}
+        if scenario == 'empty': return []
+        if scenario == 'invented_quote': item['fromQuote'] = 'Bob'
+        if scenario == 'unknown_id': item['to'] = 'outside-scope'
+        if scenario == 'unknown_relation': item['relation'] = 'owns'
+        if scenario == 'extra_field': item['confidence'] = 1
+        if scenario == 'too_many': return [item] * 33
+        if scenario == 'duplicate': return [item, item]
+        if scenario == 'stale': await memory.update(a, 'Changed', source=SOURCE, version=1, key='changed')
+        if scenario == 'revoked': await memory.revoke_source(SOURCE.id, revision=SOURCE.revision, key='revoke')
+        if scenario == 'cancelled': signal.set()
+        return [item]
+
+    if scenario in ('valid', 'empty'):
+        result = await propose_memory_relations(memory, refs, relations=['maintains'], extract=extract, signal=signal)
+        assert len(result) == (1 if scenario == 'valid' else 0)
+        if result:
+            assert result[0].from_ref == refs[0] and result[0].to_ref == refs[1]
+            assert result[0].from_source == SOURCE
+        assert memory.epoch == epoch
+        assert (await memory.links(a)).items == ()
+    else:
+        with pytest.raises((MemoryError, ValueError)) as failure:
+            await propose_memory_relations(memory, refs, relations=['maintains'], extract=extract,
+                max_input_chars=1 if scenario == 'oversize' else 32000, signal=signal)
+        if scenario != 'oversize':
+            expected = 'memory_context_stale' if scenario in ('stale', 'revoked') else 'memory_cancelled' if scenario == 'cancelled' else 'memory_invalid_relation_proposal'
+            assert failure.value.code == expected
+    assert len(entered) == (0 if scenario == 'oversize' else 1)
+
+
+@pytest.mark.asyncio
+async def test_relation_extractor_failures_and_preflight_do_not_call_or_retry(setup):
+    from purra_mem0 import MemoryRef, propose_memory_relations
+    _, create = setup
+    memory = create()
+    a = (await memory.add('A', source=SOURCE, key='a')).ids[0]
+    b = (await memory.add('B', source=SOURCE, key='b')).ids[0]
+    refs = [MemoryRef(a, 1), MemoryRef(b, 1)]
+    calls = []
+    async def fail(payload, signal):
+        calls.append(payload)
+        raise RuntimeError('host extractor failed')
+    for changes in ({'relations': 'rel'}, {'relations': ['rel', 'rel']}, {'max_proposals': True}, {'max_input_chars': 0}):
+        with pytest.raises((TypeError, ValueError)):
+            await propose_memory_relations(memory, refs, extract=fail, **{'relations': ['rel'], **changes})
+    with pytest.raises(MemoryError, match='memory_relation_stale'):
+        await propose_memory_relations(memory, [MemoryRef(a, 2), refs[1]], relations=['rel'], extract=fail)
+    assert calls == []
+    with pytest.raises(RuntimeError, match='host extractor failed'):
+        await propose_memory_relations(memory, refs, relations=['rel'], extract=fail)
+    assert len(calls) == 1
+    assert (await memory.links(a)).items == ()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('scenario', ['combined', 'empty', 'zero_budget', 'cancelled', 'stale', 'malformed', 'failed'])
+async def test_host_context_selection_reuses_authorized_assembly(setup, scenario):
+    from purra_mem0 import MemoryRef
+    sdk, create = setup
+    memory = create()
+    a = (await memory.add('First fact', source=SOURCE, key='a')).ids[0]
+    b = (await memory.add('Related fact', source=SOURCE, key='b')).ids[0]
+    await memory.link(MemoryRef(a, 1), MemoryRef(b, 1), 'related', key='edge')
+    calls = []
+    signal = asyncio.Event()
+    request = AgentRunRequest(messages=(), model=ModelRequest('test', 'test'), domain_context=DomainContext('test'))
+    async def select_ids(received, stop):
+        assert received is request and stop is signal
+        calls.append('select')
+        if scenario == 'failed': raise RuntimeError('host policy failed')
+        if scenario == 'malformed': return a
+        if scenario == 'empty': return []
+        if scenario == 'cancelled': signal.set(); return [a]
+        if scenario == 'stale':
+            await memory.revoke_source(SOURCE.id, key='withdraw')
+            return [a]
+        hits = await memory.retrieve(RetrievalRequest(query='fact', limit=8), stop)
+        links = await memory.links(a, direction='outgoing', valid_only=True)
+        return [links.items[0].to_ref.id, hits[0].id, links.items[0].to_ref.id, 'missing']
+    context = MemoryContext(memory=memory, select_ids=select_ids)
+    budget = ContextBudget(window_tokens=4000, output_reserve_tokens=1000, safety_reserve_tokens=0,
+        runtime_reserve_tokens=0, provider_input_tokens=3000,
+        context_allocations={'memory': 0 if scenario == 'zero_budget' else 1000})
+    if scenario in ('combined', 'empty', 'zero_budget'):
+        result = await context.build_context(request, budget, signal)
+        if scenario == 'combined':
+            block, = result.blocks
+            assert [row['id'] for row in json.loads(block.content)] == [b, a]
+            assert block.untrusted
+            assert [r['itemId'] for r in block.host_metadata[CONTEXT_EVIDENCE_RECEIPTS_KEY]] == [b, a]
+            assert len([c for c in sdk.calls if c[0] == 'search']) == 1
+        else: assert result.blocks == ()
+    else:
+        expected = {'cancelled': 'memory_cancelled', 'stale': 'memory_context_stale',
+                    'malformed': 'ids must be a sequence', 'failed': 'host policy failed'}[scenario]
+        with pytest.raises((MemoryError, TypeError, RuntimeError), match=expected):
+            await context.build_context(request, budget, signal)
+        assert not [c for c in sdk.calls if c[0] == 'search']
+    assert len(calls) == (0 if scenario == 'zero_budget' else 1)
+
+
+def test_context_requires_one_host_selection_mode(setup):
+    _, create = setup
+    memory = create()
+    for options in ({}, {'query': lambda _: '', 'select_ids': lambda *_: []}, {'select_ids': 1}):
+        with pytest.raises(TypeError): MemoryContext(memory=memory, **options)
+
+
+@pytest.mark.asyncio
+async def test_context_selection_snapshots_host_ids_before_async_read(setup):
+    from purra_mem0 import assemble_memory_context
+    _, create = setup
+    memory = create()
+    a = (await memory.add('A', source=SOURCE, key='a')).ids[0]
+    ids = [a, 'missing']
+    original = memory.select
+    async def read(selected, **kwargs):
+        ids.clear()
+        return await original(selected, **kwargs)
+    memory.select = read
+    result = await assemble_memory_context(memory, ids, 1000)
+    assert result.included == (a,)
+    assert result.missing == ('missing',)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('mode', ['query', 'selection'])
+async def test_context_rejects_unsupported_allowance_before_host_work(setup, mode):
+    _, create = setup
+    memory = create()
+    calls = []
+    def query(request):
+        calls.append('query')
+        return 'fact'
+    async def select_ids(request, signal):
+        calls.append('selection')
+        return []
+    context = MemoryContext(memory=memory, **({'query': query} if mode == 'query' else {'select_ids': select_ids}))
+    budget = ContextBudget(window_tokens=2_000_000, output_reserve_tokens=0,
+        safety_reserve_tokens=0, runtime_reserve_tokens=0, provider_input_tokens=2_000_000,
+        context_allocations={'memory': 1_000_001})
+    with pytest.raises(ValueError, match='invalid context allowance'):
+        await context.build_context(object(), budget)
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_assembly_rejects_noncallable_counter_before_storage_read(setup):
+    from purra_mem0 import assemble_memory_context
+    _, create = setup
+    memory = create()
+    calls = []
+    async def select(*args, **kwargs):
+        calls.append('read')
+        return ()
+    memory.select = select
+    with pytest.raises(TypeError, match='count_tokens'):
+        await assemble_memory_context(memory, [], 100, count_tokens=7)
+    assert calls == []

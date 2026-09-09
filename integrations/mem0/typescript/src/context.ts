@@ -2,35 +2,49 @@ import type { ContextBlock, ContextEvidenceReceipt, ContextBudget, ContextBudget
 import type { RetrievalHit } from "purra";
 import { estimateJsonTokens } from "purra";
 import { Mem0Memory, positiveInteger, requiredText } from "./memory.js";
+import { MemoryError } from "./journal.js";
+
+export type MemorySelectionPolicy = (request: ContextRequest, signal?: AbortSignal) => Promise<readonly string[]>;
+
+function validateContextAllowance(value: unknown): asserts value is number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0 || value > 1_000_000) throw new TypeError("invalid context allowance");
+}
 
 export class MemoryContext implements ContextProvider {
   readonly #memory: Mem0Memory;
-  readonly #query: (request: ContextRequest) => string;
+  readonly #query: ((request: ContextRequest) => string) | undefined;
+  readonly #selectIds: MemorySelectionPolicy | undefined;
   readonly #countTokens: (content: string) => number;
   readonly #name: string;
   readonly #desiredTokens: number;
   readonly #limit: number;
   constructor(options: {
-    memory: Mem0Memory; query: (request: ContextRequest) => string; countTokens?: (content: string) => number;
+    memory: Mem0Memory; query?: (request: ContextRequest) => string; selectIds?: MemorySelectionPolicy; countTokens?: (content: string) => number;
     name?: string; desiredTokens?: number; limit?: number;
   }) {
     this.#memory = options.memory;
     this.#query = options.query;
+    this.#selectIds = options.selectIds;
     this.#countTokens = options.countTokens ?? estimateJsonTokens;
     this.#name = requiredText(options.name ?? "memory", "context name", 128);
     this.#desiredTokens = positiveInteger(options.desiredTokens ?? 1024, "desiredTokens", 1_000_000);
     this.#limit = positiveInteger(options.limit ?? 8, "limit");
-    if (typeof this.#query !== "function" || typeof this.#countTokens !== "function") throw new TypeError("query and countTokens must be host functions");
+    if ((this.#query === undefined) === (this.#selectIds === undefined)) throw new TypeError("Provide exactly one of query or selectIds");
+    if (typeof (this.#selectIds ?? this.#query) !== "function" || typeof this.#countTokens !== "function") throw new TypeError("Selection and countTokens must be host functions");
   }
   describeContextDemands(): readonly ContextBudgetClaim[] {
     return [{ name: this.#name, desiredTokens: this.#desiredTokens }];
   }
   async buildContext(request: ContextRequest, budget: ContextBudget, signal?: AbortSignal): Promise<ContextBundle> {
-    const allowance = budget.contextAllocations[this.#name] ?? 0;
-    if (!allowance) return { blocks: [] };
+    const allowance = Object.hasOwn(budget.contextAllocations, this.#name) ? budget.contextAllocations[this.#name] : 0;
+    validateContextAllowance(allowance);
+    if (allowance === 0) return { blocks: [] };
     const epoch = this.#memory.epoch;
-    const hits = await this.#memory.retrieve({ query: this.#query(request), limit: this.#limit, scope: {} }, signal);
-    const result = await assembleMemoryContext(this.#memory, hits.map(hit => hit.id), allowance,
+    if (signal?.aborted) throw new MemoryError("memory_cancelled");
+    const ids = this.#selectIds === undefined
+      ? (await this.#memory.retrieve({ query: this.#query!(request), limit: this.#limit, scope: {} }, signal)).map(hit => hit.id)
+      : await this.#selectIds(request, signal);
+    const result = await assembleMemoryContext(this.#memory, ids, allowance,
       { name: this.#name, countTokens: this.#countTokens, expectedEpoch: epoch, ...(signal ? { signal } : {}) });
     return { blocks: result.block ? [result.block] : [] };
   }
@@ -48,9 +62,12 @@ export interface MemoryContextResult {
 export async function assembleMemoryContext(memory: Mem0Memory, ids: readonly string[], allowance: number,
   options: { name?: string; countTokens?: (content: string) => number; expectedEpoch?: number; signal?: AbortSignal } = {},
 ): Promise<MemoryContextResult> {
-  if (!Number.isSafeInteger(allowance) || allowance < 0 || allowance > 1_000_000) throw new TypeError("invalid context allowance");
+  validateContextAllowance(allowance);
+  const countTokens = options.countTokens === undefined ? estimateJsonTokens : options.countTokens;
+  if (typeof countTokens !== "function") throw new TypeError("countTokens must be callable");
   const name = requiredText(options.name ?? "memory", "context name", 128);
-  const countTokens = options.countTokens ?? estimateJsonTokens;
+  if (!Array.isArray(ids)) throw new TypeError("ids must be an array");
+  ids = Object.freeze([...ids]);
   const epoch = options.expectedEpoch ?? memory.epoch;
   memory.assertEpoch(epoch);
   const hits = await memory.select(ids, options.signal ? { signal: options.signal } : {});

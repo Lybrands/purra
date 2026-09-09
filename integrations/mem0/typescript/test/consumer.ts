@@ -54,3 +54,39 @@ await managed.annotate("candidate", { nested: { unsafe: true } }, { version: 1, 
 // @ts-expect-error Administration returns an explicit page, not a legacy array.
 page.map(item => item.id);
 void [next, result, valid];
+
+const selectedContext: ContextProvider = new MemoryContext({ memory,
+  async selectIds(request, signal) {
+    const hits = await memory.retrieve({ query: 'host query', limit: 8, scope: {} }, signal);
+    return hits.map(hit => hit.id);
+  },
+});
+void selectedContext;
+
+import { proposeMemoryRelations, type MemoryRelationExtractor, type MemoryRelationExtractionInput, type MemoryRelationProposal } from "purra-mem0";
+
+const extractRelations: MemoryRelationExtractor = async (input, signal) => {
+  const payload: MemoryRelationExtractionInput = input;
+  const cancellation: AbortSignal | undefined = signal;
+  // @ts-expect-error Extractors cannot change the host's allowed relations.
+  payload.relations.push("invented");
+  // @ts-expect-error Extractors receive immutable source records.
+  payload.records[0]!.text = "replacement";
+  void cancellation;
+  return [];
+};
+const proposals: readonly MemoryRelationProposal[] = await proposeMemoryRelations(memory, refs, {
+  relations: ["supports"], extract: extractRelations, maxInputChars: 1024, maxProposals: 8,
+});
+for (const proposal of proposals) {
+  const source: string = proposal.fromSource.id;
+  const quote: string = proposal.fromQuote;
+  // @ts-expect-error Proposals do not allow changing their source revision.
+  proposal.from.version = 2;
+  // Host adoption uses the existing explicit write API.
+  await memory.link(proposal.from, proposal.to, proposal.relation, { key: "host-adoption" });
+  void [source, quote];
+}
+// @ts-expect-error The extractor must be asynchronous.
+const syncExtractor: MemoryRelationExtractor = () => [];
+void syncExtractor;

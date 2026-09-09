@@ -175,6 +175,27 @@ business authorization, downstream adoption and production capacity require
 their own evidence. The local completion decision does not claim those checks
 passed and does not close the remaining 1.0.0 expansion items.
 
-Run-internal switching belongs to R02. Child model selection and continuation
-semantics require explicit follow-up analysis; this first Root routing contract
-does not silently grant Child routing or model-switch permissions.
+## Conversation turns and fixed Run bindings
+
+A host-owned conversation may span several Runs. Each Run retains its selected
+model binding through model rounds, tool execution and recovery. Switching the
+model while that Run is executing is not supported and is outside the development
+scope. A UI model selection made during execution may apply to the next Run; it
+must not mutate the active host's gateway configuration.
+
+For the next conversation turn, the host selects its authorized binding, constructs
+the corresponding host and submits a new Run with the conversation history it
+chooses to retain. This uses the existing R01 APIs, not a new switching API or
+`resume` with a different model. Conversation storage and history selection remain
+host responsibilities; a conversation identifier alone does not load history.
+The new model still passes normal capability and context-budget checks. Tool
+grants and cumulative budgets of the previous Run are not transferred by copying
+conversation messages; any conversation-wide limits belong to the host.
+
+`tests/test_conversation_model_routing.py` and
+`typescript/test/conversation-model-routing.test.mjs` exercise two completed Runs
+with different bindings and host-transferred user/assistant history. They check
+that the second gateway receives that history and the first Run stays unchanged.
+These are deterministic gateway checks, not real-model compatibility evidence.
+Child model selection and continuation semantics remain separate from this Root
+conversation example.

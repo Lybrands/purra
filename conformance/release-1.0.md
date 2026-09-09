@@ -23,6 +23,22 @@ resource scope, persistence, budgets, and shutdown. Installing an adapter does
 not activate it on an Agent. See [structured output](../docs/structured-output.md),
 [tool concurrency](../docs/tool-concurrency.md), and [inspection](../docs/integration-inspection.md).
 
+## Local deployment and host policy scope
+
+The current delivery target is a locally deployed, host-embedded framework.
+Hosts may call remote model APIs. Cross-machine workers, remote Agent sessions,
+new audio/video/realtime capabilities and unspecified memory migrations are
+deferred, not candidate release prerequisites. No database identification or
+second database backend is being added.
+
+Host policies select models before a Run; a later conversation turn can submit
+a new Run with another binding and host-selected history. An executing Run keeps
+its binding. Optional Mem0 supports [ordered memory selection](../integrations/mem0/selection.md)
+and [read-only relation proposals](../integrations/mem0/relations.md). The host
+owns retrieval ordering, extraction, relation semantics and explicit link writes.
+Core and components retain authorization, budget, cancellation and recovery checks.
+See [host policy boundaries](../docs/host-policies.md).
+
 ## Service evidence and limits
 
 The following describes checks performed on 2026-09-06, not an availability SLA,
@@ -98,9 +114,13 @@ this candidate. Do not upgrade an active production Run in place.
 4. Check historical reads and new Run execution independently. Restart the host,
    verify a new persisted Run and its usage/output, and keep rollback data intact.
 
-SQLite storage is v4 and rejects other storage versions; Python and TypeScript
-snapshots are not interchangeable. New invocation receipts use schema v3.
-TypeScript imports reject unsupported receipt versions. Matching SQLite v4 alone
+The optional SQLite adapter defaults to v4 and supports v5 after explicit durable
+approval activation; other versions are rejected. Python and TypeScript snapshots
+are not interchangeable. Host-owned persistence schemas are separate from these
+adapter formats. See the [upgrade guide](../docs/migrations/1.0.md) for activation,
+planning-preview policies and host-owned storage checks.
+New invocation receipts use schema v3. TypeScript imports reject unsupported
+receipt versions. Matching an adapter format marker alone
 therefore does not establish that a 0.x history or active checkpoint is compatible.
 No general 0.x history migration is supplied here; using a new database does not
 authorize deleting the old one. Recovery inspection never grants resume authority.

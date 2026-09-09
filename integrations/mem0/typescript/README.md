@@ -178,3 +178,19 @@ writes, see the [memory lifecycle guide](../README.md).
 ## Native managed providers
 
 `createManagedClient` inject native LLM and Embedding adapters into a version-pinned, package-private Mem0 module. Calls retain the existing PurrA budget, cancellation and result validation. Explicit vector dimensions must agree; the managed path rejects LangChain vector stores. It neither patches the installed SDK nor starts a proxy server. See [third-party notices](THIRD_PARTY_NOTICES.md). Raw SDK clients remain host-owned and do not acquire managed accounting automatically.
+
+## Host-controlled selection and relation proposals
+
+`new MemoryContext({ memory, selectIds: hostSelect })` accepts an async
+`hostSelect(request, signal)` returning ordered memory IDs. Supply either
+`selectIds` or the existing `query`, never both. The component rereads authorized
+records, validates evidence, and fits complete records into the context budget.
+The host owns retrieval combination, ordering, callback timeout and model costs.
+
+`proposeMemoryRelations(memory, refs, { relations: allowedNames, extract: hostExtract })`
+is exported from `purra-mem0`. Its async extractor receives `(input, signal)` and
+returns objects with exactly `from`, `to`, `relation`, `fromQuote`, `toQuote` string
+fields. IDs must match supplied `MemoryRef` revisions and quotes must occur in
+those records. Returned immutable proposals do not write links or prove that a
+relation is true. The host reviews proposals and explicitly calls `memory.link`.
+No automatic model invocation, retry or adoption policy is installed.

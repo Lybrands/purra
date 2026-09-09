@@ -127,3 +127,9 @@ before `reconcile`. An incomplete extraction can be removed with
 
 Call `drain()` before `close()`. Closing the adapter closes only its journal;
 the application owns SDK, provider, and storage resources.
+
+Host-controlled relation extraction is available as a read-only proposal helper;
+see [relation proposals](relations.md) for composition and authorization boundaries.
+
+`MemoryContext` also accepts a host selection callback for combining and ordering
+retrieval results; see [retrieval composition](selection.md).

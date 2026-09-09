@@ -1,6 +1,7 @@
 """Project whole memory records through PurrA's existing context contracts."""
 
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from purra.contracts import ContextBlock, ContextBudgetClaim, ContextBundle
@@ -9,6 +10,12 @@ from purra.evidence import CONTEXT_EVIDENCE_RECEIPTS_KEY, ContextEvidenceReceipt
 from purra.retrieval import RetrievalRequest
 
 from .memory import _integer, _text
+from ._journal import MemoryError
+
+
+def _validate_allowance(allowance):
+    if type(allowance) is not int or not 0 <= allowance <= 1_000_000:
+        raise ValueError("invalid context allowance")
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,9 +34,13 @@ async def assemble_memory_context(memory, ids, allowance, *, name="memory",
     Hosts supply ordered IDs, never trusted replacement text. A fresh component
     read enforces visibility; only whole selected records receive receipts.
     """
-    if type(allowance) is not int or not 0 <= allowance <= 1_000_000:
-        raise ValueError("invalid context allowance")
+    _validate_allowance(allowance)
+    if not callable(count_tokens):
+        raise TypeError("count_tokens must be callable")
     name = _text(name, "context name", 128)
+    if isinstance(ids, (str, bytes)) or not isinstance(ids, Sequence):
+        raise TypeError("ids must be a sequence")
+    ids = tuple(ids)
     epoch = memory.epoch if expected_epoch is None else expected_epoch
     memory.assert_epoch(epoch)
     hits = await memory.select(ids, signal=signal)
@@ -63,25 +74,35 @@ async def assemble_memory_context(memory, ids, allowance, *, name="memory",
 
 
 class MemoryContext:
-    def __init__(self, *, memory, query, count_tokens=estimate_json_tokens, name="memory", desired_tokens=1024, limit=8):
+    def __init__(self, *, memory, query=None, select_ids=None, count_tokens=estimate_json_tokens, name="memory", desired_tokens=1024, limit=8):
         self.memory = memory
         self.query = query
+        self.select_ids = select_ids
         self.count_tokens = count_tokens
         self.name = _text(name, "context name", 128)
         self.desired_tokens = _integer(desired_tokens, "desired_tokens", 1_000_000)
         self.limit = _integer(limit, "limit")
-        if not callable(query) or not callable(count_tokens):
-            raise TypeError("query and count_tokens must be host functions")
+        if (query is None) == (select_ids is None):
+            raise TypeError("provide exactly one of query or select_ids")
+        if not callable(query if select_ids is None else select_ids) or not callable(count_tokens):
+            raise TypeError("selection and count_tokens must be host functions")
 
     async def describe_context_demands(self, request, signal=None):
         return (ContextBudgetClaim(self.name, self.desired_tokens),)
 
     async def build_context(self, request, budget, signal=None):
         allowance = budget.allocation_for(self.name)
+        _validate_allowance(allowance)
         if allowance == 0:
             return ContextBundle()
         epoch = self.memory.epoch
-        hits = await self.memory.retrieve(RetrievalRequest(query=self.query(request), limit=self.limit), signal)
-        result = await assemble_memory_context(self.memory, tuple(hit.id for hit in hits), allowance,
+        if signal is not None and signal.is_set():
+            raise MemoryError("memory_cancelled")
+        if self.select_ids is None:
+            hits = await self.memory.retrieve(RetrievalRequest(query=self.query(request), limit=self.limit), signal)
+            ids = tuple(hit.id for hit in hits)
+        else:
+            ids = await self.select_ids(request, signal)
+        result = await assemble_memory_context(self.memory, ids, allowance,
             name=self.name, count_tokens=self.count_tokens, expected_epoch=epoch, signal=signal)
         return ContextBundle(blocks=(result.block,) if result.block is not None else ())

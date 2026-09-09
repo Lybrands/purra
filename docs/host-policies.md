@@ -11,7 +11,10 @@ checkpoint, or effect-recovery checks.
 | Plan generation | Python `WorkPlanner` / `ExecutionProfile.planner`; TypeScript `WorkPlanner` / `planning.plannerFactory` | Core compiles and validates tools, dependencies and execution authority |
 | Initial model-plan granularity | `PlanningPolicy` constraints, described below | A display preference is not a tool grant; revisions are not padded |
 | Model selection before a Run | Host orders authorized route candidates or selects an authorized subset | Compatible saved binding is restored without reselecting on recovery |
+| Model choice for the next conversation turn | Host submits a new Run with the chosen binding and retained conversation messages | Each existing Run keeps its binding; changing models during execution is unsupported |
 | Memory capture and resolution | Optional Mem0 component; host calls capture with authorization and supplies a resolution policy | Provenance, current authorization and revocation still apply |
+| Relation extraction | Host supplies memory revisions, allowed relation names and an extractor to the [optional proposal helper](../integrations/mem0/relations.md) | Source quotes and current revisions are checked; proposals do not authorize writes |
+| Memory retrieval composition | Host supplies an ordered-ID callback through [MemoryContext selection](../integrations/mem0/selection.md) | Fresh scoped reads, complete-record budgets and source evidence still apply |
 | Delegation | Public spawn/join/continue commands or the default delegation tool; `AgentTreePolicy` limits | Descendant grants narrow and Root budget/ownership remain authoritative |
 | Recovery scheduling | Worker discovery, schedule and public-resume callbacks; host owns service lifetime | Discovery/inspection does not grant permission to resume |
 

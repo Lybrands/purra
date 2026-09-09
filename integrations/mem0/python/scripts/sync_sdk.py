@@ -14,6 +14,9 @@ original = args.source.read_bytes()
 if hashlib.sha256(original).hexdigest() != spec["sha256"]:
     raise SystemExit("Mem0 source hash mismatch; review the SDK update before regenerating")
 text = original.decode()
+history_import = 'from mem0.memory.storage import SQLiteManager'
+assert text.count(history_import) == 1
+text = text.replace(history_import, 'from purra_mem0._history import SQLiteManager')
 before = 'class Memory(MemoryBase):\n    def __init__(self, config: MemoryConfig = MemoryConfig()):\n        self.config = config'
 after = '''class Memory(MemoryBase):
     def __init__(self, config: MemoryConfig = MemoryConfig(), *, llm=None, embedder=None):

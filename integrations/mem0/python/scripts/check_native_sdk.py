@@ -1,5 +1,5 @@
 """SDK injection boundaries with local stores and deterministic callbacks."""
-import asyncio, json, tempfile, os, sqlite3
+import asyncio, json, tempfile, os, sqlite3, gc, sys
 import deny_langchain  # Install the import tripwire before importing the component.
 from pathlib import Path
 from unittest.mock import patch
@@ -8,6 +8,35 @@ from purra.contracts import ModelCompletion, AgentMessage, ModelTokenUsage
 
 async def check(root):
     os.environ['MEM0_DIR']=str(root/'sdk');os.environ['MEM0_TELEMETRY']='false'
+    from purra_mem0._history import SQLiteManager
+    from mem0.memory.storage import SQLiteManager as UpstreamHistory
+    unraisable = []
+    with patch.object(sys, 'unraisablehook', unraisable.append):
+        try:
+            SQLiteManager(str(root/'missing-history'/'history.db'))
+        except sqlite3.OperationalError:
+            pass
+        else:
+            raise AssertionError('invalid history path accepted')
+        gc.collect()
+    assert unraisable == []
+    connection = sqlite3.connect(':memory:')
+    failure = RuntimeError('history schema initialization sentinel')
+    with patch('mem0.memory.storage.sqlite3.connect', return_value=connection), patch.object(
+        UpstreamHistory, '_migrate_history_table', side_effect=failure
+    ):
+        try:
+            SQLiteManager(':memory:')
+        except RuntimeError as error:
+            assert error is failure
+        else:
+            raise AssertionError('history schema error swallowed')
+    try:
+        connection.execute('SELECT 1')
+    except sqlite3.ProgrammingError:
+        pass
+    else:
+        raise AssertionError('failed initialization leaked history connection')
     from mem0.utils.factory import LlmFactory, EmbedderFactory, VectorStoreFactory
     from mem0.configs.base import MemoryConfig
     from purra_mem0._vendor.memory import Memory

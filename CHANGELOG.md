@@ -2,6 +2,19 @@
 
 ## 1.0.0 — Unreleased development
 
+- Add optional host-owned memory selection callbacks and read-only relation
+  proposals in both SDKs. Hosts own retrieval ordering, relation vocabulary,
+  extraction and explicit adoption; current scope, source revisions, evidence
+  and budgets remain validated. No automatic model call or link write is added.
+- Validate memory context allowances and token counters before host selection
+  or storage reads; TypeScript ignores inherited context allocation properties.
+- Close Python private Mem0 history connections on failed initialization while
+  preserving the original exception.
+- Document host-selected models across conversation turns using separate Runs;
+  each Run retains its own binding through execution and recovery.
+- Clarify optional SQLite v4/v5 activation, host-owned persistence schemas and
+  planning-preview policies in upgrade guidance.
+
 - Add host-controlled planning granularity and TypeScript host-only response presentation.
 - Add inline static image contracts, capability admission and recovery identity in both SDKs;
   verify the bounded GLM-5.3-Flash PNG-to-text combination through Chat-compatible transport.

@@ -51,7 +51,7 @@ from mem0.memory.notices import (
     get_temporal_feature_error_message_async,
 )
 from mem0.memory.setup import mem0_dir, setup_config
-from mem0.memory.storage import SQLiteManager
+from purra_mem0._history import SQLiteManager
 from mem0.memory.telemetry import MEM0_TELEMETRY, capture_event
 from mem0.memory.utils import (
     extract_json,

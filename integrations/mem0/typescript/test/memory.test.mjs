@@ -737,3 +737,151 @@ test("external metadata types cannot masquerade as the verified payload", async 
   client.rows.get(id).metadata.purra_metadata.pinned = 1;
   await assert.rejects(memory.get(id), code("memory_record_changed"));
 });
+
+for (const scenario of ['valid', 'empty', 'invented_quote', 'unknown_id', 'unknown_relation', 'extra_field', 'too_many', 'duplicate', 'stale', 'revoked', 'cancelled', 'oversize']) {
+  test(`relation proposals: ${scenario}`, async t => {
+    const { proposeMemoryRelations } = await import('../dist/index.js');
+    const { create } = fixture(t), memory = create();
+    const a = (await memory.add('Alice maintains PURRA.', { source, key: 'a' })).ids[0];
+    const b = (await memory.add('PURRA is a framework.', { source, key: 'b' })).ids[0];
+    const refs = [{ id: a, version: 1 }, { id: b, version: 1 }];
+    const controller = new AbortController(), epoch = memory.epoch;
+    let calls = 0;
+    const extract = async (payload, signal) => {
+      calls++;
+      assert.equal(signal, controller.signal);
+      assert.deepEqual(payload.relations, ['maintains']);
+      assert.throws(() => { payload.records[0].text = 'changed'; });
+      const item = { from: a, to: b, relation: 'maintains', fromQuote: 'Alice', toQuote: 'PURRA' };
+      if (scenario === 'empty') return [];
+      if (scenario === 'invented_quote') item.fromQuote = 'Bob';
+      if (scenario === 'unknown_id') item.to = 'outside-scope';
+      if (scenario === 'unknown_relation') item.relation = 'owns';
+      if (scenario === 'extra_field') item.confidence = 1;
+      if (scenario === 'too_many') return Array(33).fill(item);
+      if (scenario === 'duplicate') return [item, item];
+      if (scenario === 'stale') await memory.update(a, 'Changed', { source, version: 1, key: 'changed' });
+      if (scenario === 'revoked') await memory.revokeSource(source.id, { revision: source.revision, key: 'revoke' });
+      if (scenario === 'cancelled') controller.abort();
+      return [item];
+    };
+    const invoke = () => proposeMemoryRelations(memory, refs, { relations: ['maintains'], extract,
+      maxInputChars: scenario === 'oversize' ? 1 : 32000, signal: controller.signal });
+    if (['valid', 'empty'].includes(scenario)) {
+      const result = await invoke();
+      assert.equal(result.length, scenario === 'valid' ? 1 : 0);
+      if (result.length) { assert.deepEqual(result[0].from, refs[0]); assert.deepEqual(result[0].fromSource, source); }
+      assert.equal(memory.epoch, epoch);
+      assert.deepEqual((await memory.links(a)).items, []);
+    } else await assert.rejects(invoke, scenario === 'oversize' ? TypeError : { code:
+      ['stale', 'revoked'].includes(scenario) ? 'memory_context_stale' : scenario === 'cancelled' ? 'memory_cancelled' : 'memory_invalid_relation_proposal' });
+    assert.equal(calls, scenario === 'oversize' ? 0 : 1);
+  });
+}
+
+test('relation extraction preflight and host failures do not dispatch or retry', async t => {
+  const { proposeMemoryRelations } = await import('../dist/index.js');
+  const { create } = fixture(t), memory = create();
+  const a = (await memory.add('A', { source, key: 'a' })).ids[0];
+  const b = (await memory.add('B', { source, key: 'b' })).ids[0];
+  const refs = [{ id: a, version: 1 }, { id: b, version: 1 }];
+  let calls = 0;
+  const extract = async () => { calls++; throw Error('host extractor failed'); };
+  for (const changes of [{ relations: 'rel' }, { relations: ['rel', 'rel'] }, { maxProposals: true }, { maxInputChars: 0 }]) {
+    await assert.rejects(proposeMemoryRelations(memory, refs, { relations: ['rel'], extract, ...changes }), TypeError);
+  }
+  await assert.rejects(proposeMemoryRelations(memory, [{ id: a, version: 2 }, refs[1]], { relations: ['rel'], extract }), { code: 'memory_relation_stale' });
+  assert.equal(calls, 0);
+  await assert.rejects(proposeMemoryRelations(memory, refs, { relations: ['rel'], extract }), /host extractor failed/);
+  assert.equal(calls, 1);
+  assert.deepEqual((await memory.links(a)).items, []);
+});
+
+for (const scenario of ['combined', 'empty', 'zero_budget', 'cancelled', 'stale', 'malformed', 'failed']) {
+  test(`host context selection: ${scenario}`, async t => {
+    const { client, create } = fixture(t), memory = create();
+    const a = (await memory.add('First fact', { source, key: 'a' })).ids[0];
+    const b = (await memory.add('Related fact', { source, key: 'b' })).ids[0];
+    await memory.link({ id: a, version: 1 }, { id: b, version: 1 }, 'related', { key: 'edge' });
+    const controller = new AbortController(), request = { messages: [] };
+    let calls = 0;
+    const selectIds = async (received, signal) => {
+      assert.equal(received, request); assert.equal(signal, controller.signal); calls++;
+      if (scenario === 'failed') throw Error('host policy failed');
+      if (scenario === 'malformed') return a;
+      if (scenario === 'empty') return [];
+      if (scenario === 'cancelled') { controller.abort(); return [a]; }
+      if (scenario === 'stale') { await memory.revokeSource(source.id, { key: 'withdraw' }); return [a]; }
+      const hits = await memory.retrieve({ query: 'fact', limit: 8, scope: {} }, signal);
+      const links = await memory.links(a, { direction: 'outgoing', validOnly: true });
+      return [links.items[0].to.id, hits[0].id, links.items[0].to.id, 'missing'];
+    };
+    const context = new MemoryContext({ memory, selectIds });
+    const build = () => context.buildContext(request, { contextAllocations: { memory: scenario === 'zero_budget' ? 0 : 1000 } }, controller.signal);
+    if (['combined', 'empty', 'zero_budget'].includes(scenario)) {
+      const result = await build();
+      if (scenario === 'combined') {
+        const [block] = result.blocks;
+        assert.deepEqual(JSON.parse(block.content).map(row => row.id), [b, a]);
+        assert.equal(block.untrusted, true);
+        assert.deepEqual(block.evidence.map(r => r.itemId), [b, a]);
+        assert.equal(client.calls.filter(c => c[0] === 'search').length, 1);
+      } else assert.deepEqual(result.blocks, []);
+    } else {
+      await assert.rejects(build, scenario === 'failed' ? /host policy failed/ : scenario === 'malformed' ? TypeError :
+        { code: scenario === 'stale' ? 'memory_context_stale' : 'memory_cancelled' });
+      assert.equal(client.calls.filter(c => c[0] === 'search').length, 0);
+    }
+    assert.equal(calls, scenario === 'zero_budget' ? 0 : 1);
+  });
+}
+test('context requires exactly one selection mode', t => {
+  const { create } = fixture(t), memory = create();
+  for (const options of [{}, { query: () => '', selectIds: async () => [] }, { selectIds: 1 }]) {
+    assert.throws(() => new MemoryContext({ memory, ...options }), TypeError);
+  }
+});
+
+test('context selection snapshots host IDs before asynchronous reads', async t => {
+  const { assembleMemoryContext } = await import('../dist/index.js');
+  const { create } = fixture(t), memory = create();
+  const a = (await memory.add('A', { source, key: 'a' })).ids[0];
+  const ids = [a, 'missing'];
+  const original = memory.select.bind(memory);
+  memory.select = async (...args) => { ids.length = 0; return original(...args); };
+  const result = await assembleMemoryContext(memory, ids, 1000);
+  assert.deepEqual(result.included, [a]);
+  assert.deepEqual(result.missing, ['missing']);
+});
+
+for (const mode of ['query', 'selection']) {
+  for (const allowance of [-1, 1_000_001, 0.5, NaN, Infinity, '100', true, null]) {
+    test(`context validates ${mode} allowance ${String(allowance)} before host work`, async t => {
+      const { create } = fixture(t), memory = create();
+      let calls = 0;
+      const context = new MemoryContext({ memory, ...(mode === 'query'
+        ? { query() { calls++; return 'fact'; } }
+        : { async selectIds() { calls++; return []; } }) });
+      await assert.rejects(context.buildContext({ messages: [] }, { contextAllocations: { memory: allowance } }), /invalid context allowance/);
+      assert.equal(calls, 0);
+    });
+  }
+}
+test('assembly rejects a noncallable counter before storage access', async t => {
+  const { assembleMemoryContext } = await import('../dist/index.js');
+  const { create } = fixture(t), memory = create();
+  let calls = 0;
+  memory.select = async () => { calls++; return []; };
+  await assert.rejects(assembleMemoryContext(memory, [], 100, { countTokens: 7 }), /countTokens/);
+  assert.equal(calls, 0);
+});
+
+test('missing or inherited allocations do not authorize host selection', async t => {
+  const { create } = fixture(t), memory = create();
+  let calls = 0;
+  const context = new MemoryContext({ memory, async selectIds() { calls++; return []; } });
+  for (const contextAllocations of [{}, { memory: 0 }, Object.create({ memory: 100 })]) {
+    assert.deepEqual(await context.buildContext({ messages: [] }, { contextAllocations }), { blocks: [] });
+  }
+  assert.equal(calls, 0);
+});

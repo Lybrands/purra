@@ -164,3 +164,14 @@ result = await workflow.capture(
 ## 原生受控适配
 
 `create_managed_client` 把 PurrA 的原生模型和向量适配器注入包内、版本固定的 Mem0 私有模块，沿用现有预算、取消与结果校验。向量维度必须一致，受控路径拒绝 LangChain 向量库。不修改宿主安装的官方 SDK，也不启动代理服务。来源、许可证与修改说明见[第三方声明](THIRD_PARTY_NOTICES.md)。直接传入的原始 SDK 客户端仍由宿主管理，不自动获得受控回调的计费。
+
+## 宿主选择与关系候选
+
+`MemoryContext` 支持异步 `select_ids(request, signal)`，与原有 `query` 二选一。
+宿主返回有序记忆 ID；组件重新读取并验证来源、版本和预算，不接受替换文本。
+
+`purra_mem0.propose_memory_relations` 接受记忆引用、宿主关系词表和异步 `extract`。
+抽取回调返回仅含 `from`、`to`、`relation`、`fromQuote`、`toQuote` 字符串的对象数组。
+组件校验原文引用与当前记忆版本，只返回候选，不自动写入关系。
+关系是否成立、是否采纳和显式调用 `memory.link` 均由宿主决定。
+模型调用的授权、超时和费用预算也由宿主负责。

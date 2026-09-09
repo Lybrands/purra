@@ -11,3 +11,6 @@ __all__ = ["Mem0Memory", "MemoryContext", "MemoryContextResult", "assemble_memor
            "MemoryCaptureAuthorization", "memory_capture_intent",
            "EmbeddingResult", "MemoryBudget", "MemoryProviders", "MemoryUsage", "create_managed_client", "run_model",
            "MemoryWorkflow", "MemoryWorkflowResult", "MemoryDecisionPolicy"]
+
+from .relations import MemoryRelationProposal, propose_memory_relations
+__all__ += ["MemoryRelationProposal", "propose_memory_relations"]

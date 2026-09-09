@@ -7,3 +7,8 @@ Python uses mem0ai 2.0.19 memory/main.py; TypeScript uses mem0ai 3.1.7 dist/oss/
 The repository integrations/mem0/sdk/upstream.json records input hashes. Python scripts/sync_sdk.py verifies/regenerates the checked-in private module; TypeScript scripts/build-sdk.mjs generates dist/sdk-memory.js during the package build. No patching or source generation happens when a consumer imports the package.
 
 Generated source is reviewed by verifying the pinned input and the small transformation, then exercising SDK contract and installed-package tests. SDK upgrades require an explicit hash/contract review. Native provider clients are not constructed on the managed path. The private SDK is not part of the public API.
+
+The Python private module uses a PurrA history-manager subclass to close owned
+connections when history initialization fails and to make failed-connect cleanup
+safe. It inherits the pinned SDK's history operations and does not replace its
+schema or modify the installed upstream class.
