@@ -34,6 +34,7 @@ class AgentExecutionFactory(Protocol):
 
 from purra.execution.ownership import execution_owner, execution_claim
 from purra.interaction import UserInputRequired
+from purra.approvals import ApprovalRequired
 
 
 class AgentRunSupervisor:
@@ -201,7 +202,7 @@ class AgentRunSupervisor:
             _settle_future_exception(ready, error)
             _settle_future_exception(result_future, error)
             raise
-        except UserInputRequired as error:
+        except (UserInputRequired, ApprovalRequired) as error:
             if session is not None:
                 await session.close()
                 session = None
@@ -235,8 +236,6 @@ class AgentRunSupervisor:
             signal=signal,
         )
         await session.bind(run_id, force_claim=force_claim)
-        lease = await self._lease_store.get(run_id)
-        execution_claim.set((run_id, self._owner_id, lease.attempt))
         return session
 
     async def _subscribe(
@@ -374,6 +373,10 @@ class _LeaseSession:
                     "run execution lease could not be acquired",
                     code="run_lease_conflict",
                 )
+        state = await self._store.get(run_id)
+        if state is None or state.owner_id != self._owner_id:
+            raise ContractViolationError("Execution lease was lost", code="run_lease_lost")
+        execution_claim.set((run_id, self._owner_id, state.attempt))
         self._run_id = run_id
         self._monitor = asyncio.create_task(self._monitor_lease())
 
@@ -392,6 +395,7 @@ class _LeaseSession:
         loop = asyncio.get_running_loop()
         heartbeat_interval = max(0.05, self._lease_duration_ms / 3_000)
         next_heartbeat = loop.time() + heartbeat_interval
+        claim = execution_claim.get()
         while True:
             await asyncio.sleep(self._poll_interval_seconds)
             state = await self._store.get(self._run_id)
@@ -399,6 +403,7 @@ class _LeaseSession:
                 state is None
                 or state.cancellation_requested_at_ms is not None
                 or state.owner_id != self._owner_id
+                or (claim is not None and state.attempt != claim[2])
             ):
                 self._signal.set()
                 return

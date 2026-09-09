@@ -23,6 +23,7 @@ from purra.agent_tree import (
 )
 from purra.cancellation import OperationCanceled, await_with_cancellation, is_canceled
 from purra.interaction import UserInputRequired
+from purra.approvals import ApprovalRequired
 from purra.errors import ContractViolationError
 from purra.normalization import positive_int, required_text
 from purra.ports import CancellationSignal
@@ -259,7 +260,7 @@ class _AgentTreeSchedulingCapability:
         except asyncio.CancelledError:
             await self._repository.cancel_subtree(run.run_id)
             raise
-        except UserInputRequired:
+        except (UserInputRequired, ApprovalRequired):
             await self._repository.suspend_run(run.run_id, lease_owner_id=run.lease_owner_id, lease_epoch=run.lease_epoch)
             return
         except Exception as error:

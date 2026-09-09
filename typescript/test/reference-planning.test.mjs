@@ -620,3 +620,63 @@ async function collect(iterable) {
   for await (const value of iterable) values.push(value);
   return values;
 }
+
+for (const [domain, minimum] of [["incident-triage", 1], ["document-review", 2]]) {
+  test(`host ${domain} selects initial plan granularity through public policy`, async () => {
+    let plannerCalls = 0;
+    const agent = new Agent({
+      model: { capabilities: capabilities(), async invoke(request) {
+        if (isPlannerRequest(request)) {
+          plannerCalls += 1;
+          assert.match(request.messages[0].content, new RegExp(`at least ${minimum} distinct`));
+          const contract = request.messages.find(m => m.attributes?.planningContract);
+          assert.equal(JSON.parse(contract.content).minVisiblePlanSteps, minimum);
+          return acknowledged(request, finalTurn(JSON.stringify({ workPlan: {
+            title: domain, steps: twoStepPlan().steps.slice(0, minimum),
+          } })));
+        }
+        return acknowledged(request, finalTurn("done"));
+      } },
+      planning: {
+        policy: { planningConstraints() { return { minInitialVisibleSteps: minimum }; } },
+        plannerFactory: tasks => new ModelWorkPlanner(tasks),
+      },
+    });
+    assert.equal((await agent.invoke(plannedInput(domain))).output, "done");
+    assert.equal(plannerCalls, 1);
+    assert.throws(() => compileWorkPlan({ title: "Forbidden", steps: [
+      { id: "write", title: "Write", type: "write", executor: "tool", capabilityNames: ["unavailable"] },
+    ] }, [], { minInitialVisibleSteps: minimum }), error => error?.code === "plan_capability_not_allowed");
+  });
+}
+
+for (const minimum of [0, -1, true, 1.5, "2", Number.MAX_SAFE_INTEGER + 1]) {
+  test(`invalid initial plan preference is rejected before model call: ${minimum}`, async () => {
+    const planner = new ModelWorkPlanner({ plan() { assert.fail("must not call model"); } });
+    await assert.rejects(planner.createPlan({ messages: [{ role: "user", content: "plan" }] }, {
+      availableTools: [], planningContext: [], constraints: { minInitialVisibleSteps: minimum },
+    }), error => error?.code === "invalid_planning_constraints");
+  });
+}
+
+test("planning checkpoint preserves host constraints after JSON reopen", async () => {
+  const { PlannedExecutionCoordinator } = await import("../dist/planning/coordinator.js");
+  const make = minimum => new PlannedExecutionCoordinator({
+    options: {
+      planner: { createPlan() { return { workPlan: twoStepPlan() }; } },
+      policy: { planningConstraints() { return { minInitialVisibleSteps: minimum }; } },
+    },
+    request: { messages: [{ role: "user", content: "review" }] },
+    registrations: [], maxRounds: 6,
+  });
+  const original = make(2);
+  await original.start();
+  const saved = JSON.parse(JSON.stringify(original.checkpoint()));
+  const restored = make(3);
+  restored.restore(saved);
+  assert.equal(restored.checkpoint().capabilities.constraints.minInitialVisibleSteps, 2);
+  // Historical checkpoints omitted the preference and continue using the default.
+  delete saved.capabilities.constraints.minInitialVisibleSteps;
+  restored.restore(saved);
+  assert.equal(restored.checkpoint().capabilities.constraints.minInitialVisibleSteps, undefined);
+});

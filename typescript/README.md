@@ -6,12 +6,17 @@ An ESM Agent runtime for Node.js 22+. Applications provide a `ModelGateway` and
 compose tools, context, planning, and persistence through the public `purra` exports.
 
 
-## 1.0.0 candidate status
+## 1.0.0 development status
 
-This checkout contains an unreleased 1.0.0 candidate. Install the exact local
-artifacts from its candidate manifest; registry commands do not identify this candidate.
-See the [candidate support and upgrade guide](../conformance/release-1.0.md)
-for structured tasks, read-only MCP, safe read concurrency, inspection, and 1.x compatibility.
+This checkout is unreleased 1.0.0 development. Install matching local Core and
+integration artifacts; registry commands do not identify this development build.
+The [durable approval contract](../conformance/durable-approval.md) describes the
+work in progress. Durable Root approval recovery and host-authorized MCP writes have deterministic
+coverage; real Provider, business-service and downstream acceptance remain separate.
+Existing capabilities and 1.x compatibility are documented in the
+[1.0 support guide](../conformance/release-1.0.md).
+
+See the [upgrade notes](../docs/migrations/1.0.md) and [public compatibility](../ARCHITECTURE.md#public-compatibility) before upgrading.
 
 ## Install
 
@@ -84,7 +89,10 @@ Run requests accept `planningMode`:
 | `planned` | Plan before executing the task. |
 
 The planner requires a streaming gateway. Subscribe to Run events for public
-`planning.progress`; private plans and reasoning are excluded. See the
+`planning.delta` for each nonempty raw planning content chunk, without waiting
+for complete JSON, and `planning.progress` for complete progress records. Raw
+previews may include invalid plan fragments; execution still requires validation.
+Reasoning remains private. See the [output contract](../docs/planning-output.md) and
 [planning example](examples/planner-streaming.ts) for subscription and replay.
 
 ## Budgets and persistence
@@ -115,3 +123,14 @@ are constrained by the parent. See [Architecture](ARCHITECTURE.md).
 - [Examples](../examples/README.md)
 - [Optional packages](../integrations/README.md)
 - [MIT license](LICENSE)
+
+### Host-only results
+
+Set `responsePresentation: "none"` on `Agent` to return a result without a public
+response-presentation round. The default `"model_live"` is unchanged. Configured
+response validators, tool permissions and Run budgets still apply. `result.output`
+and `snapshot().finalOutput` are host-only data in this mode; the persisted final
+event is private, while lifecycle/tool/progress events retain their existing
+visibility. Transient stream final events carry `visibility: "private"` and no
+response-text deltas are emitted. The presentation mode is bound to the Run's
+composition and cannot be changed on resume.

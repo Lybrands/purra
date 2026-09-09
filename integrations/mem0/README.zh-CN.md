@@ -25,12 +25,26 @@ Mem0 保存文本与向量，适配器管理归属、状态、版本、操作回
 `MemoryWorkflow` 组合提取、审查与策略驱动的处理。没有配置策略时，候选保持待处理；
 策略也可以让单条候选保持待处理。模型判断相似不等于允许激活。
 
+需要在捕获前准入时，为工作流配置 capture policy ID 和修订，使用
+`memory_capture_intent` / `memoryCaptureIntent` 为准确输入生成摘要，再传入宿主签发的
+`MemoryCaptureAuthorization`。消息、来源、元数据、到期时间、策略、主体和决定会在
+Provider 或 Mem0 调度前绑定。宿主负责认证主体、判断内容是否适合捕获并审计决定。
+捕获前须用 `record_capture_authorization` / `recordCaptureAuthorization` 持久登记授权及
+可选有效期。到期只阻止新处理；显式撤销还会隐藏该决定产生的记录，但不会物理删除
+Mem0 内容或历史。
+
 | 处理类型 | 结果 |
 | --- | --- |
 | `independent` | 激活一条候选 |
 | `duplicate` | 保留一条接受的记录，停用重复项 |
 | `supersede` | 保留接受的替代记录，停用旧记录 |
 | `conflict` | 停用冲突组，等待解决 |
+
+工作流重试应保持 capture key、输入、捕获授权与策略修订不变。已完成的处理重放回执，
+不会重新提取或重新启用已撤回记录；运行中或结果未知的操作须先检查或对账。
+策略可能在处理结果持久化前再次调用，因此不得产生副作用；改变策略含义时须更新修订。
+空搜索结果不证明候选独立，`review.proposal` 也可能缺失。
+来源或记录版本过期时，在启用前拒绝。各 SDK 的用法见安装指南。
 
 ## 读取与管理
 
@@ -43,7 +57,20 @@ Mem0 保存文本与向量，适配器管理归属、状态、版本、操作回
 | `MemoryContext`、`assemble_memory_context` / `assembleMemoryContext` | 在 Token 额度内组装完整记录 |
 | `link`、`links` | 记录和查询记录版本之间的显式关系 |
 | `revoke_source` / `revokeSource` | 撤回来源或某一来源修订 |
+| `record_capture_authorization` / `recordCaptureAuthorization` | 持久登记准确的宿主捕获授权与有效期 |
+| `revoke_capture_authorization` / `revokeCaptureAuthorization` | 永久撤销一个策略决定 |
 | `validate_evidence` / `validateEvidence` | 检查已保存的记忆证据是否仍可使用 |
+
+`links` 可按 `direction`（`both`、`incoming`、`outgoing`）、精确关系名称 `relation`
+及 `valid_only` / `validOnly` 筛选。`limit` 限制扫描的关系数，因此空结果页仍可能有
+下一页；应继续读取到 `next` 为空，遍历期间保持筛选条件不变，epoch 变化后重新开始。
+有效性仅表示端点版本与可见性符合要求，不代表关系真实，也不是上下文证据回执。
+详见 [K01/K02 契约](../../conformance/memory-capture-relations.md)。
+
+使用 `relation_evidence` / `relationEvidence` 为两个精确端点签发关系回执，并在复用
+关系上下文前调用 `validate_relation_evidence` / `validateRelationEvidence`。端点变化、
+过期、撤销、删除以及存储或作用域不匹配都会使回执失效。回执证明当前可用性，不证明
+关系语义真实。
 
 `list` 返回 `items`、`next` 和 `epoch`。即使当前页为空，也应继续使用 `next` 翻页，
 直到它为 `null`；若 epoch 改变，应重新读取。`query` 过滤器按文本字面匹配，语义搜索使用 `retrieve`。

@@ -16,6 +16,7 @@ export type RunStatus = "running" | "completed" | "failed" | "canceled";
 export type PlanningMode = "auto" | "reactive" | "planned";
 
 export interface RunResult {
+  /** Host result. With responsePresentation=none this is not public response text. */
   readonly output: JsonValue;
   readonly messages: readonly Message[];
   readonly rounds: number;
@@ -32,6 +33,7 @@ export interface AgentPreset {
   readonly id: string;
   readonly revision: string;
   readonly promptSections?: readonly PromptSection[];
+  readonly modelRoute?: import('../model/routing.js').ModelRouteCandidate;
 }
 
 export interface RunRequest {
@@ -97,6 +99,7 @@ export interface ContinuationRunOptions extends RunOptionBase {
 export type RunOptions = NewRunOptions | ContinuationRunOptions;
 
 interface AgentPresetSnapshotBase {
+  readonly modelRoute?: import('../model/routing.js').ModelRouteCandidate;
   readonly presetId: string;
   readonly presetRevision: string;
   readonly promptFingerprint: string;
@@ -143,6 +146,7 @@ export interface RunSnapshot {
   readonly finalOutput?: JsonValue;
   readonly errorCode?: string;
   readonly executionCheckpoint?: AgentExecutionCheckpoint;
+  readonly toolExecutionCheckpoint?: AgentToolExecutionCheckpoint;
 }
 
 export interface AgentExecutionCheckpoint {
@@ -165,6 +169,16 @@ export interface AgentExecutionCheckpoint {
     readonly scope: string;
     readonly attempts: number;
   }[];
+}
+
+/** A settled model turn awaiting a single tool dispatch. Saving does not authorize execution. */
+export interface AgentToolExecutionCheckpoint extends Omit<AgentExecutionCheckpoint, "schemaVersion" | "phase"> {
+  readonly schemaVersion: 3;
+  readonly phase: "tool_ready";
+  readonly assistant: Message;
+  readonly invocationId: string;
+  readonly appliedGenerationLimit: number;
+  readonly allowedToolNames: readonly string[];
 }
 
 export interface RunCancellationReceipt {

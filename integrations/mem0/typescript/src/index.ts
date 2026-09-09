@@ -1,7 +1,7 @@
 /** Optional Node.js integration; not imported by PurrA Core. */
 export { MemoryError } from "./journal.js";
-export { Mem0Memory } from "./memory.js";
-export type { Mem0Client, MemoryScope, MemorySource, MemoryRecord, MemoryMetadata, MemoryFilters, MemoryPage, MemoryOperation, MemoryRef, MemoryLink, MemoryLinkPage, MemoryResolution, MemoryReview, MemoryMatch } from "./memory.js";
+export { Mem0Memory, memoryCaptureIntent } from "./memory.js";
+export type { Mem0Client, MemoryScope, MemorySource, MemoryCaptureAuthorization, MemoryRecord, MemoryMetadata, MemoryFilters, MemoryPage, MemoryOperation, MemoryRef, MemoryLink, MemoryLinkPage, MemoryRelationEvidence, MemoryResolution, MemoryReview, MemoryMatch } from "./memory.js";
 export type { MemoryContextResult } from "./context.js";
 export { MemoryContext, assembleMemoryContext } from "./context.js";
 export { createManagedClient, runModel } from "./providers.js";

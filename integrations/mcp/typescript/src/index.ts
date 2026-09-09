@@ -1,7 +1,7 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { CallToolResultSchema, ListToolsResultSchema, ErrorCode, McpError, type CallToolResult, type ServerNotification } from "@modelcontextprotocol/sdk/types.js";
 import { AgentCanceledError, AgentError, StructuredOutputContract, StructuredOutputError, jsonIdentityDigest,
-  type JsonValue, type ToolDefinition, type ToolPolicy, type ToolContext } from "purra";
+  type ToolApprovalBinding, type JsonValue, type ToolDefinition, type ToolPolicy, type ToolContext } from "purra";
 
 export class McpAdapterError extends AgentError {
   constructor(code: string) { super(code, "MCP tool boundary rejected the operation"); }
@@ -58,6 +58,23 @@ export interface McpToolBinding {
   readonly policy: ToolPolicy;
   readonly scope: NonNullable<ToolDefinition["scope"]> | null;
   readonly concurrencySafe?: boolean;
+}
+export interface McpWriteToolBinding extends ToolApprovalBinding {
+  readonly localName: string;
+  readonly policy: Readonly<{ mode: "confirm"; title: string; riskLevel: "write" | "destructive" }>;
+  readonly scope: NonNullable<ToolDefinition["scope"]>;
+  readonly concurrencySafe?: false;
+}
+export interface McpWriteToolEntry extends Omit<McpToolEntry, "policy"> {
+  readonly policy: McpWriteToolBinding["policy"];
+  readonly authorization: ToolApprovalBinding;
+}
+export interface McpWriteToolSnapshot extends Omit<McpToolSnapshot, "schemaVersion" | "entries"> {
+  readonly schemaVersion: 2;
+  readonly entries: readonly McpWriteToolEntry[];
+}
+export interface McpWriteToolCatalog extends Omit<McpToolCatalog, "snapshot"> {
+  readonly snapshot: McpWriteToolSnapshot;
 }
 export interface McpToolEntry {
   readonly remoteName: string;
@@ -135,23 +152,42 @@ function resultValue(raw: CallToolResult, output: StructuredOutputContract | und
 
 export async function discoverMcpTools(client: Client, serverId: string, bindings: Readonly<Record<string, McpToolBinding>>,
   options: McpDiscoveryOptions): Promise<McpToolCatalog> {
+  return await discover(client, serverId, bindings, options, false) as McpToolCatalog;
+}
+export async function discoverMcpWriteTools(client: Client, serverId: string, bindings: Readonly<Record<string, McpWriteToolBinding>>,
+  options: McpDiscoveryOptions): Promise<McpWriteToolCatalog> {
+  return await discover(client, serverId, bindings, options, true) as McpWriteToolCatalog;
+}
+async function discover(client: Client, serverId: string, bindings: Readonly<Record<string, McpToolBinding | McpWriteToolBinding>>,
+  options: McpDiscoveryOptions, writing: boolean) {
   const monitor = options.monitor;
   const limits = limitsOf(options.limits);
   if (!(client instanceof Client) || !(monitor instanceof McpCatalogMonitor)
     || typeof serverId !== "string" || !/^[A-Za-z0-9_.-]{1,128}$/.test(serverId)
     || !bindings || typeof bindings !== "object" || Array.isArray(bindings)) fail("mcp_binding_invalid");
-  const bound = new Map<string, McpToolBinding>();
+  const bound = new Map<string, McpToolBinding & { authorization?: ToolApprovalBinding }>();
   const localNames = new Set<string>();
   for (const [remote, binding] of Object.entries(bindings)) {
     if (!/^[A-Za-z0-9_.-]{1,128}$/.test(remote) || !binding || typeof binding.localName !== "string"
-      || !/^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(binding.localName) || binding.policy?.mode !== "read"
-      || binding.policy.riskLevel !== undefined && binding.policy.riskLevel !== "read"
+      || !/^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(binding.localName) || binding.policy?.mode !== (writing ? "confirm" : "read")
+      || !writing && binding.policy.riskLevel !== undefined && binding.policy.riskLevel !== "read"
       || typeof binding.policy.title !== "string" || !binding.policy.title.trim()
       || binding.scope !== null && typeof binding.scope !== "function"
       || binding.concurrencySafe !== undefined && typeof binding.concurrencySafe !== "boolean") fail("mcp_binding_invalid");
+    let authorization: ToolApprovalBinding | undefined;
+    if (writing) {
+      const write = binding as McpWriteToolBinding;
+      if (!["write", "destructive"].includes(write.effect) || write.policy.riskLevel !== write.effect
+        || typeof write.scope !== "function" || write.concurrencySafe !== undefined && write.concurrencySafe !== false
+        || ![write.bindingId, write.bindingRevision, write.scopeId, write.scopeRevision]
+          .every(text => typeof text === "string" && text.length > 0 && [...text].length <= 1024 && text.trim() === text)) fail("mcp_binding_invalid");
+      authorization = Object.freeze({ bindingId: write.bindingId, bindingRevision: write.bindingRevision,
+        scopeId: write.scopeId, scopeRevision: write.scopeRevision, effect: write.effect });
+    }
     if (localNames.has(binding.localName)) fail("mcp_name_conflict");
     localNames.add(binding.localName);
-    bound.set(remote, Object.freeze({ ...binding, policy: Object.freeze({ mode: "read", title: binding.policy.title.trim(), riskLevel: "read" }) }));
+    bound.set(remote, Object.freeze({ ...binding, ...(authorization === undefined ? {} : { authorization }),
+      policy: Object.freeze({ mode: writing ? "confirm" : "read", title: binding.policy.title.trim(), riskLevel: authorization?.effect ?? "read" }) }));
   }
   if (bound.size === 0 || bound.size > limits.maxTools) fail("mcp_binding_invalid");
   const revision = monitor.revision;
@@ -159,7 +195,7 @@ export async function discoverMcpTools(client: Client, serverId: string, binding
   if (client.getServerCapabilities()?.tools === undefined || client.transport === undefined) fail("mcp_tools_unavailable");
   const envelope = await contract({ type: "object" }, limits);
   const seen = new Set<string>(), cursors = new Set<string>();
-  const found = new Map<string, { entry: McpToolEntry; binding: McpToolBinding; input: StructuredOutputContract; output: StructuredOutputContract | undefined }>();
+  const found = new Map<string, { entry: McpToolEntry | McpWriteToolEntry; binding: McpToolBinding & { authorization?: ToolApprovalBinding }; input: StructuredOutputContract; output: StructuredOutputContract | undefined }>();
   let cursor: string | undefined, totalBytes = 0, finished = false;
   const requestOptions = { timeout: limits.timeoutMs, maxTotalTimeout: limits.timeoutMs,
     ...(options.signal === undefined ? {} : { signal: options.signal }) };
@@ -181,9 +217,10 @@ export async function discoverMcpTools(client: Client, serverId: string, binding
       const inputContract = await remoteContract(tool.inputSchema as Readonly<Record<string, JsonValue>>, limits);
       const outputContract = tool.outputSchema === undefined ? undefined : await remoteContract(tool.outputSchema as Readonly<Record<string, JsonValue>>, limits);
       const input = inputContract.compiled, output = outputContract?.compiled;
-      const entry: McpToolEntry = Object.freeze({ remoteName: tool.name, localName: binding.localName, description,
+      const entry = Object.freeze({ remoteName: tool.name, localName: binding.localName, description,
         inputSchema: inputContract.snapshot, outputSchema: outputContract?.snapshot ?? null,
-        policy: Object.freeze({ mode: "read", title: binding.policy.title, riskLevel: "read" }), concurrencySafe: binding.concurrencySafe ?? false });
+        policy: binding.policy, concurrencySafe: binding.concurrencySafe ?? false,
+        ...(binding.authorization === undefined ? {} : { authorization: binding.authorization }) }) as McpToolEntry | McpWriteToolEntry;
       found.set(tool.name, { entry, binding, input, output });
     }
     cursor = result.nextCursor;
@@ -194,7 +231,7 @@ export async function discoverMcpTools(client: Client, serverId: string, binding
   if (!finished) fail("mcp_catalog_limit_exceeded");
   if (found.size !== bound.size) fail("mcp_binding_missing");
   const ordered = [...found.entries()].sort((a, b) => a[1].entry.localName < b[1].entry.localName ? -1 : 1);
-  const identity = Object.freeze({ schemaVersion: 1 as const, serverId, protocolVersion: monitor.protocolVersion!,
+  const identity = Object.freeze({ schemaVersion: writing ? 2 as const : 1 as const, serverId, protocolVersion: monitor.protocolVersion!,
     entries: Object.freeze(ordered.map(([, row]) => row.entry)) });
   let revisionDigest: string;
   try { revisionDigest = await jsonIdentityDigest(identity); }
@@ -207,7 +244,9 @@ export async function discoverMcpTools(client: Client, serverId: string, binding
     };
     return Object.freeze({ name: row.entry.localName, description: row.entry.description || row.binding.policy.title,
       inputSchema: row.input.schema, argumentContract: row.input, policy: row.binding.policy, concurrencySafe: row.entry.concurrencySafe,
+      ...(row.binding.authorization === undefined ? {} : { approvalBinding: Object.freeze({ ...row.binding.authorization, bindingRevision: revisionDigest }) }),
       scope, async run(input: JsonValue, context: ToolContext) {
+        let dispatched = false;
         try {
           monitor.check(revision);
           let value: Readonly<Record<string, JsonValue>>;
@@ -216,12 +255,14 @@ export async function discoverMcpTools(client: Client, serverId: string, binding
           const decision = await scope(value, context);
           if (decision === false || typeof decision === "string" && decision.trim()) fail("mcp_scope_denied");
           monitor.check(revision); stopped(context.signal);
+          dispatched = true;
           const result = await request(() => client.request({ method: "tools/call", params: { name: remote, arguments: value } }, CallToolResultSchema,
             { timeout: limits.timeoutMs, maxTotalTimeout: limits.timeoutMs, ...(context.signal === undefined ? {} : { signal: context.signal }) }), context.signal);
           monitor.check(revision);
-          return { content: resultValue(result, row.output, envelope, limits), effectState: "not_started" };
+          return { content: resultValue(result, row.output, envelope, limits), effectState: writing ? "committed" : "not_started" };
         } catch (error) {
-          if (error instanceof McpAdapterError) return { content: { text: [], structured: null }, effectState: "not_started", errorCode: error.code };
+          if (error instanceof McpAdapterError) return { content: { text: [], structured: null }, effectState: writing && dispatched ? "unknown" : "not_started", errorCode: error.code };
+          if (writing && dispatched && error instanceof AgentCanceledError) return { content: { text: [], structured: null }, effectState: "unknown", errorCode: "mcp_canceled" };
           throw error;
         }
       },

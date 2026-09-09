@@ -1,12 +1,14 @@
 import { encodeStorageState, decodeStorageState, requireStorageFields } from "../shared/storage-state.js";
 import { PLANNING_STREAM_SCHEMA, PlanningStreamParser } from "../planning/stream.js";
 import type { JsonValue, ModelTokenUsage } from "../model/types.js";
-import { copyJsonValue } from "../model/validation.js";
+import { copyJsonValue, copyMessages } from "../model/validation.js";
+import { copyModelRouteCandidate } from '../model/routing.js';
 import { copyPreparedContextSnapshot } from "../context/coordinator.js";
 import type { OutputEvent, OutputEventDraft } from "../output/types.js";
 import { AgentError } from "../shared/errors.js";
 import type {
   AgentExecutionCheckpoint,
+  AgentToolExecutionCheckpoint,
   InvocationSettlement,
   ModelInvocationReceipt,
   RunBeginParams,
@@ -19,6 +21,8 @@ import type {
 
 export interface RunRepository {
   executeOwned?<T>(runId: string, operation: () => Promise<T>, checkpoint?: AgentExecutionCheckpoint): Promise<T>;
+  executeToolOwned?<T>(runId: string, operation: () => Promise<T>, checkpoint: AgentToolExecutionCheckpoint): Promise<T>;
+  saveToolExecutionCheckpoint?(runId: string, checkpoint: AgentToolExecutionCheckpoint, claim?: RunLeaseClaim): Promise<{ readonly snapshot: RunSnapshot; readonly event: OutputEvent }>;
   begin(params: RunBeginParams): Promise<{ readonly snapshot: RunSnapshot; readonly event: OutputEvent }>;
   openInvocation(
     runId: string,
@@ -165,6 +169,7 @@ function sourceEvent(run: StoredRun, key: string, root = true): OutputEvent | un
 
 const METERED_KINDS = new Set([
   "planning.progress",
+  "planning.delta",
   "model.delta",
   "provider.delta_batch",
   "reasoning.delta",
@@ -196,6 +201,48 @@ export class InMemoryRunRepository implements RunRepository {
     }
     return encodeStorageState("purra.run-state/v1", { runs: new Map([...this.#runs].map(([id, run]) => [id, storageRun(run)])), rootEvents: this.#rootEvents, rootEventsBySourceKey: this.#rootEventsBySourceKey });
   }
+
+  public runningRunIds(): readonly string[] {
+    return Object.freeze([...this.#runs].filter(([, run]) => run.snapshot.status === "running").map(([id]) => id));
+  }
+
+  public hasActiveRuns(): boolean {
+    return [...this.#runs.values()].some(run => run.snapshot.status === "running");
+  }
+  public hasToolExecutionCheckpoint(): boolean {
+    return [...this.#runs.values()].some(run => run.snapshot.toolExecutionCheckpoint !== undefined);
+  }
+
+  public hasSettledToolInvocation(runId: string, invocationId: string): boolean {
+    const run = this.#require(runId);
+    const receipt = run.invocationReceipts.get(invocationId), settlement = run.invocationSettlements.get(invocationId);
+    return receipt !== undefined && receipt.attempt === run.snapshot.usage.modelAttempts
+      && run.openInvocations.size === 0 && settlement?.input.status === "completed"
+      && settlement.budgetError === undefined && exceededTokenBudget(this.#root(run)) === undefined;
+  }
+
+  public async saveToolExecutionCheckpoint(
+    runId: string, checkpoint: AgentToolExecutionCheckpoint, claim: RunLeaseClaim = {},
+  ): Promise<{ readonly snapshot: RunSnapshot; readonly event: OutputEvent }> {
+    const run = this.#active(runId, claim);
+    const copied = copyToolExecutionCheckpoint(checkpoint);
+    const current = run.snapshot.toolExecutionCheckpoint;
+    if (copied.runId !== runId || !this.hasSettledToolInvocation(runId, copied.invocationId)) {
+      throw new AgentError("agent_execution_checkpoint_conflict", "Tool checkpoint requires the latest settled invocation");
+    }
+    if ((run.snapshot.executionCheckpoint?.nextRound ?? 1) > copied.nextRound
+      || (current !== undefined && canonicalJson(current) !== canonicalJson(copied))) {
+      throw new AgentError("agent_execution_checkpoint_conflict", "Tool checkpoint conflicts with the canonical continuation");
+    }
+    const key = `agent-tool-checkpoint:${runId}:${copied.nextRound}`;
+    const event = sourceEvent(run, key) ?? append(run, runId, {
+      sourceKey: key, kind: "agent.execution_checkpoint", channel: "lifecycle", visibility: "private",
+      payload: { schemaVersion: 3, phase: "tool_ready", executionProfile: copied.executionProfile, nextRound: copied.nextRound },
+    }, false);
+    run.snapshot = freezeSnapshot({ ...run.snapshot, toolExecutionCheckpoint: copied });
+    return Object.freeze({ snapshot: run.snapshot, event });
+  }
+
   /** Execution state without the canonical journal, for transactional row storage. */
   public exportJournalState(options: { readonly incremental?: boolean } = {}): {
     readonly state: string;
@@ -212,7 +259,7 @@ export class InMemoryRunRepository implements RunRepository {
     };
   }
 
-  public importState(text: string, outputEvents?: readonly OutputEvent[], options: { readonly rootRunId?: string; readonly deferredJournal?: DeferredOutputJournal } = {}): void {
+  public importState(text: string, outputEvents?: readonly OutputEvent[], options: { readonly rootRunId?: string; readonly rootRunIds?: readonly string[]; readonly deferredJournal?: DeferredOutputJournal } = {}): void {
     const shape = { runs: this.#runs, rootEvents: this.#rootEvents, rootEventsBySourceKey: this.#rootEventsBySourceKey };
     const saved = decodeStorageState(text, "purra.run-state/v1", shape, { journalCounts: new Map<string, number>() }) as typeof shape & { journalCounts?: Map<string, number> };
     for (const [id, run] of saved.runs) {
@@ -221,8 +268,21 @@ export class InMemoryRunRepository implements RunRepository {
       if (typeof id !== "string" || run.runId !== id || !saved.runs.has(run.rootRunId)
         || !Array.isArray(run.events) || !Array.isArray(run.rootEvents) || !(run.openInvocations instanceof Set)
         || ![run.bySourceKey, run.rootBySourceKey, run.invocationReceipts, run.invocationSettlements].every(v => v instanceof Map)) throw new TypeError("Invalid stored Run");
+      run.snapshot = freezeSnapshot(run.snapshot);
       for (const receipt of run.invocationReceipts.values()) validateStructuredReceipt(receipt);
       for (const value of run.invocationSettlements.values()) requireStorageFields(value, ["input", "event"], ["budgetError"]);
+    }
+    if (options.rootRunIds !== undefined && (options.rootRunId !== undefined || options.deferredJournal !== undefined
+      || !Array.isArray(options.rootRunIds) || options.rootRunIds.length === 0
+      || options.rootRunIds.some(id => typeof id !== "string" || !id) || outputEvents === undefined)) {
+      throw new TypeError("Root set selection requires detached events and no other selection");
+    }
+    const selectedRoots = options.rootRunIds === undefined
+      ? (options.rootRunId === undefined ? undefined : new Set([options.rootRunId]))
+      : new Set(options.rootRunIds);
+    const storedRoots = new Set([...saved.runs.values()].map(run => run.rootRunId));
+    if (selectedRoots !== undefined && [...selectedRoots].some(id => !storedRoots.has(id))) {
+      throw new TypeError("Root journal selection requires existing Roots");
     }
     const deferred = options.deferredJournal;
     if (deferred !== undefined && (options.rootRunId === undefined || outputEvents !== undefined || saved.journalCounts === undefined)) {
@@ -237,7 +297,7 @@ export class InMemoryRunRepository implements RunRepository {
     this.#unloadedRoots.clear();
     this.#journalCounts = saved.journalCounts ?? new Map();
     for (const run of saved.runs.values()) {
-      if (options.rootRunId !== undefined && run.rootRunId !== options.rootRunId) this.#unloadedRoots.add(run.rootRunId);
+      if (selectedRoots !== undefined && !selectedRoots.has(run.rootRunId)) this.#unloadedRoots.add(run.rootRunId);
     }
     this.#runs.clear(); for (const [key, value] of saved.runs) this.#runs.set(key, value);
     this.#rootEvents.clear(); for (const [key, value] of saved.rootEvents) this.#rootEvents.set(key, value);
@@ -497,6 +557,10 @@ export class InMemoryRunRepository implements RunRepository {
         "Agent execution checkpoint belongs to another Run",
       );
     }
+    const pendingTool = run.snapshot.toolExecutionCheckpoint;
+    if (pendingTool !== undefined && copied.nextRound !== pendingTool.nextRound + 1) {
+      throw new AgentError("agent_execution_checkpoint_conflict", "Pending tool continuation must advance exactly one round");
+    }
     const current = run.snapshot.executionCheckpoint;
     if (current !== undefined) {
       if (copied.nextRound < current.nextRound) {
@@ -528,8 +592,9 @@ export class InMemoryRunRepository implements RunRepository {
         nextRound: copied.nextRound,
       },
     }, false);
+    const { toolExecutionCheckpoint: _pending, ...snapshot } = run.snapshot;
     run.snapshot = freezeSnapshot({
-      ...run.snapshot,
+      ...snapshot,
       executionCheckpoint: copied,
     });
     return Object.freeze({ snapshot: run.snapshot, event });
@@ -1046,6 +1111,30 @@ function validatePlanningProjection(run: StoredRun, draft: OutputEventDraft): vo
       );
     }
   }
+  if (draft.kind === "planning.delta") {
+    const p = draft.payload ?? {};
+    const id = p.invocationId;
+    const index = p.sourceChunkIndex;
+    const receipt = typeof id === "string" ? run.invocationReceipts.get(id) : undefined;
+    const scope = receipt?.planningScope;
+    const source = sourceEvent(run, `provider-batch:${id}:model:private:${index}:${index}`);
+    const entries = source?.payload.entries as readonly { kind: string; sourceChunkIndex: number; payload: { delta?: string } }[] | undefined;
+    if (receipt === undefined || scope === undefined || !run.openInvocations.has(receipt.invocationId)
+      || receipt.outputProtocol !== PLANNING_STREAM_SCHEMA || p.schemaVersion !== PLANNING_STREAM_SCHEMA
+      || p.source !== "provider" || draft.channel !== "commentary"
+      || p.operationId !== scope.operationId || p.revision !== scope.revision || p.attempt !== (receipt.planningAttempt ?? 0)
+      || !Number.isSafeInteger(index) || (index as number) < 0
+      || typeof p.textDelta !== "string" || p.textDelta.length === 0
+      || Object.keys(p).sort().join(",") !== "attempt,invocationId,operationId,revision,schemaVersion,source,sourceChunkIndex,textDelta"
+      || draft.sourceKey !== `planning-delta:${id}:${index}`
+      || source?.runId !== run.runId || source?.kind !== "provider.delta_batch" || source?.visibility !== "private"
+      || source?.payload.invocationId !== id
+      || !entries?.some((entry) => entry.kind === "provider.content_delta" && entry.sourceChunkIndex === index && entry.payload.delta === p.textDelta)) {
+      throw new AgentError("planning_projection_invalid", "Planning delta differs from persisted Provider chunk");
+    }
+    requirePlanningOperation(run, scope.operationId);
+    return;
+  }
   if (draft.kind !== "planning.progress") return;
   const p = draft.payload ?? {};
   const invocationId = p.invocationId;
@@ -1209,7 +1298,11 @@ function freezeSnapshot(snapshot: RunSnapshot): RunSnapshot {
     ...snapshot,
     budgets: normalizeRunBudgets(snapshot.budgets),
     usage: Object.freeze({ ...snapshot.usage }),
-    preset: Object.freeze({ ...snapshot.preset }),
+    preset: Object.freeze({ ...snapshot.preset,
+      ...(snapshot.preset.modelRoute === undefined ? {} : {modelRoute: copyModelRouteCandidate(snapshot.preset.modelRoute)}),
+    }),
+    ...(snapshot.toolExecutionCheckpoint === undefined
+      ? {} : { toolExecutionCheckpoint: copyToolExecutionCheckpoint(snapshot.toolExecutionCheckpoint) }),
     ...(snapshot.executionCheckpoint === undefined
       ? {}
       : { executionCheckpoint: copyExecutionCheckpoint(snapshot.executionCheckpoint) }),
@@ -1222,6 +1315,7 @@ export function normalizeRunSnapshot(snapshot: RunSnapshot): RunSnapshot {
   }
   return freezeSnapshot(snapshot);
 }
+
 
 export function normalizeRunBudgets(value: RunBudgets): RunBudgets {
   if (value === null || typeof value !== "object") {
@@ -1312,6 +1406,27 @@ function copyExecutionCheckpoint(
     context: copied.context === null ? null : copyPreparedContextSnapshot(copied.context),
     contextEvidence: copyCheckpointEvidence(copied.contextEvidence),
   });
+}
+
+export function copyToolExecutionCheckpoint(value: AgentToolExecutionCheckpoint): AgentToolExecutionCheckpoint {
+  if (value.schemaVersion !== 3 || value.phase !== "tool_ready") throw new TypeError("Invalid tool checkpoint contract");
+  const { assistant: rawAssistant, invocationId, allowedToolNames, ...base } = value;
+  const copied = copyExecutionCheckpoint({ ...base, schemaVersion: 2, phase: "model_ready" });
+  const assistant = copyMessages([rawAssistant])[0]!;
+  const messages = Object.freeze(copyMessages(copied.messages));
+  const calls = assistant.toolCalls ?? [];
+  requiredText(invocationId, "tool checkpoint invocation id");
+  if (!Number.isSafeInteger(value.appliedGenerationLimit) || value.appliedGenerationLimit < 1) throw new TypeError("Invalid settled generation limit");
+  for (const attempt of copied.recoveryAttempts) nonNegativeInteger(attempt.attempts, "checkpoint recovery attempts");
+  if (assistant.role !== "assistant" || calls.length !== 1 || copied.pendingReplan !== undefined
+    || copied.roundLimit === undefined || copied.nextRound >= copied.roundLimit
+    || !Array.isArray(allowedToolNames) || allowedToolNames.some(name => typeof name !== "string" || !name.trim())
+    || new Set(allowedToolNames).size !== allowedToolNames.length || !allowedToolNames.includes(calls[0]!.name)
+    || messages.some(message => message.toolCallId === calls[0]!.id || message.toolCalls?.some(call => call.id === calls[0]!.id))) {
+    throw new TypeError("Invalid tool checkpoint continuation");
+  }
+  return Object.freeze({ ...copied, schemaVersion: 3, phase: "tool_ready", messages, assistant,
+    invocationId, appliedGenerationLimit: value.appliedGenerationLimit, allowedToolNames: Object.freeze([...allowedToolNames]) });
 }
 
 function copyCheckpointEvidence(

@@ -155,6 +155,59 @@ class MemorySource:
 
 
 @dataclass(frozen=True, slots=True)
+class MemoryCaptureAuthorization:
+    """Host grant bound to one exact pre-extraction capture intent."""
+
+    intent_digest: str
+    policy_id: str
+    policy_revision: str
+    principal_id: str
+    decision_id: str
+
+    def __post_init__(self):
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", self.intent_digest):
+            raise ValueError("invalid capture intent digest")
+        _text(self.policy_id, "capture policy id", 512)
+        _text(self.policy_revision, "capture policy revision", 512)
+        _text(self.principal_id, "capture principal id", 512)
+        _text(self.decision_id, "capture decision id", 512)
+
+    def _data(self):
+        return {
+            "intent_digest": self.intent_digest,
+            "policy_id": self.policy_id,
+            "policy_revision": self.policy_revision,
+            "principal_id": self.principal_id,
+            "decision_id": self.decision_id,
+        }
+
+
+def _capture_input(messages, source, metadata, expires_at, max_input):
+    if not isinstance(source, MemorySource):
+        raise TypeError("source must be MemorySource")
+    if not isinstance(messages, Sequence) or isinstance(messages, (str, bytes)) or not 1 <= len(messages) <= 100:
+        raise ValueError("messages must contain 1 to 100 source messages")
+    copied = []
+    for message in messages:
+        if not isinstance(message, Mapping) or set(message) != {"role", "content"} or message["role"] not in ("user", "assistant"):
+            raise ValueError("source messages may contain only user/assistant text")
+        copied.append({"role": message["role"], "content": _text(message["content"], "message", max_input)})
+    if sum(len(message["content"]) for message in copied) > max_input:
+        raise ValueError("source messages exceed max_input_chars")
+    return copied, _metadata({} if metadata is None else metadata), _expiry(expires_at)
+
+
+def memory_capture_intent(messages, *, source: MemorySource, metadata=None, expires_at=None,
+                          max_input_chars=32_000):
+    """Digest the exact content and labels that would leave the host for extraction."""
+    _integer(max_input_chars, "max_input_chars", 10_000_000)
+    copied, metadata, expires = _capture_input(messages, source, metadata, expires_at, max_input_chars)
+    return "sha256:" + _digest([
+        "purra.mem0.capture-intent/v1", copied, [source.id, source.revision], metadata, expires,
+    ])
+
+
+@dataclass(frozen=True, slots=True)
 class MemoryRecord:
     id: str
     text: str
@@ -202,6 +255,17 @@ class MemoryLinkPage:
     items: tuple[MemoryLink, ...]
     next: str | None
     epoch: int
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryRelationEvidence:
+    evidence_id: str
+    source: str
+    link_key: str
+    from_ref: MemoryRef
+    to_ref: MemoryRef
+    relation: str
+    note: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -355,11 +419,12 @@ class Mem0Memory:
         resolution = None if op is None else op["plan"].get("resolution")
         review = None if op is None else op["plan"].get("review")
         return None if op is None else MemoryOperation(key, op["state"], tuple(op["ids"] or ()),
-            MemoryUsage(**self._journal.usage(operation=key)) if op["plan"].get("budget") or op["plan"]["kind"] in {"revoke_source", "state", "annotate", "resolve", "link"} else "unknown",
+            MemoryUsage(**self._journal.usage(operation=key)) if op["plan"].get("budget") or op["plan"]["kind"] in {"revoke_source", "record_capture_authorization", "revoke_capture_authorization", "state", "annotate", "resolve", "link"} else "unknown",
             None if resolution is None else MemoryResolution(resolution["kind"], tuple(MemoryRef(**r) for r in resolution["items"]), resolution["keep"], op["plan"].get("review_key")),
             None if review is None else MemoryReview(MemoryRef(**review["candidate"]), tuple(MemoryMatch(MemoryRef(**m["item"]), m["kind"]) for m in review["matches"]), review["epoch"], key))
 
-    async def resolve(self, resolution: MemoryResolution, *, key: str, signal=None) -> MemoryOperation:
+    async def resolve(self, resolution: MemoryResolution, *, key: str,
+                      authorization: MemoryCaptureAuthorization | None = None, signal=None) -> MemoryOperation:
         """Atomically keep one accepted claim, or quarantine a conflicting group.
 
         Verify SDK content, then change only journal visibility/versions. Originals
@@ -370,12 +435,20 @@ class Mem0Memory:
         _text(key, "operation key", 512)
         data = {"kind": resolution.kind, "items": [{"id": r.id, "version": r.version} for r in resolution.items], "keep": resolution.keep}
         review_key = resolution.review_key
-        fingerprint = _digest(["resolve", data] if review_key is None else ["resolve", data, review_key])
+        if authorization is not None and not isinstance(authorization, MemoryCaptureAuthorization):
+            raise TypeError("authorization must be MemoryCaptureAuthorization")
+        authorization_data = None if authorization is None else authorization._data()
+        fingerprint_input = ["resolve", data] if review_key is None else ["resolve", data, review_key]
+        if authorization_data is not None:
+            fingerprint_input.append(authorization_data)
+        fingerprint = _digest(fingerprint_input)
         plan = {"kind": "resolve", "target": None, "meta": None, "resolution": data}
         if review_key is not None:
             plan["review_key"] = review_key
         if self._providers is not None:
             plan["budget"] = self._providers.budget.key
+        if authorization_data is not None:
+            plan["capture_authorization"] = authorization_data
 
         def apply():
             previous = self._journal.operation(key)
@@ -383,6 +456,8 @@ class Mem0Memory:
                 if previous["fingerprint"] != fingerprint:
                     raise MemoryError("memory_idempotency_conflict")
                 return self.operation(key)
+            if authorization_data is not None:
+                self._journal.assert_capture_authorization(authorization_data)
             epoch = self.epoch
             refs = resolution.items
             if review_key is not None:
@@ -444,10 +519,18 @@ class Mem0Memory:
             return self.operation(key)
         return await self._call(apply, signal)
 
-    async def links(self, item_id: str, *, limit: int = 20, after: str | None = None, signal=None) -> MemoryLinkPage:
+    async def links(self, item_id: str, *, limit: int = 20, after: str | None = None,
+                    direction: str = "both", relation: str | None = None,
+                    valid_only: bool = False, signal=None) -> MemoryLinkPage:
         """Audit bounded links; only matching, active endpoint versions are valid for use."""
         _text(item_id, "memory id", 512)
         _integer(limit, "limit", self._max_results)
+        if direction not in ("both", "incoming", "outgoing"):
+            raise ValueError("invalid relation direction")
+        if relation is not None:
+            _text(relation, "relation", 64)
+        if type(valid_only) is not bool:
+            raise ValueError("valid_only must be boolean")
         if after is not None:
             _text(after, "cursor", 512)
         def read():
@@ -455,15 +538,65 @@ class Mem0Memory:
             rows = self._journal.links(item_id, after, limit + 1)
             items = []
             for key, data in rows[:limit]:
+                if (relation is not None and data["relation"] != relation
+                        or direction == "incoming" and data["to"]["id"] != item_id
+                        or direction == "outgoing" and data["from"]["id"] != item_id):
+                    continue
                 refs = (MemoryRef(**data["from"]), MemoryRef(**data["to"]))
                 records = [self._read(ref.id) for ref in refs]
                 valid = all(record is not None and record.version == ref.version for record, ref in zip(records, refs))
+                if valid_only and not valid:
+                    continue
                 items.append(MemoryLink(key, *refs, data["relation"], data["note"], valid))
             self.assert_epoch(epoch)
             return MemoryLinkPage(tuple(items), rows[limit - 1][0] if len(rows) > limit else None, epoch)
         return await self._call(read, signal)
 
-    async def review(self, candidate: MemoryRef, *, key: str, limit: int = 8, instructions: str = "", signal=None) -> MemoryOperation:
+    async def relation_evidence(self, link: MemoryLink, *, signal=None) -> MemoryRelationEvidence:
+        """Issue evidence for one currently valid, exact persisted relation."""
+        if not isinstance(link, MemoryLink) or not link.valid:
+            raise MemoryError("memory_relation_stale")
+        expected = {"from": {"id": link.from_ref.id, "version": link.from_ref.version},
+                    "to": {"id": link.to_ref.id, "version": link.to_ref.version},
+                    "relation": link.relation, "note": link.note}
+        def read():
+            epoch = self.epoch
+            operation = self._journal.operation(link.key)
+            if (operation is None or operation["state"] != "complete"
+                    or operation["plan"].get("kind") != "link"
+                    or operation["plan"].get("link") != expected):
+                raise MemoryError("memory_relation_stale")
+            records = (self._read(link.from_ref.id), self._read(link.to_ref.id))
+            if any(record is None or record.version != ref.version
+                   for record, ref in zip(records, (link.from_ref, link.to_ref))):
+                raise MemoryError("memory_relation_stale")
+            self.assert_epoch(epoch)
+            source = "mem0-relation/" + self._scope
+            evidence_id = "mem0-relation:" + self._journal.store + ":" + _digest([link.key, expected])
+            return MemoryRelationEvidence(evidence_id, source, link.key,
+                                          link.from_ref, link.to_ref, link.relation, link.note)
+        return await self._call(read, signal)
+
+    async def validate_relation_evidence(self, receipts: Sequence[MemoryRelationEvidence], *, signal=None) -> None:
+        if (not isinstance(receipts, Sequence) or isinstance(receipts, (str, bytes))
+                or len(receipts) > self._max_results):
+            raise ValueError("relation receipts must be a bounded sequence")
+        copied = tuple(receipts)
+        if any(not isinstance(receipt, MemoryRelationEvidence) for receipt in copied):
+            raise TypeError("invalid relation evidence")
+        async def validate_one(receipt):
+            if receipt.source != "mem0-relation/" + self._scope:
+                raise MemoryError("memory_relation_stale")
+            current = await self.relation_evidence(MemoryLink(
+                receipt.link_key, receipt.from_ref, receipt.to_ref,
+                receipt.relation, receipt.note, True), signal=signal)
+            if current != receipt:
+                raise MemoryError("memory_relation_stale")
+        for receipt in copied:
+            await validate_one(receipt)
+
+    async def review(self, candidate: MemoryRef, *, key: str, limit: int = 8, instructions: str = "",
+                     authorization: MemoryCaptureAuthorization | None = None, signal=None) -> MemoryOperation:
         """Bounded semantic advice for a pending candidate. Never activates memory."""
         if self._providers is None:
             raise MemoryError("memory_review_requires_managed")
@@ -475,10 +608,27 @@ class Mem0Memory:
             raise ValueError("instructions must be bounded host policy")
         policy = _REVIEW_PROMPT + ("\nHost policy:\n" + instructions if instructions else "")
         ref_data = {"id": candidate.id, "version": candidate.version}
-        fingerprint = _digest(["review", ref_data, limit, policy])
+        if authorization is not None and not isinstance(authorization, MemoryCaptureAuthorization):
+            raise TypeError("authorization must be MemoryCaptureAuthorization")
+        authorization_data = None if authorization is None else authorization._data()
+        fingerprint_input = ["review", ref_data, limit, policy]
+        if authorization_data is not None:
+            fingerprint_input.append(authorization_data)
+        fingerprint = _digest(fingerprint_input)
         plan = {"kind": "review", "target": None, "meta": None, "budget": self._providers.budget.key, "policy_hash": _digest(policy)}
+        if authorization_data is not None:
+            plan["capture_authorization"] = authorization_data
 
         def run():
+            previous = self._journal.operation(key)
+            if previous is not None:
+                if previous["fingerprint"] != fingerprint:
+                    raise MemoryError("memory_idempotency_conflict")
+                if previous["state"] != "complete":
+                    raise MemoryError("memory_operation_unresolved")
+                return self.operation(key)
+            if authorization_data is not None:
+                self._journal.assert_capture_authorization(authorization_data)
             previous = self._journal.begin(key, fingerprint, plan)
             if previous is not None:
                 if previous["state"] != "complete":
@@ -537,6 +687,37 @@ class Mem0Memory:
     def budget_usage(self) -> MemoryUsage | None:
         """Cumulative reservations and reported usage, including searches and late calls."""
         return None if self._providers is None else MemoryUsage(**self._journal.usage(budget=self._providers.budget.key))
+
+    async def record_capture_authorization(self, authorization: MemoryCaptureAuthorization, *, key: str,
+                                           valid_from=None, expires_at=None, signal=None):
+        if not isinstance(authorization, MemoryCaptureAuthorization):
+            raise TypeError("authorization must be MemoryCaptureAuthorization")
+        _text(key, "operation key", 512)
+        valid_from, expires = _expiry(valid_from), _expiry(expires_at)
+        if valid_from is not None and expires is not None and valid_from >= expires:
+            raise ValueError("capture authorization expiry must follow valid_from")
+        data = authorization._data()
+        fingerprint = _digest(["record_capture_authorization", data, valid_from, expires])
+
+        def record():
+            self._journal.record_capture_authorization(key, fingerprint, data, valid_from, expires)
+            return self.operation(key)
+        return await self._call(record, signal)
+
+    async def revoke_capture_authorization(self, policy_id: str, decision_id: str, *, key: str, signal=None):
+        policy_id = _text(policy_id, "capture policy id", 512)
+        decision_id = _text(decision_id, "capture decision id", 512)
+        _text(key, "operation key", 512)
+        fingerprint = _digest(["revoke_capture_authorization", policy_id, decision_id])
+
+        def revoke():
+            self._journal.revoke_capture_authorization(key, fingerprint, policy_id, decision_id)
+            return self.operation(key)
+        return await self._call(revoke, signal)
+
+    @property
+    def max_input_chars(self) -> int:
+        return self._max_input
 
     @property
     def epoch(self) -> int:
@@ -626,6 +807,9 @@ class Mem0Memory:
         meta = row["meta"]
         if not internal and self._journal.revoked(meta["purra_source"], meta["purra_revision"]):
             return None
+        if (not internal and meta.get("purra_capture_policy") is not None
+                and self._journal.capture_revoked(meta["purra_capture_policy"], meta["purra_capture_decision"])):
+            return None
         if not internal and self._journal.writing(item_id):
             raise MemoryError("memory_write_busy")
         raw = self._client.get(item_id)
@@ -635,6 +819,9 @@ class Mem0Memory:
         if not internal and self._journal.writing(item_id):
             raise MemoryError("memory_write_busy")
         if not internal and self._journal.revoked(meta["purra_source"], meta["purra_revision"]):
+            return None
+        if (not internal and meta.get("purra_capture_policy") is not None
+                and self._journal.capture_revoked(meta["purra_capture_policy"], meta["purra_capture_decision"])):
             return None
         view = self._journal.view(row)
         if not include_inactive and not self._active({**meta, "purra_state": view["state"]}):
@@ -713,20 +900,20 @@ class Mem0Memory:
         return await self._write("add", text, source, key, expires_at=expires_at,
                                  metadata={} if metadata is None else metadata, state=state, reason=reason, signal=signal)
 
-    async def extract(self, messages: Sequence[Mapping[str, str]], *, source: MemorySource, key: str, expires_at=None, metadata=None, signal=None):
+    async def extract(self, messages: Sequence[Mapping[str, str]], *, source: MemorySource, key: str, expires_at=None,
+                      metadata=None, authorization: MemoryCaptureAuthorization | None = None, signal=None):
         if not self._allow_inference:
             raise MemoryError("memory_inference_disabled")
-        if not isinstance(messages, Sequence) or isinstance(messages, (str, bytes)) or not 1 <= len(messages) <= 100:
-            raise ValueError("messages must contain 1 to 100 source messages")
-        copied = []
-        for message in messages:
-            if not isinstance(message, Mapping) or set(message) != {"role", "content"} or message["role"] not in ("user", "assistant"):
-                raise ValueError("source messages may contain only user/assistant text")
-            copied.append({"role": message["role"], "content": _text(message["content"], "message", self._max_input)})
-        if sum(len(m["content"]) for m in copied) > self._max_input:
-            raise ValueError("source messages exceed max_input_chars")
+        copied, metadata, expires_at = _capture_input(messages, source, metadata, expires_at, self._max_input)
+        if authorization is not None and not isinstance(authorization, MemoryCaptureAuthorization):
+            raise TypeError("authorization must be MemoryCaptureAuthorization")
+        expected_intent = "sha256:" + _digest([
+            "purra.mem0.capture-intent/v1", copied, [source.id, source.revision], metadata, expires_at,
+        ])
+        if authorization is not None and authorization.intent_digest != expected_intent:
+            raise MemoryError("memory_capture_authorization_mismatch")
         return await self._write("extract", copied, source, key, expires_at=expires_at,
-                                 metadata={} if metadata is None else metadata, state="pending", signal=signal)
+                                 metadata=metadata, state="pending", authorization=authorization, signal=signal)
 
     async def update(self, item_id: str, text: str, *, version: int, source: MemorySource, key: str,
                      expires_at=_KEEP_EXPIRY, metadata=_KEEP_METADATA, signal=None):
@@ -775,7 +962,7 @@ class Mem0Memory:
         return await self._write("delete", None, None, key, item_id=item_id, version=version, signal=signal)
 
     async def _write(self, kind, content, source, key, *, item_id=None, version=None, expires_at=None,
-                     metadata=_KEEP_METADATA, state="active", reason=None, signal=None):
+                     metadata=_KEEP_METADATA, state="active", reason=None, authorization=None, signal=None):
         _text(key, "operation key", 512)
         if kind in ("add", "update"):
             _text(content, "memory text", self._max_input)
@@ -793,13 +980,28 @@ class Mem0Memory:
             _text(reason, "state reason", 128)
         expires = None if preserve_expiry else _expiry(expires_at)
         source_data = None if source is None else [source.id, source.revision]
-        fingerprint = _digest([kind, content, source_data, item_id, version, "preserve" if preserve_expiry else expires,
-                               "preserve" if preserve_metadata else metadata, state, reason])
+        authorization_data = None if authorization is None else authorization._data()
+        fingerprint_input = [kind, content, source_data, item_id, version, "preserve" if preserve_expiry else expires,
+                             "preserve" if preserve_metadata else metadata, state, reason]
+        if authorization_data is not None:
+            fingerprint_input.append(authorization_data)
+        fingerprint = _digest(fingerprint_input)
         plan = {"kind": kind, "target": item_id, "meta": None}
+        if authorization_data is not None:
+            plan["capture_authorization"] = authorization_data
         if self._providers is not None:
             plan["budget"] = self._providers.budget.key
 
         def execute():
+            previous = self._journal.operation(key)
+            if previous is not None:
+                if previous["fingerprint"] != fingerprint:
+                    raise MemoryError("memory_idempotency_conflict")
+                if previous["state"] != "complete":
+                    raise MemoryError("memory_operation_unresolved")
+                return self.operation(key)
+            if authorization_data is not None:
+                self._journal.assert_capture_authorization(authorization_data)
             previous = self._journal.begin(key, fingerprint, plan)
             if previous is not None:
                 if previous["state"] != "complete":
@@ -814,12 +1016,16 @@ class Mem0Memory:
                 if source is not None:
                     self._journal.assert_source({"purra_source": source.id, "purra_revision": source.revision})
                 old = None
+                old_meta = None
                 if item_id is not None:
                     old = self._read(item_id, include_inactive=True, internal=True)
                     if old is None:
                         raise MemoryError("memory_not_found")
                     if old.version != version:
                         raise MemoryError("memory_version_conflict")
+                    old_meta = self._journal.item(item_id)["meta"]
+                if authorization_data is not None:
+                    self._journal.assert_capture_authorization(authorization_data)
                 meta = {
                     "purra_scope": self._scope, "purra_store": self._journal.store,
                     "purra_operation": _digest([self._journal.store, self._scope, key]),
@@ -834,9 +1040,15 @@ class Mem0Memory:
                     "purra_created": _now() if old is None else old.created_at,
                     "purra_updated": _now(),
                 }
+                capture_policy = (authorization_data or {}).get("policy_id") if old_meta is None else old_meta.get("purra_capture_policy")
+                capture_decision = (authorization_data or {}).get("decision_id") if old_meta is None else old_meta.get("purra_capture_decision")
+                if capture_policy is not None:
+                    meta.update(purra_capture_policy=capture_policy, purra_capture_decision=capture_decision)
                 desired_text = old.text if kind == "delete" else content
                 plan.update(meta=meta, hash=None if kind == "extract" else _digest(desired_text))
                 self._journal.save_plan(key, plan)
+                if authorization_data is not None:
+                    self._journal.assert_capture_authorization(authorization_data)
                 dispatched = True
                 if kind in ("add", "extract"):
                     result = self._client.add(content, user_id=self._scope, run_id=meta["purra_operation"],

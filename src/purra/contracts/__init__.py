@@ -85,6 +85,9 @@ class AgentMessage:
         except ValueError:
             raise ValueError("unsupported message role")
         object.__setattr__(self, "role", role)
+        from purra.media import parse_static_image_content
+        if parse_static_image_content(self.content) is not None and role is not MessageRole.USER:
+            raise ValueError("Static images require user role")
         object.__setattr__(self, "content", freeze_json_value(self.content))
         object.__setattr__(self, "reasoning", _optional_text(self.reasoning))
         object.__setattr__(self, "tool_calls", tuple(self.tool_calls))
@@ -456,6 +459,10 @@ class AgentRunRequest:
     def latest_user_text(self) -> str:
         for message in reversed(self.messages):
             if message.role == "user":
+                from purra.media import parse_static_image_content
+                images = parse_static_image_content(message.content)
+                if images is not None:
+                    return images["text"]
                 return str(message.content or "")
         return ""
 
@@ -483,6 +490,9 @@ class PlanningConstraints:
     execution mechanism that the request's admitted runtime cannot support.
     ``allow_model_only_fallback`` controls whether invalid Planner output may
     degrade to a side-effect-free response for this request.
+    ``min_initial_visible_steps`` is the built-in model Planner's initial plan
+    preference, not a permission boundary. Revisions and custom WorkPlanners
+    retain their own cardinality rules; Core still validates executable plans.
     """
 
     context_satisfied_tool_names: frozenset[str] = frozenset()
@@ -492,8 +502,13 @@ class PlanningConstraints:
     execution_satisfied_tool_names: frozenset[str] = frozenset()
     planning_excluded_executors: frozenset[StepExecutor] = frozenset()
     allow_model_only_fallback: bool = True
+    min_initial_visible_steps: int = 3
 
     def __post_init__(self) -> None:
+        if type(self.min_initial_visible_steps) is not int:
+            raise TypeError("min_initial_visible_steps must be an integer")
+        if not 1 <= self.min_initial_visible_steps <= 9_007_199_254_740_991:
+            raise ValueError("min_initial_visible_steps must be a positive safe integer")
         for field_name in (
             "context_satisfied_tool_names",
             "planning_excluded_tool_names",
@@ -1417,8 +1432,12 @@ class ApprovalRequest:
     risk_level: ToolRiskLevel
     summary: str
     timeout_seconds: float = 300.0
+    binding: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
+        if self.binding is not None:
+            from purra.approvals import copy_tool_approval_binding
+            object.__setattr__(self, "binding", copy_tool_approval_binding(self.binding))
         title = required_text(self.title, "approval title")
         timeout = float(self.timeout_seconds)
         if timeout <= 0:

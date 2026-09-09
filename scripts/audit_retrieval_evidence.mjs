@@ -169,14 +169,14 @@ export async function replayCheckpoint(captured, options = {}) {
     ...checkpoint, runId: claim.runId, messages,
   }, lease);
   now += 10;
-  await agent.recoverAgentTreeRoot(rootId, {
+  const aggregation = await agent.recoverAgentTreeRoot(rootId, {
     messages: [{ role: "user", content: "Recover audit." }],
   }, OPTIONS);
   const snapshot = await adapters.runs.get(claim.runId);
   const events = await adapters.runs.listRootEvents(rootId, 0);
   const receipt = events.find((event) => event.runId === claim.runId && event.kind === "invocation.started")?.payload.receipt;
   const request = received[0];
-  return { snapshot, request, receipt, report: {
+  return { snapshot, request, receipt, aggregation, report: {
     status: snapshot.status, errorCode: snapshot.errorCode ?? null,
     contextProviderCalls: counts.provider, compressionCalls: counts.compression,
     retrieverCalls: counts.retrieval, modelCalls: received.length,

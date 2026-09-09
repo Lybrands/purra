@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "cases": [
+    {"name":"ready","storageVersion":4,"status":"ready","blockers":[]},
+    {"name":"active","storageVersion":4,"status":"blocked","blockers":["approval_activation_execution_pending"]},
+    {"name":"foreign","storageVersion":4,"status":"blocked","blockers":["approval_activation_foreign_sdk"]},
+    {"name":"enabled","storageVersion":5,"status":"already_enabled","blockers":[]}
+  ]
+}

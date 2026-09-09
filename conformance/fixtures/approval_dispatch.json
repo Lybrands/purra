@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "cases": [
+    {"name": "unchanged", "dispatches": 1, "claims": 1},
+    {"name": "revoked", "dispatches": 0, "claims": 0, "error": "tool_scope_violation"},
+    {"name": "scope_error", "dispatches": 0, "claims": 0, "error": "tool_scope_validation_failed"},
+    {"name": "canceled", "dispatches": 0, "claims": 0},
+    {"name": "canceled_after_scope", "dispatches": 0, "claims": 0},
+    {"name": "control_error", "dispatches": 0, "claims": 0, "error": "run_lease_conflict"},
+    {"name": "rejected", "dispatches": 0, "claims": 0}
+  ]
+}

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "purra-mcp"
 version = "1.0.0"
-description = "Host-owned, read-only MCP tools for PurrA"
+description = "Host-owned MCP tools with durable write approvals for PurrA"
 requires-python = ">=3.11"
 dependencies = ["purra==1.0.0", "mcp==1.29.1"]
 readme = "README.md"

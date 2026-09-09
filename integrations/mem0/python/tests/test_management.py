@@ -1,4 +1,5 @@
 import pytest
+from dataclasses import replace
 
 from purra_mem0 import MemoryError, MemorySource
 from test_memory import SOURCE, setup
@@ -97,23 +98,53 @@ async def test_links_preserve_visibility_and_audit_stale_or_revoked_endpoints(se
     assert (await memory.get(a)).version == 1
     assert {item_id: len(rows) for item_id, rows in sdk.histories.items()} == before
     assert (await memory.links(a)).items[0].valid
+    evidence = await memory.relation_evidence((await memory.links(a)).items[0])
+    assert evidence.relation == "supports" and evidence.source.startswith("mem0-relation/")
+    await memory.validate_relation_evidence((evidence,))
+    with pytest.raises(MemoryError, match="memory_relation_stale"):
+        await memory.validate_relation_evidence((replace(evidence, relation="contradicts"),))
+    with pytest.raises(ValueError):
+        await memory.validate_relation_evidence((evidence,) * 101)
+    with pytest.raises(TypeError):
+        await memory.validate_relation_evidence((object(),))
+    assert not (await memory.links(a, direction="incoming")).items
+    assert (await memory.links(b, direction="incoming", relation="supports", valid_only=True)).items[0].key == "link"
+    assert not (await memory.links(a, relation="unrelated")).items
+    for options in ({"direction": "sideways"}, {"relation": ""}, {"valid_only": "false"}):
+        with pytest.raises(ValueError): await memory.links(a, **options)
     memory.close()
     restored = create()
+    await restored.validate_relation_evidence((evidence,))
     assert await restored.link(*refs, "supports", key="link", note="人工确认") == operation
     outsider = create(scope=MemoryScope("foreign", "project"))
     assert not (await outsider.links(a)).items
+    with pytest.raises(MemoryError, match="memory_relation_stale"):
+        await outsider.validate_relation_evidence((evidence,))
     with pytest.raises(MemoryError, match="memory_not_found"):
         await outsider.link(*refs, "supports", key="foreign")
     await restored.annotate(a, {"pinned": True}, version=1, key="pin")
     assert not (await restored.links(a)).items[0].valid
+    with pytest.raises(MemoryError, match="memory_relation_stale"):
+        await restored.validate_relation_evidence((evidence,))
+    with pytest.raises(MemoryError, match="memory_relation_stale"):
+        await restored.relation_evidence((await restored.links(a)).items[0])
     with pytest.raises(MemoryError, match="memory_version_conflict"):
         await restored.link(*refs, "supports", key="stale")
     await restored.link(MemoryRef(a, 2), refs[1], "relates_to", key="link-2")
+    current_evidence = await restored.relation_evidence((await restored.links(a, relation="relates_to")).items[0])
     page = await restored.links(a, limit=1)
     assert page.next == "link" and not page.items[0].valid
+    filtered = await restored.links(a, limit=1, valid_only=True, relation="relates_to", direction="outgoing")
+    assert not filtered.items and filtered.next == "link"
+    next_page = await restored.links(a, limit=1, after=filtered.next, valid_only=True, relation="relates_to", direction="outgoing")
+    assert next_page.items[0].key == "link-2" and next_page.next is None
+    assert not (await outsider.links(a, valid_only=True, direction="outgoing")).items
     assert (await restored.links(a, limit=1, after=page.next)).items[0].valid
     await restored.revoke_source(SOURCE.id, key="withdraw")
     assert all(not item.valid for item in (await restored.links(a)).items)
+    assert not (await restored.links(a, valid_only=True)).items
+    with pytest.raises(MemoryError, match="memory_relation_stale"):
+        await restored.validate_relation_evidence((current_evidence,))
 
 
 @pytest.mark.asyncio

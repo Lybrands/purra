@@ -114,6 +114,7 @@ export interface ModelProtocolCapabilities {
   readonly streaming: FeatureSupport;
   readonly cancellation: FeatureSupport;
   readonly publicProgress?: FeatureSupport;
+  readonly imageInput?: FeatureSupport;
   readonly assistantContentWithToolCalls: AssistantContentWithToolCalls;
   readonly jsonSchemaLevel: string;
   readonly streamFinishSemantics: string;

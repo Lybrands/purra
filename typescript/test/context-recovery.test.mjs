@@ -1,8 +1,33 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { AgentError, estimateMessagesTokens, prepareContext } from "purra";
+import { AgentError, estimateMessagesTokens, prepareContext, staticImageContent } from "purra";
 import { restoreContext } from "../dist/context/coordinator.js";
 import { captureAutomaticCheckpoint, replayCheckpoint } from "../../scripts/audit_retrieval_evidence.mjs";
+
+test("recovery executes with checkpointed images and rejects oversized image allowance before dispatch", async () => {
+  const baseline = await captureAutomaticCheckpoint({ compression: false });
+  const capabilities = { ...baseline.capabilities, protocol: { ...baseline.capabilities.protocol, imageInput: "supported" } };
+  const captured = await captureAutomaticCheckpoint({ compression: false, capabilities });
+  const content = staticImageContent("Inspect the saved image", [{ mediaType: "image/png", dataBase64: "YQ==", inputTokens: 2000 }]);
+  const recovered = await replayCheckpoint(captured, { capabilities, compression: false, editCheckpoint(checkpoint) {
+    checkpoint.messages.push({ role: "user", content });
+  } });
+  assert.equal(recovered.report.status, "completed");
+  assert.equal(recovered.report.retrieverCalls, 0);
+  assert.equal(recovered.report.contextProviderCalls, 0);
+  assert.deepEqual(recovered.request.messages.at(-1).content, content);
+  const rejected = await replayCheckpoint(captured, { capabilities, compression: false, editCheckpoint(checkpoint) {
+    checkpoint.messages.push({ role: "user", content: staticImageContent("Inspect", [{ mediaType: "image/png", dataBase64: "YQ==", inputTokens: 1_000_000 }]) });
+  } });
+  assert.equal(rejected.report.status, "failed");
+  assert.equal(rejected.report.errorCode, "protected_messages_exceed_compression_budget");
+  assert.equal(rejected.report.modelCalls, 0);
+  const changed = await replayCheckpoint(captured, { compression: false, capabilities: baseline.capabilities,
+    editCheckpoint(checkpoint) { checkpoint.messages.push({ role: "user", content }); } });
+  assert.equal(changed.aggregation.state, "blocked");
+  assert.equal(changed.aggregation.results[0].errorCode, "agent_preset_mismatch");
+  assert.equal(changed.report.modelCalls, 0);
+});
 
 test("Child Run recovery restores resolved context and receipts without requerying data", async () => {
   const captured = await captureAutomaticCheckpoint();

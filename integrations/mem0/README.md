@@ -27,12 +27,31 @@ configured Mem0 store.
 Without a policy, candidates stay pending. A policy may also leave individual
 candidates pending. Model similarity alone does not authorize activation.
 
+For an opt-in pre-capture gate, configure the workflow's capture policy ID and
+revision, create a `MemoryCaptureAuthorization` over
+`memory_capture_intent` / `memoryCaptureIntent`, and pass it with the capture.
+The exact content, source, metadata, expiry, policy, principal and decision are
+bound before Provider or Mem0 dispatch. This receipt is issued by the host; the
+integration does not authenticate principals or decide which content is eligible.
+Persist the grant before capture. Expired grants stop new processing; explicit
+revocation also hides records produced by that decision. Revocation does not
+physically erase Mem0 content or history.
+
 | Resolution | Result |
 | --- | --- |
 | `independent` | Activate one candidate |
 | `duplicate` | Keep one accepted record and disable the copies |
 | `supersede` | Keep the accepted replacement and disable older records |
 | `conflict` | Disable the group until it is resolved |
+
+For workflow retries, keep capture key, input, capture authorization and policy
+revision unchanged.
+Completed resolutions replay their receipts; they do not re-extract or reactivate
+withdrawn records. Running/unknown operations require inspection or reconciliation.
+Policy may run again before a resolution is persisted, so it must be free of
+side effects. Change its revision when changing its meaning. An empty search
+does not prove independence, and `review.proposal` may be absent. Stale source
+or record versions fail before activation. SDK examples are in the usage guides.
 
 ## Read and manage
 
@@ -45,7 +64,22 @@ candidates pending. Model similarity alone does not authorize activation.
 | `MemoryContext`, `assemble_memory_context` / `assembleMemoryContext` | Assemble whole records within a token allowance |
 | `link`, `links` | Record and inspect explicit relations between record versions |
 | `revoke_source` / `revokeSource` | Withdraw a source or one of its revisions |
+| `record_capture_authorization` / `recordCaptureAuthorization` | Persist an exact host capture grant and validity window |
+| `revoke_capture_authorization` / `revokeCaptureAuthorization` | Permanently revoke one policy decision |
 | `validate_evidence` / `validateEvidence` | Check whether saved memory evidence remains usable |
+
+`links` optionally filters `direction` (`both`, `incoming`, `outgoing`), exact
+`relation`, and `valid_only` / `validOnly`. Its limit bounds scanned links, so
+an empty filtered page may still have a continuation cursor. Continue until
+`next` is null, keep filters fixed during traversal, and restart if the epoch
+changes. Validity concerns endpoint versions and visibility, not relation truth
+or a context evidence receipt. See [K01/K02 contract](../../conformance/memory-capture-relations.md).
+
+Use `relation_evidence` / `relationEvidence` to issue an exact two-endpoint
+relationship receipt, and `validate_relation_evidence` /
+`validateRelationEvidence` immediately before reusing relationship-derived
+context. Endpoint changes, expiry, withdrawal, deletion, store or scope mismatch
+invalidate the receipt. It attests current eligibility, not semantic truth.
 
 `list` returns `items`, `next`, and `epoch`. Continue with `next` even when a page
 is empty; `null` marks the end. Restart the view if its epoch changes. Its `query`

@@ -1,6 +1,6 @@
 # purra-mcp (TypeScript)
 
-Development package for explicitly authorized, read-only MCP tools. Requires
+Development package for host-authorized MCP read tools and durable approval-gated writes. Requires
 Node.js 22+, matching `purra`, and the pinned official
 `@modelcontextprotocol/sdk@1.30.0` (v1 line). Core has no MCP dependency.
 Build Core and this package, then install both in the consuming application.
@@ -88,8 +88,8 @@ rediscovery or hidden model calls occur.
 An AbortSignal stops local waiting; the official SDK sends a best-effort
 cancellation notification. It does not prove the remote task stopped. Late
 results are discarded. `effectState: "not_started"` describes the declared
-absence of host writes, not whether a network request was sent. Write tools are
-outside this adapter's support.
+absence of host writes for read bindings, not whether a network request was sent.
+The separate write entry point below classifies uncertain effects conservatively.
 
 Shared fixtures run against the official local client/server protocol, with a
 JSON serialization boundary. The installed smoke also launches and closes a
@@ -126,3 +126,82 @@ HTTP connection failures (including `fetch` transport `TypeError`) return
 configured request timeout. The host must close the monitor when discarding a
 failed session, then initialize a new session and explicitly rediscover tools
 before resuming work. Transport recovery never authorizes new tools.
+
+## Durable writes (1.0 development)
+
+The separate write discovery entry point requires explicit host authorization:
+confirm policy, matching `write` or `destructive` effect, a callable scope validator,
+and nonempty binding/scope IDs and revisions. Server annotations never grant this
+permission. Read discovery keeps its 1.0 contract and schema-1 snapshot. Write
+snapshots use schema 2 and include the host authorization identity; concurrency
+is disabled for these tools.
+
+```ts
+import { discoverMcpWriteTools } from "purra-mcp";
+
+const writes = await discoverMcpWriteTools(client, "documents", {
+  "remote.update": {
+    localName: "update_document",
+    policy: { mode: "confirm", title: "Update document", riskLevel: "write" },
+    scope: validateCurrentDocumentScope,
+    bindingId: "document-service", bindingRevision: "host-config-1",
+    scopeId: "sandbox-documents", scopeRevision: "scope-1", effect: "write",
+  },
+}, { monitor });
+const identity = writes.registrations[0]!.approvalBinding!;
+```
+
+In `toolCheckpointHandler`, spread the current `identity` into `ApprovalIntent.create`
+alongside the actual checkpoint call and current Run preset fingerprint, then call
+`approvals.prepare`. Configure Agent with `approval: approvals.gateway()`,
+`idempotency: storage.idempotency`, and `toolCheckpointNames: ["update_document"]`.
+
+The registration's effective binding revision is the complete write catalog digest,
+which includes the original host binding revision, server identity, selected schemas,
+and scope identity. Do not substitute the original host revision or reuse old binding
+metadata after rediscovery. Core requires a durable approval gateway and its exact
+receipt store, and the SQLite gateway checks the current registration identity against
+the approved intent before dispatch. A live in-memory approval gateway is insufficient.
+The handler function is an adapter implementation; applications execute it through
+Core's tool catalog, never as a substitute for approval/claim checks.
+
+A validated success response records `committed`. Local argument/scope/catalog
+rejection before sending records `not_started`. Once a request is submitted,
+timeout, cancellation, disconnect, catalog changes, RPC errors, `isError` responses,
+and invalid/unsupported output record `unknown`. An error response cannot prove
+that no remote write occurred. Unknown effects retain their durable claim; the
+adapter never retries or automatically reconciles them. Host reconciliation requires
+independent evidence. A successful remote response is protocol completion evidence,
+not a read-back audit of the business data.
+
+The protocol tests include SQLite approval restart, current-binding mismatch,
+scope revocation, committed receipts and retained unknown claims against a synthetic
+SDK server. Build the sibling Core and SQLite packages before TypeScript tests; include
+Core, MCP and SQLite source directories on `PYTHONPATH` for Python tests. These are
+deterministic local tests, separate from real Provider/MCP service and downstream
+acceptance. See [durable approval](../../../conformance/durable-approval.md).
+
+## Independent write-server acceptance
+
+The repository's installed-consumer check now runs five scenarios against the
+separate Python SDK process in `integrations/mcp/fixtures/write_server.py`:
+success, lost response, exit before write, exit after write, and an error response
+after write. The server accepts only a fixed synthetic value, writes inside a
+fresh temporary directory, and fsyncs an independent event ledger. The host waits
+for durable approval, reopens SQLite before approving, then checks both the local
+receipt/unknown claim and the remote file. Reopening after completion/failure must
+not dispatch again. Every scenario verifies that the server process has exited.
+
+Copy `scripts/check-installed-write.mjs` into an independent npm consumer
+containing matching Core, SQLite and MCP tarballs. Use a Python environment
+containing the pinned `mcp` SDK for the fixture server:
+
+```sh
+node check-installed-write.mjs /absolute/path/to/write_server.py /absolute/path/to/python
+```
+
+These are controlled independent-service fault checks, using a scripted model.
+They do not prove real Provider capability or third-party business-service
+acceptance. The remote ledger is verification evidence, never an approval or
+automatic reconciliation command. The CI workflow includes both consumers;
+local success does not claim that remote CI has executed.

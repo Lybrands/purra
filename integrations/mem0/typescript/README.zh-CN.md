@@ -123,6 +123,34 @@ async function capture(
 `policy(candidate, review)` 和稳定的 `policyRevision`。
 策略返回已授权且保留审查键的 `MemoryResolution`，或返回 `undefined` 保持待处理；策略可以是异步函数。
 
+需要在消息到达 Mem0 或 Provider 前强制授权时，绑定宿主签发的准确捕获意图：
+
+```ts
+import { MemoryWorkflow, memoryCaptureIntent } from "purra-mem0";
+
+const authorization = {
+  intentDigest: memoryCaptureIntent(messages, { source, metadata }),
+  policyId: capturePolicyId,
+  policyRevision: capturePolicyRevision,
+  principalId: authenticatedUserId,
+  decisionId: hostDecisionId,
+};
+const workflow = new MemoryWorkflow(memory, { capturePolicyId, capturePolicyRevision });
+await memory.recordCaptureAuthorization(authorization, {
+  key: `capture-authorization:${hostDecisionId}`,
+  expiresAt: captureAuthorizationExpiresAt,
+});
+const result = await workflow.capture(messages, {
+  source, key: operationKey, metadata, authorization,
+});
+```
+
+宿主负责认证、内容适用性和决定审计。重试必须沿用相同授权；缺失或不匹配的授权会在
+操作日志及 Provider 调用前失败，同一 key 更换已绑定授权会触发幂等冲突。
+调用 `revokeCaptureAuthorization(policyId, decisionId, { key })` 可持久撤销决定，阻止
+新的提取、审查和激活，并隐藏由其产生的记录。到期只阻止新处理；两者均不物理删除
+Mem0 内容或历史。
+
 ## 生命周期
 
 关闭前调用 `await memory.drain()` 和 `memory.close()`，再关闭 SDK 与模型服务资源。

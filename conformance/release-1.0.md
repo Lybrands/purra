@@ -2,8 +2,9 @@
 
 English | [简体中文](release-1.0.zh-CN.md)
 
-The package metadata in this checkout is 1.0.0. This is an **unreleased
-candidate**, not a publication announcement. Registry installation commands may
+This document records the 1.0.0 **unreleased candidate** scope, not a publication
+announcement. The current checkout is 1.0.0 development; see its
+[approval contract](durable-approval.md). Registry installation commands may
 still select an earlier published version. Candidate consumers must use the
 exact wheel or npm tarball supplied with their candidate manifest. Install Core
 and optional PurrA packages at the same version.
@@ -19,8 +20,8 @@ compaction, Mem0, and MCP.
 
 The application owns model capabilities, credentials, SDK clients, authorization,
 resource scope, persistence, budgets, and shutdown. Installing an adapter does
-not activate it on an Agent. See [structured output](structured-output.md),
-[tool concurrency](tool-concurrency.md), and [inspection](integration-inspection.md).
+not activate it on an Agent. See [structured output](../docs/structured-output.md),
+[tool concurrency](../docs/tool-concurrency.md), and [inspection](../docs/integration-inspection.md).
 
 ## Service evidence and limits
 

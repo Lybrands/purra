@@ -4,6 +4,8 @@ import json
 
 
 def is_input_checkpoint_update(current, updated):
+    if current.phase != "model_ready" or updated.phase != "model_ready":
+        return False
     if updated.input_revision != current.input_revision + 1:
         return False
     expected_checkpoint = replace(current, input_revision=updated.input_revision, messages=updated.messages)

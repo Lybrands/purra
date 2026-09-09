@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from collections.abc import Callable, Awaitable
 
-from purra.agent_execution_checkpoint import AgentExecutionCheckpoint
+from purra.agent_execution_checkpoint import AgentExecutionCheckpoint, AgentToolExecutionCheckpoint
 from purra.agent_tree import AgentCapabilityGrant
 from purra.agent_presets import AgentPresetSnapshot
 from purra.errors import ContractViolationError
@@ -91,9 +91,20 @@ class AgentCoreRunOptions:
     agent_tree_lease_epoch: int | None = None
     agent_capability_grant: AgentCapabilityGrant | None = None
     agent_execution_checkpoint: AgentExecutionCheckpoint | None = None
+    tool_checkpoint_names: frozenset[str] | None = None
+    tool_checkpoint_handler: Callable[[AgentToolExecutionCheckpoint], Awaitable[None]] | None = None
     checkpoint_handler: Callable[[AgentExecutionCheckpoint], Awaitable[AgentExecutionCheckpoint]] | None = None
 
     def __post_init__(self) -> None:
+        if self.tool_checkpoint_handler is not None and not callable(self.tool_checkpoint_handler):
+            raise TypeError("tool checkpoint handler must be callable")
+        if self.tool_checkpoint_names is not None:
+            names = frozenset(self.tool_checkpoint_names)
+            if not names or any(not isinstance(name, str) or not name or name.strip() != name for name in names):
+                raise ValueError("tool checkpoint names must be nonempty tool names")
+            if self.tool_checkpoint_handler is None:
+                raise ValueError("tool checkpoint names require a handler")
+            object.__setattr__(self, "tool_checkpoint_names", names)
         claims = tuple(self.context_claims)
         names = [claim.name for claim in claims]
         if len(names) != len(set(names)):

@@ -95,6 +95,7 @@ class ModelProtocolCapabilities:
     json_schema_level: str = "unknown"
     stream_finish_semantics: str = "normalized"
     usage_semantics: str = "normalized"
+    image_input: FeatureSupport = FeatureSupport.UNKNOWN
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -114,6 +115,7 @@ class ModelProtocolCapabilities:
             "streaming",
             "cancellation",
             "public_progress",
+            "image_input",
         ):
             object.__setattr__(self, name, FeatureSupport(getattr(self, name)))
         object.__setattr__(
@@ -159,6 +161,7 @@ class ModelProtocolCapabilities:
             "jsonSchemaLevel": self.json_schema_level,
             "streamFinishSemantics": self.stream_finish_semantics,
             "usageSemantics": self.usage_semantics,
+            **({"imageInput": self.image_input.value} if self.image_input is not FeatureSupport.UNKNOWN else {}),
         }
 
     def digest(self) -> str:

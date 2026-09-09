@@ -146,4 +146,72 @@ stay unknown. Reconciling a tool does not clear post-checkpoint model attempts.
 Permissions, complete usage, effects outside this adapter and Agent Tree ownership
 remain unknown. `authority` is always `diagnosis_only`; execution must revalidate.
 The current reader loads the selected Root journal to count model attempts.
-See the Core [inspection contract](../../../conformance/integration-inspection.md).
+See the Core [inspection contract](../../../docs/integration-inspection.md).
+
+## 1.0 approval storage foundation (unreleased)
+
+Explicit offline v5 activation and host-authorized decision storage are available.
+The opt-in Reactive/Planned/Auto Root runtime supports atomic approval waits, same-Run
+recovery and claim/receipt association. Configure `toolCheckpointHandler`,
+`approval: approvals.gateway()` and the same adapter’s `idempotency`; existing
+model-ready checkpoint types remain unchanged. Root approval after read-only Child
+work is covered; select business writes explicitly with `toolCheckpointNames`.
+Child write approval is unsupported. MCP writes have deterministic and controlled
+independent-service coverage; business-service and downstream acceptance remain separate.
+Keep production databases on their current format until the runtime integration
+and acceptance are complete. See the [durable approval contract](../../../conformance/durable-approval.md#storage-foundation-api)
+for activation, API methods, replay behavior and SDK format boundaries.
+
+### Approval observations (1.0 development)
+
+On explicitly activated v5 storage, recovery inspection adds current tool-ready
+approval state, record count, checkpoint intent match, matching completed receipt
+and Run-associated unknown approval claims. Reads do not expire or alter decisions.
+Current host binding/permission checks remain unknown and required at execution.
+Reports retain `diagnosis_only` authority and omit private approval data. Legacy v4
+reports retain their existing shape. See the [approval inspection contract](../../../conformance/durable-approval.md#read-only-approval-inspection-implemented).
+
+## Offline approval upgrade preflight
+
+`await storage.inspectApprovalUpgrade()` reads a consistent database snapshot and returns
+`schemaVersion: 1`, `authority: diagnosis_only`, `storageVersion`, `targetVersion: 5`,
+`status` (`ready`, `blocked`, `already_enabled`) and `blockers`. It does not create
+schema objects, migrate rows, refresh decisions, or acquire a writer transaction.
+As with other inspections, initial adapter construction is separate and can initialize
+its normal schema. Use preflight on an already open adapter, not as a raw-file validator.
+
+For v4, preflight validates same-SDK metadata and journals across every scope and
+reports the first encountered foreign-SDK or unsettled-execution blocker. Corrupt
+state and unsupported formats raise instead of reporting readiness. Results omit
+scope names, Run IDs and stored content. `already_enabled` reports the format only,
+not the health of all v5 execution state.
+
+A `ready` result can become stale immediately. Stop writers, back up and use the
+existing explicit activation method; activation repeats the checks inside its write
+transaction. Preflight is not an upgrade permit, backup, automatic migration or
+v5-to-v4 rollback API. Never point a validation fixture at production data.
+
+For WAL-safe backup and restoration to a new path, see the
+[offline upgrade procedure](../../../conformance/sqlite-upgrade.md).
+
+## Synthetic host lifecycle check
+
+From the repository root, run:
+
+```sh
+npm run build --prefix typescript
+npm run build --prefix integrations/sqlite/typescript
+node integrations/sqlite/typescript/scripts/check-host-lifecycle.mjs
+```
+
+The check persists host-owned Run configuration separately, closes the first host,
+reconstructs the request profile, current binding/scope revisions and absolute
+approval expiry, then starts `RecoveryWorker` with a durable cursor and schedule.
+An authenticated synthetic decision wakes the worker. The check waits for canonical
+completion, stops the service, reopens storage, and verifies one completed receipt
+with no claim or active lease.
+
+This repository check imports its deterministic test host; it is not a production
+host library. Applications must own the authenticated principal, configuration
+registry and current resource-scope resolver. Missing or mismatched configuration
+must fail before public resume. No Provider or MCP service is called.

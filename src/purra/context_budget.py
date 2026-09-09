@@ -18,6 +18,7 @@ from purra.contracts import (
     ToolSchema,
 )
 from purra.errors import ContextOverflowError
+from purra.media import image_input_tokens, parse_static_image_content
 from purra.json_values import thaw_json_mapping, thaw_json_value
 
 
@@ -116,9 +117,15 @@ def _budget_message_mapping(message: AgentMessage) -> dict[str, Any]:
     """
 
     value = thaw_json_mapping(message.attributes)
+    image_content = parse_static_image_content(message.content)
+    if image_content is not None:
+        # The host image allowance is added separately; transport encoding is
+        # not text for the model to tokenize. Canonical messages stay untouched.
+        for image in image_content["images"]:
+            image["dataBase64"] = ""
     value.update({
         "role": message.role.value,
-        "content": thaw_json_value(message.content),
+        "content": image_content if image_content is not None else thaw_json_value(message.content),
     })
     if message.reasoning is not None:
         value["structured_reasoning_content"] = message.reasoning
@@ -433,7 +440,7 @@ def _proportional_shares(weights: Sequence[int], available: int) -> list[int]:
 
 def estimate_agent_messages_tokens(messages: Iterable[AgentMessage]) -> int:
     return 2 + sum(
-        estimate_json_tokens(_budget_message_mapping(message)) + 4
+        estimate_json_tokens(_budget_message_mapping(message)) + image_input_tokens(message.content) + 4
         for message in messages
     )
 

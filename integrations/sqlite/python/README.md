@@ -143,29 +143,7 @@ independently and need not sum to the total median.
 The application owns database access, backups, and retention. Checkpoints contain
 private model data. Call `await core.close()` before `storage.close()`.
 
-## Opt-in closeout verification
-
-After building TypeScript Core and SQLite, run both SDKs through separate writer
-processes, transaction termination, tool-receipt reconciliation and checkpoint
-reopening. The default fixture has 20 Roots, 60 Runs, 20,000 events and 64 KiB
-checkpoint messages per Root; all databases and effect markers are temporary.
-
-```sh
-PYTHONPATH=src:integrations/sqlite/python/src .venv/bin/python integrations/sqlite/python/scripts/verify_load.py --output /tmp/purra-load.json
-```
-
-`scripts/verify_provider.py` additionally runs a synthetic lookup task against a
-user-selected DeepSeek configuration in a PurrTypos settings database. It requires
-network access and consumes real API tokens. Supply `--config-db`, `--config-id`
-and `--output`; add `.:integrations/openai/python/src` to `PYTHONPATH` and install
-the OpenAI SDK. Credentials are read in memory, never written to the report.
-Its explicit test transport maps `max_completion_tokens` to `max_tokens`, disables
-thinking, drops OpenAI-only options, and maps `developer` messages to `system`.
-This does not certify unmodified OpenAI transport compatibility with DeepSeek.
-The eager reference is current code with deferred hydration disabled, not a
-historical release. One paired run is functional evidence, not a latency SLA.
-
-### Read-only recovery inspection
+## Read-only recovery inspection
 
 `await storage.inspect_recovery(run_id, expected_preset=effective_preset_snapshot)`
 reads one committed snapshot without claiming a lease, resuming, reconciling or
@@ -175,4 +153,68 @@ messages or raw tool receipts. Run-bound pending claims and post-checkpoint mode
 attempts are separate blockers; reconciling a tool does not clear the attempt.
 Permissions, complete usage, effects outside this adapter and Agent Tree ownership
 remain unknown. `authority` is always `diagnosis_only`; execution must revalidate.
-See the Core [inspection contract](../../../conformance/integration-inspection.md).
+See the Core [inspection contract](../../../docs/integration-inspection.md).
+
+## 1.0 approval storage foundation (unreleased)
+
+Explicit offline v5 activation and host-authorized decision storage are available.
+The opt-in tool-ready runtime supports Reactive, Planned and Auto Root recovery
+with atomic claim/receipt association. Host-authorized MCP writes have deterministic
+and controlled independent-service coverage. Child writes are unsupported; real
+Provider, business MCP and downstream acceptance remain separate.
+Keep production databases on their current format until the runtime integration
+and acceptance are complete. See the [durable approval contract](../../../conformance/durable-approval.md#storage-foundation-api)
+for activation, API methods, replay behavior and SDK format boundaries.
+
+### Approval observations (1.0 development)
+
+On explicitly activated v5 storage, recovery inspection adds current tool-ready
+approval state, record count, checkpoint intent match, matching completed receipt
+and Run-associated unknown approval claims. Reads do not expire or alter decisions.
+Current host binding/permission checks remain unknown and required at execution.
+Reports retain `diagnosis_only` authority and omit private approval data. Legacy v4
+reports retain their existing shape. See the [approval inspection contract](../../../conformance/durable-approval.md#read-only-approval-inspection-implemented).
+
+## Offline approval upgrade preflight
+
+`await storage.inspect_approval_upgrade()` reads a consistent database snapshot and returns
+`schemaVersion: 1`, `authority: diagnosis_only`, `storageVersion`, `targetVersion: 5`,
+`status` (`ready`, `blocked`, `already_enabled`) and `blockers`. It does not create
+schema objects, migrate rows, refresh decisions, or acquire a writer transaction.
+As with other inspections, initial adapter construction is separate and can initialize
+its normal schema. Use preflight on an already open adapter, not as a raw-file validator.
+
+For v4, preflight validates same-SDK metadata and journals across every scope and
+reports the first encountered foreign-SDK or unsettled-execution blocker. Corrupt
+state and unsupported formats raise instead of reporting readiness. Results omit
+scope names, Run IDs and stored content. `already_enabled` reports the format only,
+not the health of all v5 execution state.
+
+A `ready` result can become stale immediately. Stop writers, back up and use the
+existing explicit activation method; activation repeats the checks inside its write
+transaction. Preflight is not an upgrade permit, backup, automatic migration or
+v5-to-v4 rollback API. Never point a validation fixture at production data.
+
+For WAL-safe backup and restoration to a new path, see the
+[offline upgrade procedure](../../../conformance/sqlite-upgrade.md).
+
+## Synthetic host lifecycle check
+
+From the repository root, run:
+
+```sh
+PYTHONPATH=src:integrations/sqlite/python/src .venv/bin/python \
+  integrations/sqlite/python/scripts/check_host_lifecycle.py
+```
+
+The check persists host-owned Run configuration separately, closes the first host,
+reconstructs the request profile, current binding/scope revisions and absolute
+approval expiry, then starts `RecoveryWorker` with a durable cursor and schedule.
+An authenticated synthetic decision wakes the worker. The check waits for canonical
+completion, stops the service, reopens storage, and verifies one completed receipt
+with no claim or active lease.
+
+This repository check imports its deterministic test host; it is not a production
+host library. Applications must own the authenticated principal, configuration
+registry and current resource-scope resolver. Missing or mismatched configuration
+must fail before public resume. No Provider or MCP service is called.

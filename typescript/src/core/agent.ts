@@ -1,3 +1,5 @@
+import { ApprovalRequired } from "../approvals.js";
+import { copyToolExecutionCheckpoint } from "../run/store.js";
 import { UserInputRequired } from "../interaction.js";
 import type {
   InvocationOutputBudget,
@@ -25,6 +27,7 @@ import {
 } from "../model/validation.js";
 import { AgentCanceledError, AgentError } from "../shared/errors.js";
 import { stableFingerprint } from "../shared/fingerprint.js";
+import { copyModelRouteCandidate } from '../model/routing.js';
 import {
   isPrivatePresentationMessage,
   publicPresentationMessages,
@@ -72,6 +75,7 @@ import {
 } from "../run/store.js";
 import type {
   AgentExecutionCheckpoint,
+  AgentToolExecutionCheckpoint,
   AgentPreset,
   AgentPresetSnapshot,
   ModelInvocationReceipt,
@@ -139,7 +143,11 @@ import {
   type RecoveryRequest,
 } from "../recovery/index.js";
 
+type AgentRuntimeCheckpoint = AgentExecutionCheckpoint | AgentToolExecutionCheckpoint;
+
 export interface AgentOptions {
+  readonly toolCheckpointHandler?: (checkpoint: AgentToolExecutionCheckpoint, request: RunRequest, claim: RunLeaseClaim) => Promise<void>;
+  readonly toolCheckpointNames?: readonly string[];
   readonly checkpointHandler?: (checkpoint: AgentExecutionCheckpoint, request: RunRequest, claim: RunLeaseClaim) => Promise<AgentExecutionCheckpoint>;
   readonly model: ModelGateway;
   readonly tools?: readonly ToolDefinition[];
@@ -154,6 +162,8 @@ export interface AgentOptions {
   readonly context?: ContextOptions;
   readonly planning?: PlanningOptions;
   readonly responseValidation?: ResponseValidationOptions;
+  /** `none` returns a host-only result without a public response presentation. */
+  readonly responsePresentation?: "model_live" | "none";
   readonly durable?: DurableOptions;
   readonly agentTree?: AgentTreeOptions;
   readonly recovery?: RecoveryPolicy;
@@ -183,7 +193,7 @@ export type AgentStreamEvent =
   | { readonly type: "model_delta"; readonly delta: string }
   | { readonly type: "agent_progress"; readonly text: string }
   | ToolExecutionEvent
-  | { readonly type: "final"; readonly result: AgentRunResult };
+  | { readonly type: "final"; readonly result: AgentRunResult; readonly visibility?: "private" };
 
 type Emit = (event: Exclude<AgentStreamEvent, { readonly type: "final" }>) => void;
 
@@ -220,6 +230,7 @@ export class Agent {
   readonly #runRepository: RunRepository;
   readonly #outputPublisher: OutputPublisher;
   readonly #outputPolicy: OutputPolicy;
+  readonly #responsePresentation: "model_live" | "none";
   readonly #context: ContextOptions | undefined;
   readonly #planning: PlanningOptions | undefined;
   readonly #responseValidationOptions: ResponseValidationOptions;
@@ -235,11 +246,18 @@ export class Agent {
   readonly #operations: AgentOperationController | undefined;
   readonly #evidenceValidator: ModelInputEvidenceValidator | undefined;
   readonly #idempotencyNamespace = globalThis.crypto.randomUUID();
+  readonly #toolCheckpointHandler: AgentOptions["toolCheckpointHandler"];
+  readonly #toolCheckpointNames: readonly string[] | undefined;
   readonly #checkpointHandler: AgentOptions["checkpointHandler"];
   #invocationSequence = 0;
 
   public constructor(options: AgentOptions) {
     this.#checkpointHandler = options.checkpointHandler;
+    this.#toolCheckpointHandler = options.toolCheckpointHandler;
+    if (options.toolCheckpointHandler !== undefined && options.approval?.requiresDurableIdempotency !== true) {
+      throw new AgentError("approval_runtime_required", "Tool checkpoints require a durable approval gateway");
+    }
+    this.#toolCheckpointNames = options.toolCheckpointNames === undefined ? undefined : Object.freeze([...options.toolCheckpointNames]);
     if (typeof options.model?.invoke !== "function") {
       throw new TypeError("Agent requires a model gateway");
     }
@@ -323,7 +341,11 @@ export class Agent {
       this.#configuredAgentTreeGrant = undefined;
       effectiveDefinitions = definitions;
     }
+    if (options.agentTree !== undefined && this.#toolCheckpointHandler !== undefined && this.#toolCheckpointNames === undefined) {
+      throw new AgentError("approval_gate_unavailable", "Agent tree approvals require explicit tool checkpoint names");
+    }
     this.#tools = new ToolCatalog(effectiveDefinitions, {
+      runtimeManaged: effectiveDefinitions.slice(definitions.length),
       ...(options.approval === undefined ? {} : { approval: options.approval }),
       ...(options.idempotency === undefined ? {} : { idempotency: options.idempotency }),
       ...(options.toolLimits === undefined ? {} : { limits: options.toolLimits }),
@@ -333,6 +355,11 @@ export class Agent {
     this.#runRepository = options.runRepository ?? new InMemoryRunRepository();
     this.#outputPublisher = options.outputPublisher ?? new InMemoryOutputPublisher();
     this.#outputPolicy = options.outputPolicy ?? allowAllOutput;
+    if (options.responsePresentation !== undefined
+      && options.responsePresentation !== "model_live" && options.responsePresentation !== "none") {
+      throw new TypeError("responsePresentation must be model_live or none");
+    }
+    this.#responsePresentation = options.responsePresentation ?? "model_live";
     this.#planning = copyPlanningOptions(options.planning);
     this.#durable = copyDurableOptions(options.durable, this.#planning, options.preset);
     this.#responseValidationOptions = copyResponseValidationOptions(options.responseValidation);
@@ -402,8 +429,16 @@ export class Agent {
     if (this.#runRepository.executeOwned === undefined) throw new AgentError("run_lease_required", "Root recovery requires durable execution ownership");
     const saved = await this.#runRepository.get(runId);
     if (saved.status !== "running") throw new AgentError("run_terminal", "Run is terminal");
-    if (saved.executionCheckpoint === undefined) throw new AgentError("checkpoint_missing", "Run has no resumable checkpoint");
-    return this.#submit(request, { budgets: saved.budgets, deadlineAt: saved.deadlineAt }, undefined, saved.executionCheckpoint);
+    const checkpoint = saved.toolExecutionCheckpoint ?? saved.executionCheckpoint;
+    if (checkpoint?.phase === "tool_ready") {
+      copyToolExecutionCheckpoint(checkpoint);
+      if (this.#toolCheckpointHandler === undefined || this.#runRepository.executeToolOwned === undefined
+        || (this.#toolCheckpointNames !== undefined && !this.#toolCheckpointNames.includes(checkpoint.assistant.toolCalls![0]!.name))) {
+        throw new AgentError("approval_runtime_required", "Tool recovery requires its durable approval handler and execution ownership");
+      }
+    }
+    if (checkpoint === undefined) throw new AgentError("checkpoint_missing", "Run has no resumable checkpoint");
+    return this.#submit(request, { budgets: saved.budgets, deadlineAt: saved.deadlineAt }, undefined, checkpoint);
   }
 
   public spawnAgents(command: SpawnAgentsCommand): Promise<SpawnAgentsReceipt> {
@@ -505,8 +540,13 @@ export class Agent {
     request: RunRequest,
     options: RunOptions,
     treeScope?: AgentTreeRunScope,
-    resumeCheckpoint?: AgentExecutionCheckpoint,
+    resumeCheckpoint?: AgentRuntimeCheckpoint,
   ): Promise<RunHandle> {
+    if (this.#preset.modelRoute !== undefined &&
+      await stableFingerprint(copyJsonValue(this.#preset.modelRoute.capabilities as unknown as JsonValue)) !==
+      await stableFingerprint(copyJsonValue(this.#capabilities as unknown as JsonValue))) {
+      throw new AgentError('model_route_mismatch', 'Model route capabilities differ from configured model');
+    }
     const callerMessages = copyMessages(request.messages);
     if (callerMessages.length === 0) throw new TypeError("Run requires at least one caller message");
     const enabledTools = request.enabledTools === undefined
@@ -533,13 +573,19 @@ export class Agent {
         runtimeLimits: this.#runtimeLimits,
         contextStrategy: this.#context?.strategy ?? "single_pass",
         planningBinding: this.#planning?.binding ?? null,
+        ...(this.#capabilities.protocol.imageInput === undefined ? {} : { imageInput: this.#capabilities.protocol.imageInput }),
+        ...(this.#responsePresentation === "none" ? { responsePresentation: "none" } : {}),
         durableBinding: this.#durable?.binding ?? null,
         agentTree: agentTreeSnapshot,
         recovery: this.#recoveryPolicy.snapshot(),
         toolExecution: this.#tools.executionSnapshotFor(enabledTools),
+        ...(this.#preset.modelRoute === undefined ? {} : {
+          modelRouteRequest: { maxGenerationTokens: request.maxGenerationTokens ?? null },
+        }),
       })),
     ]);
     const preset: AgentPresetSnapshot = Object.freeze({
+      ...(this.#preset.modelRoute === undefined ? {} : { modelRoute: this.#preset.modelRoute }),
       schemaVersion: 5,
       presetId: this.#preset.id,
       presetRevision: this.#preset.revision,
@@ -624,7 +670,7 @@ export class Agent {
       const [persistedPreset, currentPreset, persistedCheckpoint, selectedCheckpoint] = await Promise.all([
         stableFingerprint(copyJsonValue(snapshot.preset as unknown as JsonValue)),
         stableFingerprint(copyJsonValue(preset as unknown as JsonValue)),
-        stableFingerprint(copyJsonValue((snapshot.executionCheckpoint ?? null) as unknown as JsonValue)),
+        stableFingerprint(copyJsonValue((snapshot.toolExecutionCheckpoint ?? snapshot.executionCheckpoint ?? null) as unknown as JsonValue)),
         stableFingerprint(copyJsonValue(resumeCheckpoint as unknown as JsonValue)),
       ]);
       if (persistedPreset !== currentPreset) {
@@ -718,7 +764,9 @@ export class Agent {
       );
       return ownsAgentTreeRoot ? this.#settleRootAgentTree(session.runId, running) : running;
     };
-    const persistentExecution = this.#runRepository.executeOwned === undefined
+    const persistentExecution = resumeCheckpoint?.phase === "tool_ready"
+      ? this.#runRepository.executeToolOwned!(session.runId, executePersistent, resumeCheckpoint)
+      : this.#runRepository.executeOwned === undefined
       ? executePersistent()
       : this.#runRepository.executeOwned(session.runId, executePersistent, resumeCheckpoint);
     const execution = persistentExecution.finally(() => session.releaseWaitingExecution());
@@ -947,7 +995,7 @@ export class Agent {
       });
       return result;
     } catch (error) {
-      if (error instanceof UserInputRequired) { suspended = true; throw error; }
+      if (error instanceof UserInputRequired || error instanceof ApprovalRequired) { suspended = true; throw error; }
       if (error instanceof AgentCanceledError) {
         await repository.cancelSubtree(rootRunId);
       } else {
@@ -977,7 +1025,7 @@ export class Agent {
         );
       }
     }
-    await session.complete(result);
+    await session.complete(result, this.#responsePresentation);
   }
 
   public async *stream(input: AgentRunInput): AsyncIterable<AgentStreamEvent> {
@@ -998,7 +1046,9 @@ export class Agent {
       wake = undefined;
     };
     void this.#executeTransient(runInput, emit).then(
-      (result) => emit({ type: "final", result }),
+      (result) => emit({ type: "final", result,
+        ...(this.#responsePresentation === "none" ? { visibility: "private" as const } : {}),
+      }),
       (error: unknown) => { failure = error; },
     ).finally(() => {
       settled = true;
@@ -1026,11 +1076,11 @@ export class Agent {
     evidence: readonly ContextEvidenceReceipt[],
     metadata: Readonly<Record<string, JsonValue>>,
     continuation?: DurableRecoverySnapshot,
-    resumeCheckpoint?: AgentExecutionCheckpoint,
+    resumeCheckpoint?: AgentRuntimeCheckpoint,
   ): Promise<RunResult> {
     if (this.#operations !== undefined) session.operations = this.#operations.withOutput(session);
     try {
-      if (resumeCheckpoint !== undefined && this.#agentTreeRepository !== undefined) {
+      if (resumeCheckpoint?.phase === "model_ready" && this.#agentTreeRepository !== undefined) {
         resumeCheckpoint = await this.#resumeChildRuns(
           resumeCheckpoint,
           session,
@@ -1074,7 +1124,7 @@ export class Agent {
       await this.#completePersistentSession(session, result);
       return result;
     } catch (error) {
-      if (error instanceof UserInputRequired) { session.releaseWaitingExecution(); throw error; }
+      if (error instanceof UserInputRequired || error instanceof ApprovalRequired) { session.releaseWaitingExecution(); throw error; }
       if (session.deadlineExceeded) {
         const deadlineError = new AgentError("run_deadline_exceeded", "Run deadline has elapsed", {
           cause: error,
@@ -1104,7 +1154,7 @@ export class Agent {
     planning?: PlannedExecutionCoordinator,
     responseValidation = new ResponseValidationCoordinator(),
     transientExecutionKey?: string,
-    resumeCheckpoint?: AgentExecutionCheckpoint,
+    resumeCheckpoint?: AgentRuntimeCheckpoint,
     modelTasks?: ModelTaskRunner,
     autoPlanning?: AutoPlanningPreparation,
   ): Promise<AgentRunResult> {
@@ -1143,13 +1193,13 @@ export class Agent {
     let autoPlanningPhase: "initial" | "remaining" | undefined = (
       autoPlanning !== undefined && planning === undefined
     ) ? (resumeCheckpoint?.initialPlanningOpen === false ? "remaining" : "initial") : undefined;
-    const validatedResultMode = session !== undefined
-      && this.#agentTreeRoots.has(session.rootRunId);
+    const validatedResultMode = this.#responsePresentation === "none"
+      || (session !== undefined && this.#agentTreeRoots.has(session.rootRunId));
     const recovery = new RecoveryLedger(this.#recoveryPolicy);
     if (resumeCheckpoint !== undefined) {
       if (
         resumeCheckpoint.runId !== session?.runId
-        || resumeCheckpoint.phase !== "model_ready"
+        || !["model_ready", "tool_ready"].includes(resumeCheckpoint.phase)
       ) {
         throw new AgentError(
           "agent_execution_checkpoint_conflict",
@@ -1157,7 +1207,7 @@ export class Agent {
         );
       }
       recovery.restore(resumeCheckpoint.recoveryAttempts);
-      if (this.#checkpointHandler !== undefined) {
+      if (resumeCheckpoint.phase === "model_ready" && this.#checkpointHandler !== undefined) {
         const updated = await this.#checkpointHandler(resumeCheckpoint, this.#agentTreeRoots.get(session!.rootRunId)?.request ?? input.persistedRequest ?? { messages: input.messages, planningMode }, session!.leaseClaim);
         if (updated.runId !== resumeCheckpoint.runId) throw new TypeError("checkpoint handler changed Run identity");
         messages.splice(0, messages.length, ...copyMessages(updated.messages));
@@ -1177,6 +1227,7 @@ export class Agent {
       round <= roundLimit;
       round += 1
     ) {
+      const pendingTool = resumeCheckpoint?.phase === "tool_ready" && round === resumeCheckpoint.nextRound ? resumeCheckpoint : undefined;
       throwIfCanceled(input.signal);
       if (pendingReplan !== undefined) {
         if (planning === undefined) throw new AgentError("replanning_unavailable", "Checkpoint requires its Planner");
@@ -1189,6 +1240,7 @@ export class Agent {
       let enabledTools: readonly string[] | undefined = planning?.state === undefined
         ? input.enabledTools
         : transition?.allowedToolNames ?? [];
+      if (pendingTool !== undefined) enabledTools = pendingTool.allowedToolNames.filter(name => enabledTools === undefined || enabledTools.includes(name));
       if (publicPresentationPending) enabledTools = Object.freeze([]);
       const businessTools = this.#tools.specsFor(enabledTools);
       const tools = Object.freeze([
@@ -1217,7 +1269,7 @@ export class Agent {
         activeEvidence,
         context?.evidence ?? [],
       ));
-      const projectedMessages = context === undefined
+      const projectedMessages = context === undefined || pendingTool !== undefined
         ? Object.freeze([...messages])
         : await context.project(messages, input.signal);
       const modelRequest = Object.freeze({
@@ -1226,10 +1278,10 @@ export class Agent {
         capabilitySnapshot: this.#capabilities,
         outputBudget,
       });
-      let turn: ModelTurn;
+      let turn: ModelTurn = pendingTool === undefined ? undefined! : { message: pendingTool.assistant, finishReason: "tool_calls", appliedGenerationLimit: pendingTool.appliedGenerationLimit };
       let receipt: ModelInvocationReceipt | undefined;
       let visibleOutputEmitted = false;
-      while (true) {
+      while (pendingTool === undefined) {
         const invocationEvidence = mergeEvidence(
           activeEvidence,
           context?.evidence ?? [],
@@ -1273,10 +1325,12 @@ export class Agent {
                 chunkIndex += 1;
               }
               if (!responseValidation.enabled && tools.length === 0) {
-                if (emit !== undefined && chunk.contentDelta !== undefined && chunk.contentDelta !== "") {
-                  visibleOutputEmitted = true;
+                if (this.#responsePresentation !== "none") {
+                  if (emit !== undefined && chunk.contentDelta !== undefined && chunk.contentDelta !== "") {
+                    visibleOutputEmitted = true;
+                  }
+                  emitModelDelta(chunk, emit);
                 }
-                emitModelDelta(chunk, emit);
                 emitAgentProgress(chunk, emit);
               }
             },
@@ -1517,6 +1571,23 @@ export class Agent {
         messages.push(planningMessage(revised, true));
         continue;
       }
+      if (this.#toolCheckpointHandler !== undefined && (this.#toolCheckpointNames === undefined
+        || calls.some(call => this.#toolCheckpointNames!.includes(call.name)))) {
+        if (session === undefined || session.parentRunId !== undefined) {
+          throw new AgentError("approval_runtime_unsupported", "Durable tool checkpoints currently require a Root Run");
+        }
+        const checkpoint = pendingTool ?? copyToolExecutionCheckpoint({
+          schemaVersion: 3, runId: session.runId, phase: "tool_ready",
+          executionProfile: planning?.state === undefined ? planningMode : "planned",
+          ...(planning?.state === undefined ? {} : { planning: planning.checkpoint() }),
+          roundLimit, initialPlanningOpen: autoPlanningPhase === "initial", nextRound: round,
+          messages: messages.slice(0, -1), assistant, invocationId: receipt!.invocationId, appliedGenerationLimit: turn.appliedGenerationLimit,
+          allowedToolNames: businessTools.map(tool => tool.name),
+          context: context?.snapshot() ?? null, contextEvidence: activeEvidence,
+          responseAttempts, recoveryAttempts: recovery.snapshot(),
+        });
+        await this.#toolCheckpointHandler(checkpoint, input.persistedRequest ?? { messages: input.messages, planningMode }, session.leaseClaim);
+      }
       let batch: Awaited<ReturnType<ToolCatalog["executeBatch"]>>;
       try {
         batch = await this.#tools.executeBatch(calls, {
@@ -1544,6 +1615,8 @@ export class Agent {
           ),
         });
       } catch (error) {
+        if (this.#toolCheckpointHandler !== undefined && (this.#toolCheckpointNames === undefined
+          || calls.some(call => this.#toolCheckpointNames!.includes(call.name)))) throw error;
         const cause = preExecutionToolRecoveryCause(error);
         if (cause === undefined) throw error;
         const retry = await this.#decideRecovery(recovery, {
@@ -1599,7 +1672,7 @@ export class Agent {
       } else {
         planning?.state?.completeToolRound();
       }
-      if (session !== undefined && (session.parentRunId !== undefined || this.#checkpointHandler !== undefined)) {
+      if (session !== undefined && (session.parentRunId !== undefined || this.#checkpointHandler !== undefined || this.#toolCheckpointHandler !== undefined)) {
         const checkpoint: AgentExecutionCheckpoint = Object.freeze({
           schemaVersion: 2, runId: session.runId, phase: "model_ready",
           executionProfile: planning?.state === undefined ? planningMode : "planned",
@@ -1780,7 +1853,7 @@ export class Agent {
     runId: string,
     authority?: RunSession,
     evidence: readonly ContextEvidenceReceipt[] = [],
-    resumeCheckpoint?: AgentExecutionCheckpoint,
+    resumeCheckpoint?: AgentRuntimeCheckpoint,
   ): Promise<{
     readonly context?: PreparedContext;
     readonly planning?: PlannedExecutionCoordinator;
@@ -2008,7 +2081,7 @@ export class Agent {
   #restoreContext(
     input: AgentRunInput,
     metadata: Readonly<Record<string, JsonValue>>,
-    checkpoint: AgentExecutionCheckpoint,
+    checkpoint: AgentRuntimeCheckpoint,
     modelTasks: ModelTaskRunner | undefined,
   ): PreparedContext | undefined {
     if ((checkpoint.context !== null) !== (this.#context !== undefined)) {
@@ -2284,7 +2357,11 @@ function copyPreset(value: AgentPreset): AgentPreset & { readonly promptSections
     }
     return Object.freeze({ id: sectionId, role: section.role, content: copyJsonValue(section.content) });
   }));
-  return Object.freeze({ id, revision, promptSections });
+  let modelRoute;
+  if (value.modelRoute !== undefined) {
+    modelRoute = copyModelRouteCandidate(value.modelRoute);
+  }
+  return Object.freeze({ id, revision, promptSections, ...(modelRoute === undefined ? {} : {modelRoute}) });
 }
 
 function copyEvidence(value: readonly ContextEvidenceReceipt[]): readonly ContextEvidenceReceipt[] {

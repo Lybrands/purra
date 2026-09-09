@@ -16,13 +16,20 @@ def build_recovery_inspection(state: Mapping[str, Any]) -> dict[str, Any]:
         "cancellation": ("requested", "clear", "unknown"),
         "deadline": ("expired", "open", "unknown"),
     }
+    if "approvalState" in state:
+        enums.update({
+            "approvalState": ("none", "missing", "pending", "approved", "rejected", "expired", "canceled", "unknown"),
+            "approvalCheckpointIntent": ("matched", "mismatch", "unknown"),
+            "approvalReceipt": ("complete", "absent", "unknown"),
+        })
     observed = {}
     for key, choices in enums.items():
         value = state.get(key, "unknown")
         if value not in choices:
             raise ValueError("invalid recovery observation")
         observed[key] = value
-    for key in ("attemptsAfterCheckpoint", "unknownToolReceipts"):
+    count_keys = ("attemptsAfterCheckpoint", "unknownToolReceipts") + (("approvalRecords", "approvalUnknownReceipts") if "approvalState" in state else ())
+    for key in count_keys:
         value = state.get(key)
         if value is not None and (type(value) is not int or not 0 <= value <= 9007199254740991):
             raise ValueError("invalid recovery count")
@@ -50,7 +57,24 @@ def build_recovery_inspection(state: Mapping[str, Any]) -> dict[str, Any]:
         else:
             cautions.append("unattributed_tool_effect_unknown")
         actions.append("reconcile_tools")
-    for key in (*enums, "attemptsAfterCheckpoint", "unknownToolReceipts"):
+    if "approvalState" in state:
+        for status, code, action in (("missing", "approval_not_found", "inspect_approval"),
+                ("pending", "approval_required", "await_approval"), ("rejected", "approval_rejected", "inspect_approval"),
+                ("expired", "approval_expired", "inspect_approval"), ("canceled", "approval_canceled", "inspect_approval")):
+            if observed["approvalState"] == status:
+                if status in ("expired", "canceled") and observed["approvalReceipt"] == "complete":
+                    cautions.append("approval_terminal_receipt_present")
+                else:
+                    reasons.append(code)
+                actions.append(action)
+        if observed["approvalCheckpointIntent"] == "mismatch":
+            reasons.append("approval_intent_conflict"); actions.append("inspect_approval")
+        if (observed["approvalUnknownReceipts"] or 0) > 0:
+            if "tool_effect_unknown" not in reasons: reasons.append("tool_effect_unknown")
+            actions.append("reconcile_tools")
+        unknown.append("currentApprovalBinding")
+        actions.append("verify_approval_binding")
+    for key in (*enums, *count_keys):
         if observed[key] in (None, "unknown"):
             unknown.append(key)
     # Even zero storage-wide claims do not prove Run-specific external effects.

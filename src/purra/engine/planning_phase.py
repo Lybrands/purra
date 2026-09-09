@@ -264,6 +264,7 @@ class PlanningCapability:
                     "allowModelOnlyFallback": (
                         constraints.allow_model_only_fallback
                     ),
+                    "minInitialVisibleSteps": constraints.min_initial_visible_steps,
                     "planned": True,
                     "workPlanStepCount": len(planning.work_plan.steps),
                     "executionPlanStepCount": (

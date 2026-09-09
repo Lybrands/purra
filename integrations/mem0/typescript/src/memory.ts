@@ -21,6 +21,13 @@ export interface Mem0Client {
 }
 export interface MemoryScope { readonly user: string; readonly project: string; readonly agent?: string }
 export interface MemorySource { readonly id: string; readonly revision: string }
+export interface MemoryCaptureAuthorization {
+  readonly intentDigest: string;
+  readonly policyId: string;
+  readonly policyRevision: string;
+  readonly principalId: string;
+  readonly decisionId: string;
+}
 export type MemoryMetadata = Readonly<Record<string, string | number | boolean | null>>;
 export type MemoryFilters = Readonly<Record<string, string | number | boolean | null | readonly (string | number | boolean | null)[]>>;
 export interface MemoryRecord {
@@ -38,6 +45,10 @@ export interface MemoryLink {
   readonly relation: string; readonly note: string; readonly valid: boolean;
 }
 export interface MemoryLinkPage { readonly items: readonly MemoryLink[]; readonly next: string | null; readonly epoch: number }
+export interface MemoryRelationEvidence {
+  readonly evidenceId: string; readonly source: string; readonly linkKey: string;
+  readonly from: MemoryRef; readonly to: MemoryRef; readonly relation: string; readonly note: string;
+}
 export type MemoryResolution = { readonly items: readonly MemoryRef[]; readonly reviewKey?: string } & (
   { readonly kind: "independent" | "duplicate" | "supersede"; readonly keep: string }
   | { readonly kind: "conflict"; readonly keep?: never }
@@ -56,6 +67,7 @@ export interface MemoryOperation {
 }
 interface WriteOptions { readonly key: string; readonly signal?: AbortSignal }
 interface SourceOptions extends WriteOptions { readonly source: MemorySource; readonly expiresAt?: string | null; readonly metadata?: MemoryMetadata }
+interface ExtractOptions extends SourceOptions { readonly authorization?: MemoryCaptureAuthorization }
 interface VersionOptions extends WriteOptions { readonly version: number }
 type Content = string | { role: string; content: string }[] | null;
 type Raw = Record<string, unknown>;
@@ -119,6 +131,35 @@ function expiry(value: string | null | undefined): string | null {
 }
 function sourceCopy(source: MemorySource): MemorySource {
   return Object.freeze({ id: requiredText(source?.id, "source id", 1024), revision: requiredText(source?.revision, "source revision", 512) });
+}
+function captureInput(messages: readonly { role: "user" | "assistant"; content: string }[], source: MemorySource,
+  metadata: MemoryMetadata | undefined, expiresAt: string | null | undefined, maxInput: number) {
+  const copiedSource = sourceCopy(source);
+  if (!Array.isArray(messages) || messages.length < 1 || messages.length > 100) throw new TypeError("messages must contain 1 to 100 source messages");
+  const copied = messages.map(message => {
+    if (!message || Object.keys(message).sort().join(",") !== "content,role" || !["user", "assistant"].includes(message.role)) {
+      throw new TypeError("source messages may contain only user/assistant text");
+    }
+    return { role: message.role, content: requiredText(message.content, "message", maxInput) };
+  });
+  if (copied.reduce((total, message) => total + [...message.content].length, 0) > maxInput) throw new TypeError("source messages exceed maxInputChars");
+  return { messages: copied, source: copiedSource, metadata: metadataCopy(metadata ?? {}), expiresAt: expiry(expiresAt) };
+}
+export function memoryCaptureIntent(messages: readonly { role: "user" | "assistant"; content: string }[], options: {
+  source: MemorySource; metadata?: MemoryMetadata; expiresAt?: string | null; maxInputChars?: number;
+}): string {
+  const maxInput = positiveInteger(options.maxInputChars ?? 32_000, "maxInputChars", 1_000_000);
+  const input = captureInput(messages, options.source, options.metadata, options.expiresAt, maxInput);
+  return "sha256:" + digest(["purra.mem0.capture-intent/v1", input.messages,
+    [input.source.id, input.source.revision], input.metadata, input.expiresAt]);
+}
+function authorizationCopy(value: MemoryCaptureAuthorization): MemoryCaptureAuthorization {
+  if (!value || typeof value !== "object" || !/^sha256:[0-9a-f]{64}$/.test(value.intentDigest)) throw new TypeError("invalid capture authorization");
+  return Object.freeze({ intentDigest: value.intentDigest,
+    policyId: requiredText(value.policyId, "capture policy id", 512),
+    policyRevision: requiredText(value.policyRevision, "capture policy revision", 512),
+    principalId: requiredText(value.principalId, "capture principal id", 512),
+    decisionId: requiredText(value.decisionId, "capture decision id", 512) });
 }
 function resolutionCopy(value: MemoryResolution, limit = 100): MemoryResolution {
   if (!value || !["independent", "duplicate", "supersede", "conflict"].includes(value.kind) || !Array.isArray(value.items)
@@ -193,6 +234,8 @@ export class Mem0Memory implements Retriever {
     catch (error) { this.#journal.close(); throw error; }
   }
 
+  get maxInputChars(): number { return this.#maxInput; }
+
   async #call<T>(work: () => Promise<T>, signal?: AbortSignal): Promise<T> {
     if (this.#closed) throw new MemoryError("memory_closed");
     if (signal?.aborted) throw new MemoryError("memory_cancelled");
@@ -223,25 +266,50 @@ export class Mem0Memory implements Retriever {
   operation(key: string): MemoryOperation | undefined {
     const op = this.#journal.operation(requiredText(key, "operation key", 512));
     return op ? Object.freeze({ key, state: op.state, ids: Object.freeze(op.ids ?? []),
-      usage: op.plan.budget || ["revoke_source", "state", "annotate", "resolve", "link"].includes(op.plan.kind) ? this.#journal.usage("operation", key) : "unknown",
+      usage: op.plan.budget || ["revoke_source", "record_capture_authorization", "revoke_capture_authorization", "state", "annotate", "resolve", "link"].includes(op.plan.kind) ? this.#journal.usage("operation", key) : "unknown",
       ...(op.plan.resolution ? { resolution: resolutionCopy(op.plan.resolution) } : {}),
       ...(op.plan.review ? { review: reviewCopy(op.plan.review, key) } : {}) }) : undefined;
   }
+  async recordCaptureAuthorization(authorizationValue: MemoryCaptureAuthorization, options: WriteOptions & {
+    validFrom?: string | null; expiresAt?: string | null }): Promise<MemoryOperation> {
+    const authorization = authorizationCopy(authorizationValue), key = requiredText(options.key, "operation key", 512);
+    const validFrom = expiry(options.validFrom), expires = expiry(options.expiresAt);
+    if (validFrom !== null && expires !== null && validFrom >= expires) throw new TypeError("capture authorization expiry must follow validFrom");
+    const data = { intent_digest: authorization.intentDigest, policy_id: authorization.policyId,
+      policy_revision: authorization.policyRevision, principal_id: authorization.principalId, decision_id: authorization.decisionId };
+    const fingerprint = digest(["record_capture_authorization", data, validFrom, expires]);
+    return this.#call(async () => { this.#journal.recordCaptureAuthorization(key, fingerprint, data, validFrom, expires); return this.operation(key)!; }, options.signal);
+  }
+  async revokeCaptureAuthorization(policyIdValue: string, decisionIdValue: string, options: WriteOptions): Promise<MemoryOperation> {
+    const policyId = requiredText(policyIdValue, "capture policy id", 512);
+    const decisionId = requiredText(decisionIdValue, "capture decision id", 512);
+    const key = requiredText(options.key, "operation key", 512);
+    const fingerprint = digest(["revoke_capture_authorization", policyId, decisionId]);
+    return this.#call(async () => { this.#journal.revokeCaptureAuthorization(key, fingerprint, policyId, decisionId); return this.operation(key)!; }, options.signal);
+  }
   /** Verify content, then atomically keep one claim or quarantine a group. No SDK mutations. */
-  async resolve(value: MemoryResolution, options: WriteOptions): Promise<MemoryOperation> {
+  async resolve(value: MemoryResolution, options: WriteOptions & { authorization?: MemoryCaptureAuthorization }): Promise<MemoryOperation> {
     const resolution = resolutionCopy(value, this.#maxResults), key = requiredText(options.key, "operation key", 512);
     const reviewKey = resolution.reviewKey;
     const data = { kind: resolution.kind, items: resolution.items, keep: resolution.keep ?? null };
-    const fingerprint = digest(reviewKey === undefined ? ["resolve", data] : ["resolve", data, reviewKey]);
+    const authorization = options.authorization === undefined ? undefined : authorizationCopy(options.authorization);
+    const authorizationData = authorization === undefined ? undefined : { intent_digest: authorization.intentDigest,
+      policy_id: authorization.policyId, policy_revision: authorization.policyRevision,
+      principal_id: authorization.principalId, decision_id: authorization.decisionId };
+    const fingerprintInput: unknown[] = reviewKey === undefined ? ["resolve", data] : ["resolve", data, reviewKey];
+    if (authorizationData !== undefined) fingerprintInput.push(authorizationData);
+    const fingerprint = digest(fingerprintInput);
     const plan: Plan = { kind: "resolve", target: null, meta: null, resolution };
     if (reviewKey !== undefined) plan.review_key = reviewKey;
     if (this.#providers) plan.budget = this.#providers.budget.key;
+    if (authorizationData !== undefined) plan.capture_authorization = authorizationData;
     return this.#call(async () => {
       const previous = this.#journal.operation(key);
       if (previous) {
         if (previous.fingerprint !== fingerprint) throw new MemoryError("memory_idempotency_conflict");
         return this.operation(key)!;
       }
+      if (authorizationData !== undefined) this.#journal.assertCaptureAuthorization(authorizationData);
       const epoch = this.epoch;
       let refs = resolution.items;
       if (reviewKey !== undefined) {
@@ -292,32 +360,84 @@ export class Mem0Memory implements Retriever {
       return this.operation(key)!;
     }, options.signal);
   }
-  async links(id: string, options: { limit?: number; after?: string; signal?: AbortSignal } = {}): Promise<MemoryLinkPage> {
+  async links(id: string, options: { limit?: number; after?: string; direction?: "both" | "incoming" | "outgoing"; relation?: string; validOnly?: boolean; signal?: AbortSignal } = {}): Promise<MemoryLinkPage> {
     requiredText(id, "memory id", 512);
     const limit = positiveInteger(options.limit ?? 20, "limit", this.#maxResults);
     const after = options.after === undefined ? undefined : requiredText(options.after, "cursor", 512);
+    const direction = options.direction === undefined ? "both" : options.direction;
+    if (!["both", "incoming", "outgoing"].includes(direction)) throw new TypeError("Invalid relation direction");
+    const relation = options.relation === undefined ? undefined : requiredText(options.relation, "relation", 64);
+    const validOnly = options.validOnly === undefined ? false : options.validOnly;
+    if (typeof validOnly !== "boolean") throw new TypeError("validOnly must be boolean");
     return this.#call(async () => {
       const epoch = this.epoch, rows = this.#journal.links(id, after, limit + 1), items: MemoryLink[] = [];
       for (const { key, data } of rows.slice(0, limit)) {
+        if (relation !== undefined && data.relation !== relation
+          || direction === "incoming" && data.to.id !== id
+          || direction === "outgoing" && data.from.id !== id) continue;
         const from = await this.#read(data.from.id), to = await this.#read(data.to.id);
         const valid = from !== undefined && to !== undefined && from.version === data.from.version && to.version === data.to.version;
+        if (validOnly && !valid) continue;
         items.push(Object.freeze({ ...data, from: Object.freeze(data.from), to: Object.freeze(data.to), key, valid }));
       }
       this.assertEpoch(epoch);
       return Object.freeze({ items: Object.freeze(items), next: rows.length > limit ? rows[limit - 1]!.key : null, epoch });
     }, options.signal);
   }
-  async review(candidate: MemoryRef, options: WriteOptions & { limit?: number; instructions?: string }): Promise<MemoryOperation> {
+  async relationEvidence(link: MemoryLink, options: { signal?: AbortSignal } = {}): Promise<MemoryRelationEvidence> {
+    if (!link?.valid) throw new MemoryError("memory_relation_stale");
+    const expected = {from:{id:requiredText(link.from.id,"from id",512),version:positiveInteger(link.from.version,"from version",2**31-2)},
+      to:{id:requiredText(link.to.id,"to id",512),version:positiveInteger(link.to.version,"to version",2**31-2)},
+      relation:requiredText(link.relation,"relation",64), note:typeof link.note === "string" ? link.note : ""};
+    const key = requiredText(link.key,"link key",512);
+    return this.#call(async () => {
+      const epoch = this.epoch;
+      const operation = this.#journal.operation(key);
+      if (!operation || operation.state !== "complete" || operation.plan.kind !== "link"
+        || !isDeepStrictEqual(operation.plan.link,expected)) throw new MemoryError("memory_relation_stale");
+      const [from,to] = await Promise.all([this.#read(expected.from.id),this.#read(expected.to.id)]);
+      if (!from || !to || from.version !== expected.from.version || to.version !== expected.to.version) throw new MemoryError("memory_relation_stale");
+      this.assertEpoch(epoch);
+      return Object.freeze({evidenceId:`mem0-relation:${this.#journal.store}:${digest([key,expected])}`,
+        source:"mem0-relation/"+this.#scope, linkKey:key, from:Object.freeze(expected.from),
+        to:Object.freeze(expected.to), relation:expected.relation, note:expected.note});
+    },options.signal);
+  }
+  async validateRelationEvidence(receipts: readonly MemoryRelationEvidence[], options: {signal?:AbortSignal} = {}): Promise<void> {
+    if (!Array.isArray(receipts) || receipts.length > this.#maxResults) throw new TypeError("relation receipts must be a bounded array");
+    for (const receipt of receipts) {
+      if (receipt?.source !== "mem0-relation/"+this.#scope) throw new MemoryError("memory_relation_stale");
+      const link = Object.freeze({key:receipt.linkKey,from:receipt.from,to:receipt.to,
+        relation:receipt.relation,note:receipt.note,valid:true});
+      if (!isDeepStrictEqual(await this.relationEvidence(link,options),receipt)) throw new MemoryError("memory_relation_stale");
+    }
+  }
+  async review(candidate: MemoryRef, options: WriteOptions & { limit?: number; instructions?: string;
+    authorization?: MemoryCaptureAuthorization }): Promise<MemoryOperation> {
     if (!this.#providers) throw new MemoryError("memory_review_requires_managed");
     const ref = Object.freeze({ id: requiredText(candidate?.id, "candidate id", 512), version: positiveInteger(candidate.version, "candidate version", 2 ** 31 - 2) });
     const key = requiredText(options.key, "review key", 512), limit = positiveInteger(options.limit === undefined ? 8 : options.limit, "review limit", this.#maxResults - 1);
     const instructions = options.instructions === undefined ? "" : options.instructions;
     if (typeof instructions !== "string" || [...instructions].length > 4000) throw new TypeError("instructions must be bounded host policy");
     const policy = REVIEW_PROMPT + (instructions ? "\nHost policy:\n" + instructions : "");
-    const fingerprint = digest(["review", ref, limit, policy]);
+    const authorization = options.authorization === undefined ? undefined : authorizationCopy(options.authorization);
+    const authorizationData = authorization === undefined ? undefined : { intent_digest: authorization.intentDigest,
+      policy_id: authorization.policyId, policy_revision: authorization.policyRevision,
+      principal_id: authorization.principalId, decision_id: authorization.decisionId };
+    const fingerprintInput: unknown[] = ["review", ref, limit, policy];
+    if (authorizationData !== undefined) fingerprintInput.push(authorizationData);
+    const fingerprint = digest(fingerprintInput);
     const plan: Plan = { kind: "review", target: null, meta: null, budget: this.#providers.budget.key, policy_hash: digest(policy) };
+    if (authorizationData !== undefined) plan.capture_authorization = authorizationData;
     return this.#call(async () => {
-      const previous = this.#journal.begin(key, fingerprint, plan);
+      let previous = this.#journal.operation(key);
+      if (previous) {
+        if (previous.fingerprint !== fingerprint) throw new MemoryError("memory_idempotency_conflict");
+        if (previous.state !== "complete") throw new MemoryError("memory_operation_unresolved");
+        return this.operation(key)!;
+      }
+      if (authorizationData !== undefined) this.#journal.assertCaptureAuthorization(authorizationData);
+      previous = this.#journal.begin(key, fingerprint, plan);
       if (previous) {
         if (previous.state !== "complete") throw new MemoryError("memory_operation_unresolved");
         return this.operation(key)!;
@@ -428,12 +548,16 @@ export class Mem0Memory implements Retriever {
     if (!row || row.deleted) return undefined;
     const meta = row.meta;
     if (!internal && this.#journal.revoked(meta.purra_source, meta.purra_revision)) return undefined;
+    if (!internal && meta.purra_capture_policy !== undefined
+        && this.#journal.captureRevoked(meta.purra_capture_policy, meta.purra_capture_decision!)) return undefined;
     if (!internal && this.#journal.writing(id)) throw new MemoryError("memory_write_busy");
     const result = await this.#client.get(id);
     if (result === null) throw new MemoryError("memory_record_changed");
     const raw = this.#owned(result, row);
     if (!internal && this.#journal.writing(id)) throw new MemoryError("memory_write_busy");
     if (!internal && this.#journal.revoked(meta.purra_source, meta.purra_revision)) return undefined;
+    if (!internal && meta.purra_capture_policy !== undefined
+        && this.#journal.captureRevoked(meta.purra_capture_policy, meta.purra_capture_decision!)) return undefined;
     const view = itemView(row);
     if (!includeInactive && !this.#active({ ...meta, purra_state: view.state })) return undefined;
     return Object.freeze({ id, text: raw.memory as string, version: view.version, state: view.state,
@@ -493,17 +617,17 @@ export class Mem0Memory implements Retriever {
   async add(text: string, options: SourceOptions & { state?: MemoryRecord["state"]; reason?: string | null }): Promise<MemoryOperation> {
     return this.#write("add", text, options);
   }
-  async extract(messages: readonly { role: "user" | "assistant"; content: string }[], options: SourceOptions): Promise<MemoryOperation> {
+  async extract(messages: readonly { role: "user" | "assistant"; content: string }[], options: ExtractOptions): Promise<MemoryOperation> {
     if (!this.#allowInference) throw new MemoryError("memory_inference_disabled");
-    if (!Array.isArray(messages) || messages.length < 1 || messages.length > 100) throw new TypeError("messages must contain 1 to 100 source messages");
-    const copied = messages.map(message => {
-      if (!message || Object.keys(message).sort().join(",") !== "content,role" || !["user", "assistant"].includes(message.role)) {
-        throw new TypeError("source messages may contain only user/assistant text");
-      }
-      return { role: message.role, content: requiredText(message.content, "message", this.#maxInput) };
-    });
-    if (copied.reduce((total, m) => total + [...m.content].length, 0) > this.#maxInput) throw new TypeError("source messages exceed maxInputChars");
-    return this.#write("extract", copied, { ...options, state: "pending" });
+    const input = captureInput(messages, options.source, options.metadata, options.expiresAt, this.#maxInput);
+    const authorization = options.authorization === undefined ? undefined : authorizationCopy(options.authorization);
+    const expectedIntent = "sha256:" + digest(["purra.mem0.capture-intent/v1", input.messages,
+      [input.source.id, input.source.revision], input.metadata, input.expiresAt]);
+    if (authorization !== undefined && authorization.intentDigest !== expectedIntent) {
+      throw new MemoryError("memory_capture_authorization_mismatch");
+    }
+    return this.#write("extract", input.messages, { ...options, source: input.source, metadata: input.metadata,
+      expiresAt: input.expiresAt, ...(authorization === undefined ? {} : { authorization }), state: "pending" });
   }
   async update(id: string, text: string, options: SourceOptions & VersionOptions): Promise<MemoryOperation> {
     return this.#write("update", text, options, id, options.version);
@@ -538,7 +662,8 @@ export class Mem0Memory implements Retriever {
     return this.#write("delete", null, options, id, options.version);
   }
   async #write(kind: string, content: Content, options: WriteOptions & { source?: MemorySource; expiresAt?: string | null;
-    metadata?: MemoryMetadata; state?: MemoryRecord["state"]; reason?: string | null }, target: string | null = null, version: number | null = null): Promise<MemoryOperation> {
+    metadata?: MemoryMetadata; state?: MemoryRecord["state"]; reason?: string | null;
+    authorization?: MemoryCaptureAuthorization }, target: string | null = null, version: number | null = null): Promise<MemoryOperation> {
     const key = requiredText(options.key, "operation key", 512);
     if (kind === "add" || kind === "update") requiredText(content, "memory text", this.#maxInput);
     const source = ["add", "extract", "update"].includes(kind) ? sourceCopy(options.source!) : null;
@@ -549,12 +674,28 @@ export class Mem0Memory implements Retriever {
     const metadata = preserveMetadata ? null : metadataCopy(options.metadata ?? {});
     const state = options.state ?? "active", reason = options.reason == null ? null : requiredText(options.reason, "state reason", 128);
     if (!["active", "pending", "disabled"].includes(state)) throw new TypeError("invalid memory state");
-    const fingerprint = digest([kind, content, source ? [source.id, source.revision] : null, target, version, preserveExpiry ? "preserve" : expires,
-      preserveMetadata ? "preserve" : metadata, state, reason]);
+    const authorization = options.authorization === undefined ? null : authorizationCopy(options.authorization);
+    const authorizationData = authorization === null ? null : {
+      intent_digest: authorization.intentDigest, policy_id: authorization.policyId,
+      policy_revision: authorization.policyRevision, principal_id: authorization.principalId,
+      decision_id: authorization.decisionId,
+    };
+    const fingerprintInput: unknown[] = [kind, content, source ? [source.id, source.revision] : null, target, version,
+      preserveExpiry ? "preserve" : expires, preserveMetadata ? "preserve" : metadata, state, reason];
+    if (authorizationData !== null) fingerprintInput.push(authorizationData);
+    const fingerprint = digest(fingerprintInput);
     const plan: Plan = { kind, target, meta: null };
+    if (authorizationData !== null) plan.capture_authorization = authorizationData;
     if (this.#providers) plan.budget = this.#providers.budget.key;
     return this.#call(async () => {
-      const previous = this.#journal.begin(key, fingerprint, plan);
+      let previous = this.#journal.operation(key);
+      if (previous) {
+        if (previous.fingerprint !== fingerprint) throw new MemoryError("memory_idempotency_conflict");
+        if (previous.state !== "complete") throw new MemoryError("memory_operation_unresolved");
+        return this.operation(key)!;
+      }
+      if (authorizationData !== null) this.#journal.assertCaptureAuthorization(authorizationData);
+      previous = this.#journal.begin(key, fingerprint, plan);
       if (previous) {
         if (previous.state !== "complete") throw new MemoryError("memory_operation_unresolved");
         return this.operation(key)!;
@@ -565,11 +706,14 @@ export class Mem0Memory implements Retriever {
         if (execution) { execution.operation = key; execution.check(); }
         if (source) this.#journal.assertSource({ purra_source: source.id, purra_revision: source.revision });
         let old: MemoryRecord | undefined;
+        let oldMeta: Metadata | undefined;
         if (target !== null) {
           old = await this.#read(target, true, true);
           if (!old) throw new MemoryError("memory_not_found");
           if (old.version !== version) throw new MemoryError("memory_version_conflict");
+          oldMeta = this.#journal.item(target)!.meta;
         }
+        if (authorizationData !== null) this.#journal.assertCaptureAuthorization(authorizationData);
         const meta: Metadata = {
           purra_scope: this.#scope, purra_store: this.#journal.store,
           purra_operation: digest([this.#journal.store, this.#scope, key]),
@@ -582,10 +726,17 @@ export class Mem0Memory implements Retriever {
           purra_reason: old ? old.reason : reason,
           purra_created: old ? old.createdAt : new Date().toISOString(), purra_updated: new Date().toISOString(),
         };
+        const capturePolicy = oldMeta?.purra_capture_policy ?? authorizationData?.policy_id;
+        const captureDecision = oldMeta?.purra_capture_decision ?? authorizationData?.decision_id;
+        if (capturePolicy !== undefined) {
+          meta.purra_capture_policy = capturePolicy;
+          meta.purra_capture_decision = captureDecision!;
+        }
         const desiredText = kind === "delete" ? old!.text : content as string;
         plan.meta = meta;
         plan.hash = kind === "extract" ? null : digest(desiredText);
         this.#journal.savePlan(key, plan);
+        if (authorizationData !== null) this.#journal.assertCaptureAuthorization(authorizationData);
         dispatched = true;
         let ids: string[];
         if (kind === "add" || kind === "extract") {

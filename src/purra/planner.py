@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import time
+from purra.media import parse_static_image_content, static_image_content
 from dataclasses import replace
 from collections.abc import Callable
 from enum import StrEnum
@@ -140,13 +141,12 @@ _PlannerEnum = TypeVar("_PlannerEnum", bound=StrEnum)
 
 PLANNER_SYSTEM_PROMPT += "\n" + PLANNING_STREAM_INSTRUCTION
 
-MIN_INITIAL_PLAN_STEPS = 3
-INITIAL_PLANNING_PROMPT = f"""
+INITIAL_PLANNING_PROMPT = """
 
-An initial planned WorkPlan must contain at least {MIN_INITIAL_PLAN_STEPS}
+An initial planned WorkPlan must contain at least {minimum}
 distinct user-visible semantic steps. A final implicit Respond step does not
 count toward this minimum. If the task does not require at least
-{MIN_INITIAL_PLAN_STEPS} real visible steps, return needsTodos:false instead.
+{minimum} real visible steps, return needsTodos:false instead.
 Never pad the plan with placeholder, bookkeeping, validation, or completion
 steps merely to reach this minimum.
 """
@@ -332,7 +332,7 @@ class AgentPlanner:
                 capabilities,
                 limits,
                 minimum_visible_steps=(
-                    MIN_INITIAL_PLAN_STEPS if turn is None else 1
+                    capabilities.constraints.min_initial_visible_steps if turn is None else 1
                 ),
             )
             reused = ({step.id for step in turn.completed_steps} & {step.id for step in result.work_plan.steps}) if turn else set()
@@ -476,7 +476,7 @@ def build_planner_messages(
         "maxToolSteps": limits.max_tool_steps,
     }
     if turn is None:
-        payload["minVisiblePlanSteps"] = MIN_INITIAL_PLAN_STEPS
+        payload["minVisiblePlanSteps"] = capabilities.constraints.min_initial_visible_steps
     if limits.max_steps is not None:
         payload["maxPlanSteps"] = limits.max_steps
     if capabilities.planning_context_blocks:
@@ -519,7 +519,9 @@ def build_planner_messages(
     ) + (
         RUNTIME_REPLANNING_PROMPT
         if turn is not None
-        else INITIAL_PLANNING_PROMPT
+        else INITIAL_PLANNING_PROMPT.format(
+            minimum=capabilities.constraints.min_initial_visible_steps,
+        )
     )
     agent_instructions = _planner_agent_instructions(request)
     if agent_instructions:
@@ -565,11 +567,26 @@ def build_planner_messages(
                 separators=(",", ":"),
             )
         )
+    images = []
+    image_inputs = []
+    for index, message in enumerate(request.messages):
+        value = parse_static_image_content(message.content)
+        if value is not None:
+            start = len(images)
+            images.extend(value["images"])
+            image_inputs.append({
+                "messageIndex": index,
+                "text": value["text"],
+                "imageIndexes": list(range(start, len(images))),
+            })
+    if images:
+        payload["imageInputs"] = image_inputs
+    content = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     return (
         AgentMessage(role=MessageRole.SYSTEM, content=system_content),
         AgentMessage(
             role=MessageRole.USER,
-            content=json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            content=static_image_content(content, images) if images else content,
         ),
     )
 
@@ -593,7 +610,8 @@ def _recent_conversation_context(
         if message.role is MessageRole.USER and not latest_user_seen:
             latest_user_seen = True
             continue
-        content = str(message.content or "").strip()
+        images = parse_static_image_content(message.content)
+        content = (images["text"] if images is not None else str(message.content or "")).strip()
         if not content:
             continue
         remaining = max_characters - used
@@ -643,7 +661,8 @@ def _planner_host_context(
             continue
         if message.host_metadata.get("promptSection") is not None:
             continue
-        content = str(message.content or "").strip()
+        images = parse_static_image_content(message.content)
+        content = (images["text"] if images is not None else str(message.content or "")).strip()
         if not content:
             continue
         remaining = max_characters - used

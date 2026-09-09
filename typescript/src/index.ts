@@ -1,4 +1,9 @@
 export { Agent } from "./core/agent.js";
+export { STATIC_IMAGE_PROFILE, staticImageContent, parseStaticImageContent } from "./model/media.js";
+export type { StaticImage, StaticImageContent } from "./model/media.js";
+export { APPROVAL_INTENT_PROFILE, ApprovalIntent, copyApprovalDecisionCommand, copyApprovalRecord } from "./approvals.js";
+export type { ToolApprovalBinding } from "./tools/types.js";
+export type { ApprovalStatus, ApprovalIntentValue, ApprovalRecord, ApprovalDecisionCommand, ApprovalDecisionAudit } from "./approvals.js";
 export {
   OUTPUT_SCHEMA_PROFILE, JSON_IDENTITY_PROFILE,
   StructuredOutputContract, StructuredOutputError,
@@ -388,10 +393,12 @@ export type {
 export {
   assertRunRepositoryConforms,
   InMemoryRunRepository,
+  copyToolExecutionCheckpoint,
 } from "./run/store.js";
 export type { RunRepository } from "./run/store.js";
 export type {
   AgentExecutionCheckpoint,
+  AgentToolExecutionCheckpoint,
   AgentPreset,
   AgentPresetSnapshot,
   AgentRuntimeLimitSnapshot,
@@ -418,6 +425,7 @@ export type { JsonSchema } from "./tools/schema.js";
 export type {
   ToolApprovalGateway,
   ToolApprovalRequest,
+  ToolDispatchContext,
   ToolApprovalStatus,
   ToolBatchResult,
   ToolContext,
@@ -459,3 +467,14 @@ export { buildRecoveryInspection, inspectRecovery } from "./observability/inspec
 export type { RecoveryObservations, RecoveryInspection } from "./observability/inspection.js";
 export { checkIntegration } from "./testing/conformance.js";
 export type { IntegrationCheck, IntegrationCapability, EvidenceCategory } from "./testing/conformance.js";
+
+export { ApprovalRequired } from "./approvals.js";
+
+export { copyToolHandlerResult } from "./tools/catalog.js";
+
+export { RecoveryWorker } from "./worker.js";
+export type { RecoveryWorkerResult, RecoverySchedule } from "./worker.js";
+export { selectModelRoute, resolveModelRoute } from './model/routing.js';
+export type { ModelRouteCandidate, ModelRouteRequirements } from './model/routing.js';
+export { ModelRouteRegistry } from './model/routing.js';
+export type { ModelRouteBinding } from './model/routing.js';

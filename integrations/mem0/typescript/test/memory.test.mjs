@@ -662,21 +662,45 @@ test("links preserve visibility and audit stale or revoked endpoints", async t =
   assert.equal(operation.usage.embeddingCalls, 0); assert.equal(operation.usage.llmCalls, 0);
   assert.equal((await memory.get(a)).version, 1); assert.deepEqual(client.histories, before);
   assert.equal((await memory.links(a)).items[0].valid, true);
+  const evidence = await memory.relationEvidence((await memory.links(a)).items[0]);
+  assert.equal(evidence.relation,"supports"); assert.match(evidence.source,/^mem0-relation\//);
+  await memory.validateRelationEvidence([evidence]);
+  await assert.rejects(memory.validateRelationEvidence([{...evidence,relation:"contradicts"}]),code("memory_relation_stale"));
+  await assert.rejects(memory.validateRelationEvidence(Array(101).fill(evidence)),TypeError);
+  await assert.rejects(memory.validateRelationEvidence([{}]),code("memory_relation_stale"));
+  assert.deepEqual((await memory.links(a, {direction:"incoming"})).items, []);
+  assert.equal((await memory.links(b, {direction:"incoming", relation:"supports", validOnly:true})).items[0].key,"link");
+  assert.deepEqual((await memory.links(a, {relation:"unrelated"})).items, []);
+  for (const options of [{direction:"sideways"}, {relation:""}, {validOnly:"false"}]) {
+    await assert.rejects(memory.links(a, options), TypeError);
+  }
   memory.close();
   const restored = create();
+  await restored.validateRelationEvidence([evidence]);
   assert.deepEqual(await restored.link(from, to, "supports", { key: "link", note: "人工确认" }), operation);
   const outsider = create({ scope: { user: "foreign", project: "project" } });
   assert.deepEqual((await outsider.links(a)).items, []);
+  await assert.rejects(outsider.validateRelationEvidence([evidence]),code("memory_relation_stale"));
   await assert.rejects(outsider.link(from, to, "supports", { key: "foreign" }), code("memory_not_found"));
   await restored.annotate(a, { pinned: true }, { version: 1, key: "pin" });
   assert.equal((await restored.links(a)).items[0].valid, false);
+  await assert.rejects(restored.validateRelationEvidence([evidence]),code("memory_relation_stale"));
+  await assert.rejects(restored.relationEvidence((await restored.links(a)).items[0]),code("memory_relation_stale"));
   await assert.rejects(restored.link(from, to, "supports", { key: "stale" }), code("memory_version_conflict"));
   await restored.link({ id: a, version: 2 }, to, "relates_to", { key: "link-2" });
+  const currentEvidence = await restored.relationEvidence((await restored.links(a,{relation:"relates_to"})).items[0]);
   const page = await restored.links(a, { limit: 1 });
   assert.equal(page.next, "link"); assert.equal(page.items[0].valid, false);
+  const filtered = await restored.links(a, {limit:1, validOnly:true, relation:"relates_to", direction:"outgoing"});
+  assert.deepEqual(filtered.items, []); assert.equal(filtered.next,"link");
+  const nextPage = await restored.links(a, {limit:1, after:filtered.next, validOnly:true, relation:"relates_to", direction:"outgoing"});
+  assert.equal(nextPage.items[0].key,"link-2"); assert.equal(nextPage.next,null);
+  assert.deepEqual((await outsider.links(a, {validOnly:true,direction:"outgoing"})).items, []);
   assert.equal((await restored.links(a, { limit: 1, after: page.next })).items[0].valid, true);
   await restored.revokeSource(source.id, { key: "withdraw" });
   assert.ok((await restored.links(a)).items.every(link => !link.valid));
+  assert.deepEqual((await restored.links(a, {validOnly:true})).items, []);
+  await assert.rejects(restored.validateRelationEvidence([currentEvidence]),code("memory_relation_stale"));
 });
 
 test("explicit context reports whole deferred and missing records without search", async t => {

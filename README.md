@@ -7,12 +7,19 @@ tool execution, planning, context, and recoverable Runs inside your application.
 The application supplies its models, tools, data sources, and access rules.
 
 
-## 1.0.0 candidate status
+## 1.0.0 development status
 
-This checkout contains an unreleased 1.0.0 candidate. Install the exact local
-artifacts from its candidate manifest; registry commands do not identify this candidate.
-See the [candidate support and upgrade guide](conformance/release-1.0.md)
-for structured tasks, read-only MCP, safe read concurrency, inspection, and 1.x compatibility.
+This checkout is unreleased 1.0.0 development. Install matching local Core and
+integration artifacts; registry commands do not identify this development build.
+The [durable approval contract](conformance/durable-approval.md) describes the
+work in progress. Both SDKs have deterministic approval recovery tests for Reactive,
+Planned and Auto Root Runs, plus host-authorized MCP writes with durable receipts.
+Read-only approval observations are available. Extended recovery and real
+service/downstream acceptance remain unfinished.
+Existing capabilities and 1.x compatibility are documented in the
+[1.0 support guide](conformance/release-1.0.md).
+
+See the [upgrade notes](docs/migrations/1.0.md) and [public compatibility](ARCHITECTURE.md#public-compatibility) before upgrading.
 
 ## Install
 
@@ -105,6 +112,9 @@ before retrying them. Persistent storage alone does not make those writes replay
 
 ## Documentation
 
+- Capability guides: [planning output](docs/planning-output.md), [structured output](docs/structured-output.md), [tool concurrency](docs/tool-concurrency.md), [integration and recovery inspection](docs/integration-inspection.md).
+- [Upgrade from 0.x to 1.0](docs/migrations/1.0.md).
+
 - [TypeScript guide](typescript/README.md)
 - [Examples](examples/README.md)
 - [Optional packages](integrations/README.md)
@@ -115,3 +125,5 @@ before retrying them. Persistent storage alone does not make those writes replay
 ## License
 
 [MIT](LICENSE)
+
+Host policy composition and limits: [guide](docs/host-policies.md).

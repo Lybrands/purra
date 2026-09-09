@@ -13,6 +13,7 @@ export type OutputVisibility = "private" | "public";
 
 export type OutputEventKind =
   | "planning.progress"
+  | "planning.delta"
   | "agent.progress"
   | "model.diagnostics"
   | "operation.started"
@@ -43,6 +44,7 @@ export type OutputEventKind =
   | "long_task.checkpoint"
   | "durable.recovery_snapshot"
   | "agent.execution_checkpoint"
+  | "approval.required"
   | "input.required"
   | "input.answered";
 

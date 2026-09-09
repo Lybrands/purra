@@ -1,4 +1,5 @@
 import { AgentCanceledError, AgentError } from "../shared/errors.js";
+import { assertImageInputSupport } from "./media.js";
 import type {
   Message,
   ModelFinishReason,
@@ -83,6 +84,7 @@ export async function invokeModel(
   limits: ModelStreamLimits = DEFAULT_STREAM_LIMITS,
   onDiagnostics?: (metrics: Readonly<Record<string, number | string | null>>) => void,
 ): Promise<ModelTurn> {
+  assertImageInputSupport(request.messages, request.capabilitySnapshot?.protocol.imageInput);
   const stop = invocationSignal(signal, limits.invocationTimeoutMs);
   const started = performance.now();
   const gatewayStartedAtMs = Date.now();

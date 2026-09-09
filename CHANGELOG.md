@@ -1,6 +1,75 @@
 # Changelog
 
-## 1.0.0 — Unreleased candidate
+## 1.0.0 — Unreleased development
+
+- Add host-controlled planning granularity and TypeScript host-only response presentation.
+- Add inline static image contracts, capability admission and recovery identity in both SDKs;
+  verify the bounded GLM-5.3-Flash PNG-to-text combination through Chat-compatible transport.
+- Preserve context-overflow reasons on recovery and budget image tokens without treating
+  base64 transport bytes as prompt text.
+
+- Verify approval-linked running Run recovery after host reconciliation in both SDKs,
+  including receipt reuse, non-execution retry gates and scope revocation after reopen.
+
+- Revalidate TypeScript approval-linked claims against the persisted approval identity
+  and approved revision before host reconciliation; mismatches retain the unknown claim.
+
+- Bound offline SQLite backup waiting, validation and hashing with a configurable
+  cooperative deadline; pre-publication timeout leaves no destination or staging file.
+
+- Add a standalone SQLite snapshot command with WAL-aware copying, integrity checks,
+  private staging and no-overwrite publication, plus offline rollback guidance.
+
+- Add read-only, database-wide SQLite approval-upgrade preflight in both SDKs.
+  Activation revalidates under its writer transaction; a ready report grants no permission.
+
+- Read pending approval records with one table query in both SQLite adapters,
+  preserving identity validation, ordering, state filtering and read-only behavior.
+
+- Emit provisional `planning.delta` events for each nonempty planning content chunk,
+  before complete JSON records arrive. Persist and validate exact source evidence
+  in memory and SQLite; preserve final plan admission and private reasoning.
+  Planning content is now publicly previewable, including invalid/retried fragments.
+  See [chunk streaming contract](docs/planning-output.md).
+
+- Add installed Python/TypeScript consumers against an independent synthetic MCP
+  writer, covering response loss and process exit before/after writes. The checks
+  verify remote file evidence, retained unknown claims, no repeat dispatch and
+  process cleanup; CI now runs them with matching Core/SQLite/MCP artifacts.
+
+- Fence late approved tool results by the original execution lease epoch. Expired
+  TypeScript leases cannot be revived by heartbeats; stale execution contexts
+  cannot alter Run state, renew or release a newer epoch, or complete a receipt.
+  Unknown claims remain persisted and block repeat dispatch after reopen.
+
+- Extend v5 SQLite recovery inspection with private-data-free approval state,
+  checkpoint intent matching, completed receipts and Run-associated unknown claims.
+  Reads never refresh decisions or grant execution authority; v4 reports stay unchanged.
+
+- Add separate host-authorized MCP write discovery in both SDKs, preserving the
+  1.0 read-only API. Write registrations require durable approval/receipt gateways
+  and bind catalog, scope and effect identity to the persisted intent. Failures
+  after request submission retain unknown effects and block duplicate dispatch.
+  Deterministic protocol and SQLite recovery tests cover these boundaries; real
+  service and downstream acceptance remain separate.
+
+- Revalidate host scope after tool approval and check cancellation before entering
+  the idempotency gateway. Revoked or unavailable authorization does not dispatch
+  the tool or acquire a tool claim. Existing live approval APIs remain supported.
+- Add immutable approval intents and host-authorized SQLite decision storage,
+  with revision checks, historical command replay and explicit v5 activation.
+  Python and TypeScript additionally support opt-in tool-ready checkpoints and
+  same-Run approval recovery with atomic claim/receipt associations. Reactive,
+  Planned and Auto Root recovery, plus Root approval after read-only Child work,
+  pass deterministic tests. Child write approval is unsupported.
+- Align Core and all seven optional packages, exact internal dependencies and
+  npm lockfiles at 1.0.0. This version has not been published.
+
+The [durable approval contract](conformance/durable-approval.md) defines the
+implemented runtime, diagnostics and recovery boundaries. Storage decisions
+alone are not execution permissions.
+
+### Core capabilities
 
 - Add versioned strict object output contracts, shared JSON identity, and Run-bound
   structured model tasks with local/native-required modes and explicit bounded repairs.
@@ -18,6 +87,12 @@
 
 Candidate support and upgrade boundaries: [English](conformance/release-1.0.md) ·
 [简体中文](conformance/release-1.0.zh-CN.md). This entry does not indicate publication.
+
+### Upgrade notes
+
+SQLite storage moves from v3 to v4 without automatic migration. Complete or cancel
+active Runs before upgrading and retain the old data and runtime for rollback.
+See the [upgrade guide](docs/migrations/1.0.md) / [升级指南](docs/migrations/1.0.zh-CN.md).
 
 ## 0.5.0 — 2026-09-06
 

@@ -65,7 +65,10 @@ covers the adapter's storage scope and adds `unattributed_tool_effect_unknown` t
 Run-specific effects stay unknown. Zero claims never proves all external effects
 safe. Tool reconciliation can remove a pending claim but cannot remove the separate
 `run_recovery_requires_reconciliation` blocker for post-checkpoint model attempts.
-The inspection API provides no tool-ready cursor or general side-effect recovery.
+These v4 observations provide no tool-ready cursor or general side-effect recovery.
+Opt-in v5 approval inspection additionally identifies Run-associated approval claims
+and observes tool-ready checkpoint intent matches and completed receipts without
+mutating storage. See the [1.0 approval inspection contract](../conformance/durable-approval.md#read-only-approval-inspection-implemented).
 
 `suggestedActions` contains advisory inspection, reconciliation and revalidation
 steps. None executes work or authorizes a retry. Reports describe a past observation

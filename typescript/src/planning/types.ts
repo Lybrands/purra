@@ -51,6 +51,8 @@ export interface ExecutionPlan {
 }
 
 export interface PlanningConstraints {
+  /** Initial model-planner visible-step preference; defaults to three. */
+  readonly minInitialVisibleSteps?: number;
   readonly maxSteps?: number;
   readonly allowedCapabilityNames?: readonly string[];
   readonly excludedCapabilityNames?: readonly string[];

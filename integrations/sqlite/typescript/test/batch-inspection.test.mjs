@@ -1,0 +1,31 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
+import { InMemoryRunRepository, assertRunRepositoryConforms } from 'purra';
+import { SqliteAgentAdapters } from '../dist/index.js';
+
+test('batch matches individual inspection and loads state once', async t => {
+  const dir = mkdtempSync(join(tmpdir(), 'purra-batch-'));
+  const storage = new SqliteAgentAdapters(join(dir, 'db'), { scope:'batch' });
+  t.after(() => { storage.close(); rmSync(dir, { recursive:true }); });
+  const reference = new InMemoryRunRepository(); await assertRunRepositoryConforms(reference);
+  const { preset, budgets } = await reference.get('conformance-run-1');
+  const ids = ['a', 'b', 'c'];
+  for (const requestedRunId of ids) await storage.runs.begin({ preset, budgets, requestedRunId, deadlineAt:null, metadata:{} });
+  await storage.runs.cancel('a');
+  const expected = Object.create(null);
+  for (const id of ids) expected[id] = await storage.inspectRecovery(id);
+  const queries = [], original = DatabaseSync.prototype.prepare;
+  t.mock.method(DatabaseSync.prototype, 'prepare', function(sql) { queries.push(sql); return original.call(this, sql); });
+  assert.deepEqual(await storage.inspectRecoveryMany([...ids, 'a']), expected);
+  assert.equal(queries.filter(q => q.includes('SELECT version,body FROM purra_state') && q.includes("sdk='typescript'")).length, 1);
+  queries.length = 0;
+  assert.deepEqual(await storage.inspectRecoveryMany([]), {});
+  assert.deepEqual(queries, []);
+  await assert.rejects(storage.inspectRecoveryMany(['a', 'missing']));
+  assert.deepEqual(await storage.inspectRecoveryMany(ids), expected);
+  await assert.rejects(storage.inspectRecoveryMany(Array(101).fill('a')));
+});

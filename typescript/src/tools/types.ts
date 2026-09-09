@@ -39,7 +39,16 @@ export interface ToolPlanningMetadata {
   readonly prerequisiteTools?: readonly string[];
 }
 
+export interface ToolApprovalBinding {
+  readonly bindingId: string;
+  readonly bindingRevision: string;
+  readonly scopeId: string;
+  readonly scopeRevision: string;
+  readonly effect: "write" | "destructive";
+}
+
 export interface ToolDefinition {
+  readonly approvalBinding?: ToolApprovalBinding;
   readonly argumentContract?: import("../structured.js").StructuredOutputContract;
   readonly concurrencySafe?: boolean;
   readonly name: string;
@@ -58,13 +67,22 @@ export interface ToolDefinition {
 }
 
 export interface ToolApprovalRequest {
+  readonly dispatch?: ToolDispatchContext;
   readonly call: ToolCall;
   readonly title: string;
   readonly riskLevel: ToolRiskLevel;
   readonly summary: string;
 }
 
+export interface ToolDispatchContext {
+  readonly approvalBinding?: ToolApprovalBinding;
+  readonly runId: string;
+  readonly call: ToolCall;
+}
+
 export interface ToolApprovalGateway {
+  readonly requiresDurableIdempotency?: boolean;
+  readonly idempotencyGateway?: ToolIdempotencyGateway;
   request(
     approval: ToolApprovalRequest,
     signal?: AbortSignal,
@@ -75,6 +93,7 @@ export interface ToolIdempotencyGateway {
   executeOnce(
     key: string,
     operation: () => Promise<ToolHandlerResult>,
+    dispatch?: ToolDispatchContext,
   ): Promise<ToolHandlerResult>;
 }
 

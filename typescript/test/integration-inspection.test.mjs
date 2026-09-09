@@ -47,3 +47,12 @@ test('report preflight and cancellation',async()=>{
   await assert.rejects(checkIntegration({component:'host',version:'1',checks:[check,check]}),TypeError);assert.equal(calls,0);
   await assert.rejects(checkIntegration({component:'host',version:'1',checks:[check]}),{name:'AbortError'});
 });
+
+const approvalFixture = JSON.parse(readFileSync(new URL('../../conformance/fixtures/approval_inspection.json', import.meta.url)));
+for (const item of approvalFixture.cases) test(`approval inspection: ${item.id}`, () => {
+  const report = buildRecoveryInspection({...item.state,approvalDigest:'private-secret',principalId:'private-secret',arguments:{secret:'private-secret'}});
+  assert.deepEqual(report.blockers,item.blockers); assert.deepEqual(report.cautions,item.cautions ?? []);
+  assert.equal(report.authority,'diagnosis_only'); assert.ok(report.unknown.includes('currentApprovalBinding'));
+  assert.equal(JSON.stringify(report).includes('private-secret'),false);
+});
+for (const state of approvalFixture.invalid) test(`invalid approval observation: ${JSON.stringify(state)}`,()=>assert.throws(()=>buildRecoveryInspection(state),TypeError));

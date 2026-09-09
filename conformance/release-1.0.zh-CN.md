@@ -2,13 +2,13 @@
 
 [English](release-1.0.md) | 简体中文
 
-当前源码的包元数据为 1.0.0，状态是**尚未发布的候选**。注册表安装命令可能仍获取旧的已发布版本；验证候选时必须使用候选清单对应的准确 wheel 或 npm tarball。Core 与各个 PurrA 可选包必须使用相同版本。
+本文记录 1.0.0 **尚未发布候选**的支持范围，不代表发布公告。当前源码已进入 1.0.0 开发，见[审批契约](durable-approval.zh-CN.md)。注册表安装命令可能仍获取旧的已发布版本；验证候选时必须使用候选清单对应的准确 wheel 或 npm tarball。Core 与各个 PurrA 可选包必须使用相同版本。
 
 ## 首发能力
 
 Python 和 TypeScript 均提供 Run 绑定的完整对象结构化任务、显式 `local`／`native_required`、有界且默认关闭的格式修复、限定作用域的 MCP 只读工具、显式安全只读批次的有界并行、接入检查报告及只读恢复诊断。Core 没有运行时依赖；七个可选包分别为 OpenAI、Anthropic、SQLite、interaction、compaction、Mem0、MCP。
 
-模型能力、凭据、SDK 客户端、授权、资源范围、持久化、预算和关闭操作归宿主管理。安装适配包不会自动在 Agent 中启用它。参见[结构化输出](structured-output.md)、[工具并行](tool-concurrency.md)、[接入与诊断](integration-inspection.md)。
+模型能力、凭据、SDK 客户端、授权、资源范围、持久化、预算和关闭操作归宿主管理。安装适配包不会自动在 Agent 中启用它。参见[结构化输出](../docs/structured-output.md)、[工具并行](../docs/tool-concurrency.md)、[接入与诊断](../docs/integration-inspection.md)。
 
 ## 服务验证与边界
 

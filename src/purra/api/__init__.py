@@ -5,6 +5,8 @@ packages, but complete execution is entered through this module.  Runtime
 implementation modules are not application entry points.
 """
 
+from purra.worker import RecoveryWorker, RecoveryWorkerResult, RecoverySchedule
+
 from purra.engine import (
     AgentCore,
     AgentCoreRunOptions,
@@ -44,7 +46,7 @@ from purra.agent_tree_execution import (
     RunCommandService,
 )
 from purra.agent_tree_policy import AgentTreePolicy
-from purra.agent_execution_checkpoint import AgentExecutionCheckpoint
+from purra.agent_execution_checkpoint import AgentExecutionCheckpoint, AgentToolExecutionCheckpoint
 from purra.agent_tree_lease import (
     AgentRunLeaseClaim,
     current_agent_run_lease,
@@ -83,6 +85,9 @@ from purra.run_control import (
 from purra.run_state import canonicalize_execution_plan
 
 __all__ = [
+    "RecoveryWorker",
+    "RecoverySchedule",
+    "RecoveryWorkerResult",
     "AgentCore",
     "AgentExecutionCheckpoint",
     "AgentCapabilityGrant",
@@ -169,3 +174,11 @@ from purra.observability.inspection import build_recovery_inspection, inspect_re
 __all__ += ["build_recovery_inspection", "inspect_recovery"]
 from purra.testing import IntegrationCheck, check_integration
 __all__ += ["IntegrationCheck", "check_integration"]
+
+from purra.approvals import ApprovalRequired
+__all__ += ["AgentToolExecutionCheckpoint", "ApprovalRequired"]
+
+from purra.model_routing import ModelRouteCandidate, select_model_route, resolve_model_route
+__all__ += ["ModelRouteCandidate", "select_model_route", "resolve_model_route"]
+from purra.model_routing import ModelRouteBinding, ModelRouteRegistry
+__all__ += ["ModelRouteBinding", "ModelRouteRegistry"]

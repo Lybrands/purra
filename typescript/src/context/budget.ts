@@ -1,4 +1,5 @@
 import type { JsonValue, Message, ToolSpec } from "../model/types.js";
+import { imageInputTokens, parseStaticImageContent } from "../model/media.js";
 import { AgentError } from "../shared/errors.js";
 import type { ContextBudget, ContextBudgetClaim, ContextReserves } from "./types.js";
 
@@ -27,7 +28,7 @@ export function estimateToolSchemaTokens(tools: readonly ToolSpec[]): number {
 
 export function estimateMessagesTokens(messages: readonly Message[]): number {
   return 2 + messages.reduce(
-    (total, message) => total + estimateJsonTokens(messageForBudget(message)) + 4,
+    (total, message) => total + estimateJsonTokens(messageForBudget(message)) + imageInputTokens(message.content) + 4,
     0,
   );
 }
@@ -225,10 +226,15 @@ function proportionalShares(weights: readonly number[], available: number): numb
 }
 
 function messageForBudget(message: Message): Readonly<Record<string, JsonValue>> {
+  const images = parseStaticImageContent(message.content);
+  // Image allowance is added separately; base64 is transport data, not text.
+  const content = images === undefined ? message.content : {
+    ...images, images: images.images.map(image => ({ ...image, dataBase64: "" })),
+  };
   return {
     ...(message.attributes ?? {}),
     role: message.role,
-    content: message.content,
+    content,
     ...(message.reasoning === undefined ? {} : { structured_reasoning_content: message.reasoning }),
     ...(message.providerData === undefined ? {} : { provider_continuation_data: message.providerData }),
     ...(message.toolCalls === undefined

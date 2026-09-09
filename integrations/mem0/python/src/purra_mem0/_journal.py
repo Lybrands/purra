@@ -51,6 +51,13 @@ class Journal:
             CREATE TABLE IF NOT EXISTS purra_mem0_revocations (
                 scope TEXT NOT NULL, source TEXT NOT NULL, revision TEXT NOT NULL,
                 PRIMARY KEY(scope,source,revision));
+            CREATE TABLE IF NOT EXISTS purra_mem0_capture_authorizations (
+                scope TEXT NOT NULL, policy TEXT NOT NULL, decision TEXT NOT NULL,
+                authorization TEXT NOT NULL, valid_from TEXT, expires TEXT,
+                PRIMARY KEY(scope,policy,decision));
+            CREATE TABLE IF NOT EXISTS purra_mem0_capture_revocations (
+                scope TEXT NOT NULL, policy TEXT NOT NULL, decision TEXT NOT NULL,
+                PRIMARY KEY(scope,policy,decision));
         """)
         with self.transaction():
             self.db.execute("INSERT OR IGNORE INTO purra_mem0_info VALUES ('store',?)", (uuid.uuid4().hex,))
@@ -127,6 +134,8 @@ class Journal:
                 self.assert_snapshot(op["plan"])
             if op is not None and op["plan"]["kind"] != "delete" and op["plan"].get("meta"):
                 self.assert_source(op["plan"]["meta"])
+            if op is not None and op["plan"].get("capture_authorization"):
+                self.assert_capture_authorization(op["plan"]["capture_authorization"])
             limits = json.loads(self.db.execute("SELECT limits FROM purra_mem0_budgets WHERE scope=? AND key=?", (self.scope, budget)).fetchone()[0])
             used = self.usage(budget=budget)
             if (used[kind + "_calls"] + 1 > limits["max_" + kind + "_calls"]
@@ -191,6 +200,67 @@ class Journal:
                 self.db.execute("INSERT INTO purra_mem0_revocations VALUES (?,?,?)", (self.scope, source, revision or ""))
                 self.db.execute("UPDATE purra_mem0_epochs SET epoch=epoch+1 WHERE scope=?", (self.scope,))
 
+    def capture_revoked(self, policy, decision):
+        with self.lock:
+            return self.db.execute(
+                "SELECT 1 FROM purra_mem0_capture_revocations WHERE scope=? AND policy=? AND decision=?",
+                (self.scope, policy, decision)).fetchone() is not None
+
+    def assert_capture_authorization(self, authorization):
+        with self.lock:
+            if self.capture_revoked(authorization["policy_id"], authorization["decision_id"]):
+                raise MemoryError("memory_capture_authorization_revoked")
+            row = self.db.execute(
+                "SELECT authorization,valid_from,expires FROM purra_mem0_capture_authorizations WHERE scope=? AND policy=? AND decision=?",
+                (self.scope, authorization["policy_id"], authorization["decision_id"])).fetchone()
+            if row is None or json.loads(row["authorization"]) != authorization:
+                raise MemoryError("memory_capture_authorization_unavailable")
+            now = datetime.now(timezone.utc)
+            if row["valid_from"] is not None and datetime.fromisoformat(row["valid_from"].replace("Z", "+00:00")) > now:
+                raise MemoryError("memory_capture_authorization_not_yet_valid")
+            if row["expires"] is not None and datetime.fromisoformat(row["expires"].replace("Z", "+00:00")) <= now:
+                raise MemoryError("memory_capture_authorization_expired")
+
+    def record_capture_authorization(self, key, fingerprint, authorization, valid_from, expires):
+        with self.transaction():
+            previous = self.operation(key)
+            if previous:
+                if previous["fingerprint"] != fingerprint:
+                    raise MemoryError("memory_idempotency_conflict")
+                return
+            if self.capture_revoked(authorization["policy_id"], authorization["decision_id"]):
+                raise MemoryError("memory_capture_authorization_revoked")
+            row = self.db.execute(
+                "SELECT authorization,valid_from,expires FROM purra_mem0_capture_authorizations WHERE scope=? AND policy=? AND decision=?",
+                (self.scope, authorization["policy_id"], authorization["decision_id"])).fetchone()
+            values = (authorization, valid_from, expires)
+            if row is not None and (json.loads(row["authorization"]), row["valid_from"], row["expires"]) != values:
+                raise MemoryError("memory_capture_authorization_conflict")
+            plan = {"kind": "record_capture_authorization", "target": None, "meta": None,
+                    "capture_authorization": authorization, "valid_from": valid_from, "expires": expires}
+            self.db.execute("INSERT INTO purra_mem0_ops VALUES (?,?,?,'complete',?,'[]')",
+                            (self.scope, key, fingerprint, json.dumps(plan)))
+            if row is None:
+                self.db.execute("INSERT INTO purra_mem0_capture_authorizations VALUES (?,?,?,?,?,?)",
+                                (self.scope, authorization["policy_id"], authorization["decision_id"],
+                                 json.dumps(authorization), valid_from, expires))
+
+    def revoke_capture_authorization(self, key, fingerprint, policy, decision):
+        with self.transaction():
+            previous = self.operation(key)
+            if previous:
+                if previous["fingerprint"] != fingerprint:
+                    raise MemoryError("memory_idempotency_conflict")
+                return
+            plan = {"kind": "revoke_capture_authorization", "target": None, "meta": None,
+                    "policy_id": policy, "decision_id": decision}
+            self.db.execute("INSERT INTO purra_mem0_ops VALUES (?,?,?,'complete',?,'[]')",
+                            (self.scope, key, fingerprint, json.dumps(plan)))
+            if not self.capture_revoked(policy, decision):
+                self.db.execute("INSERT INTO purra_mem0_capture_revocations VALUES (?,?,?)",
+                                (self.scope, policy, decision))
+                self.db.execute("UPDATE purra_mem0_epochs SET epoch=epoch+1 WHERE scope=?", (self.scope,))
+
     def item(self, item_id):
         with self.lock:
             row = self.db.execute("SELECT record FROM purra_mem0_items WHERE scope=? AND id=?", (self.scope, item_id)).fetchone()
@@ -228,6 +298,8 @@ class Journal:
                 raise MemoryError("memory_context_stale")
             if plan.get("review_key") is not None:
                 self.assert_snapshot(self.review_plan(plan["review_key"]))
+            if plan.get("capture_authorization") is not None:
+                self.assert_capture_authorization(plan["capture_authorization"])
             records = []
             now = datetime.now(timezone.utc)
             for ref in refs:

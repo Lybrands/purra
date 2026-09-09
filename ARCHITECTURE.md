@@ -37,6 +37,13 @@ Model reasoning, provisional Provider data, user-visible commentary, final
 output, tool lifecycle, and Artifacts remain separate channels. Publication is
 downstream of persistence; subscribers are never the source of Run truth.
 
+## Host policies
+
+Hosts select business policy through public composition ports; Core validates
+the resulting execution. Built-in defaults are not universal business rules.
+See [host policies](docs/host-policies.md) for replaceable choices, binding and
+recovery obligations, and the current cross-SDK output-policy limits.
+
 ## Execution styles
 
 Auto execution is the default. Core adds the private, empty-argument
@@ -101,6 +108,30 @@ Run and continue at the next model round only when that checkpoint, its lease,
 and its Agent preset snapshot all match. An in-flight Provider stream, an
 in-flight tool, and Planned execution remain fail-stop boundaries; PurrA does
 not infer or replay their missing state.
+
+## Planning output
+
+Planning previews are persisted before publication. Each content chunk can be
+observed before complete JSON arrives; only a validated plan grants execution authority.
+See the [detailed contract](docs/planning-output.md).
+
+## Read-only tool concurrency
+
+Read batches may run concurrently only with explicit safety declarations and a
+bounded limit. Authorization, cancellation and lease fences remain mandatory.
+See the [detailed contract](docs/tool-concurrency.md).
+
+Confirm-mode tools additionally revalidate current host scope after approval,
+before entering idempotency. Scope callbacks must tolerate repeated validation
+and must not perform the approved write themselves. This check does not close
+a remote service's authorization race. See the [durable approval contract](conformance/durable-approval.md)
+for the opt-in 1.0 approval and receipt APIs.
+
+## Integration reports and recovery inspection
+
+Integration reports distinguish tested capabilities from unknowns. Recovery
+inspection observes stored evidence without granting permission to resume.
+See the [detailed contract](docs/integration-inspection.md).
 
 ## Safety invariants
 
@@ -234,7 +265,26 @@ transactions and journal rows through that boundary. Python exposes it from
 adapter contract, separate from application ports and public output projections.
 Python record identifiers do not depend on module paths. Repository state and
 canonical output history commit atomically, while lazy history stays transaction-local.
-SQLite storage v4 rejects other versions before database initialization writes.
-It provides no legacy codec or automatic migration. SDK state schemas, execution
+SQLite retains legacy v4 support and rejects unsupported formats before initialization
+writes. Approval storage requires explicit offline v5 activation; it preserves
+same-SDK history and requires no active Runs, unresolved claims or foreign-SDK rows.
+Preopened v4 writers are fenced. There is no automatic migration or general legacy
+codec; see the [approval storage boundary](conformance/durable-approval.md#persistence-and-10-compatibility). SDK state schemas, execution
 checkpoint versions, preset versions and package versions evolve independently;
 Python and TypeScript snapshots are not interchangeable.
+
+## Public compatibility
+
+- Patch releases preserve documented public APIs and behavior. Minor releases
+  add capabilities through new exports, optional parameters, or explicitly
+  negotiated capabilities; they do not add mandatory methods to existing host ports.
+- Public types and documented exports are the supported surface. Private module
+  paths, internal state codecs, and generated SDK extension internals are not
+  application APIs. A version-pinned storage adapter contract is documented separately.
+- Existing event/error meanings are preserved. Where a contract explicitly allows
+  unknown fields or codes, consumers must retain an unknown state rather than
+  interpreting it as success or permission to resume. Closed enums are not
+  implicitly extensible merely because they are represented as strings.
+- A breaking public change requires a major version. Removing an existing data
+  format or reinterpreting persisted state is not a harmless patch. Storage format
+  numbers do not bypass application-visible compatibility commitments.

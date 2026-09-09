@@ -65,7 +65,7 @@ Run 状态和输出历史的还原；Agent 树、产物与长任务操作只还�
 Root 日志；未加载的 Root 不能读取或写入，其检查点与事件计数保持不变。
 租约认领、公开 `transaction()` 和创建 Run 等无法定位既有 Root 的操作仍校验完整作用域。
 执行快照仍按作用域加载和保存，包含检查点和回执，适合数据量受控的本地场景。
-本次存储格式为 v4。构造器在修改数据库参数、表或索引之前拒绝其他所有版本（包括
+存储格式为 v4。构造器在修改数据库参数、表或索引之前拒绝其他所有版本（包括
 v1/v2/v3）；拒绝后原库不变。没有自动迁移或旧格式恢复路径。
 Python 与 TypeScript 的执行快照不能互换。
 事件幂等键的索引范围是单个 Root（Python 则是整个作用域）。打开已有 v4 数据库时，
@@ -114,3 +114,28 @@ node integrations/sqlite/typescript/scripts/benchmark-execution-writes.mjs
 
 应用负责数据库访问、备份和数据保留。检查点包含私有模型数据。
 等待活动执行结束后再调用 `storage.close()`。
+
+TypeScript 支持 opt-in Reactive/Planned/Auto Root 审批等待、同 Run 恢复及 claim/receipt 关联。
+配置 `toolCheckpointHandler`、`approval: approvals.gateway()` 和同一适配器的
+`idempotency`，旧模型续点类型保持不变。详见[运行入口](../../../conformance/durable-approval.zh-CN.md#typescript-工具续点运行入口开发中)。
+Root 在只读 Child 完成后等待审批的组合已验证；用 `toolCheckpointNames` 明确选择业务写工具。
+Child 写审批和 MCP 写验收仍未完成。
+
+## 合成宿主生命周期检查
+
+在仓库根目录执行：
+
+```sh
+npm run build --prefix typescript
+npm run build --prefix integrations/sqlite/typescript
+node integrations/sqlite/typescript/scripts/check-host-lifecycle.mjs
+```
+
+检查会把宿主管理的 Run 配置单独持久化，关闭首个宿主，再重建原请求配置、当前
+binding/scope revision 和原绝对审批期限。随后启动带持久游标及调度的
+`RecoveryWorker`；合成的已认证审批决定提交后显式唤醒 worker。检查等待规范 Run
+完成，停止服务，重开存储，并确认只有一个完成回执，没有遗留 claim 或活动 lease。
+
+这是仓库内的确定性检查，会导入测试宿主，不是生产宿主库。应用必须自行管理认证主体、
+配置注册表和当前资源范围解析器；配置缺失或不匹配必须在公共 resume 前失败。检查不调用
+Provider 或 MCP 服务，也不代表下游验收。

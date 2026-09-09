@@ -6,11 +6,13 @@ PurrA 是面向 Python 和 TypeScript 的 Agent 运行时，负责在应用中�
 工具执行、规划、上下文和可恢复的 Run。应用提供模型、工具、数据源与访问规则。
 
 
-## 1.0.0 候选状态
+## 1.0.0 开发状态
 
-当前源码为尚未发布的 1.0.0 候选。请按候选清单安装准确本地产物；注册表安装命令不保证获取本候选。
-首发结构化任务、MCP 只读工具、安全读批次并行及只读诊断的支持范围，
-以及 0.x 升级和 1.x 兼容承诺，见[候选说明](conformance/release-1.0.zh-CN.md)。
+当前源码为尚未发布的 1.0.0 开发版。请安装版本一致的 Core 与集成本地产物；注册表命令不保证获取此开发版本。
+[持久化审批契约](conformance/durable-approval.zh-CN.md)记录本版开发中的能力；双端已通过 Reactive、Planned、Auto Root 审批恢复，以及宿主授权 MCP 写工具和持久回执的确定性验证。已提供只读审批诊断；扩展恢复、真实服务及下游验收仍未完成。
+已有能力及 1.x 兼容承诺见[1.0 支持说明](conformance/release-1.0.zh-CN.md)。
+
+0.x 升级要求见[升级说明](docs/migrations/1.0.zh-CN.md)。
 
 ## 安装
 
@@ -96,6 +98,9 @@ JavaScript 和 TypeScript 用法见 [TypeScript 指南](typescript/README.zh-CN.
 
 ## 文档
 
+- 功能指南：[计划输出](docs/planning-output.md)、[结构化输出](docs/structured-output.md)、[工具并发](docs/tool-concurrency.md)、[接入与恢复诊断](docs/integration-inspection.md)。
+- [从 0.x 升级到 1.0](docs/migrations/1.0.zh-CN.md)。
+
 - [TypeScript 指南](typescript/README.zh-CN.md)
 - [示例](examples/README.zh-CN.md)
 - [可选包](integrations/README.zh-CN.md)
@@ -106,3 +111,7 @@ JavaScript 和 TypeScript 用法见 [TypeScript 指南](typescript/README.zh-CN.
 ## 许可证
 
 [MIT](LICENSE)
+
+长期公共接口约定见[兼容承诺](ARCHITECTURE.md#public-compatibility)。
+
+宿主策略、默认行为与替换边界见[接入指南](docs/host-policies.md)。

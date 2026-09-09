@@ -12,3 +12,13 @@ export async function consumer(client: Client, monitor: McpCatalogMonitor) {
   return {snapshot,tools,agentOptions,digest:await jsonIdentityDigest(output.validateValue({ok:true}))};
 }
 void Agent;
+
+import { discoverMcpWriteTools, type McpWriteToolBinding, type McpWriteToolSnapshot } from 'purra-mcp';
+export async function writeConsumer(client: Client, monitor: McpCatalogMonitor) {
+  const binding: McpWriteToolBinding = {localName:'write',policy:{mode:'confirm',title:'Write',riskLevel:'write'},
+    scope:() => true,bindingId:'fixture',bindingRevision:'1',scopeId:'sandbox',scopeRevision:'1',effect:'write'};
+  const snapshot: McpWriteToolSnapshot = (await discoverMcpWriteTools(client,'fixture',{write:binding},{monitor})).snapshot;
+  // @ts-expect-error Writes have their own snapshot contract.
+  const readSnapshot: McpToolSnapshot = snapshot;
+  return snapshot;
+}

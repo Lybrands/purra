@@ -37,8 +37,11 @@ class TaskCapabilityRequirements:
     structured_output_level: str = "none"
     streaming_required: bool = False
     cancellation_required: bool = False
+    image_input_required: bool = False
 
     def __post_init__(self) -> None:
+        if type(self.image_input_required) is not bool:
+            raise ValueError("image_input_required must be boolean")
         mode = str(getattr(self.reasoning_mode, "value", self.reasoning_mode) or "")
         if mode not in {"default", "enabled", "disabled"}:
             raise ValueError("task reasoning mode must be default, enabled, or disabled")
@@ -66,6 +69,8 @@ def preflight_capabilities(
     """Reject an incompatible task before it can create execution state."""
 
     reasons: list[str] = []
+    if requirements.image_input_required and snapshot.protocol.image_input is not FeatureSupport.SUPPORTED:
+        reasons.append("image_input")
     if not snapshot.actionable:
         reasons.append("profile_not_actionable")
     if not snapshot.protocol.reasoning_mode_is_supported(

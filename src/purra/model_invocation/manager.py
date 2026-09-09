@@ -611,6 +611,10 @@ class AgentModelInvocationManager:
         """
 
         snapshot = call.request.capability_snapshot
+        from purra.media import parse_static_image_content
+        if any(parse_static_image_content(message.content) is not None for message in messages):
+            if snapshot.protocol.image_input.value != "supported":
+                raise ContractViolationError("Model profile does not declare image input support", code="model_capability_incompatible")
         window = context.context_window_tokens or snapshot.context_window_tokens
         if window > snapshot.context_window_tokens:
             raise ContractViolationError(

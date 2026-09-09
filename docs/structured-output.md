@@ -1,7 +1,7 @@
 # Object output schema profile
 
 `purra.output-schema/v1` defines complete JSON object validation in Python and
-TypeScript. The shared vectors are in `fixtures/structured_output.json`. This
+TypeScript. The shared vectors are in `conformance/fixtures/structured_output.json`. This
 profile validates syntax and structure, not the factual accuracy of generated
 content. Constructing a contract or calling `parse` never invokes a model.
 

@@ -354,6 +354,7 @@ def _core(
     runtime_limits=None,
     tool_catalog=None,
     agent_tree=False,
+    execution_lease_store=None,
 ):
     adapters = adapters or InMemoryAgentAdapters()
     resolved_profile = profile or ExecutionProfile()
@@ -371,6 +372,7 @@ def _core(
         ):
             bindings[role] = AgentComponentBinding(f"portable.{role}", "1")
     return AgentCore(
+        execution_lease_store=execution_lease_store,
         model_gateway=gateway,
         run_repository=adapters.runs,
         output_repository=adapters.outputs,

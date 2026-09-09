@@ -130,6 +130,48 @@ pass an async `policy(candidate, review)` and a stable `policy_revision` to
 `MemoryWorkflow`. Return an authorized `MemoryResolution` that retains the review
 key, or `None` to leave the candidate pending.
 
+To require authorization before messages can reach Mem0 or its providers, bind a
+host-issued grant to the exact capture intent:
+
+```python
+from purra_mem0 import MemoryCaptureAuthorization, memory_capture_intent
+
+capture_policy_id = "project-memory"
+capture_policy_revision = "2026-09-09"
+intent = memory_capture_intent(messages, source=source, metadata=metadata)
+authorization = MemoryCaptureAuthorization(
+    intent_digest=intent,
+    policy_id=capture_policy_id,
+    policy_revision=capture_policy_revision,
+    principal_id=authenticated_user_id,
+    decision_id=host_decision_id,
+)
+workflow = MemoryWorkflow(
+    memory,
+    capture_policy_id=capture_policy_id,
+    capture_policy_revision=capture_policy_revision,
+)
+await memory.record_capture_authorization(
+    authorization,
+    key=f"capture-authorization:{host_decision_id}",
+    expires_at=capture_authorization_expires_at,
+)
+result = await workflow.capture(
+    messages, source=source, key=operation_key,
+    metadata=metadata, authorization=authorization,
+)
+```
+
+The host owns authentication, eligibility and audit of the decision. Keep the
+authorization unchanged on retry. Missing or mismatched grants fail before the
+operation journal and Provider calls; changing a bound grant under the same key
+causes an idempotency conflict.
+
+Call `revoke_capture_authorization(policy_id, decision_id, key=...)` to persist a
+revocation. It prevents new extraction, review and activation under the decision
+and hides records produced by it. Expiry only stops new processing. Neither path
+physically deletes Mem0 content or history.
+
 ## Lifecycle
 
 Before shutdown, call `await memory.drain()` and `memory.close()`, then close SDK

@@ -58,6 +58,17 @@ export class StorageSession {
     }
     return { body: JSON.stringify(this.#saved), journals: checkpoint?.journals ?? [] };
   }
+
+  hasToolExecutionCheckpoint(): boolean {
+    if (this.#selection !== "all") throw new Error("Full storage selection is required");
+    return this.stores.runs.hasToolExecutionCheckpoint();
+  }
+
+  hasUnsettledExecution(): boolean {
+    if (this.#selection !== "all") throw new Error("Full storage selection is required");
+    return this.stores.runs.hasActiveRuns() || this.stores.runTree.hasActiveRuns()
+      || Object.values(this.extra.tools).some(receipt => receipt.state === "claimed");
+  }
 }
 
 export const STORAGE_PORT_METHODS = {

@@ -6,11 +6,13 @@
 组合工具、上下文、规划和持久化能力。
 
 
-## 1.0.0 候选状态
+## 1.0.0 开发状态
 
-当前源码为尚未发布的 1.0.0 候选。请按候选清单安装准确本地产物；注册表安装命令不保证获取本候选。
-首发结构化任务、MCP 只读工具、安全读批次并行及只读诊断的支持范围，
-以及 0.x 升级和 1.x 兼容承诺，见[候选说明](../conformance/release-1.0.zh-CN.md)。
+当前源码为尚未发布的 1.0.0 开发版。请安装版本一致的 Core 与集成本地产物；注册表命令不保证获取此开发版本。
+[持久化审批契约](../conformance/durable-approval.zh-CN.md)记录本版开发中的能力；Root 持久化审批恢复与宿主授权 MCP 写工具已具备确定性验证；真实 Provider、业务服务与下游验收仍需分别完成。
+已有能力及 1.x 兼容承诺见[1.0 支持说明](../conformance/release-1.0.zh-CN.md)。
+
+0.x 升级要求见[升级说明](../docs/migrations/1.0.zh-CN.md)。
 
 ## 安装
 
@@ -77,8 +79,9 @@ Run 请求通过 `planningMode` 选择模式：
 | `reactive` | 通过模型与工具循环执行，不激活规划。 |
 | `planned` | 执行任务前先规划。 |
 
-Planner 要求网关支持流式输出。订阅 Run 事件可接收公开的 `planning.progress`，
-其中不包含私有计划和推理。订阅与重放用法见[规划示例](examples/planner-streaming.ts)。
+Planner 要求网关支持流式输出。订阅 Run 事件可逐片段接收 `planning.delta`，无需等待完整 JSON；
+`planning.progress` 保留完整进度记录的语义。原始预览可能包含无效计划片段，执行仍须通过校验，推理保持私有。
+契约见[计划输出](../docs/planning-output.md)，订阅与重放用法见[规划示例](examples/planner-streaming.ts)。
 
 ## 预算与持久化
 
@@ -103,3 +106,13 @@ Core 会保留“未知”状态，而不会把它记成 0。
 - [示例](../examples/README.zh-CN.md)
 - [可选包](../integrations/README.zh-CN.md)
 - [MIT 许可证](LICENSE)
+
+长期公共接口约定见[兼容承诺](../ARCHITECTURE.md#public-compatibility)。
+
+### 仅返回宿主结果
+
+在 `Agent` 上设置 `responsePresentation: "none"`，可省略额外的公开回答呈现轮次。
+默认 `"model_live"` 保持原行为。已有结果校验、工具权限和 Run 预算仍然生效。
+此模式下 `result.output`、`snapshot().finalOutput` 是宿主私有结果，最终事件保持私有；
+生命周期、工具和进度事件保留原可见性。临时 stream 不输出回答文本增量，最终结果事件
+标记 `visibility: "private"`。呈现选择纳入 Run 配置身份，恢复时不能切换公开方式。
