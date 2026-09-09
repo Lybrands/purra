@@ -33,6 +33,9 @@ revision, create a `MemoryCaptureAuthorization` over
 The exact content, source, metadata, expiry, policy, principal and decision are
 bound before Provider or Mem0 dispatch. This receipt is issued by the host; the
 integration does not authenticate principals or decide which content is eligible.
+Persist the grant before capture. Expired grants stop new processing; explicit
+revocation also hides records produced by that decision. Revocation does not
+physically erase Mem0 content or history.
 
 | Resolution | Result |
 | --- | --- |
@@ -61,6 +64,8 @@ or record versions fail before activation. SDK examples are in the usage guides.
 | `MemoryContext`, `assemble_memory_context` / `assembleMemoryContext` | Assemble whole records within a token allowance |
 | `link`, `links` | Record and inspect explicit relations between record versions |
 | `revoke_source` / `revokeSource` | Withdraw a source or one of its revisions |
+| `record_capture_authorization` / `recordCaptureAuthorization` | Persist an exact host capture grant and validity window |
+| `revoke_capture_authorization` / `revokeCaptureAuthorization` | Permanently revoke one policy decision |
 | `validate_evidence` / `validateEvidence` | Check whether saved memory evidence remains usable |
 
 `links` optionally filters `direction` (`both`, `incoming`, `outgoing`), exact

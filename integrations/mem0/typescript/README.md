@@ -149,6 +149,10 @@ const authorization = {
   decisionId: hostDecisionId,
 };
 const workflow = new MemoryWorkflow(memory, { capturePolicyId, capturePolicyRevision });
+await memory.recordCaptureAuthorization(authorization, {
+  key: `capture-authorization:${hostDecisionId}`,
+  expiresAt: captureAuthorizationExpiresAt,
+});
 const result = await workflow.capture(messages, {
   source, key: operationKey, metadata, authorization,
 });
@@ -158,6 +162,11 @@ The host owns authentication, eligibility and audit of the decision. Keep the
 authorization unchanged on retry. Missing or mismatched grants fail before the
 operation journal and Provider calls; changing a bound grant under the same key
 causes an idempotency conflict.
+
+Call `revokeCaptureAuthorization(policyId, decisionId, { key })` to persist a
+revocation. It prevents new extraction, review and activation under the decision
+and hides records produced by it. Expiry only stops new processing. Neither path
+physically deletes Mem0 content or history.
 
 ## Lifecycle
 

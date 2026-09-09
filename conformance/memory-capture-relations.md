@@ -1,10 +1,9 @@
 # K01/K02 memory capture and relation queries
 
-Status: K02 is complete inside the optional `purra-mem0` integration for scoped,
-explicit relation queries and exact relationship evidence. K01 now has an
-opt-in pre-capture authorization binding; eligibility policy persistence,
-revocation and consumer acceptance remain open. Core does not acquire a
-dependency on Mem0 or its journal.
+Status: K01 and K02 are complete inside the optional `purra-mem0` integration
+for host-authorized capture and scoped explicit relations. Downstream adoption
+and real Provider acceptance remain separate. Core does not acquire a dependency
+on Mem0 or its journal.
 
 ## Current capture boundary
 
@@ -35,13 +34,36 @@ authenticate the principal, decide content eligibility, audit issuance and keep
 decision IDs unique in its own authority boundary. A later refusal to activate a
 candidate cannot undo an earlier Provider disclosure or write.
 
+Before capture, the host persists the exact grant through
+`record_capture_authorization` / `recordCaptureAuthorization`, with optional
+`valid_from` / `validFrom` and `expires_at` / `expiresAt`. A decision ID is unique
+within a policy: another operation may replay the same grant and validity window,
+but cannot replace its intent, revision, principal or window. A prior revocation
+is a durable tombstone and prevents later registration.
+
+`revoke_capture_authorization` / `revokeCaptureAuthorization` persists that
+tombstone and advances the scope epoch. New extraction, review and resolution
+effects revalidate the persisted grant immediately before their first dispatch;
+managed Provider admission checks it again for each LLM or Embedding call.
+Not-yet-valid, expired, unavailable and revoked grants use distinct stable error
+codes. Completed operations remain auditable and replayable without creating a
+new effect.
+
+Expiry limits when new processing may start; it does not retroactively erase a
+record. Explicit revocation removes records produced by that capture decision
+from ordinary reads, retrieval, context, relationship validity and activation.
+The external Mem0 copy and history may remain, just as source withdrawal does;
+retention and physical erasure stay with the host. A raw SDK mutation already in
+flight at the instant of revocation cannot be cancelled atomically, but any late
+committed record retains the revoked decision fields and remains unavailable.
+
 The opt-in configuration preserves existing 1.0 calls: workflows without a
 capture policy keep their former behavior, while supplying a grant without a
 configured policy is rejected to prevent silently ignored authorization data.
 Reuse existing scope, source revisions, operation identity and unknown-effect
-reconciliation. Do not automatically capture complete Run transcripts. Policy
-decision persistence, time validity, revocation and revalidation before a first
-unresolved dispatch remain K01 work.
+reconciliation. Do not automatically capture complete Run transcripts. The
+host's business eligibility policy, authentication, consent UI and audit system
+remain outside the integration contract.
 
 ## Bounded relation filtering
 

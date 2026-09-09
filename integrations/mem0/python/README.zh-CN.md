@@ -138,6 +138,11 @@ workflow = MemoryWorkflow(
     capture_policy_id=capture_policy_id,
     capture_policy_revision=capture_policy_revision,
 )
+await memory.record_capture_authorization(
+    authorization,
+    key=f"capture-authorization:{host_decision_id}",
+    expires_at=capture_authorization_expires_at,
+)
 result = await workflow.capture(
     messages, source=source, key=operation_key,
     metadata=metadata, authorization=authorization,
@@ -146,6 +151,9 @@ result = await workflow.capture(
 
 宿主负责认证、内容适用性和决定审计。重试必须沿用相同授权；缺失或不匹配的授权会在
 操作日志及 Provider 调用前失败，同一 key 更换已绑定授权会触发幂等冲突。
+调用 `revoke_capture_authorization(policy_id, decision_id, key=...)` 可持久撤销决定，
+阻止新的提取、审查和激活，并隐藏由其产生的记录。到期只阻止新处理；两者均不物理
+删除 Mem0 内容或历史。
 
 ## 生命周期
 

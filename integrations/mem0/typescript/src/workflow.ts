@@ -64,7 +64,8 @@ export class MemoryWorkflow {
       const record = await this.#memory.get(id, { includeInactive: true, ...signal });
       if (!record || record.state !== "pending") continue;
       const reviewed = await this.#memory.review({ id, version: record.version }, {
-        key: prefix + ":review:" + suffix, limit: this.#limit, ...signal,
+        key: prefix + ":review:" + suffix, limit: this.#limit,
+        ...(options.authorization === undefined ? {} : { authorization: options.authorization }), ...signal,
       });
       if (reviewed.state !== "complete" || !reviewed.review || !this.#policy) { pendingIds.push(id); continue; }
       const decision = await this.#policy(record, reviewed.review);
@@ -72,7 +73,8 @@ export class MemoryWorkflow {
       if (decision.reviewKey !== reviewed.review.key || !decision.items.some(ref => ref.id === id && ref.version === record.version)) {
         throw new TypeError("Workflow decision must include the candidate and its review key");
       }
-      const resolved = await this.#memory.resolve(decision, { key: resolveKey, ...signal });
+      const resolved = await this.#memory.resolve(decision, { key: resolveKey,
+        ...(options.authorization === undefined ? {} : { authorization: options.authorization }), ...signal });
       resolutions.push(resolved);
       if (resolved.state !== "complete") pendingIds.push(id);
     }

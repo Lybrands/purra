@@ -29,6 +29,9 @@ Mem0 保存文本与向量，适配器管理归属、状态、版本、操作回
 `memory_capture_intent` / `memoryCaptureIntent` 为准确输入生成摘要，再传入宿主签发的
 `MemoryCaptureAuthorization`。消息、来源、元数据、到期时间、策略、主体和决定会在
 Provider 或 Mem0 调度前绑定。宿主负责认证主体、判断内容是否适合捕获并审计决定。
+捕获前须用 `record_capture_authorization` / `recordCaptureAuthorization` 持久登记授权及
+可选有效期。到期只阻止新处理；显式撤销还会隐藏该决定产生的记录，但不会物理删除
+Mem0 内容或历史。
 
 | 处理类型 | 结果 |
 | --- | --- |
@@ -54,6 +57,8 @@ Provider 或 Mem0 调度前绑定。宿主负责认证主体、判断内容是�
 | `MemoryContext`、`assemble_memory_context` / `assembleMemoryContext` | 在 Token 额度内组装完整记录 |
 | `link`、`links` | 记录和查询记录版本之间的显式关系 |
 | `revoke_source` / `revokeSource` | 撤回来源或某一来源修订 |
+| `record_capture_authorization` / `recordCaptureAuthorization` | 持久登记准确的宿主捕获授权与有效期 |
+| `revoke_capture_authorization` / `revokeCaptureAuthorization` | 永久撤销一个策略决定 |
 | `validate_evidence` / `validateEvidence` | 检查已保存的记忆证据是否仍可使用 |
 
 `links` 可按 `direction`（`both`、`incoming`、`outgoing`）、精确关系名称 `relation`

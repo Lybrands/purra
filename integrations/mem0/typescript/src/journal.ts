@@ -21,6 +21,8 @@ export interface Metadata {
   purra_reason: string | null;
   purra_created: string;
   purra_updated: string;
+  purra_capture_policy?: string;
+  purra_capture_decision?: string;
 }
 export interface ItemView {
   version: number; state: Metadata["purra_state"]; metadata: MemoryMetadata;
@@ -43,6 +45,8 @@ export interface Plan {
     intent_digest: string; policy_id: string; policy_revision: string;
     principal_id: string; decision_id: string;
   };
+  valid_from?: string | null; expires?: string | null;
+  policy_id?: string; decision_id?: string;
 }
 export interface OperationRow {
   key: string; fingerprint: string; state: "running" | "unknown" | "failed" | "complete" | "discarded";
@@ -81,6 +85,13 @@ export class Journal {
       CREATE TABLE IF NOT EXISTS purra_mem0_revocations (
         scope TEXT NOT NULL, source TEXT NOT NULL, revision TEXT NOT NULL,
         PRIMARY KEY(scope,source,revision));
+      CREATE TABLE IF NOT EXISTS purra_mem0_capture_authorizations (
+        scope TEXT NOT NULL, policy TEXT NOT NULL, decision TEXT NOT NULL,
+        authorization TEXT NOT NULL, valid_from TEXT, expires TEXT,
+        PRIMARY KEY(scope,policy,decision));
+      CREATE TABLE IF NOT EXISTS purra_mem0_capture_revocations (
+        scope TEXT NOT NULL, policy TEXT NOT NULL, decision TEXT NOT NULL,
+        PRIMARY KEY(scope,policy,decision));
     `);
     this.transaction(() => {
       this.db.prepare("INSERT OR IGNORE INTO purra_mem0_info VALUES ('store',?)").run(randomUUID().replaceAll("-", ""));
@@ -150,6 +161,7 @@ export class Journal {
       const op = operation === undefined ? undefined : this.operation(operation);
       if (op?.plan.kind === "review") this.assertSnapshot(op.plan);
       if (op && op.plan.kind !== "delete" && op.plan.meta) this.assertSource(op.plan.meta);
+      if (op?.plan.capture_authorization) this.assertCaptureAuthorization(op.plan.capture_authorization);
       const limits = JSON.parse(this.db.prepare("SELECT limits FROM purra_mem0_budgets WHERE scope=? AND key=?").get(this.scope, budget)!.limits as string) as Record<string, number>;
       const used = this.usage("budget", budget);
       if (used[kind === "llm" ? "llmCalls" : "embeddingCalls"] + 1 > limits["max_" + kind + "_calls"]!
@@ -206,6 +218,50 @@ export class Journal {
       }
     });
   }
+  captureRevoked(policy: string, decision: string): boolean {
+    return !!this.db.prepare("SELECT 1 FROM purra_mem0_capture_revocations WHERE scope=? AND policy=? AND decision=?")
+      .get(this.scope, policy, decision);
+  }
+  assertCaptureAuthorization(authorization: NonNullable<Plan["capture_authorization"]>): void {
+    if (this.captureRevoked(authorization.policy_id, authorization.decision_id)) throw new MemoryError("memory_capture_authorization_revoked");
+    const row = this.db.prepare("SELECT authorization,valid_from,expires FROM purra_mem0_capture_authorizations WHERE scope=? AND policy=? AND decision=?")
+      .get(this.scope, authorization.policy_id, authorization.decision_id);
+    if (!row || JSON.stringify(JSON.parse(row.authorization as string)) !== JSON.stringify(authorization)) {
+      throw new MemoryError("memory_capture_authorization_unavailable");
+    }
+    const now = Date.now();
+    if (row.valid_from !== null && Date.parse(row.valid_from as string) > now) throw new MemoryError("memory_capture_authorization_not_yet_valid");
+    if (row.expires !== null && Date.parse(row.expires as string) <= now) throw new MemoryError("memory_capture_authorization_expired");
+  }
+  recordCaptureAuthorization(key: string, fingerprint: string, authorization: NonNullable<Plan["capture_authorization"]>,
+      validFrom: string | null, expires: string | null): void {
+    this.transaction(() => {
+      const previous = this.operation(key);
+      if (previous) { if (previous.fingerprint !== fingerprint) throw new MemoryError("memory_idempotency_conflict"); return; }
+      if (this.captureRevoked(authorization.policy_id, authorization.decision_id)) throw new MemoryError("memory_capture_authorization_revoked");
+      const row = this.db.prepare("SELECT authorization,valid_from,expires FROM purra_mem0_capture_authorizations WHERE scope=? AND policy=? AND decision=?")
+        .get(this.scope, authorization.policy_id, authorization.decision_id);
+      if (row && (JSON.stringify(JSON.parse(row.authorization as string)) !== JSON.stringify(authorization)
+          || row.valid_from !== validFrom || row.expires !== expires)) throw new MemoryError("memory_capture_authorization_conflict");
+      const plan: Plan = { kind: "record_capture_authorization", target: null, meta: null,
+        capture_authorization: authorization, valid_from: validFrom, expires };
+      this.db.prepare("INSERT INTO purra_mem0_ops VALUES (?,?,?,'complete',?,'[]')").run(this.scope, key, fingerprint, JSON.stringify(plan));
+      if (!row) this.db.prepare("INSERT INTO purra_mem0_capture_authorizations VALUES (?,?,?,?,?,?)")
+        .run(this.scope, authorization.policy_id, authorization.decision_id, JSON.stringify(authorization), validFrom, expires);
+    });
+  }
+  revokeCaptureAuthorization(key: string, fingerprint: string, policy: string, decision: string): void {
+    this.transaction(() => {
+      const previous = this.operation(key);
+      if (previous) { if (previous.fingerprint !== fingerprint) throw new MemoryError("memory_idempotency_conflict"); return; }
+      const plan: Plan = { kind: "revoke_capture_authorization", target: null, meta: null, policy_id: policy, decision_id: decision };
+      this.db.prepare("INSERT INTO purra_mem0_ops VALUES (?,?,?,'complete',?,'[]')").run(this.scope, key, fingerprint, JSON.stringify(plan));
+      if (!this.captureRevoked(policy, decision)) {
+        this.db.prepare("INSERT INTO purra_mem0_capture_revocations VALUES (?,?,?)").run(this.scope, policy, decision);
+        this.db.prepare("UPDATE purra_mem0_epochs SET epoch=epoch+1 WHERE scope=?").run(this.scope);
+      }
+    });
+  }
   item(id: string): Item | undefined {
     const row = this.db.prepare("SELECT record FROM purra_mem0_items WHERE scope=? AND id=?").get(this.scope, id);
     return row ? JSON.parse(row.record as string) as Item : undefined;
@@ -228,6 +284,7 @@ export class Journal {
       if (this.db.prepare("SELECT 1 FROM purra_mem0_ops WHERE scope=? AND state IN ('running','unknown')").get(this.scope)) throw new MemoryError("memory_write_busy");
       if (this.epoch !== epoch) throw new MemoryError("memory_context_stale");
       if (plan.review_key !== undefined) this.assertSnapshot(this.reviewPlan(plan.review_key));
+      if (plan.capture_authorization !== undefined) this.assertCaptureAuthorization(plan.capture_authorization);
       const records: Item[] = [], now = Date.now();
       for (const [index, ref] of refs.entries()) {
         const row = this.item(ref.id);

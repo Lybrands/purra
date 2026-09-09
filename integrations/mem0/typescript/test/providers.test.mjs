@@ -287,6 +287,7 @@ test("capture authorization is checked before providers and bound to retry", asy
 
   const authorization = { intentDigest: memoryCaptureIntent(messages, { source }),
     policyId: "capture", policyRevision: "v3", principalId: "host:user", decisionId: "decision-1" };
+  await memory.recordCaptureAuthorization(authorization, { key: "authorize:decision-1", expiresAt: "2099-01-01T00:00:00Z" });
   const result = await workflow.capture(messages, { ...options, authorization });
   const journal = new DatabaseSync(join(path, "journal.db"));
   const row = journal.prepare("SELECT plan FROM purra_mem0_ops WHERE json_extract(plan, '$.kind')='extract'").get();
@@ -302,6 +303,49 @@ test("capture authorization is checked before providers and bound to retry", asy
   await assert.rejects(workflow.capture(messages, { ...options,
     authorization: { ...authorization, decisionId: "decision-2" } }), { code: "memory_idempotency_conflict" });
   assert.equal(providerCalls, before);
+});
+test("capture authorization validity and revocation persist", async t => {
+  const { create } = fixture(t);
+  let providerCalls = 0;
+  const providers = { budget: reviewBudget,
+    embed: async (...args) => { providerCalls++; return embed(...args); },
+    complete: async (...args) => { providerCalls++; return complete(...args); } };
+  const memory = create({ providers });
+  const intentDigest = memoryCaptureIntent(messages, { source });
+  const workflow = new MemoryWorkflow(memory, { capturePolicyId: "capture", capturePolicyRevision: "v3" });
+
+  const future = { intentDigest, policyId: "capture", policyRevision: "v3", principalId: "host:user", decisionId: "future" };
+  await memory.recordCaptureAuthorization(future, { key: "authorize:future", validFrom: "2099-01-01T00:00:00Z" });
+  await assert.rejects(workflow.capture(messages, { source, key: "future", authorization: future }),
+    { code: "memory_capture_authorization_not_yet_valid" });
+  const expired = { ...future, decisionId: "expired" };
+  await memory.recordCaptureAuthorization(expired, { key: "authorize:expired", expiresAt: "2000-01-01T00:00:00Z" });
+  await assert.rejects(workflow.capture(messages, { source, key: "expired", authorization: expired }),
+    { code: "memory_capture_authorization_expired" });
+  assert.equal(providerCalls, 0);
+
+  const active = { ...future, decisionId: "active" };
+  await memory.recordCaptureAuthorization(active, { key: "authorize:active", expiresAt: "2099-01-01T00:00:00Z" });
+  await assert.rejects(memory.recordCaptureAuthorization({ ...active, principalId: "host:other" },
+    { key: "authorize:active:conflict", expiresAt: "2099-01-01T00:00:00Z" }),
+  { code: "memory_capture_authorization_conflict" });
+  const captured = await workflow.capture(messages, { source, key: "active", authorization: active });
+  const id = captured.extraction.ids[0];
+  await memory.revokeCaptureAuthorization("capture", "active", { key: "revoke:active" });
+  assert.equal(await memory.get(id, { includeInactive: true }), undefined);
+  const usage = memory.budgetUsage();
+  await assert.rejects(memory.review({ id, version: 1 }, { key: "review:revoked", authorization: active }),
+    { code: "memory_capture_authorization_revoked" });
+  await assert.rejects(memory.resolve({ kind: "independent", items: [{ id, version: 1 }], keep: id },
+    { key: "resolve:revoked", authorization: active }), { code: "memory_capture_authorization_revoked" });
+  assert.deepEqual(memory.budgetUsage(), usage);
+  await assert.rejects(memory.recordCaptureAuthorization(active, { key: "authorize:active:again" }),
+    { code: "memory_capture_authorization_revoked" });
+  memory.close();
+
+  const restored = create({ providers });
+  assert.equal(await restored.get(id, { includeInactive: true }), undefined);
+  assert.equal(restored.operation("revoke:active").state, "complete");
 });
 test("capture intent digest is shared with Python", () => {
   assert.equal(memoryCaptureIntent([{ role: "user", content: "作者😺" }], {

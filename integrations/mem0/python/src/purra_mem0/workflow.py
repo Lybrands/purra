@@ -86,7 +86,7 @@ class MemoryWorkflow:
                 continue  # Never reactivate a revoked or externally resolved record.
             reviewed = await self.memory.review(MemoryRef(record.id, record.version),
                                                 key=prefix + ":review:" + suffix,
-                                                limit=self.review_limit, signal=signal)
+                                                limit=self.review_limit, authorization=authorization, signal=signal)
             if reviewed.state != "complete" or reviewed.review is None or self.policy is None:
                 pending.append(item_id)
                 continue
@@ -99,7 +99,8 @@ class MemoryWorkflow:
                     or reviewed.review.candidate not in decision.items):
                 raise ValueError("workflow decision must include the candidate and its review key")
             # resolve validates all versions, scope, source authority and the reviewed group.
-            resolved = await self.memory.resolve(decision, key=resolve_key, signal=signal)
+            resolved = await self.memory.resolve(decision, key=resolve_key,
+                                                  authorization=authorization, signal=signal)
             resolutions.append(resolved)
             if resolved.state != "complete":
                 pending.append(item_id)
