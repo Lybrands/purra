@@ -19,6 +19,22 @@ scope、配置、取消、deadline、预算及 lease。MCP 写入口要求独立
 Child 写入、混合／多调用审批批次、任意嵌套审批与 clarification 组合，以及通用分布式
 效果恢复不在支持边界内。不承诺端到端 exactly-once。
 
+## 扩展 1.1 完成边界
+
+归入 1.1 的存储与效果恢复工作，已在上述 Root 单写支持边界内完成：
+
+- SQLite 元数据访问已使用索引候选页、选定 Root 日志恢复和经过校验的元数据事务。
+  双端一次性负载入口覆盖独立并发 writer、日志序列连续性、被杀事务回滚、checkpoint
+  重开和未知效果对账。测量值只描述有界合成运行点，不构成通用吞吐、延迟或生产容量保证。
+- 1.1 支持的数据升级是显式的同 SDK v4→v5 离线路径：保留历史读取，拒绝活跃 Run、
+  未解决 claim 和其他 SDK 行，并提供包含 WAL 的备份及恢复到新路径。任意历史格式迁移
+  与活跃 Run 跨版本续跑不是 1.1 公共契约。
+- 效果恢复覆盖已实现的 Root 单写完整矩阵：已确认完成时复用回执，确认未执行时重新经过
+  当前全部派发门禁，未知效果继续阻塞，终态 Run 保持终态，审批身份不匹配则拒绝对账。
+  跨机器 ownership 与通用分布式对账属于后续契约。
+
+这些完成判断不提升业务 MCP、下游、远端 CI、跨平台迁移或生产负载等独立证据门槛。
+
 ## 宿主接入顺序
 
 1. 保留备份，用原运行时完成活跃 Run 并处理未知效果。离线 v5 激活检查全部 scope，
@@ -40,6 +56,7 @@ Child 写入、混合／多调用审批批次、任意嵌套审批与 clarificat
 | 类别 | 入口 | 验证边界 |
 | --- | --- | --- |
 | 确定性 | SQLite 双端 approvals、approval-resume 测试及共享 approval JSON fixtures | 授权、决策竞争、重启、回执失败、lease 故障和只读诊断 |
+| 有界 SQLite 负载 | 构建 TypeScript Core 与 SQLite 后运行 `integrations/sqlite/python/scripts/verify_load.py` | 一次性双端数据库、并发 writer、回滚、恢复和重开；不主张生产容量 |
 | 安装产物 | MCP 双端 installed-write 消费者 | 源码目录外安装匹配 wheel/tarball，检查模块来源及内部文件排除 |
 | 独立 MCP 进程 | `integrations/mcp/fixtures/write_server.py` | 脚本模型、合成文件；成功、丢响应、写前／写后退出及写后报错，检查账本和进程退出 |
 | 真实 Provider／业务 MCP | 协议入口＋能力＋实际服务／模型 | 脚本模型及合成写服务不能证明此项 |

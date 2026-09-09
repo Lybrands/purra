@@ -25,6 +25,31 @@ Child writes, mixed/multiple-call approval batches, arbitrary nested approval an
 clarification combinations, and general distributed effect recovery are outside
 this supported boundary. No end-to-end exactly-once guarantee is made.
 
+## Expanded 1.1 completion boundary
+
+The additional storage and recovery work assigned to 1.1 is complete inside the
+supported Root single-write boundary:
+
+- SQLite metadata access uses indexed candidate pages, selected-Root journal
+  restoration and validated metadata transactions. The disposable dual-SDK
+  load check covers concurrent independent writers, continuous journal sequences,
+  killed-transaction rollback, checkpoint reopen and unknown-effect reconciliation.
+  Its measurements describe a bounded synthetic operating point; they are not a
+  universal throughput, latency or production-capacity guarantee.
+- The supported data upgrade is the explicit same-SDK v4-to-v5 offline path. It
+  preserves historical reads, rejects active Runs, unresolved claims and foreign
+  SDK rows, and provides WAL-aware backup plus restoration to a new path. Arbitrary
+  historical formats and active-Run cross-version continuation are not public 1.1
+  contracts.
+- Effect recovery covers the complete implemented Root single-write matrix:
+  confirmed completion reuses a receipt, proof of non-execution returns through
+  every current dispatch gate, unknown effects remain blocked, terminal Runs stay
+  terminal, and mismatched approval identity is rejected. Cross-machine ownership
+  and general distributed reconciliation belong to a later contract.
+
+These completion decisions do not upgrade the separate real business MCP,
+downstream, remote-CI, cross-platform migration or production-load evidence gates.
+
 ## Host integration sequence
 
 1. Preserve a backup and finish active Runs/reconcile unresolved effects with the
@@ -51,6 +76,7 @@ tool-ready continuation is schema 3. Python/TypeScript storage is not interchang
 | Evidence | Reproducible entry points | Boundary |
 | --- | --- | --- |
 | Deterministic | SQLite `test_approvals.py`, `test_approval_resume.py`; TypeScript `approvals.test.mjs`, `approval-resume.test.mjs`; shared `approval_*.json` fixtures | Synthetic authorization, decision races, restart, receipt failure, lease faults and read-only inspection |
+| Bounded SQLite load | `integrations/sqlite/python/scripts/verify_load.py` after building TypeScript Core and SQLite | Disposable dual-SDK database, concurrent writers, rollback, recovery and reopen; no production capacity claim |
 | Installed artifacts | MCP Python `scripts/check_installed_write.py`, TypeScript `scripts/check-installed-write.mjs` | Install matching wheel/tarballs outside source; check package origins and private-file exclusion |
 | Independent MCP process | `integrations/mcp/fixtures/write_server.py`, driven by both installed consumers | Scripted model, synthetic file; success, lost response, exit before/after write and error after write; verify ledger and process cleanup |
 | Real Provider/business MCP | Host-selected protocol + capability + actual service/model | Not established by scripted models or synthetic writers |
