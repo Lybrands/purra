@@ -1,6 +1,7 @@
 // Deterministic recovery audit; shared with the regression tests.
 // Run: npm --prefix typescript run build && node scripts/audit_retrieval_evidence.mjs
 // Uses deterministic gateways and in-memory repositories; no external services.
+import { treeTestGateway } from "../typescript/test/support/model-gateway.mjs";
 import assert from "node:assert/strict";
 import { pathToFileURL } from "node:url";
 import {
@@ -58,7 +59,7 @@ function makeAgent(adapters, counts, invoke, options = {}) {
     retriever: { async retrieve() { counts.retrieval += 1; return [HIT]; } },
   });
   return new Agent({
-    model: { capabilities: options.capabilities ?? CAPABILITIES, invoke }, tools: [retrieval.definition],
+    model: treeTestGateway({ capabilities: options.capabilities ?? CAPABILITIES, invoke }), tools: [retrieval.definition],
     context: options.context?.(counts) ?? contextOptions(counts, options.compression), runRepository: adapters.runs,
     outputPublisher: adapters.outputs,
     agentTree: { repository: adapters.runTree, rootAgentId: "audit-root-agent" },
@@ -125,21 +126,34 @@ export async function replayCheckpoint(captured, options = {}) {
   const adapters = new InMemoryAgentAdapters({ agentTreeClockMs: () => now });
   const counts = { provider: 0, compression: 0, retrieval: 0 };
   const received = [];
+  let releaseRoot, rootEntered;
+  const rootGate = new Promise(resolve => { releaseRoot = resolve; });
+  const rootStarted = new Promise(resolve => { rootEntered = resolve; });
+  let startingRoot = true;
   const agent = makeAgent(adapters, counts, async (request) => {
-    received.push(request);
-    return turn(request, "recovered");
-  }, options);
-  const rootId = "audit-replay-root";
-  await adapters.runs.begin({
-    requestedRunId: rootId, agentId: "audit-root-agent", preset: captured.rootSnapshot.preset,
-    deadlineAt: null, budgets: captured.rootSnapshot.budgets, metadata: {},
-  });
-  await adapters.runTree.beginRoot({
-    runId: rootId, agentId: "audit-root-agent", name: "root", title: "Root",
-    instruction: "Own the audit.", objective: "Replay a checkpoint.",
-    capabilityGrant: new AgentCapabilityGrant(captured.rootSnapshot.preset.agentTree.capabilityGrant),
-    idempotencyKey: `begin:${rootId}`,
-  });
+    if (request.messages.some(m => m.content === CHILD.instruction)) {
+      received.push(request);
+      return turn(request, "recovered");
+    }
+    rootEntered();
+    await rootGate;
+    return turn(request, "Root complete");
+  }, {...options, context: () => {
+    const {provider, providerFactory, compression, compressionFactory, ...configuration} =
+      options.context?.(counts) ?? contextOptions(counts, options.compression);
+    return {...configuration,
+      providerFactory: tasks => startingRoot ? undefined : (providerFactory?.(tasks) ?? provider),
+      compressionFactory: tasks => startingRoot ? undefined : (compressionFactory?.(tasks) ?? compression),
+    };
+  }});
+  // The live Root owns recovery; only the Child is restored from a checkpoint.
+  const handle = await agent.submit({messages:[{role:"user",content:"Recover audit."}]}, OPTIONS);
+  handle.result.catch(() => undefined);
+  await rootStarted;
+  startingRoot = false;
+  try {
+  const rootId = handle.runId;
+  counts.provider = counts.compression = counts.retrieval = 0;
   const [child] = (await adapters.runTree.spawnAgents({
     parentRunId: rootId, idempotencyKey: "audit-child", children: [{
       ...CHILD,
@@ -169,9 +183,7 @@ export async function replayCheckpoint(captured, options = {}) {
     ...checkpoint, runId: claim.runId, messages,
   }, lease);
   now += 10;
-  const aggregation = await agent.recoverAgentTreeRoot(rootId, {
-    messages: [{ role: "user", content: "Recover audit." }],
-  }, OPTIONS);
+  const aggregation = await agent.joinAgentRuns(rootId, [claim.runId]);
   const snapshot = await adapters.runs.get(claim.runId);
   const events = await adapters.runs.listRootEvents(rootId, 0);
   const receipt = events.find((event) => event.runId === claim.runId && event.kind === "invocation.started")?.payload.receipt;
@@ -186,6 +198,10 @@ export async function replayCheckpoint(captured, options = {}) {
     providerInputEstimate: request === undefined ? null : estimateMessagesTokens(request.messages),
     declaredWindow: (options.capabilities ?? CAPABILITIES).contextWindowTokens,
   } };
+  } finally {
+    releaseRoot();
+    await handle.result.catch(() => undefined);
+  }
 }
 
 async function projectionControl(checkpoint) {

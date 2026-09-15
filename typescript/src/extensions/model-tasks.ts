@@ -66,6 +66,8 @@ export interface ModelTaskInvocationAuthority {
   ): Promise<void>;
   persistPlanningProgress?(receipt: ModelInvocationReceipt, progress: PlanningProgress): Promise<boolean>;
   recordModelDiagnostics?(receipt: ModelInvocationReceipt, metrics: Readonly<Record<string, JsonValue>>): Promise<void>;
+  publishParentProgress?(receipt: ModelInvocationReceipt, index: number, chunk: ModelStreamChunk): Promise<void>;
+  publishParentProgressState?(receipt: ModelInvocationReceipt, state: "completed" | "aborted"): Promise<void>;
   publishRecoveryDecision(decision: RecoveryDecision, round: number): Promise<void>;
 }
 
@@ -352,6 +354,31 @@ export class ModelTaskRunner {
       throw error;
     });
     return Object.freeze({ turn, outputBudget: request.outputBudget });
+  }
+
+  public async streamProgress(messages: readonly Message[], options: ModelTaskOptions = {}): Promise<void> {
+    if (typeof this.#model.stream !== "function" || this.#capabilities?.protocol.streaming !== "supported") throw new AgentError("model_stream_unavailable", "Parent presentation requires streaming");
+    if (!this.#authority?.publishParentProgress || !this.#authority?.publishParentProgressState) throw new AgentError("parent_presentation_unavailable", "Parent presentation requires durable output authority");
+    let receipt: ModelInvocationReceipt | undefined;
+    let index = 0;
+    let hasContent = false;
+    let published = false;
+    try {
+      await this.#invoke(this.#request(copyMessages(messages), options), options.signal, true, async (chunk, current) => {
+        receipt = current;
+        hasContent ||= Boolean(chunk.contentDelta?.trim());
+        if (chunk.finishReason !== undefined && !hasContent) throw new AgentError("stage_output_empty", "Parent presentation returned no text");
+        if ((chunk.toolCallDeltas?.length ?? 0) > 0) throw new AgentError("stage_output_tool_call", "Parent presentation cannot call tools");
+        published = true;
+        await this.#authority!.publishParentProgress!(current!, index++, chunk);
+      });
+      if (receipt) await this.#authority.publishParentProgressState(receipt, "completed");
+    } catch (error) {
+      if (receipt && published) {
+        try { await this.#authority.publishParentProgressState(receipt, "aborted"); } catch { /* Retain the original stream failure. */ }
+      }
+      throw error;
+    }
   }
 
   public async streamText(

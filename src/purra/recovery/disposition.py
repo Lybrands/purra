@@ -47,6 +47,14 @@ def decide_failure(
             if signal.checkpoint_available
             else FailureDisposition.RETRY_ATTEMPT
         )
+    elif (
+        signal.category is FailureCategory.TRANSIENT_PROVIDER
+        and signal.retryable
+    ):
+        # Automatic attempts are exhausted, but this is still a provider
+        # condition that may recover.  Preserve the Unit for a durable resume
+        # instead of converting the whole task into a permanent failure.
+        disposition = FailureDisposition.PAUSE_RECOVERABLE
     else:
         disposition = FailureDisposition.FAIL_PERMANENT
     return FailureDecision(

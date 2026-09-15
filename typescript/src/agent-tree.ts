@@ -121,6 +121,7 @@ export interface AgentNode {
 }
 
 export interface AgentTreeRun {
+  readonly dependencyRunIds: readonly string[];
   readonly runId: string;
   readonly agentId: string;
   readonly rootRunId: string;
@@ -151,6 +152,7 @@ export interface ContextCheckpoint {
 }
 
 export interface ChildAgentSpec {
+  readonly dependsOn?: readonly string[];
   readonly name: string;
   readonly title: string;
   readonly instruction: string;
@@ -298,21 +300,35 @@ export class InMemoryRunTreeRepository implements RunTreeRepository {
   readonly #clockMs: () => number;
 
   /** Opaque version-pinned storage data, never a public output projection. */
-  public exportState(): string { return encodeStorageState("purra.tree-state/v1", { agents: this.#agents, runs: this.#runs, checkpoints: this.#checkpoints, spawnReceipts: new Map([...this.#spawnReceipts].map(([id, value]) => [id, { digest: value.digest, receipt: value.receipt }])), continueReceipts: new Map([...this.#continueReceipts].map(([id, value]) => [id, { digest: value.digest, receipt: value.receipt }])), rootDigests: this.#rootDigests, sequence: this.#sequence, agentSequence: this.#agentSequence, runSequence: this.#runSequence, batchSequence: this.#batchSequence, checkpointSequence: this.#checkpointSequence }); }
+  public exportState(): string { return encodeStorageState("purra.tree-state/v3", { agents: this.#agents, runs: this.#runs, checkpoints: this.#checkpoints, spawnReceipts: new Map([...this.#spawnReceipts].map(([id, value]) => [id, { digest: value.digest, receipt: value.receipt }])), continueReceipts: new Map([...this.#continueReceipts].map(([id, value]) => [id, { digest: value.digest, receipt: value.receipt }])), rootDigests: this.#rootDigests, sequence: this.#sequence, agentSequence: this.#agentSequence, runSequence: this.#runSequence, batchSequence: this.#batchSequence, checkpointSequence: this.#checkpointSequence }); }
   public importState(text: string): void {
     const shape = { agents: this.#agents, runs: this.#runs, checkpoints: this.#checkpoints, spawnReceipts: this.#spawnReceipts, continueReceipts: this.#continueReceipts, rootDigests: this.#rootDigests, sequence: this.#sequence, agentSequence: this.#agentSequence, runSequence: this.#runSequence, batchSequence: this.#batchSequence, checkpointSequence: this.#checkpointSequence };
-    const saved = decodeStorageState(text, "purra.tree-state/v1", shape) as typeof shape;
+    const saved = decodeStorageState(text, "purra.tree-state/v3", shape) as typeof shape;
+    const restoredRuns = new Map([...saved.runs].map(([id, run]) => [id, freezeRun(run)]));
+    for (const [id, run] of restoredRuns) {
+      if (id !== run.runId) throw new TypeError("Stored dependency Run identity mismatch");
+      for (const dependencyId of run.dependencyRunIds) {
+        const dependency = restoredRuns.get(dependencyId);
+        if (dependency === undefined || run.parentRunId === null || dependency.parentRunId !== run.parentRunId || dependency.rootRunId !== run.rootRunId) {
+          throw new TypeError("Stored dependency is outside its sibling scope");
+        }
+      }
+    }
+    validateDependencyGraph(new Map([...restoredRuns].map(([id, run]) => [id, run.dependencyRunIds])));
     for (const value of [...saved.spawnReceipts.values(), ...saved.continueReceipts.values()]) requireStorageFields(value, ["digest", "receipt"]);
     const restoreAgent = (node: AgentNode): AgentNode => freezeAgent({ ...node, capabilityGrant: new AgentCapabilityGrant(node.capabilityGrant) });
-    this.#agents.clear(); for (const [key, value] of saved.agents) this.#agents.set(key, restoreAgent(value));
-    this.#runs.clear(); for (const [key, value] of saved.runs) this.#runs.set(key, value);
-    this.#checkpoints.clear(); for (const [key, value] of saved.checkpoints) this.#checkpoints.set(key, value);
-    this.#spawnReceipts.clear(); for (const [key, value] of saved.spawnReceipts) this.#spawnReceipts.set(key, {
+    const restoredAgents = new Map([...saved.agents].map(([key, value]) => [key, restoreAgent(value)]));
+    const restoredSpawn = new Map([...saved.spawnReceipts].map(([key, value]) => [key, {
       ...value, receipt: { ...value.receipt, items: value.receipt.items.map(item => ({ ...item, agent: restoreAgent(item.agent) })) },
-    });
-    this.#continueReceipts.clear(); for (const [key, value] of saved.continueReceipts) this.#continueReceipts.set(key, {
+    }]));
+    const restoredContinue = new Map([...saved.continueReceipts].map(([key, value]) => [key, {
       ...value, receipt: { ...value.receipt, agent: restoreAgent(value.receipt.agent) },
-    });
+    }]));
+    this.#agents.clear(); for (const [key, value] of restoredAgents) this.#agents.set(key, value);
+    this.#runs.clear(); for (const [key, value] of restoredRuns) this.#runs.set(key, value);
+    this.#checkpoints.clear(); for (const [key, value] of saved.checkpoints) this.#checkpoints.set(key, value);
+    this.#spawnReceipts.clear(); for (const [key, value] of restoredSpawn) this.#spawnReceipts.set(key, value);
+    this.#continueReceipts.clear(); for (const [key, value] of restoredContinue) this.#continueReceipts.set(key, value);
     this.#rootDigests.clear(); for (const [key, value] of saved.rootDigests) this.#rootDigests.set(key, value);
     this.#sequence = saved.sequence;
     this.#agentSequence = saved.agentSequence;
@@ -387,6 +403,7 @@ export class InMemoryRunTreeRepository implements RunTreeRepository {
       parentRunId: null,
       previousRunId: agent.latestRunId,
       spawnBatchId: null,
+      dependencyRunIds: Object.freeze([]),
       objective: requiredText(command.objective, "root Run objective"),
       input: Object.freeze({}),
       required: true,
@@ -416,8 +433,9 @@ export class InMemoryRunTreeRepository implements RunTreeRepository {
     if (new Set(children.map((child) => child.name)).size !== children.length) {
       throw new TypeError("Spawned Agent names must be unique");
     }
+    validateDependencies(children);
     const idempotencyKey = requiredText(command.idempotencyKey, "spawn idempotency key");
-    const digest = await stableFingerprint(children.map(childSpecJson));
+    const digest = await stableFingerprint({children: children.map(childSpecJson)});
     const key = keyOf(parentRunId, idempotencyKey);
     const replay = this.#spawnReceipts.get(key);
     if (replay !== undefined) {
@@ -450,10 +468,12 @@ export class InMemoryRunTreeRepository implements RunTreeRepository {
     if (participating.size + children.length > grant.maxAgentsPerRoot) {
       fail("agent_capacity_exceeded", "Root Agent capacity was exceeded");
     }
+    const grants = children.map(spec => grant.authorizeChild(spec.capabilityGrant));
+    const dependencyIds = new Map(children.map((spec, index) => [spec.name, `agent-run-${this.#runSequence + index + 1}`]));
     this.#batchSequence += 1;
     const batchId = `agent-batch-${this.#batchSequence}`;
-    const items = children.map((spec) => {
-      const childGrant = grant.authorizeChild(spec.capabilityGrant);
+    const items = children.map((spec, index) => {
+      const childGrant = grants[index]!;
       this.#agentSequence += 1;
       this.#runSequence += 1;
       const agentId = `agent-${this.#agentSequence}`;
@@ -481,6 +501,7 @@ export class InMemoryRunTreeRepository implements RunTreeRepository {
         parentRunId: parentRun.runId,
         previousRunId: null,
         spawnBatchId: batchId,
+        dependencyRunIds: Object.freeze(spec.dependsOn.map(name => dependencyIds.get(name)!)),
         objective: spec.objective,
         input: spec.input,
         required: spec.required,
@@ -577,6 +598,7 @@ export class InMemoryRunTreeRepository implements RunTreeRepository {
       parentRunId: requester.runId,
       previousRunId: target.latestRunId,
       spawnBatchId: null,
+      dependencyRunIds: Object.freeze([]),
       objective: input.message,
       input: Object.freeze({}),
       required: input.required,
@@ -606,6 +628,7 @@ export class InMemoryRunTreeRepository implements RunTreeRepository {
     const reclaimable = (run.status === "running" && this.#leaseExpired(run, now))
       || (run.status === "waiting" && run.leaseOwnerId === null && run.leaseEpoch > 0);
     if (run.status !== "queued" && !reclaimable) return undefined;
+    if (run.dependencyRunIds.some(id => ACTIVE_RUN_STATUSES.has(this.#requireRun(id).status))) return undefined;
     const ownerId = requiredText(options.ownerId ?? "run-tree-supervisor", "lease owner id");
     const leaseDurationMs = positive(options.leaseDurationMs ?? 30_000, "lease duration");
     const root = this.#requireActiveAgent(this.#requireRun(run.rootRunId).agentId);
@@ -870,6 +893,7 @@ export class InMemoryRunTreeRepository implements RunTreeRepository {
     return Object.freeze([...this.#runs.values()]
       .filter((run) => (
         run.rootRunId === root
+        && run.dependencyRunIds.every(id => !ACTIVE_RUN_STATUSES.has(this.#requireRun(id).status))
         && (
           run.status === "queued"
           || (run.status === "waiting" && run.leaseOwnerId === null && run.leaseEpoch > 0)
@@ -1003,6 +1027,7 @@ export class InMemoryRunTreeRepository implements RunTreeRepository {
 }
 
 interface NormalizedChildAgentSpec {
+  readonly dependsOn: readonly string[];
   readonly name: string;
   readonly title: string;
   readonly instruction: string;
@@ -1032,6 +1057,7 @@ function copyChildSpec(value: ChildAgentSpec): NormalizedChildAgentSpec {
   }
   return Object.freeze({
     name: requiredText(value.name, "child Agent name"),
+    dependsOn: uniqueText(value.dependsOn ?? [], "Child dependency"),
     title: requiredText(value.title, "child Agent title"),
     instruction: requiredText(value.instruction, "child Agent instruction"),
     objective: requiredText(value.objective, "child Agent objective"),
@@ -1046,6 +1072,7 @@ function copyChildSpec(value: ChildAgentSpec): NormalizedChildAgentSpec {
 
 function childSpecJson(value: NormalizedChildAgentSpec): JsonValue {
   return {
+    dependsOn: [...value.dependsOn],
     name: value.name,
     title: value.title,
     instruction: value.instruction,
@@ -1062,7 +1089,25 @@ function freezeAgent(value: AgentNode): AgentNode {
 }
 
 function freezeRun(value: AgentTreeRun): AgentTreeRun {
-  return Object.freeze(value);
+  return Object.freeze({...value, dependencyRunIds: uniqueText(value.dependencyRunIds, "dependency Run id")});
+}
+
+function validateDependencies(children: readonly NormalizedChildAgentSpec[]): void {
+  validateDependencyGraph(new Map(children.map(child => [child.name, child.dependsOn])));
+}
+
+function validateDependencyGraph(graph: ReadonlyMap<string, readonly string[]>): void {
+  const visited = new Set<string>(), active = new Set<string>();
+  const visit = (name: string): void => {
+    if (!graph.has(name)) throw new TypeError("Child dependency must name a sibling in the spawn command");
+    if (active.has(name)) throw new TypeError("Child dependencies must be acyclic");
+    if (visited.has(name)) return;
+    active.add(name);
+    for (const dependency of graph.get(name)!) visit(dependency);
+    active.delete(name);
+    visited.add(name);
+  };
+  for (const name of graph.keys()) visit(name);
 }
 
 function sameGrant(left: AgentCapabilityGrant, right: AgentCapabilityGrant): boolean {

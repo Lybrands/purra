@@ -79,6 +79,8 @@ class AgentRunSupervisor:
         self,
         repository: RunTreeRepository,
         executor: AgentTreeRunExecutor,
+        *,
+        deliver_results=None,
     ) -> None:
         """Attach tree scheduling to this execution owner exactly once."""
 
@@ -87,6 +89,7 @@ class AgentRunSupervisor:
         self._agent_tree = _AgentTreeSchedulingCapability(
             repository=repository,
             executor=executor,
+            deliver_results=deliver_results,
             owner_id=self._owner_id,
             lease_duration_ms=self._lease_duration_ms,
         )
@@ -99,6 +102,7 @@ class AgentRunSupervisor:
         *,
         lease_owner_id: str | None = None,
         lease_epoch: int | None = None,
+        delivery_signal: asyncio.Event | None = None,
     ) -> AgentRunAggregation:
         tree = self._agent_tree
         if tree is None:
@@ -112,6 +116,7 @@ class AgentRunSupervisor:
             signal,
             lease_owner_id=lease_owner_id,
             lease_epoch=lease_epoch,
+            delivery_signal=delivery_signal,
         )
 
     async def submit(

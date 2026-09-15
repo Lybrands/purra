@@ -2,6 +2,41 @@
 
 ## 1.0.0 — Unreleased development
 
+- Internal restructuring with no public API or behavior change: split
+  `purra/contracts/__init__.py` into per-domain modules behind an unchanged
+  re-export facade; convert `purra/agent_tree.py` into a package
+  (`contracts` / `ports` / `memory` / `lease` / `query` / `receiver` /
+  `delivery`) so the contract layer no longer imports adapter state; extract
+  tree orchestration, durable resume, planning promotion, orchestration
+  support, and run-budget helpers out of `engine/orchestrator.py` into
+  focused modules guarded by the structure ratchet; centralize
+  `AgentModelInvocationManager` construction behind
+  `create_model_invocation_manager`; add the shared batch tool-scope
+  predicate (`tools.scoping`) consumed by both authorization layers; move
+  `LongTaskExecutionStatus` / `LongTaskExecutionUpdate` /
+  `LongTaskExecutionResult` ownership into `long_tasks.contracts`; split the
+  long-task dispatcher's recipe compiler, progress payloads, and continuation
+  binding into modules; split the in-memory long-task repository into
+  scheduling and settlement mixins; make `StorageSession` port forwarding
+  explicit properties; load `purra.testing` lazily from `purra.api`; rename
+  `tools.contract.py` to `tools.contracts.py`; de-duplicate the
+  `BufferedEventSink` name; and add an SDK type-name parity ratchet
+  (`tests/test_sdk_parity_names.py` with `docs/sdk-parity-names.json`).
+- Unify execution output under its owning Agent. Parallel Recipe operations
+  share their Run; only independent Agent loops create delegated executions.
+- Return available delegation results to the normal model loop through
+  `delegateToAgents` and `receiveAgentResults`, without timed collection windows
+  or default stage-presentation model calls. Managed serial presentation requires
+  an explicit host instruction; remove the built-in prompt and reject unconfigured
+  explicit presentation before side effects. Preserve legacy delivery recovery
+  checks and snapshot fields. See [unified output](conformance/parent-result-streaming.md).
+- Retain Agent dependency scope/cycle checks, failure blocking and cancellation;
+  durable Recipe dependencies use the operation scheduler with lease fencing.
+- Remove `bind_agent_tree_root` / `recover_agent_tree_root` and TypeScript
+  `bindAgentTreeRoot` / `recoverAgentTreeRoot`. Root recovery uses `resume` with
+  canonical checkpoints and execution ownership. Child joins require an active
+  Root, and unresolved delivery is checked before restarting execution.
+
 - Add optional host-owned memory selection callbacks and read-only relation
   proposals in both SDKs. Hosts own retrieval ordering, relation vocabulary,
   extraction and explicit adoption; current scope, source revisions, evidence

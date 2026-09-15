@@ -134,7 +134,7 @@ class RunEvidenceStore:
 
     def resolve_child_runs(self, tool_call_id: str, content: str) -> None:
         record = self._records[f"tool:{tool_call_id}"]
-        if record.tool_name != "delegateToAgents":
+        if record.tool_name not in {"delegateToAgents", "receiveAgentResults", "continueAgent"}:
             raise ValueError("Only a Child Run receipt can be resolved")
         tokens = estimate_text_tokens(content)
         self._records[record.evidence_id] = replace(record, content=content, token_estimate=tokens)

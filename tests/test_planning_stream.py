@@ -3,7 +3,11 @@ from pathlib import Path
 
 import pytest
 
-from purra.planning_stream import PlanningStreamParser, PlanningStreamError
+from purra.planning_stream import (
+    PlanningStreamParser,
+    PlanningStreamError,
+    PlanningTextDeltaParser,
+)
 
 
 FIXTURE = json.loads((Path(__file__).parents[1] / "conformance/fixtures/planning_stream.json").read_text())
@@ -43,6 +47,19 @@ def test_partial_and_unknown_records_are_never_public_and_buffers_are_bounded():
         parser.feed('"}\n')
 
 
+def test_planning_text_delta_parser_decodes_progress_without_exposing_wire_or_plan():
+    parser = PlanningTextDeltaParser()
+    pieces = [
+        '{"v":1,"type":"progress","text":"先',
+        '\\u6838\\u5bf9\\n范',
+        '围"}\n{"v":1,"type":"plan","plan":{"secret":"PRIVATE"}}\n',
+    ]
+    deltas = [delta for piece in pieces for delta in parser.feed(piece)]
+    assert "".join(delta.text for delta in deltas) == "先核对\n范围"
+    assert {delta.record_index for delta in deltas} == {1}
+    assert "PRIVATE" not in str(deltas)
+
+
 import asyncio
 from dataclasses import replace
 
@@ -61,7 +78,8 @@ def _request():
 
 def wire(plan=None, text=None):
     return json.dumps({"v": 1, "type": "progress", "text": text} if text else
-                      {"v": 1, "type": "plan", "plan": plan or {"needsTodos": False, "reason": "PRIVATE_PLAN_MARKER"}}, ensure_ascii=False) + "\n"
+                      {"v": 1, "type": "plan", "plan": plan or {"needsTodos": False, "reason": "PRIVATE_PLAN_MARKER"}},
+                      ensure_ascii=False, separators=(",", ":")) + "\n"
 
 
 class Policy:
@@ -777,12 +795,15 @@ async def test_cancel_settles_already_reported_planning_usage_once():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("width", FIXTURE["deltaChunkWidths"])
 async def test_planning_delta_preserves_each_chunk_before_next_chunk_and_plan_commit(width):
-    wire_text = wire(text="准备核对。") + wire().rstrip("\n")
-    parts = [wire_text[i:i + width] for i in range(0, len(wire_text), width)]
+    text = "准备核对。"
+    progress_wire = wire(text=text)
+    prefix, suffix = progress_wire.split(text)
+    parts = [text[i:i + width] for i in range(0, len(text), width)]
     gates = [asyncio.Event() for _ in parts]
     script = [ModelStreamChunk(reasoning_delta="reasoning-only")]
-    for part, gate in zip(parts, gates):
-        script.extend([part, gate])
+    for index, (part, gate) in enumerate(zip(parts, gates)):
+        script.extend([(prefix if index == 0 else "") + part, gate])
+    script.append(suffix + wire().rstrip("\n"))
     core, adapters, gateway = managed([script])
     seen = []
     try:
@@ -801,7 +822,7 @@ async def test_planning_delta_preserves_each_chunk_before_next_chunk_and_plan_co
                 gates[index].set()
             assert (await handle.wait()).status.value == "done"
         assert len(seen) == len(parts)
-        assert "".join(event.payload["textDelta"] for event in seen) == wire_text
+        assert "".join(event.payload["textDelta"] for event in seen) == text
         assert seen == [event async for event in handle.subscribe() if event.kind is OutputEventKind.PLANNING_DELTA]
     finally:
         for gate in gates:
@@ -811,14 +832,18 @@ async def test_planning_delta_preserves_each_chunk_before_next_chunk_and_plan_co
 
 @pytest.mark.asyncio
 async def test_planning_delta_keeps_rejected_attempt_separate_from_repair():
-    core, adapters, gateway = managed([["{", "invalid\n"], [wire()]])
+    prefix = '{"v":1,"type":"progress","text":"'
+    core, adapters, gateway = managed([
+        [prefix + "旧预览", '"oops\n'],
+        [wire(text="新预览") + wire()],
+    ])
     try:
         handle = await core.submit(_request())
         assert (await handle.wait()).status.value == "done"
         events = [event async for event in handle.subscribe() if event.kind is OutputEventKind.PLANNING_DELTA]
-        assert [event.payload["attempt"] for event in events] == [0, 0, 1]
-        assert [event.payload["textDelta"] for event in events[:2]] == ["{", "invalid\n"]
-        assert events[0].invocation_id != events[2].invocation_id
+        assert [event.payload["attempt"] for event in events] == [0, 1]
+        assert [event.payload["textDelta"] for event in events] == ["旧预览", "新预览"]
+        assert events[0].invocation_id != events[1].invocation_id
         assert gateway.executions == 1
     finally:
         await core.close()
@@ -827,7 +852,8 @@ async def test_planning_delta_keeps_rejected_attempt_separate_from_repair():
 @pytest.mark.asyncio
 async def test_cancel_after_partial_planning_delta_prevents_late_preview_and_execution():
     gate = asyncio.Event()
-    core, adapters, gateway = managed([["{", gate, '"late":true}']])
+    prefix = '{"v":1,"type":"progress","text":"'
+    core, adapters, gateway = managed([[prefix + "先", gate, '后续"}\n' + wire()]])
     try:
         async with asyncio.timeout(5):
             handle = await core.submit(_request())
@@ -839,7 +865,7 @@ async def test_cancel_after_partial_planning_delta_prevents_late_preview_and_exe
             before = [event async for event in handle.subscribe()]
             gate.set()
             assert before == [event async for event in handle.subscribe()]
-            assert [e.payload["textDelta"] for e in before if e.kind is OutputEventKind.PLANNING_DELTA] == ["{"]
+            assert [e.payload["textDelta"] for e in before if e.kind is OutputEventKind.PLANNING_DELTA] == ["先"]
             assert gateway.executions == 0
     finally:
         gate.set()

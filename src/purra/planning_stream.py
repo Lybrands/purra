@@ -11,6 +11,7 @@ from purra.json_values import freeze_json_mapping
 PLANNING_STREAM_SCHEMA = "purra.planning-stream/v1"
 PLANNING_STREAM_INSTRUCTION = """Use purra.planning-stream/v1: UTF-8 JSON Lines,
 one compact JSON object per record. Terminate every progress record with LF.
+Use the exact compact key order shown below for every record.
 Emit zero to sixteen {"v":1,"type":"progress","text":"short user-facing intent"}
 records, then exactly one {"v":1,"type":"plan","plan":<the required plan object>}.
 No other keys, record types, Markdown, or text outside records. Each progress text
@@ -55,6 +56,156 @@ class PlanningProgress:
     def to_mapping(self) -> dict[str, object]:
         return {"text": self.text, "recordIndex": self.record_index,
                 "sourceStart": self.source_start, "sourceEnd": self.source_end}
+
+
+@dataclass(frozen=True, slots=True)
+class PlanningTextDelta:
+    text: str
+    record_index: int
+
+
+class PlanningTextDeltaParser:
+    """Project only the ordered public ``progress.text`` JSON string.
+
+    The planning instruction requires the compact key order shown in its
+    example. Bytes from plan records and malformed prefixes are skipped. JSON
+    string escapes are decoded incrementally, so raw protocol syntax never
+    crosses the public boundary.
+    """
+
+    _PREFIX = '{"v":1,"type":"progress","text":"'
+    _ESCAPES = {
+        '"': '"', "\\": "\\", "/": "/", "b": "\b",
+        "f": "\f", "n": "\n", "r": "\r", "t": "\t",
+    }
+
+    def __init__(self) -> None:
+        self._state = "prefix"
+        self._prefix_index = 0
+        self._record_index = 1
+        self._unicode = ""
+        self._high_surrogate: int | None = None
+
+    def feed(self, text: str) -> tuple[PlanningTextDelta, ...]:
+        emitted: list[PlanningTextDelta] = []
+        current: list[str] = []
+
+        def flush() -> None:
+            if current:
+                emitted.append(PlanningTextDelta(
+                    "".join(current), self._record_index,
+                ))
+                current.clear()
+
+        for character in text:
+            if self._state == "skip":
+                if character == "\n":
+                    self._next_record()
+                continue
+            if self._state == "prefix":
+                if character == self._PREFIX[self._prefix_index]:
+                    self._prefix_index += 1
+                    if self._prefix_index == len(self._PREFIX):
+                        self._state = "text"
+                    continue
+                self._state = "skip"
+                if character == "\n":
+                    self._next_record()
+                continue
+            if self._state == "escape":
+                if character == "u":
+                    self._unicode = ""
+                    self._state = "unicode"
+                elif character in self._ESCAPES:
+                    current.append(self._ESCAPES[character])
+                    self._state = "text"
+                else:
+                    flush()
+                    self._state = "skip"
+                continue
+            if self._state == "unicode":
+                if character not in "0123456789abcdefABCDEF":
+                    flush()
+                    self._state = "skip"
+                    continue
+                self._unicode += character
+                if len(self._unicode) < 4:
+                    continue
+                value = int(self._unicode, 16)
+                if 0xD800 <= value <= 0xDBFF:
+                    self._high_surrogate = value
+                    self._state = "low_slash"
+                elif 0xDC00 <= value <= 0xDFFF:
+                    flush()
+                    self._state = "skip"
+                else:
+                    current.append(chr(value))
+                    self._state = "text"
+                continue
+            if self._state == "low_slash":
+                if character == "\\":
+                    self._state = "low_u"
+                else:
+                    flush()
+                    self._state = "skip"
+                continue
+            if self._state == "low_u":
+                if character == "u":
+                    self._unicode = ""
+                    self._state = "low_unicode"
+                else:
+                    flush()
+                    self._state = "skip"
+                continue
+            if self._state == "low_unicode":
+                if character not in "0123456789abcdefABCDEF":
+                    flush()
+                    self._state = "skip"
+                    continue
+                self._unicode += character
+                if len(self._unicode) < 4:
+                    continue
+                low = int(self._unicode, 16)
+                high = self._high_surrogate
+                if high is None or not 0xDC00 <= low <= 0xDFFF:
+                    flush()
+                    self._state = "skip"
+                    continue
+                current.append(chr(0x10000 + ((high - 0xD800) << 10) + low - 0xDC00))
+                self._high_surrogate = None
+                self._state = "text"
+                continue
+            if self._state == "suffix":
+                if character == "}":
+                    self._state = "newline"
+                else:
+                    self._state = "skip"
+                continue
+            if self._state == "newline":
+                if character == "\n":
+                    self._next_record()
+                else:
+                    self._state = "skip"
+                continue
+            if character == "\\":
+                self._state = "escape"
+            elif character == '"':
+                flush()
+                self._state = "suffix"
+            elif ord(character) < 32 or 0xD800 <= ord(character) <= 0xDFFF:
+                flush()
+                self._state = "skip"
+            else:
+                current.append(character)
+        flush()
+        return tuple(emitted)
+
+    def _next_record(self) -> None:
+        self._record_index += 1
+        self._prefix_index = 0
+        self._state = "prefix"
+        self._unicode = ""
+        self._high_surrogate = None
 
 
 class PlanningStreamParser:
@@ -174,4 +325,5 @@ class PlanningStreamParser:
 
 
 __all__ = ["PLANNING_STREAM_SCHEMA", "PLANNING_STREAM_INSTRUCTION", "PlanningScope",
-           "PlanningProgress", "PlanningStreamParser", "PlanningStreamError"]
+           "PlanningProgress", "PlanningTextDelta", "PlanningTextDeltaParser",
+           "PlanningStreamParser", "PlanningStreamError"]

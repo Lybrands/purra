@@ -10,13 +10,27 @@ import asyncio
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Protocol, runtime_checkable
 
 from purra.contracts import AgentRunRequest, ExecutionRecipe, ExecutionPlan
+from purra.agent_tree import AgentTreeRun, AgentNode
+from purra.long_tasks.progress import (
+    final_response as _final_response,
+    progress_unit_payload as _progress_unit_payload,
+)
+from purra.long_tasks.recipe_compiler import (
+    compile_recipe_units as _compile_recipe_units,
+    require_same_recipe as _require_same_recipe,
+    same_optional_text as _same_optional_text,
+)
+from purra.long_tasks.continuation import prepare_continuation
+from purra.long_tasks.coordinator import LongTaskUnitSettlement
+from purra.errors import ContractViolationError
 from purra.events import AgentEvent, CoreEventType
 from purra.json_values import freeze_json_mapping, thaw_json_mapping
 from purra.long_tasks.contracts import (
+    BudgetExhaustionDisposition,
     LongTaskBudgetLimits,
     LongTaskCreateCommand,
     LongTaskRecord,
@@ -28,17 +42,18 @@ from purra.long_tasks.contracts import (
     LongTaskUnitSpec,
     LongTaskUnitStatus,
 )
-from purra.long_tasks.coordinator import LongTaskCoordinator
 from purra.long_tasks.ports import LongTaskRepository
 from purra.normalization import non_negative_int, optional_text, required_text
 from purra.ports import CancellationSignal
-from purra.recovery import FailureCategory, FailureSignal
+from purra.recovery import FailureSignal
 from purra.task_admission.contracts import (
     LongTaskDispatchReceipt,
+    TaskAdmissionDecision,
+)
+from purra.long_tasks.contracts import (
     LongTaskExecutionResult,
     LongTaskExecutionStatus,
     LongTaskExecutionUpdate,
-    TaskAdmissionDecision,
 )
 
 
@@ -58,6 +73,9 @@ class DurableTaskDescriptor:
     deadline_at_ms: int | None = None
     budget_limits: LongTaskBudgetLimits = field(
         default_factory=LongTaskBudgetLimits
+    )
+    budget_exhaustion_disposition: BudgetExhaustionDisposition = (
+        BudgetExhaustionDisposition.PAUSE_RECOVERABLE
     )
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
@@ -84,6 +102,11 @@ class DurableTaskDescriptor:
             object.__setattr__(self, "deadline_at_ms", deadline)
         if not isinstance(self.budget_limits, LongTaskBudgetLimits):
             raise TypeError("durable task budget_limits must be LongTaskBudgetLimits")
+        object.__setattr__(
+            self,
+            "budget_exhaustion_disposition",
+            BudgetExhaustionDisposition(self.budget_exhaustion_disposition),
+        )
         object.__setattr__(self, "metadata", freeze_json_mapping(self.metadata))
 
 
@@ -104,6 +127,8 @@ class DurableUnitExecutionContext:
     run_id: str
     dependency_outputs: Mapping[str, str]
     bind_run: Callable[[str], Awaitable[None]] = _unbound_unit_run
+    tree_run: AgentTreeRun | None = None
+    tree_agent: AgentNode | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.task, LongTaskRecord):
@@ -201,6 +226,22 @@ class RecipeLongTaskDispatcher:
         )
         self._clock_ms = clock_ms or (lambda: int(time.time() * 1000))
 
+    async def prepare_continuation(
+        self,
+        task_id: str,
+        *,
+        source_run_id: str,
+        run_id: str,
+    ) -> None:
+        """Bind one already-authorized continuation Root to its Recipe task."""
+
+        await prepare_continuation(
+            self._long_tasks,
+            task_id,
+            source_run_id=source_run_id,
+            run_id=run_id,
+        )
+
     async def dispatch(
         self,
         request: AgentRunRequest,
@@ -283,6 +324,12 @@ class RecipeLongTaskDispatcher:
         signal: CancellationSignal | None = None,
     ) -> LongTaskExecutionResult:
         run_id = required_text(run_id, "durable Run id")
+        bindings = await self._long_tasks.list_run_bindings(task_id)
+        if not any(binding.run_id == run_id for binding in bindings):
+            raise ContractViolationError("Recipe is not bound to this Run", code="recipe_root_binding_conflict")
+        units = await self._long_tasks.list_units(task_id)
+        if any(unit.run_id is not None and unit.status is not LongTaskUnitStatus.COMPLETED for unit in units):
+            raise ContractViolationError("Legacy delegated Unit execution requires reconciliation", code="recipe_tree_reconciliation_required")
         runner = _RecipeUnitRunner(
             repository=self._long_tasks,
             executors=self._executors,
@@ -290,14 +337,15 @@ class RecipeLongTaskDispatcher:
             run_id=run_id,
             worker_id=self._worker_id,
         )
-        await runner.emit_progress(task_id)
-        task = await LongTaskCoordinator(
-            self._long_tasks,
-            worker_id=self._worker_id,
+        coordinator = LongTaskUnitSettlement(
+            self._long_tasks, worker_id=self._worker_id,
             lease_duration_ms=self._lease_duration_ms,
-            retry_backoff_ms=self._retry_backoff_ms,
-            idle_poll_ms=self._idle_poll_ms,
-        ).run(task_id, runner, signal)
+            retry_backoff_ms=self._retry_backoff_ms, idle_poll_ms=self._idle_poll_ms,
+        )
+        task = await coordinator.run(task_id, runner, signal)
+        current_execution = asyncio.current_task()
+        if current_execution is not None and current_execution.cancelling():
+            raise asyncio.CancelledError
         await runner.emit_progress(task.id)
         units = await self._long_tasks.list_units(task.id)
         if task.status is LongTaskStatus.COMPLETED:
@@ -432,6 +480,9 @@ class RecipeLongTaskDispatcher:
                     )
                 ),
                 budget_limits=descriptor.budget_limits,
+                budget_exhaustion_disposition=(
+                    descriptor.budget_exhaustion_disposition
+                ),
                 metadata=metadata,
             ),
         )
@@ -467,54 +518,32 @@ class _RecipeUnitRunner:
         await self.emit_progress(task.id)
 
         async def bind_run(run_id: str) -> None:
-            bound = await self._repository.bind_unit_run(
-                task.id,
-                unit.id,
-                worker_id=self._worker_id,
-                lease_epoch=unit.lease_epoch,
-                run_id=run_id,
-            )
-            if (
-                bound.status is not LongTaskUnitStatus.RUNNING
-                or bound.run_id != str(run_id or "").strip()
-            ):
-                raise asyncio.CancelledError
-            await self.emit_progress(task.id)
+            if run_id != self._run_id:
+                raise ContractViolationError("An operation belongs to its owning Run", code="long_task_unit_run_conflict")
 
         context = DurableUnitExecutionContext(
-            task=task,
-            unit=unit,
-            run_id=self._run_id,
-            dependency_outputs=await self._dependency_outputs(unit),
-            bind_run=bind_run,
+            task=task, unit=unit, run_id=self._run_id,
+            dependency_outputs=await self._dependency_outputs(unit), bind_run=bind_run,
         )
         executor = self._executors.require(str(unit.metadata.get("executor") or ""))
         result = await executor.execute(context, signal)
         if not isinstance(result, LongTaskUnitResult):
             raise TypeError("durable unit executor returned an invalid result")
-        return result
+        if result.run_id is not None and result.run_id != self._run_id:
+            raise ContractViolationError("Operation result belongs to another Run", code="long_task_unit_run_conflict")
+        # Unit identity is (task, unit, attempt); no synthetic Agent Run is created.
+        return replace(result, run_id=None)
 
-    def classify_unit_failure(self, task, unit, error: Exception) -> FailureSignal:
-        del task
-        executor = self._executors.get(str(unit.metadata.get("executor") or ""))
-        if executor is None:
-            return _permanent_execution_failure(error)
+    def classify_unit_failure(self, task, unit, error: Exception) -> FailureSignal | None:
+        executor = self._executors.require(str(unit.metadata.get("executor") or ""))
         classifier = getattr(executor, "classify_failure", None)
-        if not callable(classifier):
-            return _permanent_execution_failure(error)
-        try:
-            failure = classifier(error)
-        except Exception:
-            return _permanent_execution_failure(error)
-        if not isinstance(failure, FailureSignal):
-            return _permanent_execution_failure(error)
-        return failure
+        return None if classifier is None else classifier(error)
 
-    def split_unit(self, task, unit, error: Exception) -> LongTaskSplitResult:
-        executor = self._executors.get(str(unit.metadata.get("executor") or ""))
+    def split_unit(self, task, unit, error: Exception) -> LongTaskSplitResult | None:
+        executor = self._executors.require(str(unit.metadata.get("executor") or ""))
         splitter = getattr(executor, "split_unit", None)
-        if not callable(splitter):
-            return LongTaskSplitResult(children=(), replacement_dependency_ids=())
+        if splitter is None:
+            return None
         split = splitter(
             DurableUnitExecutionContext(
                 task=task,
@@ -524,8 +553,6 @@ class _RecipeUnitRunner:
             ),
             error,
         )
-        if not isinstance(split, LongTaskSplitResult):
-            raise TypeError("durable unit splitter returned an invalid result")
         return split
 
     async def on_unit_settled(self, task_id: str) -> None:
@@ -573,100 +600,12 @@ class _RecipeUnitRunner:
         return outputs
 
 
-def _progress_unit_payload(unit: LongTaskUnitRecord) -> dict[str, object]:
-    title = str(unit.metadata.get("displayTitle") or "").strip()
-    return {
-        "id": unit.id,
-        "position": unit.position,
-        "plannerStepId": str(unit.metadata.get("plannerStepId") or unit.id),
-        "kind": str(unit.metadata.get("unitKind") or ""),
-        **({"title": title} if title else {}),
-        "status": unit.status.value,
-        "attempt": unit.attempt,
-        "maxAttempts": unit.max_attempts,
-        **({"runId": unit.run_id} if unit.run_id else {}),
-        **({"outputRef": unit.output_ref} if unit.output_ref else {}),
-        **({"errorCode": unit.error_code} if unit.error_code else {}),
-        "updateTime": unit.update_time,
-    }
-
-
-def _compile_recipe_units(
-    recipe: ExecutionRecipe,
-    covered_step_ids: Sequence[str],
-) -> tuple[LongTaskUnitSpec, ...]:
-    covered = frozenset(covered_step_ids)
-    mapped: set[str] = set()
-    units: list[LongTaskUnitSpec] = []
-    for position, step in enumerate(recipe.steps):
-        plan_step_id = step.plan_step_id or step.id
-        if plan_step_id not in covered:
-            raise ValueError(
-                "execution recipe maps to an unadmitted plan step: "
-                + plan_step_id
-            )
-        mapped.add(plan_step_id)
-        units.append(LongTaskUnitSpec(
-            id=step.id,
-            position=position,
-            dependencies=step.depends_on,
-            input_ref=step.input_ref,
-            max_attempts=step.max_attempts,
-            metadata={
-                **thaw_json_mapping(step.metadata),
-                "unitKind": step.kind,
-                "executor": step.executor or step.kind,
-                "plannerStepId": plan_step_id,
-            },
-        ))
-    missing = covered - mapped
-    if missing:
-        raise ValueError(
-            "execution recipe does not implement admitted plan steps: "
-            + ", ".join(sorted(missing))
-        )
-    return tuple(units)
-
-
-def _require_same_recipe(
-    task: LongTaskRecord,
-    recipe: ExecutionRecipe,
-) -> None:
-    if thaw_json_mapping(task.metadata.get("recipe") or {}) != recipe.to_metadata():
-        raise RuntimeError("durable_task_recipe_conflict")
-
-
-def _same_optional_text(left: object, right: object) -> bool:
-    return (
-        None if left is None else str(left).strip()
-    ) == (
-        None if right is None else str(right).strip()
-    )
-
-
-def _permanent_execution_failure(error: Exception) -> FailureSignal:
-    code = str(getattr(error, "code", "") or "").strip()
-    return FailureSignal(
-        category=FailureCategory.BUSINESS_INVARIANT,
-        code=(code or str(error) or type(error).__name__)[:240],
-        retryable=False,
-    )
-
-
 def _dispatch_message(task: LongTaskRecord) -> str:
     if task.status is LongTaskStatus.COMPLETED:
         return "Durable task is already complete."
     if task.status is LongTaskStatus.FAILED:
         return "Durable task is failed and requires an explicit retry decision."
     return f"Durable task started with {task.total_units} execution units."
-
-
-def _final_response(units: Sequence[LongTaskUnitRecord]) -> str:
-    for unit in reversed(units):
-        value = unit.metadata.get("finalResponse")
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    return "Durable task completed."
 
 
 __all__ = [

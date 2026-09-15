@@ -18,7 +18,7 @@ async def test_state_survives_fresh_interpreter_and_excludes_private_cache(tmp_p
     run = await session.runs.begin(RunCreateParams(None, "persist", None), AgentEvent("run.started"))
     session.save_tool_receipt((run.run_id, "call"), ToolCall("call", "lookup", "{}"), ToolHandlerResult("found"))
     # A new in-memory cache must not silently become persisted data.
-    session.runs._state.unrelated_cache = object()
+    session.state.run.unrelated_cache = object()
     body = session.export_snapshot()
     assert "unrelated_cache" not in body and "purra.adapters.memory" not in body
     path = tmp_path / "state.json"
@@ -50,7 +50,7 @@ def test_codec_uses_only_explicit_record_ids_even_if_other_dataclasses_are_impor
 
 
 @pytest.mark.parametrize("change", [
-    lambda s: s.update(schema="purra.storage-state/python/v0"),
+    lambda s: s.update(schema="purra.storage-state/python/v1"),
     lambda s: s["groups"]["run"].pop("runs"),
     lambda s: s["groups"]["run"].update(private_cache={}),
     lambda s: s["groups"]["run"].update(runs=[]),
@@ -74,3 +74,25 @@ def test_rejects_unsupported_schema_or_storage_fields(change):
 def test_rejects_malformed_tagged_values(body):
     with pytest.raises(ValueError):
         load_storage_value(body)
+
+
+@pytest.mark.asyncio
+async def test_restored_adapters_share_explicit_state_with_fresh_runtime_resources():
+    from purra.adapters import InMemoryAgentAdapters
+    from purra.adapter_state import AdapterState
+
+    state = AdapterState()
+    adapters = InMemoryAgentAdapters(state=state)
+    run = await adapters.runs.begin(RunCreateParams(None, "shared", None), AgentEvent("run.started"))
+    assert run.run_id in state.run.runs
+    restored = AdapterState.from_groups(load_storage_value(dump_storage_value(state.to_groups())))
+    assert restored.run.lock is not state.run.lock
+    assert restored.run.changed is not state.run.changed
+    assert restored.run.tool_inflight == {}
+    assert restored.run.run_tree_authority is None
+    restored_adapters = InMemoryAgentAdapters(state=restored)
+    assert (await restored_adapters.runs.get(run.run_id)).status.value == "running"
+    second = await restored_adapters.runs.begin(RunCreateParams(None, "next", None), AgentEvent("run.started"))
+    assert second.run_id != run.run_id
+    assert second.run_id in restored.run.runs
+    assert second.run_id not in state.run.runs

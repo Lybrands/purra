@@ -22,6 +22,10 @@ from purra.agent_tree import (
     SpawnAgentsReceipt,
 )
 from purra.cancellation import OperationCanceled, await_with_cancellation, is_canceled
+from purra.agent_tree.delivery import deliver_agent_results
+from purra.agent_tree.query import AgentTreeQuery
+from purra.agent_tree.receiver import AgentResultReceiver
+from purra.agent_tree.lease import bind_agent_run_lease
 from purra.interaction import UserInputRequired
 from purra.approvals import ApprovalRequired
 from purra.errors import ContractViolationError
@@ -90,6 +94,7 @@ class AgentTreeRunCoordinator(Protocol):
         *,
         lease_owner_id: str | None = None,
         lease_epoch: int | None = None,
+        delivery_signal: CancellationSignal | None = None,
     ) -> AgentRunAggregation: ...
 
 
@@ -107,6 +112,7 @@ class _AgentTreeSchedulingCapability:
         executor: AgentTreeRunExecutor,
         owner_id: str | None = None,
         lease_duration_ms: int = 30_000,
+        deliver_results=None,
     ) -> None:
         if not isinstance(repository, RunTreeRepository):
             raise TypeError("Agent tree supervisor requires RunTreeRepository")
@@ -114,6 +120,7 @@ class _AgentTreeSchedulingCapability:
             raise TypeError("Agent tree supervisor requires one Run executor")
         self._repository = repository
         self._executor = executor
+        self._deliver_results = deliver_results
         self._owner_id = required_text(
             owner_id or f"agent-tree-supervisor-{uuid4().hex}",
             "Agent tree supervisor owner id",
@@ -123,7 +130,22 @@ class _AgentTreeSchedulingCapability:
             "Agent tree lease duration",
         )
 
-    async def execute_and_join(
+    async def execute_and_join(self, requester_run_id, run_ids, signal=None, *,
+                               lease_owner_id=None, lease_epoch=None,
+                               delivery_signal=None):
+        requester = await self._repository.get_run(requester_run_id)
+        if self._deliver_results is not None and requester.root_run_id == requester_run_id:
+            return await deliver_agent_results(
+                lambda notify: self._execute_and_join(requester_run_id, run_ids, signal,
+                    lease_owner_id=lease_owner_id, lease_epoch=lease_epoch, notify=notify),
+                lambda results: self._deliver_results(requester_run_id, results, delivery_signal or signal),
+            )
+        return await self._execute_and_join(
+            requester_run_id, run_ids, signal,
+            lease_owner_id=lease_owner_id, lease_epoch=lease_epoch,
+        )
+
+    async def _execute_and_join(
         self,
         requester_run_id: str,
         run_ids: tuple[str, ...],
@@ -131,6 +153,7 @@ class _AgentTreeSchedulingCapability:
         *,
         lease_owner_id: str | None = None,
         lease_epoch: int | None = None,
+        notify=None,
     ) -> AgentRunAggregation:
         requester_id = required_text(requester_run_id, "requester Run id")
         target_ids = tuple(dict.fromkeys(
@@ -140,6 +163,12 @@ class _AgentTreeSchedulingCapability:
             return await self._repository.aggregate_runs(requester_id, ())
 
         requester = await self._repository.get_run(requester_id)
+        for identity in target_ids:
+            target = await self._repository.get_run(identity)
+            for dependency_id in target.dependency_run_ids:
+                dependency = await self._repository.get_run(dependency_id)
+                if not dependency.terminal and dependency_id not in target_ids:
+                    raise ContractViolationError("Join must include unfinished dependencies", code="agent_dependency_join_incomplete")
         if requester.status is AgentTreeRunStatus.WAITING:
             await self._repository.require_run_claim(
                 requester_id,
@@ -147,7 +176,7 @@ class _AgentTreeSchedulingCapability:
                 lease_epoch=lease_epoch,
             )
         else:
-            requester = await self._repository.mark_waiting(
+            requester = await self._mark_waiting(
                 requester_id,
                 lease_owner_id=lease_owner_id,
                 lease_epoch=lease_epoch,
@@ -167,10 +196,15 @@ class _AgentTreeSchedulingCapability:
                     requester_id,
                     target_ids,
                 )
+                if notify is not None:
+                    await notify(aggregate)
                 pending = set(aggregate.pending_run_ids)
                 if not pending:
                     joined = True
                     return aggregate
+                if (await self._repository.get_run(requester_id)).status is AgentTreeRunStatus.RUNNING:
+                    await self._mark_waiting(requester_id,
+                        lease_owner_id=lease_owner_id, lease_epoch=lease_epoch)
                 for candidate in await self._repository.list_runnable(root_run_id):
                     if candidate.run_id not in pending or candidate.run_id in attempted:
                         continue
@@ -181,13 +215,33 @@ class _AgentTreeSchedulingCapability:
                     )
                     if claimed is None:
                         continue
-                    task = asyncio.create_task(self._execute_claimed(claimed, signal))
+                    async def execute_and_notify(run):
+                        await self._execute_claimed(run, signal)
+                        if notify is not None:
+                            current = await self._repository.aggregate_runs(requester_id, target_ids)
+                            await notify(replace(current, results=tuple(item for item in current.results if item["runId"] == run.run_id)))
+                    task = asyncio.create_task(execute_and_notify(claimed))
                     active[task] = claimed.run_id
                     attempted.add(claimed.run_id)
                 if not active:
-                    if pending <= attempted:
+                    blocked = set(attempted)
+                    changed = True
+                    while changed:
+                        changed = False
+                        for identity in pending - blocked:
+                            candidate = await self._repository.get_run(identity)
+                            if any(dependency in blocked for dependency in candidate.dependency_run_ids):
+                                blocked.add(identity)
+                                changed = True
+                    if pending <= blocked:
                         joined = True
                         return aggregate
+                    # Other joins can occupy the shared root capacity. Their
+                    # completion is progress even when this join has no worker.
+                    if any(item.status is AgentTreeRunStatus.RUNNING
+                           for item in await self._repository.list_descendants(root_run_id)):
+                        await asyncio.sleep(0.01)
+                        continue
                     raise ContractViolationError(
                         "Child Run scheduler made no progress",
                         code="agent_run_scheduler_stalled",
@@ -212,6 +266,8 @@ class _AgentTreeSchedulingCapability:
                 requester_id,
                 target_ids,
             )
+            if notify is not None:
+                await notify(aggregate)
             joined = True
             return aggregate
         except asyncio.CancelledError as error:
@@ -230,11 +286,31 @@ class _AgentTreeSchedulingCapability:
         finally:
             current = await self._repository.get_run(requester_id)
             if joined and current.status is AgentTreeRunStatus.WAITING:
-                await self._repository.release_waiting(
-                    requester_id,
-                    lease_owner_id=lease_owner_id,
-                    lease_epoch=lease_epoch,
-                )
+                try:
+                    await self._repository.release_waiting(requester_id,
+                        lease_owner_id=lease_owner_id, lease_epoch=lease_epoch)
+                except ContractViolationError as error:
+                    if error.code not in {"agent_run_state_conflict", "agent_capacity_exceeded"}:
+                        raise
+                    await self._repository.require_run_claim(requester_id,
+                        lease_owner_id=lease_owner_id, lease_epoch=lease_epoch)
+                    if (await self._repository.get_run(requester_id)).terminal:
+                        raise
+
+
+    async def _mark_waiting(self, run_id, *, lease_owner_id=None, lease_epoch=None):
+        try:
+            return await self._repository.mark_waiting(run_id,
+                lease_owner_id=lease_owner_id, lease_epoch=lease_epoch)
+        except ContractViolationError as error:
+            if error.code != "agent_run_state_conflict":
+                raise
+            await self._repository.require_run_claim(run_id,
+                lease_owner_id=lease_owner_id, lease_epoch=lease_epoch)
+            current = await self._repository.get_run(run_id)
+            if current.status is not AgentTreeRunStatus.WAITING:
+                raise
+            return current
 
     async def _execute_claimed(
         self,
@@ -249,6 +325,9 @@ class _AgentTreeSchedulingCapability:
         )
         expected_context_version = agent.context_version
         try:
+            dependencies = [await self._repository.get_run(identity) for identity in run.dependency_run_ids]
+            if any(dependency.status is not AgentTreeRunStatus.DONE for dependency in dependencies):
+                raise ContractViolationError("A required predecessor did not complete", code="agent_dependency_failed")
             result = await self._execute_with_heartbeat(
                 run,
                 agent,
@@ -266,7 +345,7 @@ class _AgentTreeSchedulingCapability:
         except Exception as error:
             await self._repository.fail_run(
                 run.run_id,
-                str(getattr(error, "code", "") or type(error).__name__),
+                str(getattr(error, "code", "") or "agent_execution_failed"),
                 lease_owner_id=run.lease_owner_id,
                 lease_epoch=run.lease_epoch,
             )
@@ -298,12 +377,10 @@ class _AgentTreeSchedulingCapability:
         checkpoint: ContextCheckpoint | None,
         signal: CancellationSignal | None,
     ) -> AgentTreeExecutionResult:
-        execution = asyncio.create_task(self._executor.execute(
-            run,
-            agent,
-            checkpoint,
-            signal,
-        ))
+        with bind_agent_run_lease(run.run_id, required_text(run.lease_owner_id, "Agent Run lease owner"), run.lease_epoch):
+            execution = asyncio.create_task(self._executor.execute(
+                run, agent, checkpoint, signal,
+            ))
         heartbeat = asyncio.create_task(self._heartbeat(run))
         try:
             done, _ = await asyncio.wait(
@@ -347,12 +424,14 @@ class AgentTreeRunSupervisor:
         *,
         repository: RunTreeRepository,
         executor: AgentTreeRunExecutor,
+        deliver_results=None,
         owner_id: str | None = None,
         lease_duration_ms: int = 30_000,
     ) -> None:
         self._scheduling = _AgentTreeSchedulingCapability(
             repository=repository,
             executor=executor,
+            deliver_results=deliver_results,
             owner_id=owner_id,
             lease_duration_ms=lease_duration_ms,
         )
@@ -365,6 +444,7 @@ class AgentTreeRunSupervisor:
         *,
         lease_owner_id: str | None = None,
         lease_epoch: int | None = None,
+        delivery_signal: CancellationSignal | None = None,
     ) -> AgentRunAggregation:
         return await self._scheduling.execute_and_join(
             requester_run_id,
@@ -372,6 +452,7 @@ class AgentTreeRunSupervisor:
             signal,
             lease_owner_id=lease_owner_id,
             lease_epoch=lease_epoch,
+            delivery_signal=delivery_signal,
         )
 
 
@@ -392,6 +473,8 @@ class RunCommandService:
             raise TypeError("Run command service supervisor is invalid")
         self._repository = repository
         self._supervisor = supervisor
+        self.agents = AgentTreeQuery(repository)
+        self.results = AgentResultReceiver(repository, self.join_runs)
 
     async def begin_root(self, command: BeginRootAgentCommand) -> AgentTreeRun:
         return await self._repository.begin_root(command)
@@ -444,6 +527,7 @@ class RunCommandService:
         *,
         lease_owner_id: str | None = None,
         lease_epoch: int | None = None,
+        delivery_signal: CancellationSignal | None = None,
     ) -> AgentRunAggregation:
         if self._supervisor is None:
             return await self._repository.aggregate_runs(
@@ -456,6 +540,18 @@ class RunCommandService:
             signal,
             lease_owner_id=lease_owner_id,
             lease_epoch=lease_epoch,
+            delivery_signal=delivery_signal,
+        )
+
+    async def receive_runs(
+        self, requester_run_id: str, run_ids: tuple[str, ...],
+        signal: CancellationSignal | None = None, *,
+        after_run_ids: tuple[str, ...] = (),
+        lease_owner_id: str | None = None, lease_epoch: int | None = None,
+    ) -> AgentRunAggregation:
+        return await self.results.receive(
+            requester_run_id, run_ids, signal, after_run_ids=after_run_ids,
+            lease_owner_id=lease_owner_id, lease_epoch=lease_epoch,
         )
 
     async def cancel_run(self, run_id: str) -> tuple[str, ...]:

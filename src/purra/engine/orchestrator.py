@@ -2,13 +2,20 @@
 
 from __future__ import annotations
 
+
 import asyncio
 from contextlib import aclosing, suppress
 from dataclasses import dataclass, replace
 from hashlib import sha256
 import json
 from time import perf_counter, time
-from typing import Any, AsyncIterator, Callable, Iterable, Mapping, Sequence
+from typing import (
+    Any,
+    AsyncIterator,
+    Callable,
+    Mapping,
+    Sequence,
+)
 from uuid import uuid4
 
 from purra.agent_tree import (
@@ -33,8 +40,11 @@ from purra.agent_tree_execution import (
     AgentTreeExecutionResult,
     RunCommandService,
 )
-from purra.agent_tree_lease import bind_agent_run_lease
-from purra.agent_tree_tool import build_agent_tree_tool_registration
+from purra.agent_tree.lease import bind_agent_run_lease
+from purra.engine.root_output import RootOutputObserver
+from purra.engine.agent_result_delivery import AgentResultDelivery
+from purra.engine.agent_context import AgentConversationLoader, child_run_options, task_message
+from purra.agent_tree_tool import AGENT_TREE_TOOL_NAMES, AgentToolContext, build_agent_tree_tools
 from purra.agent_tree_policy import AgentTreePolicy
 from purra.agent_presets import (
     AgentPreset,
@@ -51,7 +61,6 @@ from purra.cancellation import (
 from purra.context_budget import (
     allocate_context_budget,
     estimate_agent_messages_tokens,
-    estimate_json_tokens,
     estimate_tool_schema_tokens,
     max_generation_tokens_for_context,
     resolve_context_budget_claims,
@@ -68,7 +77,6 @@ from purra.contracts import (
     AgentRuntimeResult,
     ApprovalDecision,
     ApprovalStatus,
-    ContextBlock,
     ContextBudget,
     ContextBudgetClaim,
     ContextBundle,
@@ -77,24 +85,19 @@ from purra.contracts import (
     MessageRole,
     PlanningMode,
     PlanningCapabilities,
-    ResponseConstraints,
     RunCreateParams,
     RunId,
-    RunProvenance,
     RunStatus,
     RuntimeLimits,
     RuntimeOutcome,
     StepExecutor,
-    StepStatus,
     TaskContextRequest,
     ExecutionPlan,
-    TaskStep,
     ToolExecutionLimits,
     ToolPlanningRequirement,
     TraceRecord,
 )
 from purra.normalization import (
-    optional_text as _optional_text,
     required_text,
 )
 from purra.errors import (
@@ -116,6 +119,36 @@ from purra.engine.context_capability import ContextCapability
 from purra.engine.compaction_phase import (
     compact_after_planning,
     compact_before_planning,
+)
+from purra.engine.run_budget import (
+    _context_result_reserve_tokens,
+    _execution_context_budget,
+    _resolve_run_output_budget,
+    _selected_context_window_tokens,
+)
+import purra.engine.durable_resume as durable_resume
+import purra.engine.planning_promotion as planning_promotion
+from purra.engine.orchestration_support import (
+    record_stage_failure,
+    _run_result,
+    _runtime_result_from_durable,
+    _uses_validated_result,
+    _collect_durable_updates,
+    _record_safe_exception,
+    _settle_execution_exception,
+    _execution_error_code,
+    _PreparedRuntimePhase,
+)
+import purra.engine.agent_tree_orchestrator as agent_tree_orchestration
+from purra.engine.agent_tree_orchestrator import (
+    _AgentCoreTreeRunExecutor,
+    _AgentTreeRootBinding,
+    _bind_agent_tree_lease,
+    _bind_agent_tree_run,
+    _configure_agent_tree_capability,
+    _require_root_agent_tree_quiescent,
+    _restrict_agent_capabilities,
+    _settle_root_agent_tree_run,
 )
 from purra.engine.canonical_sink import (
     BufferedEventSink as _BufferedEventSink,
@@ -144,6 +177,7 @@ from purra.model_protocol import (
 )
 from purra.model_invocation import (
     AgentModelInvocationManager,
+    create_model_invocation_manager,
     ModelInvocationContext,
 )
 from purra.model_execution import AgentModelResponseJudge, AgentModelTaskRunner
@@ -154,7 +188,6 @@ from purra.planning_activation import (
     AutoPlanningRequest,
 )
 from purra.plan_compiler import (
-    projected_planning_tool_schemas,
     runtime_tool_names_for_planning_names,
 )
 from purra.ports import (
@@ -166,8 +199,6 @@ from purra.ports import (
     ExecutionLeaseStore,
     ExecutionStateFactory,
     PlanningPolicy,
-    ResponseJudge,
-    ResponseValidator,
     RunCommit,
     RunRepository,
     TaskContextDemandProvider,
@@ -179,8 +210,11 @@ from purra.ports import (
     ModelInputEvidenceValidator,
 )
 from purra.output import AgentResponseTransaction
-from purra.output.contracts import PublicPresentationMode, ResponseTransactionMode
-from purra.output.contracts import ResponseTransactionPolicy
+from purra.output.contracts import (
+    PublicPresentationMode,
+    ResponseTransactionPolicy,
+    ResponseTransactionMode,
+)
 from purra.output.processor import AgentOutputProcessor
 from purra.output.run_repository import CanonicalRunRepository
 from purra.output.ports import AgentOutputPublisher, AgentOutputRepository
@@ -193,26 +227,15 @@ from purra.tools import (
     InMemoryApprovalGateway,
     InMemoryToolCatalog,
     model_visible_tool_schema,
-    resolve_tool_display_name,
 )
 from purra.task_admission import (
     ExecutionMode,
     LongTaskDispatcher,
     LongTaskExecutionStatus,
-    LongTaskExecutionUpdate,
     TaskAdmissionEvaluator,
 )
 from purra.timing import duration_ms as _duration_ms
 from purra.operations import AgentOperationController
-
-
-@dataclass(frozen=True, slots=True)
-class _PreparedRuntimePhase:
-    request: AgentRunRequest
-    prepared_request: AgentRunRequest
-    budget: ContextBudget
-    state: ExecutionState
-    events: tuple[AgentEvent, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -221,208 +244,6 @@ class _RuntimeDependencies:
     context_provider: ContextProvider
     conversation_compactor: ConversationCompactor | None
     context_capability: ContextCapability
-
-
-@dataclass(frozen=True, slots=True)
-class _AgentTreeRootBinding:
-    request: AgentRunRequest
-    options: AgentCoreRunOptions
-
-
-class _AgentCoreTreeRunExecutor:
-    """Route Child Runs back through this AgentCore's normal supervisor."""
-
-    def __init__(self, core: "AgentCore") -> None:
-        self._core = core
-
-    async def execute(
-        self,
-        run: AgentTreeRun,
-        agent: AgentNode,
-        checkpoint: ContextCheckpoint | None,
-        signal: CancellationSignal | None = None,
-    ) -> AgentTreeExecutionResult:
-        binding = self._core._agent_tree_roots.get(run.root_run_id)
-        if binding is None:
-            return AgentTreeExecutionResult(
-                status=AgentTreeRunStatus.FAILED,
-                error_code="agent_tree_root_not_bound",
-            )
-        with bind_agent_run_lease(
-            run.run_id,
-            required_text(run.lease_owner_id, "Agent Run lease owner"),
-            run.lease_epoch,
-        ):
-            reconciled = await self._reconcile_canonical_run(run)
-            if isinstance(reconciled, AgentTreeExecutionResult):
-                return reconciled
-            resume_checkpoint = reconciled
-
-        input_payload = thaw_json_mapping(run.input_payload)
-        objective = run.objective
-        if input_payload:
-            objective += "\n\nInput:\n" + json.dumps(
-                input_payload,
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
-        child_request = replace(
-            binding.request,
-            messages=(
-                AgentMessage(
-                    role=MessageRole.SYSTEM,
-                    content=agent.instruction,
-                    origin=MessageOrigin.MODEL,
-                    attributes={
-                        "agentId": agent.agent_id,
-                        "parentAgentId": agent.parent_agent_id or "",
-                    },
-                ),
-                AgentMessage(role=MessageRole.USER, content=objective),
-            ),
-            tools_enabled=bool(
-                agent.capability_grant.allowed_tools
-                or agent.capability_grant.can_spawn_agents
-            ),
-            planning_mode=PlanningMode.AUTO,
-            metadata={
-                **thaw_json_mapping(binding.request.metadata),
-                "agentId": agent.agent_id,
-                "rootRunId": run.root_run_id,
-                "parentRunId": run.parent_run_id or "",
-                "previousRunId": run.previous_run_id or "",
-                "contextVersion": agent.context_version,
-                "contextCheckpointId": (
-                    checkpoint.checkpoint_id if checkpoint is not None else ""
-                ),
-                "contextContentRef": (
-                    checkpoint.content_ref if checkpoint is not None else ""
-                ),
-            },
-        )
-        child_options = replace(
-            binding.options,
-            turn_id=f"agent-tree:{run.run_id}",
-            durable_continuation=None,
-            response_transaction_policy=ResponseTransactionPolicy(
-                mode=ResponseTransactionMode.VALIDATED_RESULT,
-                public_presentation=PublicPresentationMode.NONE,
-            ),
-            committed_result_facts_provider=None,
-            agent_tree_run_id=run.run_id,
-            agent_tree_root_run_id=run.root_run_id,
-            agent_tree_agent_id=run.agent_id,
-            agent_tree_parent_run_id=run.parent_run_id,
-            agent_tree_lease_owner_id=run.lease_owner_id,
-            agent_tree_lease_epoch=run.lease_epoch,
-            agent_capability_grant=agent.capability_grant,
-            agent_execution_checkpoint=resume_checkpoint,
-        )
-        with bind_agent_run_lease(
-            run.run_id,
-            required_text(run.lease_owner_id, "Agent Run lease owner"),
-            run.lease_epoch,
-        ):
-            handle = await self._core.submit(child_request, options=child_options)
-            try:
-                result = await await_with_cancellation(handle.wait(), signal)
-            except OperationCanceled:
-                await handle.cancel("ancestor_run_canceled")
-                return AgentTreeExecutionResult(
-                    status=AgentTreeRunStatus.CANCELED,
-                    error_code="agent_run_canceled",
-                )
-            except asyncio.CancelledError:
-                await handle.cancel("ancestor_run_canceled")
-                raise
-        if result.status is RunStatus.DONE:
-            if self._core._output_repository is None:
-                raise ContractViolationError(
-                    "Child Run result requires canonical output repository"
-                )
-            content = await self._core._output_repository.load_validated_result(
-                run.run_id
-            )
-            return AgentTreeExecutionResult(
-                status=AgentTreeRunStatus.DONE,
-                result={"content": content},
-                content_ref=f"run://{run.run_id}/validated-result",
-                fingerprint=sha256(content.encode("utf-8")).hexdigest(),
-            )
-        if result.status is RunStatus.CANCELED:
-            return AgentTreeExecutionResult(
-                status=AgentTreeRunStatus.CANCELED,
-                error_code=result.error or "agent_run_canceled",
-            )
-        return AgentTreeExecutionResult(
-            status=AgentTreeRunStatus.FAILED,
-            error_code=result.error or "agent_run_failed",
-        )
-
-    async def _reconcile_canonical_run(
-        self,
-        run: AgentTreeRun,
-    ) -> AgentTreeExecutionResult | AgentExecutionCheckpoint | None:
-        """Resolve a Tree/Run crash seam without replaying Provider work."""
-
-        try:
-            snapshot = await self._core._repository.get(run.run_id)
-        except ContractViolationError as error:
-            if error.code == "run_not_found":
-                return None
-            raise
-        if snapshot.status is RunStatus.DONE:
-            if self._core._output_repository is None:
-                raise ContractViolationError(
-                    "Child Run result requires canonical output repository"
-                )
-            content = await self._core._output_repository.load_validated_result(
-                run.run_id
-            )
-            return AgentTreeExecutionResult(
-                status=AgentTreeRunStatus.DONE,
-                result={"content": content},
-                content_ref=f"run://{run.run_id}/validated-result",
-                fingerprint=sha256(content.encode("utf-8")).hexdigest(),
-            )
-        if snapshot.status is RunStatus.CANCELED:
-            return AgentTreeExecutionResult(
-                status=AgentTreeRunStatus.CANCELED,
-                error_code=snapshot.error or "agent_run_canceled",
-            )
-        if snapshot.status in {RunStatus.FAILED, RunStatus.BLOCKED}:
-            return AgentTreeExecutionResult(
-                status=AgentTreeRunStatus.FAILED,
-                error_code=snapshot.error or "agent_run_failed",
-            )
-        if snapshot.execution_checkpoint is not None:
-            return snapshot.execution_checkpoint
-
-        # A canonical running row proves that execution began, but the current
-        # snapshot has no model/tool cursor. Replay could duplicate effects, so
-        # close both authorities with one stable fail-stop result.
-        error_code = "agent_run_resume_checkpoint_missing"
-        transition = RunStateMachine.fail(snapshot, error_code)
-        await self._core._repository.commit(
-            run.run_id,
-            RunCommit(
-                step_updates=transition.step_updates,
-                terminal_status=RunStatus.FAILED,
-                error=error_code,
-                events=(AgentEvent(
-                    type=CoreEventType.RUN_FAILED,
-                    run_id=run.run_id,
-                    payload={
-                        "status": RunStatus.FAILED.value,
-                        "error": error_code,
-                    },
-                ),),
-            ),
-        )
-        return AgentTreeExecutionResult(
-            status=AgentTreeRunStatus.FAILED,
-            error_code=error_code,
-        )
 
 
 def _require_runtime_limits(value: RuntimeLimits | None) -> RuntimeLimits:
@@ -670,13 +491,24 @@ class AgentCore:
         *,
         lease_owner_id: str | None = None,
         lease_epoch: int | None = None,
+        delivery_signal: CancellationSignal | None = None,
     ) -> AgentRunAggregation:
+        self._require_agent_tree_commands()
+        requester = await self._run_tree_repository.get_run(requester_run_id)
+        if requester.root_run_id not in self._agent_tree_roots:
+            raise ContractViolationError(
+                "Joining Children requires their active Root; recover the Root with resume()",
+                code="agent_tree_root_not_bound",
+            )
+        if requester_run_id == requester.root_run_id:
+            await self._result_delivery.completed(requester_run_id)
         return await self._require_agent_tree_commands().join_runs(
             requester_run_id,
             run_ids,
             signal,
             lease_owner_id=lease_owner_id,
             lease_epoch=lease_epoch,
+            delivery_signal=delivery_signal,
         )
 
     async def cancel_agent_run(self, run_id: str) -> tuple[str, ...]:
@@ -684,69 +516,6 @@ class AgentCore:
 
     async def close_agent(self, agent_id: str) -> AgentNode:
         return await self._require_agent_tree_commands().close_agent(agent_id)
-
-    async def bind_agent_tree_root(
-        self,
-        root_run_id: str,
-        request: AgentRunRequest,
-        *,
-        options: AgentCoreRunOptions | None = None,
-    ) -> None:
-        """Rebind a persisted active Root tree to this execution owner."""
-
-        repository = self._run_tree_repository
-        if repository is None:
-            self._require_agent_tree_commands()
-            raise AssertionError("unreachable")
-        if not isinstance(request, AgentRunRequest):
-            raise TypeError("Agent tree recovery requires AgentRunRequest")
-        selected_options = options or AgentCoreRunOptions()
-        if not isinstance(selected_options, AgentCoreRunOptions):
-            raise TypeError("Agent tree recovery options are invalid")
-        run_id = required_text(root_run_id, "Agent tree Root Run id")
-        root = await repository.get_run(run_id)
-        if (
-            root.run_id != root.root_run_id
-            or root.status
-            not in {AgentTreeRunStatus.RUNNING, AgentTreeRunStatus.WAITING}
-        ):
-            raise ContractViolationError(
-                "Agent tree recovery requires an active Root Run",
-                code="root_run_not_active",
-            )
-        binding = _AgentTreeRootBinding(request=request, options=selected_options)
-        existing = self._agent_tree_roots.get(run_id)
-        if existing is not None and existing != binding:
-            raise ContractViolationError(
-                "Agent tree Root Run already has a different binding",
-                code="run_identity_conflict",
-            )
-        self._agent_tree_roots[run_id] = binding
-
-    async def recover_agent_tree_root(
-        self,
-        root_run_id: str,
-        request: AgentRunRequest,
-        *,
-        options: AgentCoreRunOptions | None = None,
-        signal: CancellationSignal | None = None,
-    ) -> AgentRunAggregation:
-        """Rebind one active Root and settle its complete descendant set."""
-
-        await self.bind_agent_tree_root(
-            root_run_id,
-            request,
-            options=options,
-        )
-        repository = self._run_tree_repository
-        assert repository is not None
-        run_id = required_text(root_run_id, "Agent tree Root Run id")
-        descendants = await repository.list_descendants(run_id)
-        return await self.join_agent_runs(
-            run_id,
-            tuple(run.run_id for run in descendants),
-            signal,
-        )
 
     def _require_agent_tree_commands(self) -> RunCommandService:
         commands = self._run_commands
@@ -775,79 +544,54 @@ class AgentCore:
             allowed_tools=tuple(
                 registration.schema.name
                 for registration in self._registrations
-                if registration.schema.name != "delegateToAgents"
+                if registration.schema.name not in AGENT_TREE_TOOL_NAMES
             ),
             allowed_models=(request.model.model,),
         )
 
-    def _configure_agent_tree_capability(
-        self,
-        *,
-        base_tool_catalog: ToolCatalog,
-        policy: AgentTreePolicy | None,
-        run_tree_repository: RunTreeRepository | None,
-        root_agent_id: str | None,
-        agent_capability_grant: AgentCapabilityGrant | None,
-    ) -> None:
-        if run_tree_repository is not None and not isinstance(
-            run_tree_repository,
-            RunTreeRepository,
-        ):
-            raise TypeError("run_tree_repository must implement RunTreeRepository")
-        if agent_capability_grant is not None and not isinstance(
-            agent_capability_grant,
-            AgentCapabilityGrant,
-        ):
-            raise TypeError("agent_capability_grant is invalid")
-        if run_tree_repository is not None and policy is None:
-            raise ValueError(
-                "Agent tree execution requires an AgentPreset with "
-                "AgentTreePolicy"
-            )
-        if policy is not None and run_tree_repository is None:
-            raise ValueError("AgentTreePolicy requires a RunTreeRepository")
-        self._run_tree_repository = run_tree_repository
-        self._root_agent_id = str(
-            root_agent_id or f"root-agent-{uuid4().hex}"
-        ).strip()
-        if not self._root_agent_id:
-            raise ValueError("root_agent_id must be non-empty")
-        self._configured_agent_grant = agent_capability_grant
-        self._agent_tree_child_allowed_tools: tuple[str, ...] = ()
-        self._agent_tree_roots: dict[str, _AgentTreeRootBinding] = {}
-        self._run_commands: RunCommandService | None = None
-        if run_tree_repository is not None:
-            if self._output_processor is None or self._output_repository is None:
-                raise ValueError(
-                    "Agent tree execution requires canonical output infrastructure"
-                )
-            assert self._run_supervisor is not None
-            self._run_supervisor.configure_agent_tree(
-                run_tree_repository,
-                _AgentCoreTreeRunExecutor(self),
-            )
-            self._run_commands = RunCommandService(
-                run_tree_repository,
-                self._run_supervisor,
-            )
-            readable_tools = tuple(
-                registration.schema.name
-                for registration in base_tool_catalog.registrations()
-                if registration.policy.mode.value == "read"
-            )
-            self._agent_tree_child_allowed_tools = readable_tools
-            self._tool_catalog = AugmentedToolCatalog(
-                base_tool_catalog,
-                (build_agent_tree_tool_registration(
-                    self._run_commands,
-                    policy,
-                    child_allowed_tools=readable_tools,
-                ),),
-            )
-            return
-        self._tool_catalog = base_tool_catalog
+    def _configure_agent_tree_capability(self, *args, **kwargs):
+        return agent_tree_orchestration._configure_agent_tree_capability(self, *args, **kwargs)
+
+    async def _bind_agent_tree_run(self, *args, **kwargs):
+        return await agent_tree_orchestration._bind_agent_tree_run(self, *args, **kwargs)
+
+    async def _settle_root_agent_tree_run(self, *args, **kwargs):
+        return await agent_tree_orchestration._settle_root_agent_tree_run(self, *args, **kwargs)
+
+    def _restrict_agent_capabilities(self, *args, **kwargs):
+        return agent_tree_orchestration._restrict_agent_capabilities(*args, **kwargs)
+
+    def _bind_agent_tree_lease(self, *args, **kwargs):
+        return agent_tree_orchestration._bind_agent_tree_lease(self, *args, **kwargs)
+
+    async def _require_root_agent_tree_quiescent(self, *args, **kwargs):
+        return await agent_tree_orchestration._require_root_agent_tree_quiescent(self, *args, **kwargs)
+
+
+    async def _require_parent_delivery_settled(self, run_id):
+        if run_id in self._agent_tree_roots:
+            if self._run_commands is not None:
+                await self._run_commands.results.wait(run_id)
+            await self._result_delivery.require_settled(run_id)
+
+    def _root_output_observer(self):
+        if self._run_tree_repository is None:
+            return self._output_processor
+        return RootOutputObserver(self._output_processor,
+            self._require_root_agent_tree_quiescent,
+            self._require_parent_delivery_settled, self._result_delivery.public_locks)
+
+
+    @property
+    def active_agent_root_ids(self):
+        return tuple(self._agent_tree_roots)
+
+    async def report_agent_results(self, run_id, results, signal=None):
+        await self._result_delivery.report(run_id, results, signal)
 
     async def close(self) -> None:
+        if self._run_commands is not None:
+            await self._run_commands.results.close()
         if self._run_supervisor is not None:
             await self._run_supervisor.close()
 
@@ -867,6 +611,8 @@ class AgentCore:
             raise ContractViolationError(
                 "Run has no resumable checkpoint", code="checkpoint_missing",
             )
+        if self._run_tree_repository is not None:
+            await self._result_delivery.completed(run_id)
         if isinstance(snapshot.execution_checkpoint, AgentToolExecutionCheckpoint):
             pending_names = {call.name for call in snapshot.execution_checkpoint.assistant.tool_calls}
             if (options is None or options.tool_checkpoint_handler is None
@@ -974,76 +720,6 @@ class AgentCore:
             signal=signal,
         )
 
-    async def _bind_agent_tree_run(
-        self,
-        request: AgentRunRequest,
-        options: AgentCoreRunOptions,
-        controller: AgentRunController,
-    ) -> tuple[bool, int | None]:
-        repository = self._run_tree_repository
-        if repository is None:
-            return False, None
-        if options.agent_tree_run_id is None:
-            grant = self._configured_agent_grant or self._root_agent_grant(
-                request
-            )
-            tree_run = await repository.get_run(controller.run_id) if options.agent_execution_checkpoint is not None else await repository.begin_root(BeginRootAgentCommand(
-                run_id=controller.run_id or "",
-                agent_id=self._root_agent_id,
-                name="root",
-                title="Root Agent",
-                instruction="Own the root request.",
-                objective=request.latest_user_text() or "Run the request.",
-                capability_grant=grant,
-                idempotency_key=f"begin:{controller.run_id}",
-            ))
-            self._agent_tree_roots[tree_run.root_run_id] = _AgentTreeRootBinding(
-                request=request,
-                options=options,
-            )
-            root_owner = True
-        else:
-            tree_run = await repository.get_run(options.agent_tree_run_id)
-            if (
-                tree_run.run_id != controller.run_id
-                or tree_run.status is not AgentTreeRunStatus.RUNNING
-            ):
-                raise ContractViolationError(
-                    "Child Run identity or state does not match its tree claim",
-                    code="run_identity_conflict",
-                )
-            root_owner = False
-        agent = await repository.get_agent(tree_run.agent_id)
-        return root_owner, agent.context_version
-
-    async def _settle_root_agent_tree_run(
-        self,
-        snapshot,
-        expected_context_version: int | None,
-    ) -> None:
-        repository = self._run_tree_repository
-        if repository is None or expected_context_version is None:
-            raise ContractViolationError("Root Agent tree settlement is unbound")
-        try:
-            if snapshot.status is RunStatus.DONE:
-                await repository.complete_run(
-                    snapshot.run_id,
-                    expected_context_version=expected_context_version,
-                    result={"content": snapshot.final_response},
-                    content_ref=f"run://{snapshot.run_id}/final",
-                    fingerprint=sha256(
-                        snapshot.final_response.encode("utf-8")
-                    ).hexdigest(),
-                )
-            elif snapshot.status is RunStatus.CANCELED:
-                await repository.cancel_subtree(snapshot.run_id)
-            else:
-                await repository.fail_run(
-                    snapshot.run_id,
-                    snapshot.error or "root_run_failed",
-                )
-        finally:
-            self._agent_tree_roots.pop(snapshot.run_id, None)
 
     def _run_create_params(
         self,
@@ -1102,55 +778,6 @@ class AgentCore:
             lease_epoch=options.agent_tree_lease_epoch,
         )
 
-    @staticmethod
-    def _restrict_agent_capabilities(
-        request: AgentRunRequest,
-        grant: AgentCapabilityGrant | None,
-        registrations: tuple[ToolRegistration, ...],
-        enabled_names: frozenset[str],
-    ) -> tuple[tuple[ToolRegistration, ...], frozenset[str]]:
-        if grant is None:
-            return registrations, enabled_names
-        if request.model.model not in grant.allowed_models:
-            raise ContractViolationError(
-                "Agent Run model is outside its capability grant",
-                code="agent_capability_escalation",
-            )
-        allowed_names = set(grant.allowed_tools)
-        if grant.can_spawn_agents:
-            allowed_names.add("delegateToAgents")
-        return (
-            tuple(
-                registration
-                for registration in registrations
-                if registration.schema.name in allowed_names
-            ),
-            frozenset(enabled_names) & allowed_names,
-        )
-
-    def _bind_agent_tree_lease(
-        self,
-        registrations: tuple[ToolRegistration, ...],
-        options: AgentCoreRunOptions,
-    ) -> tuple[ToolRegistration, ...]:
-        if (
-            options.agent_tree_run_id is None
-            or self._run_commands is None
-            or self._agent_tree_policy is None
-        ):
-            return registrations
-        return tuple(
-            build_agent_tree_tool_registration(
-                self._run_commands,
-                self._agent_tree_policy,
-                child_allowed_tools=self._agent_tree_child_allowed_tools,
-                lease_owner_id=options.agent_tree_lease_owner_id,
-                lease_epoch=options.agent_tree_lease_epoch,
-            )
-            if registration.schema.name == "delegateToAgents"
-            else registration
-            for registration in registrations
-        )
 
     def _execution_registrations(
         self, request: AgentRunRequest, options: AgentCoreRunOptions,
@@ -1163,6 +790,80 @@ class AgentCore:
             request, options.agent_capability_grant, registrations, enabled_names,
         )
         return self._bind_agent_tree_lease(registrations, options), enabled_names
+
+    async def execute_operation(
+        self, request: AgentRunRequest, *, run_id: str, operation_id: str,
+        options: AgentCoreRunOptions = AgentCoreRunOptions(),
+        signal: CancellationSignal | None = None,
+    ) -> AgentRuntimeResult:
+        """Execute a private reactive tool loop inside an existing Run.
+
+        The caller owns admission and operation settlement. This method never
+        creates an Agent, changes the Run plan, saves a Run checkpoint, or
+        commits a Run result. Model usage and tool events belong to run_id.
+        """
+        operation_id = required_text(operation_id, "operation id")
+        if self._run_tree_repository is not None:
+            raise ContractViolationError("Operation Core must not expose Agent creation", code="operation_scope_invalid")
+        if any(value is not None for value in (
+            options.agent_tree_run_id,
+            options.durable_continuation,
+            options.agent_execution_checkpoint,
+            options.checkpoint_handler,
+            options.tool_checkpoint_handler,
+        )):
+            raise ContractViolationError(
+                "Operation cannot replace a Run execution",
+                code="operation_scope_invalid",
+            )
+        snapshot = await self._repository.get(run_id)
+        if snapshot is None or snapshot.status is not RunStatus.RUNNING:
+            raise ContractViolationError("Operation requires its running owner", code="operation_owner_not_running")
+        deadlines = tuple(value for value in (
+            snapshot.deadline_at_ms, options.deadline_at_ms,
+        ) if value is not None)
+        deadline = min(deadlines) if deadlines else None
+        options = replace(options, deadline_at_ms=deadline,
+            response_transaction_policy=ResponseTransactionPolicy(
+                mode=ResponseTransactionMode.VALIDATED_RESULT,
+                public_presentation=PublicPresentationMode.NONE,
+            ))
+        request = replace(request, planning_mode=PlanningMode.REACTIVE)
+        stop = ExecutionStopSignal(signal, deadline_at_ms=deadline, deadline_code="run_deadline_exceeded")
+        sink = _BufferedEventSink(self._output_processor)
+        controller = AgentRunController(repository=self._repository, event_sink=sink)
+        await controller.attach(snapshot)
+        try:
+            dependencies = self._runtime_dependencies(controller, options, request, stop)
+            registrations, names = self._execution_registrations(request, options)
+            registrations = tuple(item for item in registrations if item.schema.name in names)
+            schemas = tuple(model_visible_tool_schema(item.schema, str(request.metadata.get("locale") or "zh-CN")) for item in registrations)
+            output_budget = _resolve_run_output_budget(request, options)
+            claims = options.context_claims
+            budget = _execution_context_budget(request, options, output_budget, schemas, claims)
+            bundle = await await_with_cancellation(dependencies.context_capability.build_reactive(request, budget, stop), stop)
+            prepared = await self._prepare_runtime_phase(
+                request=request, compaction_source_request=request, options=options,
+                controller=controller, context_capability=dependencies.context_capability,
+                conversation_compactor=None, planning_bundle=bundle, bundle=bundle,
+                plan=None, selected_registrations=registrations, schemas=schemas,
+                selected_names=names, context_claims=claims, reserved_budget=budget,
+                pre_planning_compaction={"outcome": "not_configured"},
+                output_budget=output_budget, planned=False, signal=stop,
+            )
+            result, _ = await self._drive_runtime(
+                request=request, prepared_request=prepared.prepared_request, options=options,
+                controller=controller, sink=sink, conversation_compactor=None,
+                model_tasks=dependencies.model_tasks, schemas=schemas, registrations=registrations,
+                selected_names=names, planning_hook=None, plan=None, state=prepared.state,
+                budget=prepared.budget, output_budget=output_budget, signal=stop,
+                operation_id=operation_id,
+            )
+            if not isinstance(result, AgentRuntimeResult):
+                raise ContractViolationError("Operation did not return a runtime result", code="operation_result_missing")
+            return result
+        finally:
+            stop.close()
 
     async def _execute_run(
         self,
@@ -1335,27 +1036,27 @@ class AgentCore:
                 yield _run_result(controller)
                 return
             except ContextOverflowError as error:
-                await _record_safe_exception(
+                await record_stage_failure(
                     controller,
+                    error=error,
                     stage="context_reservation",
                     outcome="overflow",
-                    error=error,
+                    code="context_overflow_initial",
                     started=reservation_started,
                 )
-                await controller.fail("context_overflow_initial")
                 for event in sink.drain():
                     yield event
                 yield _run_result(controller)
                 return
             except Exception as error:
-                await _record_safe_exception(
+                await record_stage_failure(
                     controller,
+                    error=error,
                     stage="context_reservation",
                     outcome="failed",
-                    error=error,
+                    code="context_setup_failed",
                     started=reservation_started,
                 )
-                await controller.fail("context_setup_failed")
                 for event in sink.drain():
                     yield event
                 yield _run_result(controller)
@@ -1479,27 +1180,27 @@ class AgentCore:
                 yield _run_result(controller)
                 return
             except ContextOverflowError as error:
-                await _record_safe_exception(
+                await record_stage_failure(
                     controller,
+                    error=error,
                     stage="context_budget",
                     outcome="overflow",
-                    error=error,
+                    code="context_overflow_initial",
                     started=setup_started,
                 )
-                await controller.fail("context_overflow_initial")
                 for event in sink.drain():
                     yield event
                 yield _run_result(controller)
                 return
             except Exception as error:
-                await _record_safe_exception(
+                await record_stage_failure(
                     controller,
+                    error=error,
                     stage="context_budget",
                     outcome="failed",
-                    error=error,
+                    code="context_setup_failed",
                     started=setup_started,
                 )
-                await controller.fail("context_setup_failed")
                 for event in sink.drain():
                     yield event
                 yield _run_result(controller)
@@ -1562,6 +1263,8 @@ class AgentCore:
             for update in updates:
                 yield update
         finally:
+            if self._run_commands is not None and controller.run_id is not None:
+                await self._run_commands.results.close(controller.run_id)
             owned_stop.close()
             run_id = controller.run_id
             if run_id is not None:
@@ -1579,6 +1282,7 @@ class AgentCore:
                     snapshot,
                     agent_tree_context_version,
                 )
+                self._result_delivery.release(snapshot.run_id)
 
     def _planning_mode_flags(
         self,
@@ -1653,386 +1357,30 @@ class AgentCore:
             reasoning_mode=options.reasoning_mode,
         )
 
-    async def _execute_runtime_with_auto_promotion(
-        self,
-        *,
-        request: AgentRunRequest,
-        prepared_request: AgentRunRequest,
-        compaction_source_request: AgentRunRequest,
-        options: AgentCoreRunOptions,
-        controller: AgentRunController,
-        sink: _BufferedEventSink,
-        context_capability: ContextCapability,
-        conversation_compactor: ConversationCompactor | None,
-        model_tasks: AgentModelTaskRunner,
-        schemas,
-        registrations: Sequence[ToolRegistration],
-        enabled_names: frozenset[str],
-        selected_names: frozenset[str],
-        display_locale: str,
-        context_claims: Sequence[ContextBudgetClaim],
-        reserved_budget: ContextBudget,
-        planning_hook,
-        plan: ExecutionPlan | None,
-        state: ExecutionState,
-        budget: ContextBudget,
-        output_budget,
-        planning_available: bool,
-        signal: CancellationSignal | None,
-        resume_checkpoint: AgentExecutionCheckpoint | None = None,
-    ) -> tuple[
-        AgentRuntimeResult | None,
-        tuple[AgentEvent, ...],
-    ]:
-        result, events = await self._drive_runtime(
-            request=request,
-            prepared_request=prepared_request,
-            options=options,
-            controller=controller,
-            sink=sink,
-            conversation_compactor=conversation_compactor,
-            model_tasks=model_tasks,
-            schemas=schemas,
-            registrations=registrations,
-            selected_names=selected_names,
-            planning_hook=planning_hook,
-            plan=plan,
-            state=state,
-            budget=budget,
-            output_budget=output_budget,
-            planning_mode=PlanningMode.PLANNED if plan is not None else request.planning_mode,
-            planning_available=planning_available,
-            planning_required_tool_names=frozenset(
-                registration.schema.name
-                for registration in registrations
-                if registration.planning_requirement
-                is ToolPlanningRequirement.REQUIRED
-            ),
-            signal=signal,
-            resume_checkpoint=resume_checkpoint,
-        )
-        if not isinstance(result, AutoPlanningRequest):
-            return result, events
-        promoted, promoted_events = await self._promote_auto_run(
-            activation=result,
-            request=compaction_source_request,
-            options=options,
-            controller=controller,
-            sink=sink,
-            model_tasks=model_tasks,
-            context_capability=context_capability,
-            conversation_compactor=conversation_compactor,
-            registrations=registrations,
-            enabled_names=enabled_names,
-            display_locale=display_locale,
-            context_claims=context_claims,
-            reserved_budget=reserved_budget,
-            output_budget=output_budget,
-            state=state,
-            budget=budget,
-            signal=signal,
-        )
-        return promoted, (*events, *promoted_events)
+    async def _resume_checkpointed_run(self, *args, **kwargs):
+        async for _event in durable_resume._resume_checkpointed_run(self, *args, **kwargs):
+            yield _event
 
-    async def _promote_auto_run(
-        self,
-        *,
-        activation: AutoPlanningRequest,
-        request: AgentRunRequest,
-        options: AgentCoreRunOptions,
-        controller: AgentRunController,
-        sink: _BufferedEventSink,
-        model_tasks: AgentModelTaskRunner,
-        context_capability: ContextCapability,
-        conversation_compactor: ConversationCompactor | None,
-        registrations: Sequence[ToolRegistration],
-        enabled_names: frozenset[str],
-        display_locale: str,
-        context_claims: Sequence[ContextBudgetClaim],
-        reserved_budget: ContextBudget,
-        output_budget,
-        state: ExecutionState,
-        budget: ContextBudget,
-        signal: CancellationSignal | None,
-    ) -> tuple[AgentRuntimeResult | None, tuple[AgentEvent, ...]]:
-        events: list[AgentEvent] = []
-        remaining_checkpoint = (
-            activation.resume_checkpoint
-            if activation.phase == "remaining"
-            and isinstance(
-                activation.resume_checkpoint,
-                AgentExecutionCheckpoint,
-            )
-            else None
-        )
-        if activation.phase == "remaining" and remaining_checkpoint is None:
-            await controller.fail("remaining_planning_checkpoint_unavailable")
-            return None, ()
-        if remaining_checkpoint is not None:
-            request = replace(request, messages=remaining_checkpoint.messages)
-        remaining_model_rounds = (
-            self._runtime_limits.max_model_rounds - activation.round_count
-        )
-        if remaining_model_rounds < 1:
-            await controller.record_trace(TraceRecord(
-                stage="planning_activation",
-                outcome="budget_exhausted",
-                details={"roundsUsed": activation.round_count},
-            ))
-            await controller.fail("planning_activation_budget_exhausted")
-            return None, ()
-        promoted_limits = replace(
-            self._runtime_limits,
-            max_model_rounds=remaining_model_rounds,
-        )
-        pre_planning_compaction: dict[str, Any] = {
-            "outcome": "not_configured"
-        }
-        try:
-            if (
-                conversation_compactor is not None
-                and context_capability.uses_staged_context
-            ):
-                (
-                    request,
-                    pre_planning_compaction,
-                    compaction_events,
-                ) = await compact_before_planning(
-                    compactor=conversation_compactor,
-                    request=request,
-                    budget=reserved_budget,
-                    controller=controller,
-                    publish=self._publish_runtime_event,
-                    signal=signal,
-                )
-                events.extend(compaction_events)
-            planning_bundle = await await_with_cancellation(
-                context_capability.build_initial(
-                    request,
-                    reserved_budget,
-                    signal,
-                ),
-                signal,
-            )
-            _validate_context_allocations(planning_bundle, reserved_budget)
-        except OperationCanceled:
-            await controller.cancel("request_canceled")
-            return None, tuple(events)
-        except ContextOverflowError as error:
-            await _record_safe_exception(
-                controller,
-                stage="context_reservation",
-                outcome="overflow",
-                error=error,
-            )
-            await controller.fail("context_overflow_initial")
-            return None, tuple(events)
-        except Exception as error:
-            await _record_safe_exception(
-                controller,
-                stage="context_reservation",
-                outcome="failed",
-                error=error,
-            )
-            await controller.fail("context_setup_failed")
-            return None, tuple(events)
+    async def _resume_child_runs(self, *args, **kwargs):
+        return await durable_resume._resume_child_runs(self, *args, **kwargs)
 
-        planning_result = await PlanningCapability(
-            operations=self._operations,
-            model_manager=self._model_invocations,
-            planner=self._planner,
-            policy=self._planning_policy,
-            runtime_limits=promoted_limits,
-            task_orchestration=self._task_orchestration,
-        ).execute(
-            request=request,
-            planning_bundle=planning_bundle,
-            registrations=registrations,
-            enabled_names=enabled_names,
-            display_locale=display_locale,
-            model_supports_tools=options.model_supports_tools,
-            controller=controller,
-            signal=signal,
-            turn_id=options.turn_id,
-            reasoning_mode=options.reasoning_mode,
-        )
-        if planning_result.terminal:
-            return None, tuple(events)
+    async def _continue_durable_run(self, *args, **kwargs):
+        async for _event in durable_resume._continue_durable_run(self, *args, **kwargs):
+            yield _event
 
-        plan = planning_result.execution_plan
-        capabilities = planning_result.capabilities
-        admission = planning_result.admission
-        if (
-            admission is not None
-            and admission.mode is not ExecutionMode.INLINE
-            and plan is not None
-        ):
-            if self._task_orchestration is None:
-                await controller.fail("planning_admission_unavailable")
-                return None, tuple(events)
-            durable_result, durable_events = await _collect_durable_updates(
-                self._task_orchestration.complete_admission(
-                    controller=controller,
-                    request=request,
-                    plan=plan,
-                    admission=admission,
-                    sink=sink,
-                    signal=signal, defer_successful_completion=_uses_validated_result(options),
-                ),
-                run_id=controller.run_id, model=request.model.model,
-            )
-            events.extend(durable_events)
-            return durable_result, tuple(events)
+    async def _settle_durable_updates(self, *args, **kwargs):
+        async for _event in durable_resume._settle_durable_updates(self, *args, **kwargs):
+            yield _event
 
-        planning_hook = planning_result.dynamic_planning
-        selected_names = (
-            runtime_tool_names_for_planning_names(
-                registrations,
-                enabled_names,
-                effective_planning_tool_names(capabilities),
-            )
-            if planning_hook is not None
-            else _planned_tool_names(plan)
-            if plan is not None
-            else enabled_names
-        )
-        selected_registrations = tuple(
-            registration
-            for registration in registrations
-            if registration.schema.name in selected_names
-        )
-        schemas = tuple(
-            model_visible_tool_schema(registration.schema, display_locale)
-            for registration in selected_registrations
-        )
-        if remaining_checkpoint is not None:
-            resume_messages = remaining_checkpoint.messages
-            if plan is not None:
-                resume_messages = (
-                    *resume_messages,
-                    build_execution_message(plan),
-                )
-            resume_checkpoint = replace(
-                remaining_checkpoint,
-                messages=resume_messages,
-                round_limit=max(
-                    remaining_checkpoint.next_round,
-                    remaining_model_rounds,
-                ),
-            )
-            resumed_tool_schema_tokens = estimate_tool_schema_tokens(schemas)
-            resumed_budget = replace(
-                budget,
-                tool_schema_tokens=resumed_tool_schema_tokens,
-                provider_input_tokens=(
-                    budget.provider_input_tokens
-                    + budget.tool_schema_tokens
-                    - resumed_tool_schema_tokens
-                ),
-            )
-            runtime_result, runtime_events = await self._drive_runtime(
-                request=request,
-                prepared_request=replace(
-                    request,
-                    messages=resume_messages,
-                    tools_enabled=bool(schemas),
-                ),
-                options=options,
-                controller=controller,
-                sink=sink,
-                conversation_compactor=conversation_compactor,
-                model_tasks=model_tasks,
-                schemas=schemas,
-                registrations=registrations,
-                selected_names=selected_names,
-                planning_hook=planning_hook,
-                plan=plan,
-                state=state,
-                budget=resumed_budget,
-                output_budget=output_budget,
-                planning_mode=PlanningMode.PLANNED,
-                planning_available=True,
-                planning_required_tool_names=frozenset(),
-                model_round_limit=resume_checkpoint.round_limit,
-                signal=signal,
-                resume_checkpoint=resume_checkpoint,
-            )
-            events.extend(runtime_events)
-            if isinstance(runtime_result, AutoPlanningRequest):
-                await controller.fail("invalid_planning_control_call")
-                return None, tuple(events)
-            return runtime_result, tuple(events)
-        try:
-            prepared = await self._prepare_runtime_phase(
-                request=request,
-                compaction_source_request=request,
-                options=options,
-                controller=controller,
-                context_capability=context_capability,
-                conversation_compactor=conversation_compactor,
-                planning_bundle=planning_bundle,
-                bundle=planning_bundle,
-                plan=plan,
-                selected_registrations=selected_registrations,
-                schemas=schemas,
-                selected_names=selected_names,
-                context_claims=context_claims,
-                reserved_budget=reserved_budget,
-                pre_planning_compaction=pre_planning_compaction,
-                output_budget=output_budget,
-                planned=True,
-                signal=signal,
-            )
-            events.extend(prepared.events)
-        except OperationCanceled:
-            await controller.cancel("request_canceled")
-            return None, tuple(events)
-        except ContextOverflowError as error:
-            await _record_safe_exception(
-                controller,
-                stage="context_budget",
-                outcome="overflow",
-                error=error,
-            )
-            await controller.fail("context_overflow_initial")
-            return None, tuple(events)
-        except Exception as error:
-            await _record_safe_exception(
-                controller,
-                stage="context_budget",
-                outcome="failed",
-                error=error,
-            )
-            await controller.fail("context_setup_failed")
-            return None, tuple(events)
+    async def _prepare_runtime_phase(self, *args, **kwargs):
+        return await planning_promotion._prepare_runtime_phase(self, *args, **kwargs)
 
-        runtime_result, runtime_events = await self._drive_runtime(
-            request=prepared.request,
-            prepared_request=prepared.prepared_request,
-            options=options,
-            controller=controller,
-            sink=sink,
-            conversation_compactor=conversation_compactor,
-            model_tasks=model_tasks,
-            schemas=schemas,
-            registrations=registrations,
-            selected_names=selected_names,
-            planning_hook=planning_hook,
-            plan=plan,
-            state=prepared.state,
-            budget=prepared.budget,
-            output_budget=output_budget,
-            planning_mode=PlanningMode.PLANNED,
-            planning_available=True,
-            planning_required_tool_names=frozenset(),
-            model_round_limit=remaining_model_rounds,
-            signal=signal,
-        )
-        events.extend(runtime_events)
-        if isinstance(runtime_result, AutoPlanningRequest):
-            await controller.fail("invalid_planning_control_call")
-            return None, tuple(events)
-        return runtime_result, tuple(events)
+    async def _promote_auto_run(self, *args, **kwargs):
+        return await planning_promotion._promote_auto_run(self, *args, **kwargs)
+
+    async def _execute_runtime_with_auto_promotion(self, *args, **kwargs):
+        return await planning_promotion._execute_runtime_with_auto_promotion(self, *args, **kwargs)
+
 
     async def _start_or_attach_run(
         self,
@@ -2224,371 +1572,6 @@ class AgentCore:
             resume_checkpoint=checkpoint,
         )
 
-    async def _resume_checkpointed_run(
-        self,
-        request: AgentRunRequest,
-        options: AgentCoreRunOptions,
-        controller: AgentRunController,
-        sink: _BufferedEventSink,
-        model_tasks: AgentModelTaskRunner,
-        output_budget,
-        signal: CancellationSignal | None,
-    ) -> AsyncIterator[AgentEvent | AgentRunResult]:
-        checkpoint = options.agent_execution_checkpoint
-        if self._run_tree_repository is not None:
-            checkpoint = await self._resume_child_runs(
-                checkpoint,
-                options,
-                controller,
-                signal,
-            )
-            options = replace(options, agent_execution_checkpoint=checkpoint)
-        runtime_result, runtime_events = await self._resume_runtime(
-            request=request,
-            options=options,
-            controller=controller,
-            sink=sink,
-            model_tasks=model_tasks,
-            output_budget=output_budget,
-            signal=signal,
-        )
-        for event in runtime_events:
-            yield event
-        await self._settle_runtime_result(
-            request=request,
-            options=options,
-            controller=controller,
-            result=runtime_result,
-            output_budget=output_budget,
-            signal=signal,
-        )
-        for event in sink.drain():
-            yield event
-        yield _run_result(
-            controller,
-            model=(
-                runtime_result.model
-                if runtime_result is not None
-                else request.model.model
-            ),
-        )
-
-    async def _resume_child_runs(self, checkpoint, options, controller, signal):
-        calls = {call.id for message in checkpoint.messages for call in message.tool_calls if call.name == "delegateToAgents"}
-        messages = list(checkpoint.messages)
-        evidence = RunEvidenceStore.from_checkpoint_mapping(checkpoint.evidence_state)
-        required_failure = False
-        for index, message in enumerate(messages):
-            if message.role is not MessageRole.TOOL or message.tool_call_id not in calls:
-                continue
-            try: payload = json.loads(message.content)
-            except (ValueError, TypeError): continue
-            if not isinstance(payload, dict) or payload.get("state") != "pending" or not payload.get("pendingRunIds"):
-                continue
-            aggregate = await self.join_agent_runs(checkpoint.run_id, tuple(payload["pendingRunIds"]), signal,
-                lease_owner_id=options.agent_tree_lease_owner_id, lease_epoch=options.agent_tree_lease_epoch)
-            if aggregate.pending_run_ids:
-                continue
-            failures = sorted(set(payload["requiredFailures"]) | set(aggregate.required_failures))
-            required_failure = required_failure or bool(failures)
-            messages[index] = replace(message, content=json.dumps({
-                "state": "blocked" if failures else "ready", "pendingRunIds": [], "requiredFailures": failures,
-                "results": [*payload["results"], *(thaw_json_mapping(row) for row in aggregate.results)],
-            }, ensure_ascii=False, separators=(",", ":")))
-            evidence.resolve_child_runs(
-                message.tool_call_id,
-                messages[index].content,
-            )
-        if tuple(messages) != checkpoint.messages:
-            checkpoint = replace(checkpoint, messages=tuple(messages), input_revision=checkpoint.input_revision + 1,
-                                 evidence_state=evidence.checkpoint_mapping())
-            await controller.save_execution_checkpoint(checkpoint)
-        if required_failure:
-            raise ContractViolationError(
-                "A required Child Run failed",
-                code="required_child_run_failed",
-            )
-        return checkpoint
-
-    async def _prepare_runtime_phase(
-        self,
-        *,
-        request: AgentRunRequest,
-        compaction_source_request: AgentRunRequest,
-        options: AgentCoreRunOptions,
-        controller: AgentRunController,
-        context_capability: ContextCapability,
-        conversation_compactor: ConversationCompactor | None,
-        planning_bundle: ContextBundle,
-        bundle: ContextBundle,
-        plan: ExecutionPlan | None,
-        selected_registrations: Sequence[ToolRegistration],
-        schemas,
-        selected_names: frozenset[str],
-        context_claims: Sequence[ContextBudgetClaim],
-        reserved_budget: ContextBudget,
-        pre_planning_compaction: Mapping[str, Any],
-        output_budget,
-        planned: bool,
-        signal: CancellationSignal | None,
-    ) -> _PreparedRuntimePhase:
-        setup_started = perf_counter()
-        task_context: TaskContextRequest | None = None
-        task_context_claims: tuple[ContextBudgetClaim, ...] = ()
-        if (
-            context_capability.staged_provider is not None
-            and plan is not None
-            and plan.task_spec is not None
-        ):
-            task_context = _compile_task_context_request(
-                plan,
-                selected_registrations,
-                run_id=controller.run_id,
-            )
-            if isinstance(
-                context_capability.staged_provider,
-                TaskContextDemandProvider,
-            ):
-                task_context_claims = await await_with_cancellation(
-                    resolve_task_context_budget_claims(
-                        context_capability.staged_provider,
-                        request,
-                        task_context,
-                        signal,
-                    ),
-                    signal,
-                )
-        effective_context_claims = _merge_context_claims(
-            context_claims,
-            task_context_claims,
-        )
-        budget = _execution_context_budget(
-            request, options, output_budget, schemas, effective_context_claims,
-        )
-        context_mode = "single_pass" if planned else "reactive"
-        if context_capability.staged_provider is not None and planned:
-            retrieval_started = perf_counter()
-            bundle, context_mode = await await_with_cancellation(
-                context_capability.build_execution(
-                    request,
-                    budget,
-                    planning_bundle,
-                    task_context,
-                    signal,
-                ),
-                signal,
-            )
-            await controller.record_trace(TraceRecord(
-                stage="context_retrieval",
-                outcome=context_mode,
-                details={
-                    "postPlanning": context_mode == "task_spec",
-                    "plannedToolCount": len(
-                        _planned_tool_names(plan) if plan is not None else ()
-                    ),
-                    "requiredContextBlockCount": (
-                        len(task_context.required_context_blocks)
-                        if context_mode == "task_spec"
-                        else 0
-                    ),
-                    "evidenceKindCount": (
-                        len(task_context.evidence_kinds)
-                        if context_mode == "task_spec"
-                        else 0
-                    ),
-                },
-                duration_ms=_duration_ms(retrieval_started),
-            ))
-        _validate_context_allocations(bundle, budget)
-        diagnostics: dict[str, Any] = {
-            "outcome": "not_configured",
-            "plannedStepCount": len(plan.steps) if plan is not None else 0,
-            "plannedToolCount": (
-                sum(step.executor is StepExecutor.TOOL for step in plan.steps)
-                if plan is not None
-                else 0
-            ),
-            "selectedToolCount": len(selected_names),
-        }
-        events: tuple[AgentEvent, ...] = ()
-        if (
-            planned
-            and conversation_compactor is not None
-            and context_capability.uses_staged_context
-        ):
-            request, diagnostics, events = await compact_after_planning(
-                compactor=conversation_compactor,
-                source_request=compaction_source_request,
-                request=request,
-                budget=budget,
-                context_blocks=bundle.blocks,
-                plan=plan,
-                selected_names=selected_names,
-                controller=controller,
-                publish=self._publish_runtime_event,
-                signal=signal,
-            )
-        prepared_request = replace(
-            request,
-            messages=_assemble_messages(request.messages, bundle.blocks, plan),
-            context_window=budget.window_tokens,
-            tools_enabled=bool(schemas),
-        )
-        estimated_input_tokens = estimate_agent_messages_tokens(
-            prepared_request.messages
-        )
-        overflow_tokens = max(
-            0,
-            estimated_input_tokens - budget.provider_input_tokens,
-        )
-        if overflow_tokens:
-            raise ContextOverflowError(
-                "required messages exceed the initial provider input budget",
-                reason_code="required_messages_exceed_provider_budget",
-                details={
-                    "providerInputTokens": budget.provider_input_tokens,
-                    "estimatedInputTokens": estimated_input_tokens,
-                    "overflowTokens": overflow_tokens,
-                },
-            )
-        state = self._execution_state_factory.create(request)
-        if not isinstance(state, ExecutionState):
-            raise ContractViolationError(
-                "execution state factory must return ExecutionState"
-            )
-        state.run_id = controller.run_id
-        await controller.record_trace(TraceRecord(
-            stage="context_budget",
-            outcome="within_budget",
-            details={
-                "windowTokens": budget.window_tokens,
-                "providerInputTokens": budget.provider_input_tokens,
-                "toolSchemaTokens": budget.tool_schema_tokens,
-                "reservedToolSchemaTokens": reserved_budget.tool_schema_tokens,
-                "contextMode": context_mode,
-                "contextDemands": _context_demand_diagnostics(
-                    effective_context_claims,
-                    budget,
-                ),
-                "droppedMessages": 0,
-                "prePlanningCompaction": pre_planning_compaction,
-                "postPlanningOptimization": diagnostics,
-            },
-            duration_ms=_duration_ms(setup_started),
-        ))
-        budget_event = AgentEvent(
-            type=CoreEventType.CONTEXT_BUDGETED,
-            run_id=controller.run_id,
-            payload={
-                "windowTokens": budget.window_tokens,
-                "providerInputTokens": budget.provider_input_tokens,
-                "estimatedInputTokens": estimated_input_tokens,
-                "outputReserveTokens": budget.output_reserve_tokens,
-                "outputBudget": output_budget.to_mapping(),
-                "runtimeReserveTokens": budget.runtime_reserve_tokens,
-                "safetyReserveTokens": budget.safety_reserve_tokens,
-                "toolSchemaTokens": budget.tool_schema_tokens,
-                "reservedToolSchemaTokens": reserved_budget.tool_schema_tokens,
-                "contextMode": context_mode,
-                "droppedMessages": 0,
-                "projectedTotalTokens": (
-                    estimated_input_tokens
-                    + budget.tool_schema_tokens
-                    + budget.output_reserve_tokens
-                    + budget.runtime_reserve_tokens
-                    + budget.safety_reserve_tokens
-                ),
-                "overflowTokens": 0,
-                "contextAllocations": thaw_json_mapping(
-                    budget.context_allocations
-                ),
-                "diagnostics": {
-                    **thaw_json_mapping(bundle.diagnostics),
-                    "contextDemands": _context_demand_diagnostics(
-                        effective_context_claims,
-                        budget,
-                    ),
-                    "prePlanningCompaction": pre_planning_compaction,
-                    "postPlanningOptimization": diagnostics,
-                },
-            },
-        )
-        await self._publish_runtime_event(controller.run_id, budget_event)
-        return _PreparedRuntimePhase(
-            request=request,
-            prepared_request=prepared_request,
-            budget=budget,
-            state=state,
-            events=(*events, budget_event),
-        )
-
-    async def _continue_durable_run(
-        self,
-        *,
-        request: AgentRunRequest,
-        options: AgentCoreRunOptions,
-        controller: AgentRunController,
-        sink: _BufferedEventSink,
-        continuation: DurableTaskContinuation,
-        output_budget,
-        signal: CancellationSignal | None,
-    ) -> AsyncIterator[AgentEvent | AgentRunResult]:
-        orchestration = self._task_orchestration or TaskOrchestrationCapability(
-            None,
-            None,
-        )
-        updates = orchestration.continue_durable(
-            controller,
-            request,
-            continuation,
-            sink,
-            signal,
-            defer_successful_completion=_uses_validated_result(options),
-        )
-        async for update in self._settle_durable_updates(
-            updates,
-            request=request,
-            options=options,
-            controller=controller,
-            sink=sink,
-            output_budget=output_budget,
-            signal=signal,
-        ):
-            yield update
-
-    async def _settle_durable_updates(
-        self,
-        updates: AsyncIterator[AgentEvent | DurableExecutionCompletion],
-        *,
-        request: AgentRunRequest,
-        options: AgentCoreRunOptions,
-        controller: AgentRunController,
-        sink: _BufferedEventSink,
-        output_budget,
-        signal: CancellationSignal | None,
-    ) -> AsyncIterator[AgentEvent | AgentRunResult]:
-        durable_result = None
-        async for update in updates:
-            if isinstance(update, DurableExecutionCompletion):
-                durable_result = _runtime_result_from_durable(
-                    update,
-                    run_id=controller.run_id,
-                    model=request.model.model,
-                )
-            else:
-                yield update
-        if durable_result is not None:
-            await self._settle_runtime_result(
-                request=request,
-                options=options,
-                controller=controller,
-                result=durable_result,
-                output_budget=output_budget,
-                signal=signal,
-            )
-            for event in sink.drain():
-                yield event
-        yield _run_result(controller)
 
     async def _settle_runtime_result(
         self,
@@ -2611,6 +1594,7 @@ class AgentCore:
             return
         try:
             await self._require_root_agent_tree_quiescent(controller.run_id)
+            await self._require_parent_delivery_settled(controller.run_id)
             final_response = result.final_response
             validated_result: str | None = None
             policy = options.resolved_response_transaction_policy
@@ -2619,13 +1603,10 @@ class AgentCore:
                 final_response = ""
                 if policy.public_presentation is PublicPresentationMode.MODEL_LIVE:
                     transaction = AgentResponseTransaction(
-                        AgentModelInvocationManager(
+                        create_model_invocation_manager(
                             self._model_gateway,
-                            output_observer=self._output_processor,
+                            output_observer=self._root_output_observer(),
                             operation_controller=self._operations,
-                            invocation_timeout_ms=(
-                                self._runtime_limits.provider_invocation_timeout_ms
-                            ),
                             runtime_limits=self._runtime_limits,
                             max_tool_argument_chars=(
                                 self._tool_execution_limits.max_argument_chars
@@ -2678,30 +1659,6 @@ class AgentCore:
             ).strip()
             await controller.fail(code)
 
-    async def _require_root_agent_tree_quiescent(
-        self,
-        run_id: str | None,
-    ) -> None:
-        repository = self._run_tree_repository
-        if (
-            repository is None
-            or run_id is None
-            or run_id not in self._agent_tree_roots
-        ):
-            return
-        descendants = await repository.list_descendants(run_id)
-        if any(
-            run.status in {
-                AgentTreeRunStatus.QUEUED,
-                AgentTreeRunStatus.RUNNING,
-                AgentTreeRunStatus.WAITING,
-            }
-            for run in descendants
-        ):
-            raise ContractViolationError(
-                "Root Run has unfinished descendants",
-                code="root_run_not_quiescent",
-            )
 
     async def _drive_runtime(
         self,
@@ -2727,6 +1684,7 @@ class AgentCore:
         model_round_limit: int | None = None,
         signal: CancellationSignal | None,
         resume_checkpoint: AgentExecutionCheckpoint | None = None,
+        operation_id: str | None = None,
     ) -> tuple[
         AgentRuntimeResult | AutoPlanningRequest | None,
         tuple[AgentEvent, ...],
@@ -2740,13 +1698,11 @@ class AgentCore:
         manager = self._model_invocations
         if host_arguments:
             gateway = HostPlannedToolGateway(self._model_gateway, host_arguments)
-            manager = AgentModelInvocationManager(
+        if host_arguments or self._run_tree_repository is not None:
+            manager = create_model_invocation_manager(
                 gateway,
-                output_observer=self._output_processor,
+                output_observer=self._root_output_observer(),
                 operation_controller=self._operations,
-                invocation_timeout_ms=(
-                    self._runtime_limits.provider_invocation_timeout_ms
-                ),
                 runtime_limits=self._runtime_limits,
                 max_tool_argument_chars=(
                     self._tool_execution_limits.max_argument_chars
@@ -2767,29 +1723,31 @@ class AgentCore:
                     self._operations,
                 )
             ),
-            observer=controller,
+            observer=None if operation_id is not None else controller,
             context_compressor=conversation_compactor,
             limits=self._runtime_limits,
             recovery_policy=self._recovery_policy,
             operation_controller=self._operations,
-            output_observer=self._output_processor,
+            output_observer=self._root_output_observer(),
             model_manager=manager,
         )
         result: AgentRuntimeResult | AutoPlanningRequest | None = None
         events: list[AgentEvent] = []
-        async def save_checkpoint(checkpoint):
-            saved = replace(checkpoint,
+
+        def _enrich_checkpoint(checkpoint):
+            return replace(checkpoint,
                 execution_profile="planned" if plan is not None else planning_mode.value,
                 planning_state=planning_hook.checkpoint_state() if planning_hook is not None else {},
             )
+
+        async def save_checkpoint(checkpoint):
+            saved = _enrich_checkpoint(checkpoint)
             await controller.save_execution_checkpoint(saved)
             return saved
+
         async def tool_checkpoint(checkpoint):
-            saved = replace(checkpoint,
-                execution_profile="planned" if plan is not None else planning_mode.value,
-                planning_state=planning_hook.checkpoint_state() if planning_hook is not None else {},
-            )
-            await options.tool_checkpoint_handler(saved)
+            await options.tool_checkpoint_handler(_enrich_checkpoint(checkpoint))
+
         try:
             stream = runtime.run(
                 prepared_request,
@@ -2807,20 +1765,16 @@ class AgentCore:
                         for policy in options.response_judge_policies
                     ),
                 ),
-                response_transaction_mode=(
-                    ResponseTransactionMode.VALIDATED_RESULT
-                    if (
-                        controller.run_id is not None
-                        and controller.run_id in self._agent_tree_roots
-                    )
-                    else options.resolved_response_transaction_policy.mode
-                ),
+                response_transaction_mode=options.resolved_response_transaction_policy.mode,
                 execution_state=state,
                 run_id=controller.run_id,
                 turn_id=options.turn_id,
                 context_budget=budget,
                 output_budget=output_budget,
                 scope_tools_to_observer=plan is not None,
+                publish_model_commentary=(
+                    operation_id is None and options.agent_tree_parent_run_id is None
+                ),
                 force_tool_choice=bool(
                     plan is not None
                     and selected_names
@@ -2853,7 +1807,7 @@ class AgentCore:
                 resume_checkpoint=resume_checkpoint,
                 checkpoint_writer=(
                     save_checkpoint
-                    if options.agent_tree_run_id is not None or options.checkpoint_handler is not None or options.tool_checkpoint_handler is not None
+                    if operation_id is None and (options.agent_tree_run_id is not None or options.checkpoint_handler is not None or options.tool_checkpoint_handler is not None)
                     else None
                 ),
                 checkpoint_handler=options.checkpoint_handler,
@@ -2866,6 +1820,8 @@ class AgentCore:
                     events.extend(sink.drain())
                     if isinstance(update, AgentEvent):
                         event = _bind_event_to_run(update, controller.run_id)
+                        if operation_id is not None:
+                            event = replace(event, payload={**event.payload, "executionScopeId": operation_id})
                         await self._publish_runtime_event(controller.run_id, event)
                         events.append(event)
                     elif isinstance(update, (AgentRuntimeResult, AutoPlanningRequest)):
@@ -3002,11 +1958,10 @@ def _configure_output_runtime(
     )
     if operation_controller is not None and processor is not None:
         operations = operation_controller.with_output(processor)
-    invocations = AgentModelInvocationManager(
+    invocations = create_model_invocation_manager(
         model_gateway,
         output_observer=processor,
         operation_controller=operations,
-        invocation_timeout_ms=runtime_limits.provider_invocation_timeout_ms,
         runtime_limits=runtime_limits,
         max_tool_argument_chars=max_tool_argument_chars,
         budget_repository=repository,
@@ -3089,212 +2044,6 @@ class _CapturedToolCatalog:
     def enabled_names(self, request: AgentRunRequest) -> frozenset[str]:
         del request
         return self._names
-
-
-async def _record_safe_exception(
-    controller: AgentRunController,
-    *,
-    stage: str,
-    outcome: str,
-    error: Exception,
-    started: float | None = None,
-    safe_details: Mapping[str, Any] | None = None,
-) -> None:
-    overflow_details = (
-        {
-            "reasonCode": error.reason_code,
-            **error.details,
-        }
-        if isinstance(error, ContextOverflowError)
-        else {}
-    )
-    await controller.record_trace(TraceRecord(
-        stage=stage,
-        outcome=outcome,
-        details={
-            "errorType": type(error).__name__,
-            **overflow_details,
-            **(safe_details or {}),
-        },
-        duration_ms=(_duration_ms(started) if started is not None else None),
-    ))
-
-
-def _execution_error_code(error: Exception) -> str:
-    if isinstance(error, AgentCoreError):
-        code = str(getattr(error, "code", "") or "").strip()
-        if code:
-            return code
-    return "agent_execution_failed"
-
-
-async def _settle_execution_exception(
-    controller: AgentRunController,
-    sink: _BufferedEventSink,
-    error: Exception,
-) -> tuple[AgentEvent | AgentRunResult, ...] | None:
-    snapshot = controller.snapshot
-    if snapshot is None:
-        return None
-    if not snapshot.terminal:
-        if not isinstance(error, ExecutionDeadlineExceeded):
-            await _record_safe_exception(
-                controller,
-                stage="execution",
-                outcome="failed",
-                error=error,
-            )
-        await controller.fail(_execution_error_code(error))
-    return (*sink.drain(), _run_result(controller))
-
-
-def _run_result(
-    controller: AgentRunController,
-    *,
-    model: str | None = None,
-) -> AgentRunResult:
-    snapshot = controller.snapshot
-    if snapshot is None or not snapshot.terminal:
-        raise RuntimeError("agent run has no terminal snapshot")
-    return AgentRunResult(
-        run_id=snapshot.run_id,
-        status=snapshot.status,
-        final_response=snapshot.final_response,
-        error=snapshot.error,
-        model=model,
-    )
-
-
-def _runtime_result_from_durable(
-    completion: DurableExecutionCompletion,
-    *,
-    run_id: RunId | None,
-    model: str,
-) -> AgentRuntimeResult:
-    result = completion.result
-    if result.status is not LongTaskExecutionStatus.COMPLETED:
-        raise ContractViolationError(
-            "deferred durable completion must be successful"
-        )
-    return AgentRuntimeResult(
-        run_id=run_id,
-        outcome=RuntimeOutcome.COMPLETED,
-        final_response=result.final_response,
-        model=model,
-        round_count=0,
-    )
-
-
-async def _collect_durable_updates(
-    updates: AsyncIterator[AgentEvent | DurableExecutionCompletion],
-    *,
-    run_id: RunId | None,
-    model: str,
-) -> tuple[AgentRuntimeResult | None, tuple[AgentEvent, ...]]:
-    result = None
-    events: list[AgentEvent] = []
-    async for update in updates:
-        if isinstance(update, DurableExecutionCompletion):
-            result = _runtime_result_from_durable(
-                update,
-                run_id=run_id,
-                model=model,
-            )
-        else:
-            events.append(update)
-    return result, tuple(events)
-
-
-def _uses_validated_result(options: AgentCoreRunOptions) -> bool:
-    return (
-        options.resolved_response_transaction_policy.mode
-        is ResponseTransactionMode.VALIDATED_RESULT
-    )
-
-
-def _selected_context_window_tokens(
-    request: AgentRunRequest,
-    options: AgentCoreRunOptions,
-) -> int:
-    """Resolve context capacity from explicit selection or the model snapshot."""
-
-    profile_window = request.model.capability_snapshot.context_window_tokens
-    selected = (
-        request.context_window
-        or options.default_context_window_tokens
-        or profile_window
-    )
-    if selected > profile_window:
-        raise UnsupportedModelFeatureError(
-            "selected context window exceeds the model capability snapshot",
-            code="model_context_capacity_exceeded",
-            retryable=False,
-        )
-    return selected
-
-
-def _resolve_run_output_budget(
-    request: AgentRunRequest,
-    options: AgentCoreRunOptions,
-):
-    target = options.result_capacity_target_tokens
-    return resolve_invocation_output_budget(
-        request.model.capability_snapshot,
-        max_generation_tokens=request.model.max_generation_tokens,
-        result_capacity_target_tokens=target,
-        result_capacity_source=(
-            ResultCapacitySource.WORKFLOW_POLICY if target is not None else None
-        ),
-    )
-
-
-def _context_result_reserve_tokens(
-    output_budget,
-    *,
-    physical_generation_capacity: int,
-) -> int:
-    """Size Provider input without treating its generation cap as a reserve.
-
-    A declared result-capacity target is used for context planning only.  When
-    a workflow has no target, Core keeps a conservative 8K planning reserve;
-    the exact Provider maximum is still derived from actual input at the
-    invocation boundary.
-    """
-
-    physical = int(physical_generation_capacity)
-    target = output_budget.result_capacity_target_tokens
-    desired = 8_192 if target is None else target
-    return min(desired, output_budget.max_generation_tokens, physical)
-
-
-def _execution_context_budget(
-    request: AgentRunRequest,
-    options: AgentCoreRunOptions,
-    output_budget,
-    schemas,
-    claims: Sequence[ContextBudgetClaim],
-) -> ContextBudget:
-    window_tokens = _selected_context_window_tokens(request, options)
-    physical = max_generation_tokens_for_context(
-        window_tokens=window_tokens,
-        tools=schemas,
-        safety_reserve_tokens=options.safety_reserve_tokens,
-        runtime_reserve_tokens=options.runtime_reserve_tokens,
-        minimum_message_tokens=options.minimum_message_tokens,
-    )
-    constrain_output_budget_to_context(output_budget, max_generation_tokens=physical)
-    output_reserve = _context_result_reserve_tokens(
-        output_budget, physical_generation_capacity=physical,
-    )
-    return allocate_context_budget(
-        window_tokens=window_tokens,
-        output_reserve_tokens=output_reserve,
-        tools=schemas,
-        claims=claims,
-        safety_reserve_tokens=options.safety_reserve_tokens,
-        runtime_reserve_tokens=options.runtime_reserve_tokens,
-        minimum_message_tokens=options.minimum_message_tokens,
-    )
 
 
 def _preset_fingerprint_for_composition(

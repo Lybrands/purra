@@ -54,9 +54,12 @@ MOVED_TOP_LEVEL_DEFINITIONS = {
         "PlanningCapability",
         "PlanningPhaseResult",
         "TaskOrchestrationCapability",
+        "_AgentCoreTreeRunExecutor",
+        "_AgentTreeRootBinding",
         "_AugmentedToolCatalog",
         "_BufferedEventSink",
         "_DynamicPlanningOrchestrator",
+        "_PreparedRuntimePhase",
         "_assemble_messages",
         "_bind_event_to_run",
         "_compile_task_context_request",
@@ -465,11 +468,18 @@ def test_recovery_persists_complete_execution_authority():
     continuation = (CORE_DIR / "engine" / "options.py").read_text(
         encoding="utf-8"
     )
-    agent_tree = (CORE_DIR / "agent_tree.py").read_text(
-        encoding="utf-8"
+    agent_tree = "\n".join(
+        (CORE_DIR / "agent_tree" / name).read_text(encoding="utf-8")
+        for name in ("__init__.py", "contracts.py", "ports.py", "memory.py")
     )
     contracts = (CORE_DIR / "contracts" / "__init__.py").read_text(
         encoding="utf-8"
+    ) + "\n".join(
+        (CORE_DIR / "contracts" / name).read_text(encoding="utf-8")
+        for name in (
+            "model.py", "planning.py", "context.py", "tools.py",
+            "approval.py", "run.py",
+        )
     )
     persistence = (CORE_DIR / "ports" / "persistence.py").read_text(
         encoding="utf-8"

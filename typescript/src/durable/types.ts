@@ -1,14 +1,17 @@
 import type { JsonValue, Message, ModelTokenUsage } from "../model/types.js";
 import type { ExecutionPlan } from "../planning/types.js";
 import type { AgentPresetSnapshot, RunBudgets } from "../run/types.js";
+import type { AgentNode, AgentTreeRun } from "../agent-tree.js";
 
 export type ExecutionMode = "inline" | "durable" | "clarify" | "reject";
+export type BudgetExhaustionDisposition = "pause_recoverable" | "fail_permanent";
 export type LongTaskStatus = "pending" | "running" | "paused" | "completed" | "failed" | "canceled";
 export type LongTaskUnitStatus =
   | "pending"
   | "waiting_retry"
   | "claimed"
   | "running"
+  | "blocked"
   | "completed"
   | "failed"
   | "canceled";
@@ -90,6 +93,7 @@ export interface LongTaskCreateCommand {
   readonly maxParallelism?: number;
   readonly deadlineAtMs: number | null;
   readonly budgets: LongTaskBudgetLimits;
+  readonly budgetExhaustionDisposition?: BudgetExhaustionDisposition;
   readonly metadata?: Readonly<Record<string, JsonValue>>;
 }
 
@@ -108,12 +112,14 @@ export interface LongTaskRecord {
   readonly maxParallelism: number;
   readonly deadlineAtMs: number | null;
   readonly budgets: LongTaskBudgetLimits;
+  readonly budgetExhaustionDisposition: BudgetExhaustionDisposition;
   readonly cancellationRequestedAtMs: number | null;
   readonly usage: LongTaskUsage;
   readonly metadata: Readonly<Record<string, JsonValue>>;
 }
 
 export interface LongTaskUnitRecord {
+  readonly runId: string | null;
   readonly taskId: string;
   readonly id: string;
   readonly position: number;
@@ -157,6 +163,7 @@ export interface LongTaskCheckpoint {
 }
 
 export interface LongTaskUnitResult {
+  readonly runId?: string;
   readonly outputRef: string;
   readonly artifactDigest?: string;
   readonly usage?: ModelTokenUsage | null;
@@ -189,10 +196,16 @@ export interface DurableTaskDescriptorResolver {
 }
 
 export interface DurableUnitExecutionContext {
+  /** Owning execution; parallel operations do not create Agent Runs. */
+  readonly runId: string;
   readonly task: LongTaskRecord;
   readonly unit: LongTaskUnitRecord;
+  /** The validated Tree Child that owns this exact Unit attempt. */
+  readonly treeRun?: AgentTreeRun;
+  readonly treeAgent?: AgentNode;
   readonly dependencyOutputs: Readonly<Record<string, string>>;
   readonly signal?: AbortSignal;
+  bindRun(runId: string): Promise<void>;
   checkpoint(payload: JsonValue): Promise<LongTaskCheckpoint>;
   recordUsage(usage: ModelTokenUsage | null): Promise<void>;
 }
@@ -295,7 +308,10 @@ export interface LongTaskRepository {
   listRunBindings(taskId: string): Promise<readonly LongTaskRunBinding[]>;
   start(taskId: string): Promise<LongTaskRecord>;
   claimReadyUnit(taskId: string, workerId: string, leaseDurationMs: number): Promise<LongTaskUnitRecord | undefined>;
+  /** Claim exactly this Unit under the normal admission gates; never select a sibling. */
+  claimUnit(taskId: string, unitId: string, workerId: string, leaseDurationMs: number): Promise<LongTaskUnitRecord | undefined>;
   markUnitRunning(claim: LongTaskClaim): Promise<LongTaskUnitRecord>;
+  bindUnitRun(claim: LongTaskClaim, runId: string): Promise<LongTaskUnitRecord>;
   heartbeat(claim: LongTaskClaim, leaseDurationMs: number): Promise<LongTaskUnitRecord>;
   appendCheckpoint(claim: LongTaskClaim, payload: JsonValue): Promise<LongTaskCheckpoint>;
   recordUsage(claim: LongTaskClaim, usage: ModelTokenUsage): Promise<LongTaskUnitRecord>;

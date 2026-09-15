@@ -1,3 +1,4 @@
+import { deliverAgentResults } from "./agent-tree-delivery.js";
 import type { JsonValue } from "./model/types.js";
 import { AgentError } from "./shared/errors.js";
 import { UserInputRequired } from "./interaction.js";
@@ -43,6 +44,7 @@ export interface AgentTreeRunExecutor {
 }
 
 export class AgentTreeRunSupervisor {
+  readonly #deliverResults: ((runId: string, results: AgentRunAggregation["results"], signal: AbortSignal) => Promise<void>) | undefined;
   readonly #repository: RunTreeRepository;
   readonly #executor: AgentTreeRunExecutor;
   readonly #ownerId: string;
@@ -52,11 +54,13 @@ export class AgentTreeRunSupervisor {
   public constructor(options: {
     readonly repository: RunTreeRepository;
     readonly executor: AgentTreeRunExecutor;
+    readonly deliverResults?: (runId: string, results: AgentRunAggregation["results"], signal: AbortSignal) => Promise<void>;
     readonly ownerId?: string;
     readonly leaseDurationMs?: number;
   }) {
     this.#repository = options.repository;
     this.#executor = options.executor;
+    this.#deliverResults = options.deliverResults;
     this.#ownerId = requiredText(
       options.ownerId ?? `agent-tree-supervisor-${globalThis.crypto.randomUUID()}`,
       "Agent tree supervisor owner id",
@@ -64,11 +68,22 @@ export class AgentTreeRunSupervisor {
     this.#leaseDurationMs = positive(options.leaseDurationMs ?? 30_000, "lease duration");
   }
 
-  public async executeAndJoin(
+  public async executeAndJoin(requesterRunId: string, runIds: readonly string[], signal?: AbortSignal,
+    claim: { readonly leaseOwnerId?: string; readonly leaseEpoch?: number } = {}): Promise<AgentRunAggregation> {
+    const requester = await this.#repository.getRun(requesterRunId);
+    if (this.#deliverResults && requester.rootRunId === requesterRunId) {
+      return deliverAgentResults((notify, stop) => this.#executeAndJoin(requesterRunId, runIds, stop, claim, notify),
+        (results, stop) => this.#deliverResults!(requesterRunId, results, stop), signal);
+    }
+    return this.#executeAndJoin(requesterRunId, runIds, signal, claim);
+  }
+
+  async #executeAndJoin(
     requesterRunId: string,
     runIds: readonly string[],
     signal?: AbortSignal,
     claim: { readonly leaseOwnerId?: string; readonly leaseEpoch?: number } = {},
+    notify?: (value: AgentRunAggregation) => void,
   ): Promise<AgentRunAggregation> {
     const requesterId = requiredText(requesterRunId, "requester Run id");
     const targets = [...new Set(runIds.map((id) => requiredText(id, "Child Run id")))];
@@ -76,10 +91,18 @@ export class AgentTreeRunSupervisor {
       return this.#repository.aggregateRuns(requesterId, []);
     }
     let requester = await this.#repository.getRun(requesterId);
+    for (const id of targets) {
+      for (const dependency of (await this.#repository.getRun(id)).dependencyRunIds) {
+        const state = (await this.#repository.getRun(dependency)).status;
+        if (!["done", "failed", "canceled"].includes(state) && !targets.includes(dependency)) {
+          throw new AgentError("agent_dependency_join_incomplete", "Join must include unfinished dependencies");
+        }
+      }
+    }
     if (requester.status === "waiting") {
       await this.#repository.requireRunClaim(requesterId, claim);
     } else {
-      requester = await this.#repository.markWaiting(requesterId, claim);
+      requester = await this.#markWaiting(requesterId, claim);
     }
     const pending = new Set(targets);
     const active = new Map<Promise<void>, string>();
@@ -89,11 +112,15 @@ export class AgentTreeRunSupervisor {
       while (pending.size > 0) {
         if (signal?.aborted === true) throw joinCanceledError();
         const aggregate = await this.#repository.aggregateRuns(requesterId, targets);
+        notify?.(aggregate);
         pending.clear();
         for (const runId of aggregate.pendingRunIds) pending.add(runId);
         if (pending.size === 0) {
           joined = true;
           return aggregate;
+        }
+        if ((await this.#repository.getRun(requesterId)).status === "running") {
+          await this.#markWaiting(requesterId, claim);
         }
         for (const candidate of await this.#repository.listRunnable(requester.rootRunId)) {
           if (!pending.has(candidate.runId) || attempted.has(candidate.runId)) continue;
@@ -102,12 +129,33 @@ export class AgentTreeRunSupervisor {
             leaseDurationMs: this.#leaseDurationMs,
           });
           if (claimed === undefined) continue;
-          const task = this.#executeClaimed(claimed, signal);
+          const task = this.#executeClaimed(claimed, signal).then(async () => {
+            if (notify) {
+              const current = await this.#repository.aggregateRuns(requesterId, targets);
+              notify({ ...current, results: current.results.filter(item => item.runId === claimed.runId) });
+            }
+          });
           active.set(task, claimed.runId);
           attempted.add(claimed.runId);
         }
         if (active.size === 0) {
-          if ([...pending].every(id => attempted.has(id))) { joined = true; return aggregate; }
+          const blocked = new Set(attempted);
+          let changed = true;
+          while (changed) {
+            changed = false;
+            for (const id of pending) {
+              if (blocked.has(id)) continue;
+              if ((await this.#repository.getRun(id)).dependencyRunIds.some(dependency => blocked.has(dependency))) {
+                blocked.add(id);
+                changed = true;
+              }
+            }
+          }
+          if ([...pending].every(id => blocked.has(id))) { joined = true; return aggregate; }
+          if ((await this.#repository.listDescendants(requester.rootRunId)).some(run => run.status === "running")) {
+            await new Promise(resolve => setTimeout(resolve, 10));
+            continue;
+          }
           throw new AgentError(
             "agent_run_scheduler_stalled",
             "Child Run scheduler made no progress",
@@ -118,6 +166,7 @@ export class AgentTreeRunSupervisor {
         pending.delete(settled.runId);
       }
       const aggregate = await this.#repository.aggregateRuns(requesterId, targets);
+      notify?.(aggregate);
       joined = true;
       return aggregate;
     } catch (error) {
@@ -126,7 +175,7 @@ export class AgentTreeRunSupervisor {
           await this.#repository.cancelSubtree(runId);
           this.#executionStops.get(runId)?.();
         }
-        for (const task of active.keys()) void task.catch(() => undefined);
+        await Promise.allSettled(active.keys());
         joined = true;
       } else {
         await Promise.allSettled(active.keys());
@@ -136,8 +185,26 @@ export class AgentTreeRunSupervisor {
     } finally {
       const current = await this.#repository.getRun(requesterId);
       if (joined && current.status === "waiting") {
-        await this.#repository.releaseWaiting(requesterId, claim);
+        try {
+          await this.#repository.releaseWaiting(requesterId, claim);
+        } catch (error) {
+          if (!(error instanceof AgentError) || !["agent_run_state_conflict", "agent_capacity_exceeded"].includes(error.code)) throw error;
+          await this.#repository.requireRunClaim(requesterId, claim);
+          if (["done", "failed", "canceled"].includes((await this.#repository.getRun(requesterId)).status)) throw error;
+        }
       }
+    }
+  }
+
+  async #markWaiting(runId: string, claim: { readonly leaseOwnerId?: string; readonly leaseEpoch?: number }): Promise<AgentTreeRun> {
+    try {
+      return await this.#repository.markWaiting(runId, claim);
+    } catch (error) {
+      if (!(error instanceof AgentError) || error.code !== "agent_run_state_conflict") throw error;
+      await this.#repository.requireRunClaim(runId, claim);
+      const current = await this.#repository.getRun(runId);
+      if (current.status !== "waiting") throw error;
+      return current;
     }
   }
 
@@ -149,6 +216,11 @@ export class AgentTreeRunSupervisor {
     const expectedContextVersion = agent.contextVersion;
     let result: AgentTreeExecutionResult;
     try {
+      for (const dependency of run.dependencyRunIds) {
+        if ((await this.#repository.getRun(dependency)).status !== "done") {
+          throw new AgentError("agent_dependency_failed", "A required predecessor did not complete");
+        }
+      }
       result = validateResult(await this.#executeWithHeartbeat(run, agent, checkpoint, signal));
     } catch (error) {
       if (error instanceof UserInputRequired) {
@@ -241,6 +313,8 @@ export class AgentTreeRunSupervisor {
 export class RunCommandService {
   readonly #repository: RunTreeRepository;
   readonly #supervisor: AgentTreeRunSupervisor | undefined;
+  readonly #received = new Map<string, Set<string>>();
+  readonly #receivers = new Map<string, { owner: string; controller: AbortController; done: boolean; error?: unknown; execution: Promise<void> }>();
 
   public constructor(
     repository: RunTreeRepository,
@@ -260,6 +334,19 @@ export class RunCommandService {
 
   public continueAgent(command: ContinueAgentCommand): Promise<ContinueAgentReceipt> {
     return this.#repository.continueAgent(command);
+  }
+
+  public async listAgents(requesterRunId: string) {
+    const runs = await this.#repository.listDescendants(requesterRunId);
+    const result = [];
+    for (const id of new Set(runs.map(run => run.agentId))) {
+      const agent = await this.#repository.getAgent(id);
+      const latest = await this.#repository.getRun(agent.latestRunId!);
+      result.push({ agentId: id, name: agent.name, title: agent.title,
+        instruction: agent.instruction, contextVersion: agent.contextVersion,
+        status: agent.state, latestRunId: latest.runId, latestRunStatus: latest.status });
+    }
+    return result;
   }
 
   public async compileChildGrant(
@@ -299,6 +386,69 @@ export class RunCommandService {
       return this.#repository.aggregateRuns(requesterRunId, runIds);
     }
     return this.#supervisor.executeAndJoin(requesterRunId, runIds, signal, claim);
+  }
+
+  public async receiveRuns(requesterRunId: string, runIds: readonly string[], signal?: AbortSignal,
+    claim: { readonly leaseOwnerId?: string; readonly leaseEpoch?: number } = {},
+    afterRunIds: readonly string[] = []): Promise<AgentRunAggregation> {
+    await this.#repository.requireRunClaim(requesterRunId, claim);
+    const ids = [...new Set(runIds)].sort();
+    await this.#repository.aggregateRuns(requesterRunId, ids);
+    const key = JSON.stringify([requesterRunId, ids]);
+    let receiver = this.#receivers.get(key);
+    if (receiver === undefined) {
+      const controller = new AbortController();
+      const entry = { owner: requesterRunId, controller, done: false, error: undefined as unknown, execution: Promise.resolve() };
+      const cancel = () => controller.abort(signal?.reason);
+      signal?.addEventListener("abort", cancel, { once: true });
+      if (signal?.aborted) cancel();
+      entry.execution = this.joinRuns(requesterRunId, ids, controller.signal, claim)
+        .then(() => undefined).catch(error => { entry.error = error; })
+        .finally(() => { entry.done = true; signal?.removeEventListener("abort", cancel); });
+      this.#receivers.set(key, entry);
+      receiver = entry;
+    }
+    const after = new Set(afterRunIds);
+    for (;;) {
+      if (signal?.aborted) { receiver.controller.abort(); await receiver.execution; throw joinCanceledError(); }
+      const aggregate = await this.#repository.aggregateRuns(requesterRunId, ids);
+      const results = aggregate.results.filter(item => !after.has(String(item.runId)));
+      if (aggregate.pendingRunIds.length === 0) await receiver.execution;
+      if (receiver.done && receiver.error !== undefined) throw receiver.error;
+      if (results.length > 0 || receiver.done) {
+        const received = this.#received.get(requesterRunId) ?? new Set<string>();
+        for (const result of results) received.add(String(result.runId));
+        this.#received.set(requesterRunId, received);
+        return Object.freeze({ ...aggregate, results: Object.freeze(results) });
+      }
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+  }
+
+  public async waitResultFeedback(runId: string): Promise<void> {
+    await Promise.all([...this.#receivers.values()].filter(item => item.owner === runId).map(item => item.execution));
+  }
+
+  public requireResultsReceived(requesterRunId: string): void {
+    for (const [key, entry] of this.#receivers) {
+      if (entry.owner !== requesterRunId) continue;
+      const [, ids] = JSON.parse(key) as [string, string[]];
+      if (ids.some(id => !this.#received.get(requesterRunId)?.has(id))) {
+        throw new AgentError("agent_results_pending", "Receive delegated results before finishing");
+      }
+    }
+  }
+
+  public async closeReceivers(requesterRunId?: string): Promise<void> {
+    const entries = [];
+    for (const pair of this.#receivers) {
+      const owner = pair[1].owner;
+      if (requesterRunId === undefined || owner === requesterRunId
+        || (await this.#repository.getRun(owner)).rootRunId === requesterRunId) entries.push(pair);
+    }
+    for (const [, entry] of entries) if (!entry.done) entry.controller.abort();
+    await Promise.allSettled(entries.map(([, entry]) => entry.execution));
+    for (const [key, entry] of entries) { this.#receivers.delete(key); this.#received.delete(entry.owner); }
   }
 
   public cancelRun(runId: string): Promise<readonly string[]> {

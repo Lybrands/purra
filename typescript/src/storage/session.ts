@@ -75,7 +75,7 @@ export const STORAGE_PORT_METHODS = {
   runs: ["begin", "openInvocation", "appendEvent", "appendBatch", "saveExecutionCheckpoint", "settleInvocation", "settleRun", "cancel", "get", "listEvents", "listRootEvents"],
   runTree: ["beginRoot", "spawnAgents", "continueAgent", "claimRun", "suspendRun", "renewRunLease", "markWaiting", "releaseWaiting", "completeRun", "failRun", "cancelSubtree", "aggregateRuns", "closeAgent", "getAgent", "getRun", "getCheckpoint", "listRunnable", "listDescendants", "requireRunClaim"],
   artifacts: ["create", "load", "findForOwner", "replayReceipt", "append", "listBatches", "finalize", "abort", "acquire", "loadActive", "renew", "release", "releaseForRun", "maintain", "inspect"],
-  longTasks: ["create", "findByIdempotencyKey", "load", "listUnits", "bindRun", "listRunBindings", "start", "claimReadyUnit", "markUnitRunning", "heartbeat", "appendCheckpoint", "recordUsage", "completeUnit", "failUnit", "listCheckpoints", "finalizeIfComplete", "pause", "resume", "requestCancel", "cancel"],
+  longTasks: ["create", "findByIdempotencyKey", "load", "listUnits", "bindRun", "listRunBindings", "start", "claimReadyUnit", "claimUnit", "markUnitRunning", "bindUnitRun", "heartbeat", "appendCheckpoint", "recordUsage", "completeUnit", "failUnit", "listCheckpoints", "finalizeIfComplete", "pause", "resume", "requestCancel", "cancel"],
 } as const;
 
 export type StoragePorts = {

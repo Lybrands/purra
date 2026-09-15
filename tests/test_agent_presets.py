@@ -204,6 +204,7 @@ def test_preset_snapshot_covers_agent_tree_configuration():
         "maxDepth": 3,
         "maxAgentsPerRoot": 16,
         "allowsRecursiveAgents": False,
+        "resultPresentationInstruction": AgentTreePolicy().result_presentation_instruction,
     }
     assert disabled_snapshot.fingerprint != enabled_snapshot.fingerprint
 

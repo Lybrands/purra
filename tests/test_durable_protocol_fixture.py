@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 from purra.contracts import RunStatus, RuntimeLimits
+from purra.long_tasks import BudgetExhaustionDisposition, LongTaskStatus, LongTaskUnitStatus
 from purra.output import OutputBatchLimits, provider_delta_batch_digest
 from purra.run_control import (
     OrphanRunCandidate,
@@ -45,6 +46,13 @@ def test_shared_durable_protocol_fixture() -> None:
         "leaseLost": "long_task_unit_lease_lost",
         "budgetExceeded": "runtime_budget_exceeded",
         "streamLimit": "model_stream_limit_exceeded",
+    }
+    assert FIXTURE["budgetExhaustionPolicy"] == {
+        "defaultDisposition": BudgetExhaustionDisposition.PAUSE_RECOVERABLE.value,
+        "optOutDisposition": BudgetExhaustionDisposition.FAIL_PERMANENT.value,
+        "pausedTaskStatus": LongTaskStatus.PAUSED.value,
+        "unfinishedUnitStatus": LongTaskUnitStatus.BLOCKED.value,
+        "errorCode": "runtime_budget_exceeded",
     }
     for row in FIXTURE["budgetCases"]:
         usage = row["usage"]

@@ -2,6 +2,17 @@ import type { JsonValue, ModelTokenUsage } from "../model/types.js";
 import { copyJsonValue } from "../model/validation.js";
 import { AgentCanceledError, AgentError } from "../shared/errors.js";
 import { stableFingerprint } from "../shared/fingerprint.js";
+import type {
+  AgentNode,
+  AgentRunAggregation,
+  AgentTreeRun,
+  ContextCheckpoint,
+  RunTreeRepository,
+} from "../agent-tree.js";
+import type {
+  AgentTreeExecutionResult,
+  RunCommandService,
+} from "../agent-tree-execution.js";
 import {
   copyAdmissionDecision,
   copyDurableTaskDescriptor,
@@ -54,8 +65,8 @@ export class RecipeLongTaskDispatcher implements LongTaskDispatcher {
   readonly #executors: DurableExecutorRegistry;
   readonly #workerId: string;
   readonly #leaseDurationMs: number;
-  readonly #retryBackoffMs: readonly number[];
   readonly #idFactory: () => string;
+
 
   public constructor(options: {
     readonly repository: LongTaskRepository;
@@ -63,7 +74,6 @@ export class RecipeLongTaskDispatcher implements LongTaskDispatcher {
     readonly executors: DurableExecutorRegistry;
     readonly workerId: string;
     readonly leaseDurationMs?: number;
-    readonly retryBackoffMs?: readonly number[];
     readonly idFactory?: () => string;
   }) {
     if (typeof options.repository?.create !== "function") {
@@ -80,9 +90,6 @@ export class RecipeLongTaskDispatcher implements LongTaskDispatcher {
     this.#executors = options.executors;
     this.#workerId = requiredText(options.workerId, "durable workerId");
     this.#leaseDurationMs = positiveInteger(options.leaseDurationMs ?? 300_000, "lease duration");
-    this.#retryBackoffMs = Object.freeze((options.retryBackoffMs ?? []).map((value) => (
-      nonNegativeInteger(value, "retry backoff")
-    )));
     this.#idFactory = options.idFactory ?? (() => globalThis.crypto.randomUUID());
   }
 
@@ -183,59 +190,65 @@ export class RecipeLongTaskDispatcher implements LongTaskDispatcher {
     if (task.metadata.recipeFingerprint !== input.receipt.recipeFingerprint) {
       throw new AgentError("durable_recipe_mismatch", "Dispatch receipt does not match stored recipe");
     }
-    if (input.runId !== task.createdByRunId) {
-      await this.#repository.bindRun(task.id, input.runId, "continuation");
+    const bindings = await this.#repository.listRunBindings(taskId);
+    if (!bindings.some(binding => binding.runId === input.runId)) {
+      throw new AgentError("recipe_root_binding_conflict", "Recipe is not bound to this Run");
     }
-    if (task.status === "completed") return this.#result(task, await this.#repository.listUnits(task.id));
-    if (task.status === "canceled" || task.status === "failed") {
-      return this.#result(task, await this.#repository.listUnits(task.id));
+    const units = await this.#repository.listUnits(taskId);
+    if (units.some(unit => unit.runId !== null && unit.status !== "completed")) {
+      throw new AgentError("recipe_tree_reconciliation_required", "Legacy delegated Unit execution requires reconciliation");
     }
     if (task.status === "pending") task = await this.#repository.start(task.id);
-    else if (task.status === "paused") task = await this.#repository.resume(task.id);
-
-    // ponytail: execute one ready unit at a time. Repository DAG and fencing
-    // stay correct; add a bounded worker pool only when parallel throughput is required.
-    while (task.status === "running") {
-      if (input.signal?.aborted === true) {
-        task = await this.#repository.pause(task.id);
-        break;
-      }
-      if (task.cancellationRequestedAtMs !== null) {
-        task = await this.#repository.cancel(task.id);
-        break;
-      }
-      let unit: LongTaskUnitRecord | undefined;
-      try {
-        unit = await this.#repository.claimReadyUnit(
-          task.id,
-          this.#workerId,
-          this.#leaseDurationMs,
-        );
-      } catch (error) {
-        if (error instanceof AgentError && error.code === "long_task_deadline_exceeded") {
-          task = await this.#requireTask(task.id);
-          break;
-        }
-        throw error;
-      }
-      if (unit === undefined) {
-        task = await this.#repository.finalizeIfComplete(task.id);
-        if (task.status === "running") await delay(1, input.signal);
-        continue;
-      }
-      await this.#runUnit(task, unit, input.observer, input.signal);
-      task = await this.#requireTask(task.id);
+    const stop = new AbortController();
+    const cancel = () => stop.abort(input.signal?.reason);
+    input.signal?.addEventListener("abort", cancel, { once: true });
+    if (input.signal?.aborted) cancel();
+    const active = new Set<Promise<void>>();
+    let executionError: unknown;
+    try {
       await emitProgress(input.observer, task, await this.#repository.listUnits(task.id));
+      task = await this.#requireTask(task.id);
+      while (task.status === "running") {
+        if (stop.signal.aborted) { task = await this.#repository.pause(task.id); break; }
+        if (task.cancellationRequestedAtMs !== null) { task = await this.#repository.cancel(task.id); break; }
+        while (active.size < task.maxParallelism) {
+          const unit = await this.#repository.claimReadyUnit(task.id, this.#workerId, this.#leaseDurationMs);
+          if (unit === undefined) break;
+          const execution = this.runUnit(task, unit, input.runId, input.observer, stop.signal)
+            .then(() => undefined).catch(error => { executionError = error; })
+            .finally(() => active.delete(execution));
+          active.add(execution);
+        }
+        if (active.size > 0) await Promise.race([...active, delay(10)]);
+        else { await this.#repository.finalizeIfComplete(task.id); await delay(1, stop.signal); }
+        if (executionError !== undefined) throw executionError;
+        const previousRevision = task.revision;
+        task = await this.#requireTask(task.id);
+        if (task.revision !== previousRevision) await emitProgress(input.observer, task, await this.#repository.listUnits(task.id));
+      }
+      return this.#result(task, await this.#repository.listUnits(task.id));
+    } catch (error) {
+      task = await this.#requireTask(task.id);
+      if (task.status === "running") {
+        task = task.cancellationRequestedAtMs !== null
+          ? await this.#repository.cancel(task.id) : await this.#repository.pause(task.id);
+      }
+      if (input.signal?.aborted || error instanceof AgentCanceledError) return this.#result(task, await this.#repository.listUnits(task.id));
+      throw error;
+    } finally {
+      stop.abort();
+      await Promise.allSettled(active);
+      input.signal?.removeEventListener("abort", cancel);
     }
-    return this.#result(task, await this.#repository.listUnits(task.id));
   }
 
-  async #runUnit(
+  async runUnit(
     task: LongTaskRecord,
     claimed: LongTaskUnitRecord,
+    runId: string,
     observer: LongTaskExecutionObserver | undefined,
     signal: AbortSignal | undefined,
-  ): Promise<void> {
+  ): Promise<LongTaskUnitRecord> {
     const claim = claimFromUnit(claimed);
     const unit = await this.#repository.markUnitRunning(claim);
     const units = await this.#repository.listUnits(task.id);
@@ -269,8 +282,14 @@ export class RecipeLongTaskDispatcher implements LongTaskDispatcher {
       const context: DurableUnitExecutionContext = Object.freeze({
         task,
         unit,
+        runId,
         dependencyOutputs,
         signal: executionController.signal,
+        bindRun: async (requestedRunId: string) => {
+          if (requiredText(requestedRunId, "Unit Run id") !== runId) {
+            throw new AgentError("long_task_unit_run_conflict", "Operation cannot change its owning Run");
+          }
+        },
         checkpoint: async (payload: JsonValue) => {
           const checkpoint = await this.#repository.appendCheckpoint(claim, payload);
           await observer?.(Object.freeze({
@@ -294,25 +313,34 @@ export class RecipeLongTaskDispatcher implements LongTaskDispatcher {
       );
       await heartbeatPending;
       if (heartbeatFailure !== undefined) throw heartbeatFailure;
-      await this.#repository.completeUnit(
+      if (result.runId != null && result.runId !== runId) {
+        throw new AgentError("long_task_unit_run_conflict", "Operation result belongs to another Run");
+      }
+      const { runId: _operationRunId, ...operationResult } = result;
+      return await this.#repository.completeUnit(
         claim,
-        result,
+        Object.freeze(operationResult),
         `${task.id}:${unit.id}:${unit.attempt}:${requiredText(result.outputRef, "durable outputRef")}`,
       );
     } catch (error) {
-      if (heartbeatFailure !== undefined) return;
-      if (error instanceof AgentError && error.code === "runtime_budget_exceeded") return;
+      if (heartbeatFailure !== undefined) throw heartbeatFailure;
       if (error instanceof AgentCanceledError || signal?.aborted === true) {
-        await this.#repository.pause(task.id);
-        return;
+        throw new AgentCanceledError();
       }
-      const retryable = isRetryable(error);
-      const index = Math.min(Math.max(0, unit.attempt - 1), Math.max(0, this.#retryBackoffMs.length - 1));
-      await this.#repository.failUnit(
+      const current = await this.#requireTask(task.id);
+      if (
+        current.status === "paused"
+        && ["runtime_budget_exceeded", "long_task_unit_lease_lost"].includes(errorCode(error))
+      ) {
+        return (await this.#repository.listUnits(task.id)).find(
+          (candidate) => candidate.id === unit.id,
+        )!;
+      }
+      return await this.#repository.failUnit(
         claim,
         errorCode(error),
-        retryable,
-        this.#retryBackoffMs[index] ?? 0,
+        false,
+        0,
       );
     } finally {
       globalThis.clearInterval(timer);
@@ -320,6 +348,11 @@ export class RecipeLongTaskDispatcher implements LongTaskDispatcher {
       signal?.removeEventListener("abort", forwardCancellation);
     }
   }
+
+  get repository(): LongTaskRepository { return this.#repository; }
+  get executors(): DurableExecutorRegistry { return this.#executors; }
+  get workerId(): string { return this.#workerId; }
+  get leaseDurationMs(): number { return this.#leaseDurationMs; }
 
   async #requireTask(taskId: string): Promise<LongTaskRecord> {
     const task = await this.#repository.load(taskId);
@@ -379,13 +412,6 @@ function validateReceipt(receipt: LongTaskDispatchReceipt): void {
   requiredText(receipt.recipeFingerprint, "durable receipt recipeFingerprint");
 }
 
-function isRetryable(error: unknown): boolean {
-  return error !== null
-    && typeof error === "object"
-    && "retryable" in error
-    && (error as { readonly retryable?: unknown }).retryable === true;
-}
-
 function errorCode(error: unknown): string {
   if (error instanceof AgentError) return error.code;
   if (error !== null && typeof error === "object" && "code" in error) {
@@ -429,11 +455,6 @@ async function abortable<T>(promise: Promise<T>, signal?: AbortSignal): Promise<
   }
 }
 
-async function delay(milliseconds: number, signal?: AbortSignal): Promise<void> {
-  if (signal?.aborted === true) throw new AgentCanceledError();
-  await new Promise<void>((resolve) => globalThis.setTimeout(resolve, milliseconds));
-}
-
 function throwIfCanceled(signal?: AbortSignal): void {
   if (signal?.aborted === true) throw new AgentCanceledError();
 }
@@ -443,12 +464,11 @@ function positiveInteger(value: number, label: string): number {
   return value;
 }
 
-function nonNegativeInteger(value: number, label: string): number {
-  if (!Number.isSafeInteger(value) || value < 0) throw new TypeError(`${label} must be non-negative`);
-  return value;
-}
-
 function requiredText(value: unknown, label: string): string {
   if (typeof value !== "string" || value.trim() === "") throw new TypeError(`${label} is required`);
   return value.trim();
+}
+
+async function delay(ms: number, signal?: AbortSignal): Promise<void> {
+  await abortable(new Promise<void>(resolve => setTimeout(resolve, ms)), signal);
 }

@@ -14,6 +14,14 @@ from purra.agent_tree import (
     InMemoryRunTreeRepository,
     SpawnAgentsCommand,
 )
+
+
+
+async def _record_delivery(run_id, results, signal):
+    assert run_id == "root-run"
+    assert results
+
+
 from purra.agent_tree_execution import (
     AgentTreeExecutionResult,
     AgentTreeRunSupervisor,
@@ -28,6 +36,10 @@ class _RecursiveExecutor:
 
     async def execute(self, run, agent, checkpoint, signal=None):
         del checkpoint
+        from purra.agent_tree.lease import current_agent_run_lease
+        proof = current_agent_run_lease(run.run_id)
+        assert proof is not None
+        assert (proof.owner_id, proof.epoch) == (run.lease_owner_id, run.lease_epoch)
         self.executed.append(agent.name)
         if agent.name == "recursive":
             assert self.service is not None
@@ -85,6 +97,7 @@ async def test_supervisor_releases_waiting_slots_for_recursive_runs():
     root = await _root(repository)
     executor = _RecursiveExecutor()
     supervisor = AgentTreeRunSupervisor(
+        deliver_results=_record_delivery,
         repository=repository,
         executor=executor,
     )
@@ -151,6 +164,7 @@ async def test_executor_failure_settles_the_child_and_blocks_required_join():
     repository = InMemoryRunTreeRepository()
     root = await _root(repository)
     supervisor = AgentTreeRunSupervisor(
+        deliver_results=_record_delivery,
         repository=repository,
         executor=_FailingExecutor(),
     )
@@ -175,7 +189,7 @@ async def test_executor_failure_settles_the_child_and_blocks_required_join():
     assert aggregate.required_failures == (receipt.items[0].run.run_id,)
     assert (
         await repository.get_run(receipt.items[0].run.run_id)
-    ).error_code == "RuntimeError"
+    ).error_code == "agent_execution_failed"
 
 
 @pytest.mark.asyncio
@@ -211,6 +225,7 @@ async def test_supervisor_renews_child_lease_while_executor_is_active():
     repository = _CountingRepository()
     root = await _root(repository)
     supervisor = AgentTreeRunSupervisor(
+        deliver_results=_record_delivery,
         repository=repository,
         executor=_SlowExecutor(),
         lease_duration_ms=9,
@@ -277,6 +292,7 @@ async def test_new_supervisor_reclaims_committed_child_once_after_worker_crash()
     recovered = RunCommandService(
         repository,
         AgentTreeRunSupervisor(
+        deliver_results=_record_delivery,
             repository=repository,
             executor=_RecoveredExecutor(),
             owner_id="recovery-worker",
@@ -308,6 +324,7 @@ async def test_join_cancellation_wakes_even_when_executor_ignores_the_signal():
     service = RunCommandService(
         repository,
         AgentTreeRunSupervisor(
+        deliver_results=_record_delivery,
             repository=repository,
             executor=_IgnoringExecutor(),
         ),
@@ -338,3 +355,95 @@ async def test_join_cancellation_wakes_even_when_executor_ignores_the_signal():
         await repository.get_run(receipt.items[0].run.run_id)
     ).status is AgentTreeRunStatus.CANCELED
     assert (await repository.get_run(root.run_id)).status is AgentTreeRunStatus.RUNNING
+
+
+@pytest.mark.asyncio
+async def test_receive_results_returns_early_with_individual_feedback():
+    repository = InMemoryRunTreeRepository()
+    await _root(repository)
+    slow = asyncio.Event()
+    calls = []
+
+    class Executor:
+        async def execute(self, run, agent, checkpoint, signal=None):
+            calls.append(agent.name)
+            if agent.name == "slow":
+                await slow.wait()
+            return AgentTreeExecutionResult(status="done", result=agent.name,
+                content_ref=f"memory://{run.run_id}", fingerprint=agent.name)
+
+    feedback = []
+    async def report(owner, results, signal=None):
+        assert owner == "root-run"
+        feedback.append(tuple(row["runId"] for row in results))
+
+    commands = RunCommandService(repository, AgentTreeRunSupervisor(
+        repository=repository, executor=Executor(), deliver_results=report,
+    ))
+    spawned = await commands.spawn_agents(SpawnAgentsCommand(
+        parent_run_id="root-run", idempotency_key="inbox",
+        children=tuple(ChildAgentSpec(name=name, title=name, instruction=name, objective=name)
+                       for name in ("fast", "slow")),
+    ))
+    ids = tuple(item.run.run_id for item in spawned.items)
+    try:
+        first = await asyncio.wait_for(commands.receive_runs("root-run", ids), 1)
+        assert [item["runId"] for item in first.results] == [ids[0]]
+        assert first.pending_run_ids == (ids[1],)
+        # The owning Agent can reason or emit its own message here.
+        slow.set()
+        second = await asyncio.wait_for(commands.receive_runs(
+            "root-run", ids, after_run_ids=(ids[0],)), 1)
+        assert second.state == "ready"
+        assert [item["runId"] for item in second.results] == [ids[1]]
+        await commands.results.wait("root-run")
+        assert feedback == [(ids[0],), (ids[1],)]
+        replay = await commands.receive_runs("root-run", ids)
+        assert len(replay.results) == 2
+        assert calls == ["fast", "slow"]
+    finally:
+        slow.set()
+        await commands.results.close()
+
+
+@pytest.mark.asyncio
+async def test_closing_result_receiver_cancels_unfinished_execution():
+    repository = InMemoryRunTreeRepository()
+    await _root(repository)
+    class Executor:
+        async def execute(self, run, agent, checkpoint, signal=None):
+            if agent.name == "slow":
+                await asyncio.Event().wait()
+            return AgentTreeExecutionResult(status="done", result="ok", content_ref="memory://ok", fingerprint="ok")
+    commands = RunCommandService(repository, AgentTreeRunSupervisor(repository=repository, executor=Executor()))
+    receipt = await commands.spawn_agents(SpawnAgentsCommand(parent_run_id="root-run", idempotency_key="cancel-inbox",
+        children=tuple(ChildAgentSpec(name=name, title=name, instruction=name, objective=name) for name in ("fast", "slow"))))
+    ids = tuple(item.run.run_id for item in receipt.items)
+    await asyncio.wait_for(commands.receive_runs("root-run", ids), 1)
+    await asyncio.wait_for(commands.results.close("root-run"), 1)
+    assert (await repository.get_run(ids[1])).status is AgentTreeRunStatus.CANCELED
+
+
+@pytest.mark.asyncio
+async def test_independent_joins_wait_for_shared_root_capacity():
+    repository = InMemoryRunTreeRepository()
+    await _root(repository)
+    active = 0
+    peak = 0
+    class Executor:
+        async def execute(self, run, agent, checkpoint, signal=None):
+            nonlocal active, peak
+            active += 1
+            peak = max(peak, active)
+            await asyncio.sleep(.03)
+            active -= 1
+            return AgentTreeExecutionResult(status="done", result=agent.name,
+                content_ref=f"memory://{run.run_id}", fingerprint=agent.name)
+    async def delegate(index):
+        service = RunCommandService(repository, AgentTreeRunSupervisor(repository=repository, executor=Executor()))
+        receipt = await service.spawn_agents(SpawnAgentsCommand(parent_run_id="root-run", idempotency_key=f"parallel:{index}",
+            children=(ChildAgentSpec(name=str(index), title=str(index), instruction="Synthetic", objective="Synthetic"),)))
+        return await service.join_runs("root-run", (receipt.items[0].run.run_id,))
+    results = await asyncio.wait_for(asyncio.gather(*(delegate(i) for i in range(6))), 2)
+    assert all(result.state == "ready" for result in results)
+    assert peak <= 3

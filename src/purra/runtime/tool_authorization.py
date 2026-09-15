@@ -30,6 +30,11 @@ from purra.recovery.guidance import (
     UNAUTHORIZED_TOOL_REPLAN_GUIDANCE,
 )
 from purra.runtime.tool_round import continuation_messages
+from purra.tools.scoping import (
+    batch_overlaps_future_tools,
+    batch_within_allowed_or_future,
+    outside_scope_names,
+)
 
 
 class ToolAuthorizationDisposition(StrEnum):
@@ -295,18 +300,24 @@ def resolve_tool_authorization(
     """Classify a complete batch before any tool handler is allowed to run."""
 
     requested_names = frozenset(call.name for call in calls)
-    if requested_names.issubset(allowed_names):
+    if not outside_scope_names(requested_names, allowed_names=allowed_names):
         return ToolAuthorizationResolution(
             disposition=ToolAuthorizationDisposition.EXECUTE,
             requested_names=requested_names,
         )
 
-    includes_future = bool(requested_names - allowed_names) and bool(
-        requested_names & future_names
+    includes_future = batch_overlaps_future_tools(
+        requested_names,
+        allowed_names=allowed_names,
+        future_names=future_names,
     )
     if (
         includes_future
-        and requested_names.issubset(allowed_names | future_names)
+        and batch_within_allowed_or_future(
+            requested_names,
+            allowed_names=allowed_names,
+            future_names=future_names,
+        )
     ):
         return _resolve_future_batch(
             calls,

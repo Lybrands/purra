@@ -11,6 +11,7 @@
     "allowedModels": []
   },
   "agentTreePolicyDefaults": {
+    "resultPresentationInstruction": null,
     "enabled": true,
     "maxChildrenPerCall": 3,
     "maxParallelRuns": 3,
@@ -91,7 +92,10 @@
     "crossRootScope": true
   },
   "recovery": {
-    "executionCheckpointSchemaVersions": { "python": 2, "typescript": 2 },
+    "executionCheckpointSchemaVersions": {
+      "python": 2,
+      "typescript": 2
+    },
     "resumablePhase": "model_ready",
     "resumableExecutionProfile": "reactive",
     "inFlightProviderOrToolPolicy": "fail_stop"
@@ -122,5 +126,12 @@
     ],
     "rootSequenceStrictlyIncreasing": true,
     "childEventsAreFilteredViews": true
+  },
+  "resultReception": {
+    "tool": "receiveAgentResults",
+    "selectionField": "runIds",
+    "acknowledgmentField": "afterRunIds",
+    "automaticPresentation": false,
+    "ordinaryOperationCreatesAgent": false
   }
 }

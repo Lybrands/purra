@@ -399,6 +399,48 @@ async def test_failed_long_task_fails_root_with_the_original_error_code():
 
 
 @pytest.mark.asyncio
+async def test_partial_long_task_closes_the_root_with_its_checkpoint_only():
+    controller, repository, sink = await _started()
+
+    class _Dispatcher:
+        async def dispatch(self, *args, **kwargs):
+            del args, kwargs
+            return LongTaskDispatchReceipt(
+                task_id="task-partial",
+                message="Dispatched",
+                admission=_admission(),
+            )
+
+        async def execute(self, task_id, *, observer, **kwargs):
+            del observer, kwargs
+            return LongTaskExecutionResult(
+                task_id=task_id,
+                status=LongTaskExecutionStatus.PARTIAL,
+                final_response="已保存阶段性成果；任务尚未完成。",
+                error="runtime_budget_exceeded",
+            )
+
+    yielded = [
+        event
+        async for event in complete_admitted_task(
+            controller=controller,
+            request=_request(),
+            plan=_plan(),
+            admission=_admission(),
+            dispatcher=_Dispatcher(),
+            sink=sink,
+            signal=None,
+        )
+    ]
+
+    assert controller.status is RunStatus.DONE
+    assert repository.status is RunStatus.DONE
+    assert repository.error is None
+    assert yielded[-1].type == CoreEventType.RUN_COMPLETED
+    assert yielded[-1].payload["final_response"] == "已保存阶段性成果；任务尚未完成。"
+
+
+@pytest.mark.asyncio
 async def test_continuation_executes_existing_receipt_without_redispatch():
     controller, repository, sink = await _started()
 

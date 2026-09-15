@@ -70,6 +70,7 @@ from purra.host_planned_tool_gateway import (
 from purra.json_values import thaw_json_mapping
 from purra.model_invocation import (
     AgentModelInvocationManager,
+    create_model_invocation_manager,
     ModelInvocationContext,
 )
 from purra.model_invocation.evidence import bind_model_input_evidence
@@ -243,11 +244,10 @@ class AgentRuntime:
         model_manager: AgentModelInvocationManager | None = None,
         evidence_validator: ModelInputEvidenceValidator | None = None,
     ):
-        self._model_manager = model_manager or AgentModelInvocationManager(
+        self._model_manager = model_manager or create_model_invocation_manager(
             model_gateway,
             output_observer=output_observer,
             operation_controller=operation_controller,
-            invocation_timeout_ms=limits.provider_invocation_timeout_ms,
             runtime_limits=limits,
             evidence_validator=evidence_validator,
         )
@@ -276,6 +276,7 @@ class AgentRuntime:
         output_budget: InvocationOutputBudget | None = None,
         round_input_tokens: int | None = None,
         scope_tools_to_observer: bool = True,
+        publish_model_commentary: bool = True,
         force_tool_choice: bool = False,
         reasoning_mode: ReasoningMode = ReasoningMode.DEFAULT,
         require_tool_call: bool | None = None,
@@ -464,6 +465,7 @@ class AgentRuntime:
                     planning_mode=planning_mode,
                     planning_available=planning_available,
                     planning_required_tool_names=planning_required_tool_names,
+                    publish_model_commentary=publish_model_commentary,
                     run_id=run_id,
                 )
                 if isinstance(activation, AgentRuntimeResult):
@@ -477,6 +479,7 @@ class AgentRuntime:
                     loop,
                     planning_hook=planning_hook,
                     scope_tools_to_observer=scope_tools_to_observer,
+                    publish_model_commentary=publish_model_commentary,
                     tools_executable=tools_executable,
                     signal=signal,
                     run_id=run_id,
@@ -559,6 +562,7 @@ class AgentRuntime:
         planning_mode: PlanningMode,
         planning_available: bool,
         planning_required_tool_names: frozenset[str],
+        publish_model_commentary: bool,
         run_id: RunId | None,
     ) -> AutoPlanningRequest | AgentRuntimeResult | None:
         if not loop.tool_finish or not loop.calls:
@@ -586,7 +590,11 @@ class AgentRuntime:
             else "initial"
         )
         accumulator = loop.accumulator
-        if accumulator is not None and accumulator.content.strip():
+        if (
+            publish_model_commentary
+            and accumulator is not None
+            and accumulator.content.strip()
+        ):
             await self._model_manager.publish_model_stream_commentary(
                 loop.stream.receipt.output_stream_id
             )
@@ -715,6 +723,7 @@ class AgentRuntime:
         *,
         planning_hook: RuntimePlanningHook | None,
         scope_tools_to_observer: bool,
+        publish_model_commentary: bool,
         tools_executable: bool,
         signal: CancellationSignal | None,
         run_id: RunId | None,
@@ -776,9 +785,10 @@ class AgentRuntime:
                 error_code="max_model_rounds",
             )
             return
-        await self._model_manager.publish_model_stream_commentary(
-            loop.stream.receipt.output_stream_id
-        )
+        if publish_model_commentary:
+            await self._model_manager.publish_model_stream_commentary(
+                loop.stream.receipt.output_stream_id
+            )
         if scope_tools_to_observer and self._observer is not None:
             await self._observer.on_tool_calls_started(
                 tuple(sorted(loop.requested_names))

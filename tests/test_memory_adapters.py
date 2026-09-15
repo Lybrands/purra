@@ -16,7 +16,7 @@ from purra.contracts import (
 )
 from purra.events import AgentEvent
 from purra.errors import ContractViolationError
-from purra.agent_tree_lease import bind_agent_run_lease
+from purra.agent_tree.lease import bind_agent_run_lease
 from purra.output import (
     AgentOutputEventDraft,
     AgentOutputIntent,

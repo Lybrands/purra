@@ -100,8 +100,8 @@ def test_complete_run_api_is_importable_from_the_package_boundary():
     assert hasattr(AgentCore, "join_agent_runs")
     assert hasattr(AgentCore, "cancel_agent_run")
     assert hasattr(AgentCore, "close_agent")
-    assert hasattr(AgentCore, "bind_agent_tree_root")
-    assert hasattr(AgentCore, "recover_agent_tree_root")
+    assert not hasattr(AgentCore, "bind_agent_tree_root")
+    assert not hasattr(AgentCore, "recover_agent_tree_root")
     assert not hasattr(AgentCore, "run")
     assert "agent_tree_policy" not in inspect.signature(
         AgentCore.__init__

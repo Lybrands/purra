@@ -100,6 +100,17 @@ class LongTaskRepository(Protocol):
 
     async def expire_deadline(self, task_id: str) -> LongTaskRecord: ...
 
+    async def claim_unit(
+        self, task_id: str, unit_id: str, *, worker_id: str,
+        lease_duration_ms: int,
+    ) -> LongTaskUnitRecord | None:
+        """Atomically claim exactly this Unit under all normal admission gates.
+
+        Return None if it is unavailable; never substitute another ready Unit.
+        This claims task ownership only, not a Tree Run or delivery ownership.
+        """
+        ...
+
     async def bind_unit_run(
         self,
         task_id: str,
@@ -108,7 +119,14 @@ class LongTaskRepository(Protocol):
         worker_id: str,
         lease_epoch: int,
         run_id: str,
-    ) -> LongTaskUnitRecord: ...
+    ) -> LongTaskUnitRecord:
+        """Bind once per claimed attempt; identical replay must not mutate state.
+
+        The active lease is required even on replay. A different Run, or a Run
+        already bound to another Unit in this task, must be rejected. Completion
+        must preserve this identity. This store does not validate Tree ancestry.
+        """
+        ...
 
     async def renew_unit_lease(
         self,
@@ -220,14 +238,14 @@ class LongTaskUnitRunner(Protocol):
         task: LongTaskRecord,
         unit: LongTaskUnitRecord,
         error: Exception,
-    ) -> FailureSignal: ...
+    ) -> FailureSignal | None: ...
 
     def split_unit(
         self,
         task: LongTaskRecord,
         unit: LongTaskUnitRecord,
         error: Exception,
-    ) -> LongTaskSplitResult: ...
+    ) -> LongTaskSplitResult | None: ...
 
 
 __all__ = ["LongTaskRepository", "LongTaskUnitRunner"]

@@ -23,8 +23,17 @@ class AgentTreePolicy:
     max_depth: int = 3
     max_agents_per_root: int = 16
     allow_recursive_agents: bool = False
+    # None receives results without scheduling a public model invocation.
+    # Hosts explicitly supply their own presentation instruction to opt in.
+    result_presentation_instruction: str | None = None
 
     def __post_init__(self) -> None:
+        if self.result_presentation_instruction is not None and (
+            not isinstance(self.result_presentation_instruction, str)
+            or not self.result_presentation_instruction.strip()
+            or len(self.result_presentation_instruction) > 4000
+        ):
+            raise ValueError("result_presentation_instruction must contain 1 to 4000 characters")
         for name in (
             "max_children_per_call",
             "max_parallel_runs",
@@ -45,6 +54,7 @@ class AgentTreePolicy:
 
     def snapshot_mapping(self) -> dict[str, object]:
         return {
+            "resultPresentationInstruction": self.result_presentation_instruction,
             "enabled": True,
             "maxChildrenPerCall": self.max_children_per_call,
             "maxParallelRuns": self.max_parallel_runs,

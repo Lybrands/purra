@@ -1,5 +1,6 @@
 import { ApprovalRequired } from "../approvals.js";
 import { copyToolExecutionCheckpoint } from "../run/store.js";
+import { completedParentDeliveries } from "../run/parent-delivery.js";
 import { UserInputRequired } from "../interaction.js";
 import type {
   InvocationOutputBudget,
@@ -201,6 +202,7 @@ interface AgentTreeRootBinding {
   readonly request: RunRequest;
   readonly options: RunOptions;
   readonly fingerprint: string;
+  readonly session?: RunSession;
 }
 
 interface AgentTreeRunScope {
@@ -241,6 +243,7 @@ export class Agent {
   readonly #agentTreePolicySnapshot: AgentTreePolicySnapshot | undefined;
   readonly #agentTreeRootId: string | undefined;
   readonly #configuredAgentTreeGrant: AgentCapabilityGrant | undefined;
+  readonly #feedbackTails = new Map<string, Promise<void>>();
   readonly #agentTreeRoots = new Map<string, AgentTreeRootBinding>();
   readonly #recoveryPolicy: RecoveryPolicy;
   readonly #operations: AgentOperationController | undefined;
@@ -295,6 +298,9 @@ export class Agent {
         repository,
         new AgentTreeRunSupervisor({
           repository,
+          ...(policy.snapshot().resultPresentationInstruction === null ? {} : {
+            deliverResults: (runId: string, results: AgentRunAggregation["results"], signal: AbortSignal) => this.reportAgentResults(runId, results, signal),
+          }),
           executor: {
             execute: (run, agent, checkpoint, signal) => (
               this.#executeAgentTreeRun(run, agent, checkpoint, signal)
@@ -326,6 +332,9 @@ export class Agent {
       this.#configuredAgentTreeGrant = tree.capabilityGrant;
       effectiveDefinitions = Object.freeze([
         ...definitions,
+        buildAgentTreeTool({ commands, policy, receiveOnly: true }),
+        buildAgentTreeTool({ commands, policy, operation: "listAgents" }),
+        buildAgentTreeTool({ commands, policy, operation: "continueAgent" }),
         buildAgentTreeTool({
           commands,
           policy,
@@ -362,6 +371,7 @@ export class Agent {
     this.#responsePresentation = options.responsePresentation ?? "model_live";
     this.#planning = copyPlanningOptions(options.planning);
     this.#durable = copyDurableOptions(options.durable, this.#planning, options.preset);
+
     this.#responseValidationOptions = copyResponseValidationOptions(options.responseValidation);
     if (options.recovery !== undefined && !(options.recovery instanceof RecoveryPolicy)) {
       throw new TypeError("recovery must be a RecoveryPolicy");
@@ -438,6 +448,7 @@ export class Agent {
       }
     }
     if (checkpoint === undefined) throw new AgentError("checkpoint_missing", "Run has no resumable checkpoint");
+    if (this.#agentTreeRepository !== undefined) await completedParentDeliveries(this.#runRepository, runId);
     return this.#submit(request, { budgets: saved.budgets, deadlineAt: saved.deadlineAt }, undefined, checkpoint);
   }
 
@@ -449,12 +460,17 @@ export class Agent {
     return this.#requireAgentTreeCommands().continueAgent(command);
   }
 
-  public joinAgentRuns(
+  public async joinAgentRuns(
     requesterRunId: string,
     runIds: readonly string[],
     signal?: AbortSignal,
     claim: { readonly leaseOwnerId?: string; readonly leaseEpoch?: number } = {},
   ): Promise<AgentRunAggregation> {
+    this.#requireAgentTreeCommands();
+    const requester = await this.#agentTreeRepository!.getRun(requesterRunId);
+    const binding = this.#agentTreeRoots.get(requester.rootRunId);
+    if (binding?.session === undefined) throw new AgentError("parent_presentation_unavailable", "Joining Children requires their active Root; recover the Root with resume()");
+    if (requesterRunId === requester.rootRunId) await binding.session.selectUndeliveredChildren([]);
     return this.#requireAgentTreeCommands().joinRuns(
       requesterRunId,
       runIds,
@@ -469,64 +485,6 @@ export class Agent {
 
   public closeAgent(agentId: string): Promise<AgentNode> {
     return this.#requireAgentTreeCommands().closeAgent(agentId);
-  }
-
-  public async bindAgentTreeRoot(
-    rootRunId: string,
-    request: RunRequest,
-    options: RunOptions,
-  ): Promise<void> {
-    const repository = this.#agentTreeRepository;
-    if (repository === undefined) {
-      this.#requireAgentTreeCommands();
-      return;
-    }
-    const runId = requiredText(rootRunId, "Agent tree Root Run id");
-    const root = await repository.getRun(runId);
-    if (
-      root.runId !== root.rootRunId
-      || (root.status !== "running" && root.status !== "waiting")
-    ) {
-      throw new AgentError(
-        "root_run_not_active",
-        "Agent tree recovery requires an active Root Run",
-      );
-    }
-    const copiedRequest = Object.freeze({
-      ...request,
-      messages: copyMessages(request.messages),
-      metadata: copyMapping(request.metadata ?? {}, "Run metadata"),
-    });
-    const copiedOptions = Object.freeze({ ...requireRunOptions(options) });
-    const binding = Object.freeze({
-      request: copiedRequest,
-      options: copiedOptions,
-      fingerprint: await agentTreeBindingFingerprint(copiedRequest, copiedOptions),
-    });
-    const existing = this.#agentTreeRoots.get(runId);
-    if (existing !== undefined && existing.fingerprint !== binding.fingerprint) {
-      throw new AgentError(
-        "run_identity_conflict",
-        "Agent tree Root Run already has a different binding",
-      );
-    }
-    this.#agentTreeRoots.set(runId, binding);
-  }
-
-  public async recoverAgentTreeRoot(
-    rootRunId: string,
-    request: RunRequest,
-    options: RunOptions,
-  ): Promise<AgentRunAggregation> {
-    await this.bindAgentTreeRoot(rootRunId, request, options);
-    const repository = this.#agentTreeRepository!;
-    const runId = requiredText(rootRunId, "Agent tree Root Run id");
-    const descendants = await repository.listDescendants(runId);
-    return await this.joinAgentRuns(
-      runId,
-      descendants.map((run) => run.runId),
-      options.signal,
-    );
   }
 
   #requireAgentTreeCommands(): RunCommandService {
@@ -731,6 +689,7 @@ export class Agent {
       });
       const rootOptions = Object.freeze({ ...options });
       this.#agentTreeRoots.set(session.runId, Object.freeze({
+        session,
         request: rootRequest,
         options: rootOptions,
         fingerprint: await agentTreeBindingFingerprint(rootRequest, rootOptions),
@@ -818,6 +777,48 @@ export class Agent {
     });
   }
 
+  public async reportAgentResults(runId: string, results: AgentRunAggregation["results"], signal: AbortSignal): Promise<void> {
+    if (this.#agentTreePolicy?.snapshot().resultPresentationInstruction == null) throw new AgentError("agent_feedback_policy_required", "Host result presentation policy is not configured");
+    for (const result of results) {
+      const child = await this.#agentTreeRepository!.getRun(String(result.runId));
+      if (child.parentRunId !== runId || !["done", "failed", "canceled"].includes(child.status)) throw new AgentError("agent_feedback_scope_invalid", "Feedback requires a terminal direct child");
+      const binding = this.#agentTreeRoots.get(runId);
+      if (!binding?.session) throw new AgentError("agent_feedback_unavailable", "Feedback requires its owning session");
+      await binding.session.recordAgentFeedbackQueued(child.runId, child.agentId, child.status);
+      const previous = this.#feedbackTails.get(runId) ?? Promise.resolve();
+      const current = previous.then(() => this.#deliverChildResults(runId, [result], signal));
+      this.#feedbackTails.set(runId, current);
+      await current;
+    }
+  }
+
+  async #deliverChildResults(runId: string, results: AgentRunAggregation["results"], signal: AbortSignal): Promise<void> {
+    const binding = this.#agentTreeRoots.get(runId);
+    const session = binding?.session;
+    if (!binding || !session) throw new AgentError("parent_presentation_unavailable", "Parent presentation requires its live Run session");
+    results = await session.selectUndeliveredChildren(results);
+    if (results.length === 0) return;
+    const deliveryId = String(results[0]!.runId);
+    const childRunIds = results.map(item => String(item.runId));
+    const tasks = new ModelTaskRunner({ model: this.#model, runId, authority: session, signal: session.signal,
+      runtimeLimits: this.#runtimeLimits,
+      ...(binding.request.maxGenerationTokens === undefined ? {} : { maxGenerationTokens: binding.request.maxGenerationTokens }),
+      ...(session.operations === undefined ? {} : { operations: session.operations }),
+    });
+    await session.recordParentDelivery(deliveryId, "started", childRunIds);
+    try {
+    await tasks.streamProgress([
+      ...binding.request.messages,
+      { role: "system", content: this.#agentTreePolicy!.snapshot().resultPresentationInstruction! },
+      { role: "user", content: JSON.stringify({ completedChildResults: results }), attributes: { publicPresentation: true } },
+    ], { signal });
+    await session.recordParentDelivery(deliveryId, "completed", childRunIds);
+    } catch (error) {
+      try { await session.recordParentDelivery(deliveryId, "aborted", childRunIds); } catch { /* Started remains unresolved. */ }
+      throw error;
+    }
+  }
+
   async #executeAgentTreeRun(
     run: AgentTreeRun,
     agent: AgentNode,
@@ -845,8 +846,26 @@ export class Agent {
       : `${run.objective}\n\nInput:\n${JSON.stringify(run.input)}`;
     const enabledTools = Object.freeze([
       ...agent.capabilityGrant.allowedTools,
-      ...(agent.capabilityGrant.canSpawnAgents ? ["delegateToAgents"] : []),
+      ...(agent.capabilityGrant.canSpawnAgents ? ["delegateToAgents", "receiveAgentResults", "continueAgent", "listAgents"] : []),
     ]);
+    const history: { role: "user" | "assistant"; content: string }[] = [];
+    let previousId = run.previousRunId;
+    const seen = new Set<string>();
+    while (previousId != null) {
+      if (seen.has(previousId)) throw new AgentError("agent_context_conflict", "Agent history contains a cycle");
+      seen.add(previousId);
+      const previous = await this.#agentTreeRepository!.getRun(previousId);
+      if (previous.agentId !== agent.agentId) throw new AgentError("agent_scope_violation", "Agent history belongs to another Agent");
+      if (previous.status === "done") {
+        const snapshot = normalizeRunSnapshot(await this.#runRepository.get(previousId));
+        if (snapshot.finalOutput === undefined) throw new AgentError("agent_context_conflict", "Agent history is unavailable");
+        const priorObjective = Object.keys(previous.input).length === 0 ? previous.objective
+          : `${previous.objective}\n\nInput:\n${JSON.stringify(previous.input)}`;
+        history.unshift({ role: "user", content: priorObjective },
+          { role: "assistant", content: typeof snapshot.finalOutput === "string" ? snapshot.finalOutput : JSON.stringify(snapshot.finalOutput) });
+      }
+      previousId = previous.previousRunId;
+    }
     const childRequest: RunRequest = Object.freeze({
       messages: Object.freeze([
         Object.freeze({
@@ -857,6 +876,7 @@ export class Agent {
             parentAgentId: agent.parentAgentId ?? "",
           }),
         }),
+        ...history,
         Object.freeze({ role: "user", content: objective }),
       ]),
       planningMode: "auto",
@@ -1003,6 +1023,7 @@ export class Agent {
       }
       throw error;
     } finally {
+      await this.#agentTreeCommands?.closeReceivers(rootRunId);
       if (!suspended) this.#agentTreeRoots.delete(rootRunId);
     }
   }
@@ -1013,6 +1034,10 @@ export class Agent {
   ): Promise<void> {
     const repository = this.#agentTreeRepository;
     if (repository !== undefined && this.#agentTreeRoots.has(session.runId)) {
+      this.#agentTreeCommands?.requireResultsReceived(session.runId);
+      await this.#agentTreeCommands?.waitResultFeedback(session.runId);
+      await this.#feedbackTails.get(session.runId);
+      await session.selectUndeliveredChildren([]);
       const descendants = await repository.listDescendants(session.runId);
       if (descendants.some((run) => (
         run.status === "queued"
@@ -1694,7 +1719,7 @@ export class Agent {
   }
 
   async #resumeChildRuns(checkpoint: AgentExecutionCheckpoint, session: RunSession): Promise<AgentExecutionCheckpoint> {
-    const calls = new Set(checkpoint.messages.flatMap(m => m.toolCalls ?? []).filter(c => c.name === "delegateToAgents").map(c => c.id));
+    const calls = new Set(checkpoint.messages.flatMap(m => m.toolCalls ?? []).filter(c => c.name === "delegateToAgents" || c.name === "receiveAgentResults" || c.name === "continueAgent").map(c => c.id));
     const messages = [...checkpoint.messages];
     let changed = false;
     let requiredFailure = false;
@@ -1708,7 +1733,7 @@ export class Agent {
       if (aggregate.pendingRunIds.length) continue;
       const requiredFailures = [...new Set([...value.requiredFailures, ...aggregate.requiredFailures])];
       requiredFailure ||= requiredFailures.length > 0;
-      const content = { state: requiredFailures.length ? "blocked" : "ready", pendingRunIds: [], requiredFailures, results: [...value.results, ...aggregate.results] };
+      const content = { ...(value.runIds ? { runIds: value.runIds } : {}), state: requiredFailures.length ? "blocked" : "ready", pendingRunIds: [], requiredFailures, results: [...value.results, ...aggregate.results] };
       messages[index] = { ...message, content: typeof message.content === "string" ? JSON.stringify(content) : content };
       changed = true;
     }

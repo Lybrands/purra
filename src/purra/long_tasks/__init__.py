@@ -1,6 +1,7 @@
 """Durable, multi-Run task execution primitives."""
 
 from purra.long_tasks.contracts import (
+    BudgetExhaustionDisposition,
     LongTaskBudgetLimits,
     LongTaskCreateCommand,
     LongTaskRecord,
@@ -14,7 +15,6 @@ from purra.long_tasks.contracts import (
     LongTaskUnitStatus,
     LongTaskUsage,
 )
-from purra.long_tasks.coordinator import LongTaskCoordinator
 from purra.long_tasks.dispatcher import (
     DurableExecutorRegistry,
     DurableTaskDescriptor,
@@ -26,12 +26,12 @@ from purra.long_tasks.dispatcher import (
 from purra.long_tasks.ports import LongTaskRepository, LongTaskUnitRunner
 
 __all__ = [
+    "BudgetExhaustionDisposition",
     "DurableExecutorRegistry",
     "DurableTaskDescriptor",
     "DurableTaskDescriptorResolver",
     "DurableUnitExecutionContext",
     "DurableUnitExecutor",
-    "LongTaskCoordinator",
     "LongTaskBudgetLimits",
     "LongTaskCreateCommand",
     "LongTaskRecord",

@@ -288,7 +288,13 @@ async def _run() -> None:
             )
 
     tree_executor = _InstalledTreeExecutor()
+
+
+    async def record_installed_delivery(root_id, results, signal):
+        assert results
+
     tree_supervisor = AgentTreeRunSupervisor(
+        deliver_results=record_installed_delivery,
         repository=tree,
         executor=tree_executor,
     )

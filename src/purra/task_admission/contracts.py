@@ -125,54 +125,6 @@ class LongTaskDispatchReceipt:
         object.__setattr__(self, "metadata", freeze_json_mapping(self.metadata))
 
 
-class LongTaskExecutionStatus(StrEnum):
-    COMPLETED = "completed"
-    FAILED = "failed"
-    CANCELED = "canceled"
-    PAUSED = "paused"
-
-
-@dataclass(frozen=True, slots=True)
-class LongTaskExecutionUpdate:
-    """One canonical parent-stream event emitted while a durable task runs."""
-
-    event: AgentEvent
-    persist: bool = True
-    plan_revision: ExecutionPlan | None = None
-    plan_revision_metadata: Mapping[str, Any] = field(default_factory=dict)
-
-    def __post_init__(self) -> None:
-        if self.plan_revision is not None and not isinstance(
-            self.plan_revision,
-            ExecutionPlan,
-        ):
-            raise TypeError("long task plan revision must be an ExecutionPlan")
-        metadata = freeze_json_mapping(self.plan_revision_metadata)
-        if metadata and self.plan_revision is None:
-            raise ValueError(
-                "long task plan revision metadata requires a plan revision"
-            )
-        object.__setattr__(self, "plan_revision_metadata", metadata)
-
-
-@dataclass(frozen=True, slots=True)
-class LongTaskExecutionResult:
-    task_id: str
-    status: LongTaskExecutionStatus
-    final_response: str = ""
-    error: str | None = None
-    metadata: Mapping[str, Any] = field(default_factory=dict)
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "task_id", required_text(
-            self.task_id, "long task execution task_id"
-        ))
-        object.__setattr__(self, "status", LongTaskExecutionStatus(self.status))
-        object.__setattr__(self, "final_response", str(self.final_response or ""))
-        object.__setattr__(self, "error", optional_text(self.error))
-        object.__setattr__(self, "metadata", freeze_json_mapping(self.metadata))
-
-
 __all__ = [
     "ExecutionMode",
     "LongTaskDispatchReceipt",

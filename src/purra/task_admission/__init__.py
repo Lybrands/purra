@@ -3,10 +3,12 @@
 from purra.task_admission.contracts import (
     ExecutionMode,
     LongTaskDispatchReceipt,
+    TaskAdmissionDecision,
+)
+from purra.long_tasks.contracts import (
     LongTaskExecutionResult,
     LongTaskExecutionStatus,
     LongTaskExecutionUpdate,
-    TaskAdmissionDecision,
 )
 from purra.task_admission.ports import (
     LongTaskDispatcher,

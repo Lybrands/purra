@@ -5,18 +5,23 @@ import test from "node:test";
 
 import {
   Agent,
+  AgentCapabilityGrant,
+  AgentTreeRunSupervisor,
   AgentError,
   createRecoverySnapshot,
   DurableExecutorRegistry,
   HmacRecoveryAuthenticator,
+  InMemoryAgentAdapters,
   InMemoryLongTaskRepository,
+  InMemoryRunTreeRepository,
   RecipeLongTaskDispatcher,
+  RunCommandService,
   claimFromUnit,
   decideOrphanRun,
   OrphanRecoveryCoordinator,
   validateContinuation,
 } from "purra";
-import { testGateway } from "./support/model-gateway.mjs";
+import { testGateway, treeTestGateway } from "./support/model-gateway.mjs";
 
 const SECRET = "phase-six-recovery-secret-has-at-least-32-bytes";
 const durableFixture = JSON.parse(readFileSync(
@@ -40,6 +45,13 @@ test("shared Durable classifications and exact lease boundary stay aligned", () 
     leaseLost: "long_task_unit_lease_lost",
     budgetExceeded: "runtime_budget_exceeded",
     streamLimit: "model_stream_limit_exceeded",
+  });
+  assert.deepEqual(durableFixture.budgetExhaustionPolicy, {
+    defaultDisposition: "pause_recoverable",
+    optOutDisposition: "fail_permanent",
+    pausedTaskStatus: "paused",
+    unfinishedUnitStatus: "blocked",
+    errorCode: "runtime_budget_exceeded",
   });
   for (const row of durableFixture.budgetCases) {
     const { usage, limits } = row;
@@ -178,7 +190,7 @@ test("repository fences an expired same-worker claim and settles replay once", a
   );
 });
 
-test("Long Task budgets fail before the next claim and preserve unreported usage", async () => {
+test("Long Task budgets pause recoverably before the next claim and preserve completed work", async () => {
   const repository = new InMemoryLongTaskRepository({ tokenFactory: () => "budget-claim" });
   await repository.create("task-budget", {
     ...taskCommand([
@@ -199,8 +211,11 @@ test("Long Task budgets fail before the next claim and preserve unreported usage
   await repository.recordUsage(first, { inputTokens: 1, generationTokens: 1 });
   await repository.completeUnit(first, { outputRef: "result:1" }, "budget-settlement");
   assert.equal(await repository.claimReadyUnit("task-budget", "worker", 60_000), undefined);
-  assert.equal((await repository.load("task-budget")).status, "failed");
-  assert.equal((await repository.listUnits("task-budget"))[1].errorCode, "runtime_budget_exceeded");
+  assert.equal((await repository.load("task-budget")).status, "paused");
+  const budgetUnits = await repository.listUnits("task-budget");
+  assert.equal(budgetUnits[0].status, "completed");
+  assert.equal(budgetUnits[1].status, "blocked");
+  assert.equal(budgetUnits[1].errorCode, "runtime_budget_exceeded");
 
   const missing = new InMemoryLongTaskRepository({ tokenFactory: () => "missing-claim" });
   await missing.create("task-missing", {
@@ -216,20 +231,15 @@ test("Long Task budgets fail before the next claim and preserve unreported usage
   await missing.start("task-missing");
   const claim = claimFromUnit(await missing.claimReadyUnit("task-missing", "worker", 60_000));
   await missing.markUnitRunning(claim);
-  await assert.rejects(
-    missing.recordUsage(claim, null),
-    (error) => error instanceof AgentError && error.code === "runtime_budget_exceeded",
-  );
+  await missing.recordUsage(claim, null);
+  assert.equal((await missing.load("task-missing")).status, "paused");
   assert.equal((await missing.load("task-missing")).usage.unreportedUsageAttempts, 1);
 });
 
-test("recipe dispatcher resumes a DAG without replaying completed units and retries safely", async () => {
-  let now = 2_000;
+test("recipe operations share their owning Run without Agent creation", async () => {
   let taskSequence = 0;
   const calls = [];
-  let secondAttempts = 0;
   const repository = new InMemoryLongTaskRepository({
-    clockMs: () => now,
     tokenFactory: () => `claim-${++taskSequence}`,
   });
   const recipe = executionRecipe();
@@ -245,10 +255,11 @@ test("recipe dispatcher resumes a DAG without replaying completed units and retr
     executors: new DurableExecutorRegistry({
       fixture: {
         async execute(context) {
-          calls.push(context.unit.id);
-          if (context.unit.id === "unit-2" && secondAttempts++ === 0) {
-            throw { code: "temporary", retryable: true };
-          }
+          assert.equal(context.unit.runId, null);
+          assert.equal(context.treeAgent, undefined);
+          assert.equal(context.treeRun, undefined);
+          await context.bindRun(context.runId);
+          calls.push([context.unit.id, context.runId]);
           await context.checkpoint({ unit: context.unit.id });
           await context.recordUsage({ inputTokens: 1, generationTokens: 1, reasoningTokens: 0 });
           return { outputRef: `artifact://${context.unit.id}` };
@@ -257,25 +268,133 @@ test("recipe dispatcher resumes a DAG without replaying completed units and retr
     }),
     workerId: "worker-a",
     leaseDurationMs: 60_000,
-    retryBackoffMs: [0],
     idFactory: () => "task-dag",
   });
   const receipt = await dispatcher.dispatch(dispatchInput(recipe));
-
-  await repository.start(receipt.taskId);
-  const first = claimFromUnit(await repository.claimReadyUnit(receipt.taskId, "worker-before-restart", 10));
-  await repository.markUnitRunning(first);
-  await repository.completeUnit(first, { outputRef: "artifact://unit-1" }, "unit-1-settlement");
-
-  const result = await dispatcher.execute({ receipt, runId: "run-2" });
+  const tree = new InMemoryRunTreeRepository();
+  await tree.beginRoot({
+    runId: "run-1",
+    agentId: "root-agent",
+    name: "root",
+    title: "Root",
+    instruction: "Own the request",
+    objective: "execute recipe",
+    capabilityGrant: new AgentCapabilityGrant({ canSpawnAgents: true }),
+    idempotencyKey: "root:run-1",
+  });
+  const result = await dispatcher.execute({ receipt, runId: "run-1" });
   assert.equal(result.status, "completed");
   assert.equal(result.finalResponse, "artifact://unit-2");
-  assert.deepEqual(calls, ["unit-2", "unit-2"]);
+  assert.deepEqual(calls.map(([unitId]) => unitId), ["unit-1", "unit-2"]);
+  assert.deepEqual([...new Set(calls.map(([, runId]) => runId))], ["run-1"]);
   assert.equal((await repository.listUnits(receipt.taskId))[0].attempt, 1);
-  assert.equal((await repository.listUnits(receipt.taskId))[1].attempt, 2);
+  assert.equal((await repository.listUnits(receipt.taskId))[1].attempt, 1);
   assert.equal((await repository.listCheckpoints(receipt.taskId, "unit-2")).length, 1);
-  assert.equal((await repository.load(receipt.taskId)).usage.invocationCount, 1);
-  now += 1;
+  assert.equal((await repository.load(receipt.taskId)).usage.invocationCount, 2);
+  const descendants = await tree.listDescendants("run-1");
+  assert.deepEqual(descendants, []);
+});
+
+test("recipe dispatcher rejects an unbound owning Run", async () => {
+  const repository = new InMemoryLongTaskRepository();
+  const dispatcher = new RecipeLongTaskDispatcher({
+    repository,
+    descriptorResolver: { resolve: () => ({ namespace: "tests", ownerId: "owner", idempotencyKey: "tree-required" }) },
+    executors: new DurableExecutorRegistry({
+      fixture: { execute: () => ({ outputRef: "must-not-run" }) },
+    }),
+    workerId: "worker",
+    idFactory: () => "tree-required-task",
+  });
+  const receipt = await dispatcher.dispatch(dispatchInput(executionRecipe()));
+  await rejectsCode(dispatcher.execute({ receipt, runId: "unbound" }), "recipe_root_binding_conflict");
+  assert.equal((await repository.listUnits(receipt.taskId))[0].attempt, 0);
+});
+
+test("Recipe progress belongs to the Root without stage presentation calls", { timeout: 5_000 }, async () => {
+  let releaseSlow;
+  const slow = new Promise((resolve) => { releaseSlow = resolve; });
+  const adapters = new InMemoryAgentAdapters();
+  const longTasks = new InMemoryLongTaskRepository();
+  const dispatcher = new RecipeLongTaskDispatcher({
+    repository: longTasks,
+    descriptorResolver: {
+      resolve: ({ runId }) => ({ namespace: "tests", ownerId: "owner", idempotencyKey: runId }),
+    },
+    executors: new DurableExecutorRegistry({
+      fixture: {
+        async execute(context) {
+          if (context.unit.id === "unit-2") await slow;
+          return {
+            outputRef: `artifact://${context.unit.id}`,
+            metadata: { finalResponse: `${context.unit.id} summary` },
+          };
+        },
+      },
+    }),
+    workerId: "recipe-worker",
+    leaseDurationMs: 1_000,
+    idFactory: () => "recipe-stream-task",
+  });
+  const agent = new Agent({
+    model: treeTestGateway({
+      async invoke() { throw new Error("Root final Provider call must not run for a Recipe result"); },
+    }),
+    preset: { id: "recipe-stream", revision: "1" },
+    runRepository: adapters.runs,
+    outputPublisher: adapters.outputs,
+    planning: {
+      binding: { id: "recipe-planner", revision: "1" },
+      policy: { planningConstraints: () => ({}) },
+      planner: { createPlan: () => ({
+        workPlan: {
+          title: "Recipe stream",
+          goal: "complete two units",
+          taskSpec: { goal: "complete two units" },
+          steps: [
+            { id: "step-1", title: "Prepare", type: "write", executor: "model" },
+            { id: "step-2", title: "Finish", type: "write", executor: "model", dependsOn: ["step-1"] },
+          ],
+        },
+      }) },
+    },
+    durable: {
+      binding: { id: "recipe-durable", revision: "1" },
+      admission: { evaluate: () => ({
+        mode: "durable",
+        reasonCode: "recipe-test",
+        coveredStepIds: ["step-1", "step-2"],
+        executionRecipe: executionRecipe(),
+      }) },
+      dispatcher,
+      recoveryAuthenticator: new HmacRecoveryAuthenticator(SECRET),
+    },
+    agentTree: {
+      repository: adapters.runTree,
+      policy: {},
+    },
+  });
+  const handle = await agent.submit(plannedUser("run Recipe through Tree"), {
+    budgets: { maxRunGenerationTokens: null, maxModelCalls: 20 },
+  });
+  try {
+    for (let index = 0; index < 200; index += 1) {
+      const units = await longTasks.load("recipe-stream-task") ? await longTasks.listUnits("recipe-stream-task") : [];
+      if (units.some(unit => unit.id === "unit-2" && unit.status === "running")) break;
+      await new Promise(resolve => setTimeout(resolve, 1));
+    }
+    assert.equal((await handle.snapshot()).status, "running");
+    assert.deepEqual(await adapters.runTree.listDescendants(handle.runId), []);
+    const events = await adapters.runs.listEvents(handle.runId, 0);
+    assert.equal(events.some(event => JSON.stringify(event.payload).includes("parent.stage.delivery")), false);
+    releaseSlow();
+    const result = await handle.result;
+    assert.equal(result.output, "artifact://unit-2");
+    assert.equal(result.durable.status, "completed");
+  } finally {
+    releaseSlow();
+    await handle.result.catch(() => undefined);
+  }
 });
 
 test("repository pause, resume, and cancellation preserve terminal authority", async () => {
@@ -828,4 +947,30 @@ test("Auto promotion preserves admission and keeps private control out of its in
   assert.equal(calls.length,1);
   assert.ok(admitted.messages.some(message => message.role === "user" && message.content === "plan remaining"));
   assert.deepEqual(admitted.messages, [user("plan remaining")]);
+});
+
+for (const persisted of [false, true]) test(`Recipe cancellation closes operations without Agent creation (${persisted})`, {timeout:2000}, async () => {
+  const repository = new InMemoryLongTaskRepository();
+  const controller = new AbortController();
+  let started;
+  const ready = new Promise(resolve => { started = resolve; });
+  const dispatcher = new RecipeLongTaskDispatcher({
+    repository,
+    descriptorResolver: {resolve: () => ({namespace:'test',ownerId:'owner',idempotencyKey:'cancel'})},
+    executors: new DurableExecutorRegistry({fixture:{async execute(context) {
+      assert.equal(context.runId,'run-1');
+      assert.equal(context.treeRun,undefined);
+      started();
+      await new Promise(resolve => context.signal.addEventListener('abort',resolve,{once:true}));
+      return {outputRef:'ignored after cancellation'};
+    }}}),
+    workerId:'worker',idFactory:()=>'cancel-task',
+  });
+  const receipt = await dispatcher.dispatch(dispatchInput(executionRecipe()));
+  const running = dispatcher.execute({receipt,runId:'run-1',signal:controller.signal});
+  await ready;
+  if (persisted) await repository.requestCancel(receipt.taskId);
+  else controller.abort();
+  assert.equal((await running).status,persisted?'canceled':'paused');
+  assert.ok((await repository.listUnits(receipt.taskId)).every(unit => unit.runId === null && unit.status !== 'running'));
 });

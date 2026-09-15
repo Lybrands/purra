@@ -267,7 +267,11 @@ async def main() -> None:
         or not any(event.run_id == descendants[0].run_id for event in journal)
     ):
         raise RuntimeError("Python child Agent journal attribution is invalid")
-    if root_model_calls != 2 or child_model_calls != 2 or len(tool_calls) != 1:
+    # New contract: delegation results return through the normal model loop
+    # (delegate call, results round), and provisional text produced with tools
+    # present still requires one tool-free public presentation round. Child
+    # runs keep their own lookup + presentation pair.
+    if root_model_calls != 3 or child_model_calls != 2 or len(tool_calls) != 1:
         raise RuntimeError("unexpected Python child Agent execution counts")
 
     print(json.dumps({

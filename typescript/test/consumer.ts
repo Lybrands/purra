@@ -180,3 +180,12 @@ function existingCheckpointConsumer(checkpoint: import('purra').AgentExecutionCh
 const optionalApprovalHost: Pick<import('purra').RunRepository, 'executeToolOwned' | 'saveToolExecutionCheckpoint'> = {};
 void existingCheckpointConsumer;
 void optionalApprovalHost;
+
+import { AgentTreePolicy } from "purra";
+const resultPresentationPolicy = new AgentTreePolicy({
+  resultPresentationInstruction: "Report available findings and unresolved questions.",
+});
+const presentationInstruction: string | null = resultPresentationPolicy.snapshot().resultPresentationInstruction;
+// @ts-expect-error Window configuration is not part of the current API.
+new AgentTreePolicy({ resultWindowMs: "2s" });
+void presentationInstruction;

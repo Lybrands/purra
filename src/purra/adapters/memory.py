@@ -6,10 +6,14 @@ not durable across process restarts and must not be used as production storage.
 
 from __future__ import annotations
 
+from purra.adapter_records import StoredRun, StoredStream
+
+from purra.adapter_state import AdapterState, RunState
+
 import asyncio
 from purra.interaction import is_input_checkpoint_update
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import replace
 from datetime import datetime, timezone
 import json
 from typing import Any
@@ -18,11 +22,9 @@ from uuid import uuid4
 from purra.contracts import (
     ModelFinishReason,
     ModelTokenUsage,
-    ExecutionPlan,
     RunCreateParams,
     RunId,
     RunStatus,
-    TaskStep,
     ToolCall,
     ToolHandlerResult,
     TraceRecord,
@@ -64,63 +66,12 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-@dataclass(slots=True)
-class _RunRecord:
-    params: RunCreateParams
-    status: RunStatus = RunStatus.RUNNING
-    conversation_id: int | None = None
-    steps: list[TaskStep] = field(default_factory=list)
-    execution_plan: ExecutionPlan | None = None
-    final_response: str | None = None
-    validated_result: str | None = None
-    error: str | None = None
-    events: list[AgentEvent] = field(default_factory=list)
-    traces: list[TraceRecord] = field(default_factory=list)
-    model_attempt_ids: set[str] = field(default_factory=set)
-    model_usage_by_invocation: dict[str, ModelTokenUsage | None] = field(
-        default_factory=dict
-    )
-    provider_output_events: int = 0
-    provider_output_bytes: int = 0
-    execution_checkpoint: AgentExecutionCheckpoint | None = None
-    checkpoint_attempt_count: int = 0
 
 
-@dataclass(slots=True)
-class _StreamRecord:
-    spec: OutputStreamSpec
-    status: str = "open"
-    finish_reason: ModelFinishReason | None = None
-    error_code: str | None = None
 
 
-class _MemoryState:
-    def __init__(self) -> None:
-        self.lock = asyncio.Lock()
-        self.changed = asyncio.Condition()
-        self.runs: dict[str, _RunRecord] = {}
-        self.output_events: dict[str, list[AgentOutputEvent]] = {}
-        self.root_output_events: dict[str, list[AgentOutputEvent]] = {}
-        self.events_by_source_key: dict[str, AgentOutputEvent] = {}
-        self.streams: dict[str, _StreamRecord] = {}
-        self.stream_by_invocation: dict[str, str] = {}
-        self.sequences: dict[str, int] = {}
-        self.root_sequences: dict[str, int] = {}
-        self.published_sequences: dict[str, int] = {}
-        self.tool_receipts: dict[
-            tuple[str, str], tuple[ToolCall, ToolHandlerResult]
-        ] = {}
-        self.tool_inflight: dict[
-            tuple[str, str], tuple[ToolCall, asyncio.Task[ToolHandlerResult]]
-        ] = {}
-        self.run_count = 0
-        self.run_tree_authority = None
 
-    def next_run_id(self) -> str:
-        self.run_count += 1
-        return f"memory-run-{self.run_count}"
-
-def _require_run(state: _MemoryState, run_id: str) -> _RunRecord:
+def _require_run(state: RunState, run_id: str) -> StoredRun:
     try:
         return state.runs[run_id]
     except KeyError as error:
@@ -130,7 +81,7 @@ def _require_run(state: _MemoryState, run_id: str) -> _RunRecord:
         ) from error
 
 
-def _run_snapshot(run_id: RunId, record: _RunRecord) -> RunSnapshot:
+def _run_snapshot(run_id: RunId, record: StoredRun) -> RunSnapshot:
     plan = record.execution_plan
     return RunSnapshot(
         run_id=run_id,
@@ -157,14 +108,14 @@ def _run_snapshot(run_id: RunId, record: _RunRecord) -> RunSnapshot:
     )
 
 
-def _run_scope_id(run_id: str, run: _RunRecord) -> str:
+def _run_scope_id(run_id: str, run: StoredRun) -> str:
     return run.params.root_run_id or run_id
 
 
 def _require_run_write(
-    state: _MemoryState,
+    state: RunState,
     run_id: str,
-) -> _RunRecord:
+) -> StoredRun:
     run = _require_run(state, run_id)
     authority = state.run_tree_authority
     if (
@@ -172,7 +123,7 @@ def _require_run_write(
         and run.params.root_run_id != run_id
         and run.params.lease_epoch is not None
     ):
-        from purra.agent_tree_lease import current_agent_run_lease
+        from purra.agent_tree.lease import current_agent_run_lease
 
         claim = current_agent_run_lease(run_id)
         authority.require_run_claim_unlocked(
@@ -183,7 +134,7 @@ def _require_run_write(
     return run
 
 
-def _scope_runs(state: _MemoryState, run_id: str, run: _RunRecord):
+def _scope_runs(state: RunState, run_id: str, run: StoredRun):
     root_run_id = _run_scope_id(run_id, run)
     return root_run_id, tuple(
         candidate
@@ -193,7 +144,7 @@ def _scope_runs(state: _MemoryState, run_id: str, run: _RunRecord):
 
 
 def _scoped_run_params(
-    state: _MemoryState,
+    state: RunState,
     run_id: str,
     params: RunCreateParams,
 ) -> RunCreateParams:
@@ -238,7 +189,7 @@ def _scoped_run_params(
     )
 
 
-def _apply_commit(record: _RunRecord, commit: RunCommit) -> None:
+def _apply_commit(record: StoredRun, commit: RunCommit) -> None:
     if record.status is not RunStatus.RUNNING:
         raise ContractViolationError("terminal run cannot accept another commit")
     if commit.replace_plan is not None:
@@ -311,7 +262,7 @@ def _event_matches_draft(
 
 
 def _existing_event(
-    state: _MemoryState,
+    state: RunState,
     draft: AgentOutputEventDraft,
 ) -> AgentOutputEvent | None:
     event = state.events_by_source_key.get(draft.source_event_key)
@@ -361,9 +312,9 @@ def _batched_provider_entries(event: AgentOutputEvent) -> tuple[Mapping[str, Any
 
 
 def _require_provider_output_budget(
-    state: _MemoryState,
+    state: RunState,
     run_id: str,
-    run: _RunRecord,
+    run: StoredRun,
     event_count: int,
     payload_bytes: int,
 ) -> None:
@@ -387,11 +338,11 @@ def _require_provider_output_budget(
 
 
 def _validate_new_event(
-    state: _MemoryState,
+    state: RunState,
     draft: AgentOutputEventDraft,
     *,
     allow_committed_stream: bool,
-) -> _RunRecord:
+) -> StoredRun:
     run = _require_run_write(state, draft.run_id)
     if draft.output_stream_id is not None:
         try:
@@ -429,7 +380,7 @@ def _validate_new_event(
     return run
 
 
-def _validate_planning_projection(state: _MemoryState, draft: AgentOutputEventDraft) -> None:
+def _validate_planning_projection(state: RunState, draft: AgentOutputEventDraft) -> None:
     from purra.planning_stream import PLANNING_STREAM_SCHEMA, PlanningStreamParser
     from purra.errors import InvalidPlannerOutputError
     stream = state.streams.get(draft.output_stream_id)
@@ -441,7 +392,8 @@ def _validate_planning_projection(state: _MemoryState, draft: AgentOutputEventDr
             or payload.get("revision") != scope.revision
             or payload.get("attempt") != stream.spec.planning_attempt
             or draft.source_event_key != (
-                f"planning-delta:{draft.invocation_id}:{payload.get('sourceChunkIndex')}"
+                f"planning-delta:{draft.invocation_id}:{payload.get('sourceChunkIndex')}:"
+                f"{payload.get('sourcePartIndex')}"
                 if draft.kind is OutputEventKind.PLANNING_DELTA
                 else f"planning:{draft.invocation_id}:{payload.get('recordIndex')}")):
         raise ContractViolationError("planning projection scope mismatch")
@@ -452,17 +404,28 @@ def _validate_planning_projection(state: _MemoryState, draft: AgentOutputEventDr
             or stage[-1].payload.get("kind") != "planning"):
         raise ContractViolationError("planning operation is not active")
     if draft.kind is OutputEventKind.PLANNING_DELTA:
-        index = payload["sourceChunkIndex"]
-        source = state.events_by_source_key.get(
-            f"provider-batch:{draft.invocation_id}:diagnostic:private:{index}:{index}"
-        )
-        if (source is None or source.run_id != draft.run_id
-                or source.invocation_id != draft.invocation_id
-                or source.visibility is not OutputVisibility.PRIVATE
-                or not any(entry.get("kind") == OutputEventKind.PROVIDER_CONTENT_DELTA.value
-                           and entry.get("sourceChunkIndex") == index
-                           and entry.get("payload", {}).get("delta") == payload["textDelta"]
-                           for entry in _batched_provider_entries(source))):
+        from purra.planning_stream import PlanningTextDeltaParser
+        target_index = payload["sourceChunkIndex"]
+        target_part = payload["sourcePartIndex"]
+        by_index = {}
+        for event in events:
+            if event.invocation_id != draft.invocation_id:
+                continue
+            for entry in _batched_provider_entries(event):
+                if entry.get("kind") == OutputEventKind.PROVIDER_CONTENT_DELTA.value:
+                    by_index[int(entry["sourceChunkIndex"])] = str(
+                        entry.get("payload", {}).get("delta", "")
+                    )
+        parser = PlanningTextDeltaParser()
+        expected = None
+        for index in sorted(by_index):
+            deltas = parser.feed(by_index[index])
+            if index == target_index and 1 <= target_part <= len(deltas):
+                expected = deltas[target_part - 1]
+                break
+        if (expected is None
+                or expected.text != payload["textDelta"]
+                or expected.record_index != payload["recordIndex"]):
             raise ContractViolationError("planning delta does not match Provider source")
         return
     # ponytail: bounded replay (1 MiB, 16 projections); index record spans only if
@@ -484,7 +447,7 @@ def _validate_planning_projection(state: _MemoryState, draft: AgentOutputEventDr
 
 
 def _append_event(
-    state: _MemoryState,
+    state: RunState,
     draft: AgentOutputEventDraft,
     *,
     allow_committed_stream: bool = False,
@@ -541,7 +504,7 @@ def _append_event(
 
 
 def _append_events(
-    state: _MemoryState,
+    state: RunState,
     drafts: tuple[AgentOutputEventDraft, ...],
 ) -> tuple[AgentOutputEvent, ...]:
     if not drafts:
@@ -573,7 +536,7 @@ def _append_events(
 
 
 class _InMemoryRunRepository:
-    def __init__(self, state: _MemoryState) -> None:
+    def __init__(self, state: RunState) -> None:
         self._state = state
 
     async def begin(
@@ -589,7 +552,7 @@ class _InMemoryRunRepository:
                     code="run_identity_conflict",
                 )
             event = replace(started_event, run_id=run_id)
-            self._state.runs[run_id] = _RunRecord(
+            self._state.runs[run_id] = StoredRun(
                 params=_scoped_run_params(self._state, run_id, params),
                 events=[event],
             )
@@ -684,7 +647,7 @@ class _InMemoryRunRepository:
 
 
 class _InMemoryToolIdempotencyGateway:
-    def __init__(self, state: _MemoryState) -> None:
+    def __init__(self, state: RunState) -> None:
         self._state = state
 
     async def execute_once(
@@ -742,7 +705,7 @@ class _InMemoryToolIdempotencyGateway:
 
 
 class _InMemoryAgentOutputRepository:
-    def __init__(self, state: _MemoryState) -> None:
+    def __init__(self, state: RunState) -> None:
         self._state = state
 
     async def begin_run_lifecycle(
@@ -758,7 +721,7 @@ class _InMemoryAgentOutputRepository:
                     code="run_identity_conflict",
                 )
             event = replace(started_event, run_id=run_id)
-            self._state.runs[run_id] = _RunRecord(
+            self._state.runs[run_id] = StoredRun(
                 params=_scoped_run_params(self._state, run_id, params),
                 events=[event],
             )
@@ -813,7 +776,7 @@ class _InMemoryAgentOutputRepository:
                         or stage[-1].kind is not OutputEventKind.OPERATION_STARTED
                         or stage[-1].payload.get("kind") != "planning"):
                     raise ContractViolationError("planning operation is not active")
-            self._state.streams[spec.output_stream_id] = _StreamRecord(spec=spec)
+            self._state.streams[spec.output_stream_id] = StoredStream(spec=spec)
             self._state.stream_by_invocation[spec.invocation_id] = (
                 spec.output_stream_id
             )
@@ -1329,7 +1292,7 @@ class _InMemoryAgentOutputRepository:
                 )
             return content
 
-    def _require_stream(self, output_stream_id: str) -> _StreamRecord:
+    def _require_stream(self, output_stream_id: str) -> StoredStream:
         try:
             return self._state.streams[output_stream_id]
         except KeyError as error:
@@ -1339,7 +1302,7 @@ class _InMemoryAgentOutputRepository:
 
 
 class _InMemoryAgentOutputPublisher:
-    def __init__(self, state: _MemoryState) -> None:
+    def __init__(self, state: RunState) -> None:
         self._state = state
 
     async def publish_committed(self, event: AgentOutputEvent) -> None:
@@ -1411,7 +1374,7 @@ def _terminal_stream_abort_draft(
 
 
 def _terminal_stream_abort_events(
-    state: _MemoryState,
+    state: RunState,
     run_id: str,
     terminal_status: RunStatus | None,
 ) -> tuple[AgentOutputEvent, ...]:
@@ -1444,7 +1407,7 @@ def _terminal_stream_abort_events(
     return events
 
 
-def _run_budget_snapshot(run: _RunRecord):
+def _run_budget_snapshot(run: StoredRun):
     from purra.ports.run_lifecycle import RunBudgetSnapshot
 
     usages = tuple(
@@ -1472,9 +1435,9 @@ def _run_budget_snapshot(run: _RunRecord):
 
 
 def _require_root_token_budgets(
-    state: _MemoryState,
+    state: RunState,
     run_id: str,
-    run: _RunRecord,
+    run: StoredRun,
 ) -> None:
     root_run_id, runs = _scope_runs(state, run_id, run)
     limits = _require_run(state, root_run_id).params.runtime_limits
@@ -1529,16 +1492,18 @@ def _require_root_token_budgets(
 class InMemoryAgentAdapters:
     """Compose process-local implementations of PurrA's host storage ports."""
 
-    def __init__(self, *, agent_tree_clock_ms=None) -> None:
-        state = _MemoryState()
+    def __init__(self, *, agent_tree_clock_ms=None, state: AdapterState | None = None) -> None:
+        self.state = state if state is not None else AdapterState()
+        state = self.state.run
         from purra.agent_tree import InMemoryRunTreeRepository
 
         self.run_tree = InMemoryRunTreeRepository(
             transaction_lock=state.lock,
+            state=self.state.tree,
             clock_ms=agent_tree_clock_ms,
         )
         state.run_tree_authority = self.run_tree
-        durable = InMemoryDurableAdapters()
+        durable = InMemoryDurableAdapters(artifact_state=self.state.artifact, task_state=self.state.task)
         self.runs: RunRepository = _InMemoryRunRepository(state)
         self.outputs: AgentOutputRepository = _InMemoryAgentOutputRepository(state)
         self.publisher: AgentOutputPublisher = _InMemoryAgentOutputPublisher(state)

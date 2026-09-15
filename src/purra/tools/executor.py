@@ -48,7 +48,12 @@ from purra.ports import (
     ToolRegistration,
     ToolIdempotencyGateway,
 )
-from purra.tools.contract import validate_tool_contract
+from purra.tools.contracts import validate_tool_contract
+from purra.tools.scoping import (
+    outside_scope_names,
+    scope_names_missing_registration,
+    unregistered_names,
+)
 from purra.tools.policy import (
     aggregate_outcomes,
     approval_error_code,
@@ -126,14 +131,17 @@ class CoreToolExecutor:
             )
 
         requested_names = frozenset(item.call.name for item in parsed_calls)
-        if not requested_names.issubset(self._registrations):
+        if unregistered_names(requested_names, registered_names=self._registrations):
             return _whole_batch_failure(
                 request.calls,
                 outcome=ToolBatchOutcome.REJECTED,
                 code="unknown_tool",
                 message="The requested tool is not registered.",
             )
-        unknown_scope_names = request.allowed_tool_names - self._registrations.keys()
+        unknown_scope_names = scope_names_missing_registration(
+            request.allowed_tool_names,
+            registered_names=self._registrations.keys(),
+        )
         if unknown_scope_names:
             return _whole_batch_failure(
                 request.calls,
@@ -141,7 +149,7 @@ class CoreToolExecutor:
                 code="invalid_tool_scope",
                 message="The execution scope contains an unregistered tool.",
             )
-        if not requested_names.issubset(request.allowed_tool_names):
+        if outside_scope_names(requested_names, allowed_names=request.allowed_tool_names):
             return _whole_batch_failure(
                 request.calls,
                 outcome=ToolBatchOutcome.REJECTED,

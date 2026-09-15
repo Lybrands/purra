@@ -15,7 +15,7 @@ def is_input_checkpoint_update(current, updated):
                 and bool(message.attributes.get("inputRequestId")) and expected_checkpoint == updated)
     if len(updated.messages) != len(current.messages):
         return False
-    calls = {call.id for message in current.messages for call in message.tool_calls if call.name == "delegateToAgents"}
+    calls = {call.id for message in current.messages for call in message.tool_calls if call.name in {"delegateToAgents", "receiveAgentResults", "continueAgent"}}
     from purra.evidence import RunEvidenceStore
     evidence = RunEvidenceStore.from_checkpoint_mapping(current.evidence_state)
     changed = False

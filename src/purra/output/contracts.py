@@ -683,9 +683,11 @@ def _validate_public_text(
         if (source is not OutputSource.PROVIDER or channel is not OutputChannel.COMMENTARY
                 or visibility is not OutputVisibility.PUBLIC or not output_stream_id or not invocation_id
                 or payload.get("schemaVersion") != PLANNING_STREAM_SCHEMA
-                or set(payload) != {"schemaVersion", "operationId", "revision", "attempt", "textDelta", "sourceChunkIndex"}
+                or set(payload) != {"schemaVersion", "operationId", "revision", "attempt", "recordIndex", "textDelta", "sourceChunkIndex", "sourcePartIndex"}
                 or not isinstance(payload.get("textDelta"), str) or not payload["textDelta"]
                 or type(payload.get("sourceChunkIndex")) is not int or payload["sourceChunkIndex"] < 1
+                or type(payload.get("sourcePartIndex")) is not int or payload["sourcePartIndex"] < 1
+                or type(payload.get("recordIndex")) is not int or payload["recordIndex"] < 1
                 or not isinstance(payload.get("operationId"), str) or not payload["operationId"]
                 or any(type(payload.get(key)) is not int or payload[key] < 0 for key in ("revision", "attempt"))):
             raise ValueError("planning delta requires a Provider chunk projection")

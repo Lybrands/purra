@@ -15,6 +15,7 @@ checkpoint, or effect-recovery checks.
 | Memory capture and resolution | Optional Mem0 component; host calls capture with authorization and supplies a resolution policy | Provenance, current authorization and revocation still apply |
 | Relation extraction | Host supplies memory revisions, allowed relation names and an extractor to the [optional proposal helper](../integrations/mem0/relations.md) | Source quotes and current revisions are checked; proposals do not authorize writes |
 | Memory retrieval composition | Host supplies an ordered-ID callback through [MemoryContext selection](../integrations/mem0/selection.md) | Fresh scoped reads, complete-record budgets and source evidence still apply |
+| Agent result reception | Enable `delegateToAgents` and `receiveAgentResults`; [unified output contract](../conformance/parent-result-streaming.md) | Results enter the owning model loop; no automatic presentation calls; legacy recovery gates remain |
 | Delegation | Public spawn/join/continue commands or the default delegation tool; `AgentTreePolicy` limits | Descendant grants narrow and Root budget/ownership remain authoritative |
 | Recovery scheduling | Worker discovery, schedule and public-resume callbacks; host owns service lifetime | Discovery/inspection does not grant permission to resume |
 
@@ -125,3 +126,87 @@ scheduling. Hosts can replace documented policies, not every internal transition
 Core has no runtime dependency on the Mem0, media, database or worker service
 integrations. A text-and-tool host need not configure those capabilities. Choosing
 policies does not require adopting additional backends or external services.
+
+## Agent delegation and result presentation
+
+The host owns delegation responsibilities, work partitioning, and whether a
+result deserves another public model invocation. PurrA enforces the supplied
+scope, grants, budgets, leases, cancellation, and recovery contracts. It does
+not infer a business role from a Recipe Unit or create Agents for ordinary
+parallel operations.
+
+Result reception does not require public presentation. Managed serial feedback
+is opt-in through a nonempty `result_presentation_instruction` (Python) or
+`resultPresentationInstruction` (TypeScript); the default is null and there is
+no built-in prompt. Hosts can also supply scheduler result callbacks. The
+managed streaming capability retains output serialization, nonempty-text/no-tool
+validation and durable delivery recovery. These constraints apply only when
+that capability is selected. Existing unresolved delivery markers remain
+reconciliation barriers even if future presentation is disabled.
+
+
+### Reusing delegated Agents
+
+The Python model-visible Agent tree tools include `listAgents`, `getAgent`, and
+`continueAgent`. Creation and result receipts expose only participating Agents'
+identities and bounded responsibility summaries,
+context version, and latest execution state. A follow-up supplies `agentId`,
+`expectedContextVersion`, and `message`; the command service rejects stale
+versions, busy Agents, and targets outside the requester's ancestry.
+
+The built-in executor restores earlier completed task inputs and validated
+answers into the next invocation of the same Agent. Intermediate tool traces
+are not replayed as conversation history. History stays within that Agent and
+is subject to the existing input budget checks; unavailable canonical history
+fails rather than silently starting over. Each invocation has its own Run,
+while the Agent identity and responsibility persist. The host decides whether
+to delegate, reuse an Agent, or perform an ordinary operation in the current
+Run; the framework does not map application task units to Agents.
+
+
+Python child executions inherit explicit execution constraints (model support,
+reasoning selection, context budget reserves and deadline). Parent response
+validators, judges, required tool calls, output shape, bindings and checkpoint
+callbacks are local to the parent execution and are not copied to children.
+
+`RunTreeRepository.list_agent_descendants` queries Agent ancestry, independently
+of the current Run. It returns a lexically ordered page after an exclusive
+Agent-id cursor. `listAgents` returns up to 50 summaries and a `nextCursor`;
+`getAgent` returns the full instructions for one authorized descendant. Durable
+adapters must implement this port directly. There is no fallback to Run ancestry.
+
+Result reception uses `RunCommandService.results` to own subscriptions, wait
+for delivery and close pending execution. The scheduler dispatches individual
+terminal results. The window configuration and window-dispatch API have been
+removed from both framework distributions; no compatibility path is provided.
+
+### Unified execution and storage contracts
+
+Agent creation has one capacity policy. Recipe execution does not reserve Agent
+slots, introduce a special Agent identity, or restrict Agent continuation.
+Task payload fields are opaque input; they cannot grant creation authority.
+Durable Recipe Units execute within their owning Run through the Unit executor.
+
+Python normalizes optional failure classification and splitting through
+`UnitFailurePolicy`. Missing hooks, or a `None` classification, select the
+permanent-failure default. Invalid hook results and exceptions raise
+`long_task_failure_hook_failed`, preserve the hook exception as their cause,
+and pause active scheduling. They are not converted into ordinary Unit failures
+or implicit retries. The dispatcher only routes hooks to the selected executor;
+the coordinator owns decisions and durable settlement.
+
+Python reference repositories and `StorageSession` share explicit
+`AdapterState` data groups. `StoredRun`, `StoredStream`, and `StoredLongTask` are
+storage records independent of repository implementations. Snapshot restore
+constructs state before connecting repositories; locks, pending tool tasks,
+output caches and runtime authority bindings are not serialized.
+The Python snapshot schema is `purra.storage-state/python/v2`; the TypeScript
+Agent tree schema is `purra.tree-state/v3`. Earlier schemas are rejected without
+migration or fallback.
+
+Python output buffering and flush timers belong to `ProviderOutputBuffer`.
+`PlanningOutputProjection` only parses source text and prepares authorized
+projections. `AgentOutputProcessor` remains the entry point and owns persistence
+and publication: source batches are committed before their public projections,
+and committed events are published in stream order. Timer errors propagate to
+the foreground operation; stream termination discards buffers and parser state.

@@ -356,6 +356,7 @@ new AgentTreePolicy({
 const treeRepository = new InMemoryRunTreeRepository();
 let treeCommands: RunCommandService;
 const treeSupervisor = new AgentTreeRunSupervisor({
+    deliverResults: async () => {},
   repository: treeRepository,
   executor: {
     async execute(run, agent) {

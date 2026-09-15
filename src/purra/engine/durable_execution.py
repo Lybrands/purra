@@ -16,7 +16,7 @@ from purra.contracts import (
     ExecutionPlan,
 )
 from purra.errors import ContractViolationError
-from purra.events import AgentEvent, CoreEventType
+from purra.events import AgentEvent, CoreEventType, bind_event_to_run
 from purra.engine.options import DurableTaskContinuation
 from purra.json_values import thaw_json_mapping
 from purra.ports import CancellationSignal
@@ -32,7 +32,7 @@ from purra.task_admission import (
 )
 
 
-class BufferedEventSink(Protocol):
+class BufferedEventSinkProtocol(Protocol):
     def drain(self) -> tuple[AgentEvent, ...]: ...
 
 
@@ -48,7 +48,7 @@ async def complete_durable_continuation(
     request: AgentRunRequest,
     continuation: DurableTaskContinuation,
     dispatcher: LongTaskDispatcher | None,
-    sink: BufferedEventSink,
+    sink: BufferedEventSinkProtocol,
     signal: CancellationSignal | None,
     *,
     defer_successful_completion: bool = False,
@@ -60,6 +60,17 @@ async def complete_durable_continuation(
         raise ContractViolationError("durable continuation source has no plan")
     admission = continuation.receipt.admission
     validate_task_admission_coverage(plan, admission)
+    prepare_continuation = getattr(dispatcher, "prepare_continuation", None)
+    if not callable(prepare_continuation):
+        raise ContractViolationError(
+            "durable continuation requires an explicit task binding",
+            code="durable_continuation_binding_unavailable",
+        )
+    await prepare_continuation(
+        continuation.receipt.task_id,
+        source_run_id=continuation.source.run_id,
+        run_id=str(controller.run_id or ""),
+    )
     await controller.record_event(
         CoreEventType.TASK_ADMISSION_DECIDED,
         {
@@ -91,7 +102,7 @@ async def complete_admitted_task(
     plan: ExecutionPlan,
     admission: TaskAdmissionDecision,
     dispatcher: LongTaskDispatcher | None,
-    sink: BufferedEventSink,
+    sink: BufferedEventSinkProtocol,
     signal: CancellationSignal | None,
     existing_receipt: LongTaskDispatchReceipt | None = None,
     defer_successful_completion: bool = False,
@@ -168,6 +179,7 @@ async def complete_admitted_task(
         ] | None = None
         execution_drained = False
         contract_violation = False
+        update_contract_violation = False
         try:
             while not execution.done() or not updates.empty():
                 pending_update = asyncio.create_task(updates.get())
@@ -198,7 +210,7 @@ async def complete_admitted_task(
                                 durable_step_aliases,
                             )
                             durable_statuses = _durable_plan_step_statuses(event)
-                            if durable_statuses and update.plan_revision is None:
+                            if durable_statuses:
                                 await controller.sync_durable_execution(
                                     durable_statuses
                                 )
@@ -209,10 +221,6 @@ async def complete_admitted_task(
                                     admission.covered_step_ids,
                                     original_plan=plan,
                                 )
-                                if durable_statuses:
-                                    await controller.sync_durable_execution(
-                                        durable_statuses
-                                    )
                                 await controller.revise_plan(
                                     update.plan_revision,
                                     revision_metadata=thaw_json_mapping(
@@ -227,6 +235,8 @@ async def complete_admitted_task(
                         else:
                             persisted = (event,)
                     except BaseException as error:
+                        if isinstance(error, ContractViolationError):
+                            update_contract_violation = True
                         if not acknowledged.done():
                             if isinstance(error, asyncio.CancelledError):
                                 acknowledged.cancel()
@@ -250,6 +260,8 @@ async def complete_admitted_task(
             result = await execution
             execution_drained = True
         except ContractViolationError:
+            if not update_contract_violation:
+                raise
             contract_violation = True
         finally:
             if not execution_drained:
@@ -281,6 +293,14 @@ async def complete_admitted_task(
                     result.final_response,
                     covered_step_ids=admission.covered_step_ids,
                 )
+        elif result.status is LongTaskExecutionStatus.PARTIAL:
+            # A host may deliberately close the interaction with a
+            # deterministic, persisted checkpoint while its durable task is
+            # still incomplete.  This is not successful durable execution:
+            # the task record keeps its failed/unfinished state and remains
+            # the authority for recovery.  The Root is complete only in the
+            # narrower sense that it has delivered the truthful checkpoint.
+            await controller.complete(result.final_response)
         elif result.status is LongTaskExecutionStatus.FAILED:
             await controller.fail(result.error or "long_task_execution_failed")
         else:
@@ -504,12 +524,3 @@ def _bind_durable_progress_to_plan(
         payload=payload,
     )
 
-
-def bind_event_to_run(event: AgentEvent, run_id: RunId | None) -> AgentEvent:
-    if run_id is None:
-        raise ContractViolationError("active run has no id")
-    if event.run_id is None:
-        return AgentEvent(type=event.type, run_id=run_id, payload=event.payload)
-    if event.run_id != run_id:
-        raise ContractViolationError("runtime event belongs to another run")
-    return event

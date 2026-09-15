@@ -1,558 +1,52 @@
-"""Stable recursive Agent identities and immutable Run chains."""
+"""Atomic in-memory reference adapter for the Run tree repository port."""
 
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field, replace
-from enum import StrEnum
-from hashlib import sha256
 import json
 import time
-from typing import Any, Protocol, runtime_checkable
+from collections.abc import Sequence
+from dataclasses import replace
+from hashlib import sha256
+from typing import Any
 
+from purra.adapter_state import AgentTreeState
 from purra.errors import ContractViolationError
 from purra.json_values import freeze_json_mapping, thaw_json_mapping
-from purra.normalization import (
-    non_negative_int,
-    positive_int,
-    required_text,
-    unique_text_tuple,
+from purra.normalization import non_negative_int, positive_int, required_text
+
+from purra.agent_tree.contracts import (
+    AgentCapabilityGrant,
+    AgentNode,
+    AgentRunAggregation,
+    AgentTreeRun,
+    AgentTreeRunStatus,
+    BeginRootAgentCommand,
+    ContextCheckpoint,
+    ContinueAgentCommand,
+    ContinueAgentReceipt,
+    SpawnAgentsCommand,
+    SpawnAgentsReceipt,
+    SpawnedAgent,
+    validate_stored_dependencies,
 )
+from purra.agent_tree.contracts import (
+    AgentNodeState,
+    _ACTIVE_RUN_STATUSES,
+    _normalize_command_lease,
+    _raise,
+)
+from purra.agent_tree.ports import RunTreeRepository
 
 
-class AgentNodeState(StrEnum):
-    ACTIVE = "active"
-    CLOSED = "closed"
-
-
-class AgentTreeRunStatus(StrEnum):
-    QUEUED = "queued"
-    RUNNING = "running"
-    WAITING = "waiting"
-    DONE = "done"
-    FAILED = "failed"
-    CANCELED = "canceled"
-
-
-_ACTIVE_RUN_STATUSES = frozenset({
-    AgentTreeRunStatus.QUEUED,
-    AgentTreeRunStatus.RUNNING,
-    AgentTreeRunStatus.WAITING,
-})
-_TERMINAL_RUN_STATUSES = frozenset({
-    AgentTreeRunStatus.DONE,
-    AgentTreeRunStatus.FAILED,
-    AgentTreeRunStatus.CANCELED,
-})
-
-
-@dataclass(frozen=True, slots=True)
-class AgentCapabilityGrant:
-    """Authority that a parent may only preserve or narrow for a child."""
-
-    can_spawn_agents: bool = False
-    max_depth: int = 3
-    max_children_per_call: int = 3
-    max_agents_per_root: int = 16
-    max_parallel_runs: int = 3
-    allowed_tools: tuple[str, ...] = ()
-    allowed_models: tuple[str, ...] = ()
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.can_spawn_agents, bool):
-            raise TypeError("can_spawn_agents must be boolean")
-        for name in (
-            "max_depth",
-            "max_children_per_call",
-            "max_agents_per_root",
-            "max_parallel_runs",
-        ):
-            object.__setattr__(
-                self,
-                name,
-                positive_int(getattr(self, name), name.replace("_", " ")),
-            )
-        object.__setattr__(
-            self,
-            "allowed_tools",
-            unique_text_tuple(self.allowed_tools),
-        )
-        object.__setattr__(
-            self,
-            "allowed_models",
-            unique_text_tuple(self.allowed_models),
-        )
-
-    def authorize_child(
-        self,
-        requested: AgentCapabilityGrant | None,
-    ) -> AgentCapabilityGrant:
-        child = requested or self
-        if not isinstance(child, AgentCapabilityGrant):
-            raise TypeError("child Agent capability grant is invalid")
-        if child.can_spawn_agents and not self.can_spawn_agents:
-            _raise("agent_capability_escalation", "child cannot gain spawn authority")
-        for name in (
-            "max_depth",
-            "max_children_per_call",
-            "max_agents_per_root",
-            "max_parallel_runs",
-        ):
-            if getattr(child, name) > getattr(self, name):
-                _raise(
-                    "agent_capability_escalation",
-                    f"child cannot increase {name}",
-                )
-        if set(child.allowed_tools) - set(self.allowed_tools):
-            _raise("agent_capability_escalation", "child cannot gain tools")
-        if set(child.allowed_models) - set(self.allowed_models):
-            _raise("agent_capability_escalation", "child cannot gain models")
-        return child
-
-    def to_mapping(self) -> dict[str, object]:
-        return {
-            "canSpawnAgents": self.can_spawn_agents,
-            "maxDepth": self.max_depth,
-            "maxChildrenPerCall": self.max_children_per_call,
-            "maxAgentsPerRoot": self.max_agents_per_root,
-            "maxParallelRuns": self.max_parallel_runs,
-            "allowedTools": list(self.allowed_tools),
-            "allowedModels": list(self.allowed_models),
-        }
-
-
-@dataclass(frozen=True, slots=True)
-class AgentNode:
-    agent_id: str
-    root_agent_id: str
-    parent_agent_id: str | None
-    depth: int
-    created_by_run_id: str
-    created_by_call_id: str
-    name: str
-    title: str
-    instruction: str
-    capability_grant: AgentCapabilityGrant
-    context_version: int = 0
-    context_checkpoint_id: str | None = None
-    latest_run_id: str | None = None
-    state: AgentNodeState = AgentNodeState.ACTIVE
-
-    def __post_init__(self) -> None:
-        for name, label in (
-            ("agent_id", "Agent id"),
-            ("root_agent_id", "root Agent id"),
-            ("created_by_run_id", "Agent creator Run id"),
-            ("created_by_call_id", "Agent creator call id"),
-            ("name", "Agent name"),
-            ("title", "Agent title"),
-            ("instruction", "Agent instruction"),
-        ):
-            object.__setattr__(self, name, required_text(getattr(self, name), label))
-        if self.parent_agent_id is not None:
-            object.__setattr__(
-                self,
-                "parent_agent_id",
-                required_text(self.parent_agent_id, "parent Agent id"),
-            )
-        depth = non_negative_int(self.depth, "Agent depth")
-        if (self.parent_agent_id is None) != (depth == 0):
-            raise ValueError("only a root Agent may have depth zero")
-        object.__setattr__(self, "depth", depth)
-        if not isinstance(self.capability_grant, AgentCapabilityGrant):
-            raise TypeError("Agent capability grant is required")
-        object.__setattr__(
-            self,
-            "context_version",
-            non_negative_int(self.context_version, "Agent context version"),
-        )
-        if self.context_checkpoint_id is not None:
-            object.__setattr__(
-                self,
-                "context_checkpoint_id",
-                required_text(self.context_checkpoint_id, "context checkpoint id"),
-            )
-        if self.latest_run_id is not None:
-            object.__setattr__(
-                self,
-                "latest_run_id",
-                required_text(self.latest_run_id, "latest Agent Run id"),
-            )
-        object.__setattr__(self, "state", AgentNodeState(self.state))
-
-
-@dataclass(frozen=True, slots=True)
-class AgentTreeRun:
-    run_id: str
-    agent_id: str
-    root_run_id: str
-    parent_run_id: str | None
-    previous_run_id: str | None
-    spawn_batch_id: str | None
-    objective: str
-    input_payload: Mapping[str, Any] = field(default_factory=dict)
-    required: bool = True
-    priority: int = 0
-    status: AgentTreeRunStatus = AgentTreeRunStatus.QUEUED
-    result: Any = None
-    error_code: str | None = None
-    created_sequence: int = 0
-    lease_owner_id: str | None = None
-    lease_epoch: int = 0
-    lease_expires_at_ms: int | None = None
-
-    def __post_init__(self) -> None:
-        for name, label in (
-            ("run_id", "Agent Run id"),
-            ("agent_id", "Agent Run Agent id"),
-            ("root_run_id", "root Run id"),
-            ("objective", "Agent Run objective"),
-        ):
-            object.__setattr__(self, name, required_text(getattr(self, name), label))
-        for name, label in (
-            ("parent_run_id", "parent Run id"),
-            ("previous_run_id", "previous Run id"),
-            ("spawn_batch_id", "spawn batch id"),
-        ):
-            value = getattr(self, name)
-            if value is not None:
-                object.__setattr__(self, name, required_text(value, label))
-        object.__setattr__(
-            self,
-            "input_payload",
-            freeze_json_mapping(self.input_payload),
-        )
-        if not isinstance(self.required, bool):
-            raise TypeError("child Agent required must be boolean")
-        if not isinstance(self.priority, int) or isinstance(self.priority, bool):
-            raise TypeError("Agent Run priority must be an integer")
-        object.__setattr__(self, "status", AgentTreeRunStatus(self.status))
-        error_code = str(self.error_code or "").strip() or None
-        if self.status is AgentTreeRunStatus.DONE and error_code is not None:
-            raise ValueError("completed Agent Run cannot carry an error")
-        if self.status in {
-            AgentTreeRunStatus.FAILED,
-            AgentTreeRunStatus.CANCELED,
-        } and error_code is None:
-            raise ValueError("failed or canceled Agent Run requires an error code")
-        object.__setattr__(self, "error_code", error_code)
-        object.__setattr__(
-            self,
-            "created_sequence",
-            non_negative_int(self.created_sequence, "Agent Run sequence"),
-        )
-        if self.lease_owner_id is not None:
-            object.__setattr__(
-                self,
-                "lease_owner_id",
-                required_text(self.lease_owner_id, "Agent Run lease owner"),
-            )
-        object.__setattr__(
-            self,
-            "lease_epoch",
-            non_negative_int(self.lease_epoch, "Agent Run lease epoch"),
-        )
-        object.__setattr__(
-            self,
-            "lease_expires_at_ms",
-            (
-                None
-                if self.lease_expires_at_ms is None
-                else positive_int(
-                    self.lease_expires_at_ms,
-                    "Agent Run lease expiry",
-                )
-            ),
-        )
-        if (self.lease_owner_id is None) != (self.lease_expires_at_ms is None):
-            raise ValueError("Agent Run lease owner and expiry must match")
-
-    @property
-    def terminal(self) -> bool:
-        return self.status in _TERMINAL_RUN_STATUSES
-
-
-@dataclass(frozen=True, slots=True)
-class ContextCheckpoint:
-    checkpoint_id: str
-    agent_id: str
-    version: int
-    previous_checkpoint_id: str | None
-    source_run_id: str
-    content_ref: str
-    fingerprint: str
-
-    def __post_init__(self) -> None:
-        for name, label in (
-            ("checkpoint_id", "context checkpoint id"),
-            ("agent_id", "context checkpoint Agent id"),
-            ("source_run_id", "context checkpoint Run id"),
-            ("content_ref", "context checkpoint content reference"),
-            ("fingerprint", "context checkpoint fingerprint"),
-        ):
-            object.__setattr__(self, name, required_text(getattr(self, name), label))
-        object.__setattr__(
-            self,
-            "version",
-            positive_int(self.version, "context checkpoint version"),
-        )
-        if self.previous_checkpoint_id is not None:
-            object.__setattr__(
-                self,
-                "previous_checkpoint_id",
-                required_text(
-                    self.previous_checkpoint_id,
-                    "previous context checkpoint id",
-                ),
-            )
-
-
-@dataclass(frozen=True, slots=True)
-class ChildAgentSpec:
-    name: str
-    title: str
-    instruction: str
-    objective: str
-    input_payload: Mapping[str, Any] = field(default_factory=dict)
-    required: bool = True
-    priority: int = 0
-    capability_grant: AgentCapabilityGrant | None = None
-
-    def __post_init__(self) -> None:
-        for name, label in (
-            ("name", "child Agent name"),
-            ("title", "child Agent title"),
-            ("instruction", "child Agent instruction"),
-            ("objective", "child Agent objective"),
-        ):
-            object.__setattr__(self, name, required_text(getattr(self, name), label))
-        object.__setattr__(
-            self,
-            "input_payload",
-            freeze_json_mapping(self.input_payload),
-        )
-        if not isinstance(self.required, bool):
-            raise TypeError("child Agent required must be boolean")
-        if not isinstance(self.priority, int) or isinstance(self.priority, bool):
-            raise TypeError("child Agent priority must be an integer")
-        if (
-            self.capability_grant is not None
-            and not isinstance(self.capability_grant, AgentCapabilityGrant)
-        ):
-            raise TypeError("child Agent capability grant is invalid")
-
-    def to_mapping(self) -> dict[str, object]:
-        return {
-            "name": self.name,
-            "title": self.title,
-            "instruction": self.instruction,
-            "objective": self.objective,
-            "input": thaw_json_mapping(self.input_payload),
-            "required": self.required,
-            "priority": self.priority,
-            "capabilityGrant": (
-                self.capability_grant.to_mapping()
-                if self.capability_grant is not None
-                else None
-            ),
-        }
-
-
-@dataclass(frozen=True, slots=True)
-class BeginRootAgentCommand:
-    run_id: str
-    agent_id: str
-    name: str
-    title: str
-    instruction: str
-    objective: str
-    capability_grant: AgentCapabilityGrant
-    idempotency_key: str
-
-    def __post_init__(self) -> None:
-        for name, label in (
-            ("run_id", "root Run id"),
-            ("agent_id", "root Agent id"),
-            ("name", "root Agent name"),
-            ("title", "root Agent title"),
-            ("instruction", "root Agent instruction"),
-            ("objective", "root Run objective"),
-            ("idempotency_key", "root Agent idempotency key"),
-        ):
-            object.__setattr__(self, name, required_text(getattr(self, name), label))
-        if not isinstance(self.capability_grant, AgentCapabilityGrant):
-            raise TypeError("root Agent capability grant is required")
-
-
-@dataclass(frozen=True, slots=True)
-class SpawnAgentsCommand:
-    parent_run_id: str
-    idempotency_key: str
-    children: tuple[ChildAgentSpec, ...]
-    lease_owner_id: str | None = None
-    lease_epoch: int | None = None
-
-    def __post_init__(self) -> None:
-        object.__setattr__(
-            self,
-            "parent_run_id",
-            required_text(self.parent_run_id, "parent Run id"),
-        )
-        object.__setattr__(
-            self,
-            "idempotency_key",
-            required_text(self.idempotency_key, "spawn idempotency key"),
-        )
-        children = tuple(self.children)
-        if not children or any(not isinstance(item, ChildAgentSpec) for item in children):
-            raise ValueError("spawn command requires child Agent specs")
-        if len({item.name for item in children}) != len(children):
-            raise ValueError("spawned Agent names must be unique in one command")
-        object.__setattr__(self, "children", children)
-        _normalize_command_lease(self)
-
-
-@dataclass(frozen=True, slots=True)
-class ContinueAgentCommand:
-    requester_run_id: str
-    idempotency_key: str
-    agent_id: str
-    expected_context_version: int
-    message: str
-    required: bool = True
-    priority: int = 0
-    lease_owner_id: str | None = None
-    lease_epoch: int | None = None
-
-    def __post_init__(self) -> None:
-        for name, label in (
-            ("requester_run_id", "continuation requester Run id"),
-            ("idempotency_key", "continuation idempotency key"),
-            ("agent_id", "continued Agent id"),
-            ("message", "continuation message"),
-        ):
-            object.__setattr__(self, name, required_text(getattr(self, name), label))
-        object.__setattr__(
-            self,
-            "expected_context_version",
-            non_negative_int(
-                self.expected_context_version,
-                "expected Agent context version",
-            ),
-        )
-        if not isinstance(self.required, bool):
-            raise TypeError("continuation required must be boolean")
-        if not isinstance(self.priority, int) or isinstance(self.priority, bool):
-            raise TypeError("continuation priority must be an integer")
-        _normalize_command_lease(self)
-
-
-@dataclass(frozen=True, slots=True)
-class SpawnedAgent:
-    agent: AgentNode
-    run: AgentTreeRun
-
-
-@dataclass(frozen=True, slots=True)
-class SpawnAgentsReceipt:
-    batch_id: str
-    items: tuple[SpawnedAgent, ...]
-    replayed: bool = False
-
-
-@dataclass(frozen=True, slots=True)
-class ContinueAgentReceipt:
-    agent: AgentNode
-    run: AgentTreeRun
-    replayed: bool = False
-
-
-@dataclass(frozen=True, slots=True)
-class AgentRunAggregation:
-    state: str
-    pending_run_ids: tuple[str, ...]
-    required_failures: tuple[str, ...]
-    results: tuple[Mapping[str, Any], ...]
-
-
-@runtime_checkable
-class RunTreeRepository(Protocol):
-    async def begin_root(self, command: BeginRootAgentCommand) -> AgentTreeRun: ...
-    async def spawn_agents(self, command: SpawnAgentsCommand) -> SpawnAgentsReceipt: ...
-    async def continue_agent(
-        self,
-        command: ContinueAgentCommand,
-    ) -> ContinueAgentReceipt: ...
-    async def claim_run(
-        self,
-        run_id: str,
-        *,
-        owner_id: str = "run-tree-supervisor",
-        lease_duration_ms: int = 30_000,
-    ) -> AgentTreeRun | None: ...
-    async def renew_run_lease(
-        self,
-        run_id: str,
-        *,
-        owner_id: str,
-        lease_epoch: int,
-        lease_duration_ms: int,
-    ) -> AgentTreeRun: ...
-    async def require_run_claim(
-        self,
-        run_id: str,
-        *,
-        lease_owner_id: str | None = None,
-        lease_epoch: int | None = None,
-    ) -> None: ...
-    async def mark_waiting(
-        self,
-        run_id: str,
-        *,
-        lease_owner_id: str | None = None,
-        lease_epoch: int | None = None,
-    ) -> AgentTreeRun: ...
-    async def release_waiting(
-        self,
-        run_id: str,
-        *,
-        lease_owner_id: str | None = None,
-        lease_epoch: int | None = None,
-    ) -> AgentTreeRun: ...
-    async def suspend_run(self, run_id: str, *, lease_owner_id: str, lease_epoch: int) -> AgentTreeRun: ...
-    async def complete_run(
-        self,
-        run_id: str,
-        *,
-        expected_context_version: int,
-        result: Any,
-        content_ref: str,
-        fingerprint: str,
-        lease_owner_id: str | None = None,
-        lease_epoch: int | None = None,
-    ) -> AgentTreeRun: ...
-    async def fail_run(
-        self,
-        run_id: str,
-        error_code: str,
-        *,
-        lease_owner_id: str | None = None,
-        lease_epoch: int | None = None,
-    ) -> AgentTreeRun: ...
-    async def cancel_subtree(self, run_id: str) -> tuple[str, ...]: ...
-    async def aggregate_runs(
-        self,
-        requester_run_id: str,
-        run_ids: Sequence[str],
-    ) -> AgentRunAggregation: ...
-    async def close_agent(self, agent_id: str) -> AgentNode: ...
-    async def get_agent(self, agent_id: str) -> AgentNode: ...
-    async def get_run(self, run_id: str) -> AgentTreeRun: ...
-    async def get_checkpoint(self, checkpoint_id: str) -> ContextCheckpoint: ...
-    async def list_runnable(self, root_run_id: str) -> tuple[AgentTreeRun, ...]: ...
-    async def list_descendants(self, run_id: str) -> tuple[AgentTreeRun, ...]: ...
-
+def _digest(value: object) -> str:
+    return sha256(json.dumps(
+        value,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
 
 class InMemoryRunTreeRepository:
     """Atomic reference adapter; hosts may implement the same port durably."""
@@ -562,28 +56,13 @@ class InMemoryRunTreeRepository:
         *,
         transaction_lock: asyncio.Lock | None = None,
         clock_ms=None,
+        state: AgentTreeState[AgentNode, AgentTreeRun, ContextCheckpoint, SpawnAgentsReceipt, ContinueAgentReceipt] | None = None,
     ) -> None:
+        self._state = state if state is not None else AgentTreeState()
         self._lock = transaction_lock or asyncio.Lock()
         self._clock_ms = clock_ms or (lambda: int(time.time() * 1000))
         if not callable(self._clock_ms):
             raise TypeError("Agent tree clock must be callable")
-        self._agents: dict[str, AgentNode] = {}
-        self._runs: dict[str, AgentTreeRun] = {}
-        self._checkpoints: dict[str, ContextCheckpoint] = {}
-        self._spawn_receipts: dict[
-            tuple[str, str],
-            tuple[str, SpawnAgentsReceipt],
-        ] = {}
-        self._continue_receipts: dict[
-            tuple[str, str],
-            tuple[str, ContinueAgentReceipt],
-        ] = {}
-        self._root_digests: dict[str, str] = {}
-        self._sequence = 0
-        self._agent_sequence = 0
-        self._run_sequence = 0
-        self._batch_sequence = 0
-        self._checkpoint_sequence = 0
 
     async def begin_root(self, command: BeginRootAgentCommand) -> AgentTreeRun:
         if not isinstance(command, BeginRootAgentCommand):
@@ -598,15 +77,15 @@ class InMemoryRunTreeRepository:
                 "capabilityGrant": command.capability_grant.to_mapping(),
                 "idempotencyKey": command.idempotency_key,
             })
-            existing_run = self._runs.get(command.run_id)
+            existing_run = self._state.runs.get(command.run_id)
             if existing_run is not None:
-                if self._root_digests.get(command.run_id) != digest:
+                if self._state.root_digests.get(command.run_id) != digest:
                     _raise(
                         "child_spawn_idempotency_conflict",
                         "root Run id was reused with different input",
                     )
                 return existing_run
-            agent = self._agents.get(command.agent_id)
+            agent = self._state.agents.get(command.agent_id)
             if agent is None:
                 agent = AgentNode(
                     agent_id=command.agent_id,
@@ -640,9 +119,9 @@ class InMemoryRunTreeRepository:
                 status=AgentTreeRunStatus.RUNNING,
                 created_sequence=self._next_sequence(),
             )
-            self._runs[run.run_id] = run
-            self._root_digests[run.run_id] = digest
-            self._agents[agent.agent_id] = replace(agent, latest_run_id=run.run_id)
+            self._state.runs[run.run_id] = run
+            self._state.root_digests[run.run_id] = digest
+            self._state.agents[agent.agent_id] = replace(agent, latest_run_id=run.run_id)
             return run
 
     async def spawn_agents(
@@ -652,9 +131,9 @@ class InMemoryRunTreeRepository:
         if not isinstance(command, SpawnAgentsCommand):
             raise TypeError("spawn_agents requires SpawnAgentsCommand")
         async with self._lock:
-            digest = _digest([item.to_mapping() for item in command.children])
+            digest = _digest({"children": [item.to_mapping() for item in command.children]})
             key = (command.parent_run_id, command.idempotency_key)
-            replay = self._spawn_receipts.get(key)
+            replay = self._state.spawn_receipts.get(key)
             if replay is not None:
                 if replay[0] != digest:
                     _raise(
@@ -678,21 +157,22 @@ class InMemoryRunTreeRepository:
                 _raise("agent_capacity_exceeded", "too many children in one call")
             participating = {
                 run.agent_id
-                for run in self._runs.values()
+                for run in self._state.runs.values()
                 if run.root_run_id == parent_run.root_run_id
             }
             if len(participating) + len(command.children) > grant.max_agents_per_root:
                 _raise("agent_capacity_exceeded", "Root Agent capacity was exceeded")
 
-            self._batch_sequence += 1
-            batch_id = f"agent-batch-{self._batch_sequence}"
+            child_grants = [grant.authorize_child(spec.capability_grant) for spec in command.children]
+            dependency_ids = {spec.name: f"agent-run-{self._state.run_sequence + index + 1}" for index, spec in enumerate(command.children)}
+            self._state.batch_sequence += 1
+            batch_id = f"agent-batch-{self._state.batch_sequence}"
             items = []
-            for spec in command.children:
-                child_grant = grant.authorize_child(spec.capability_grant)
-                self._agent_sequence += 1
-                self._run_sequence += 1
-                agent_id = f"agent-{self._agent_sequence}"
-                run_id = f"agent-run-{self._run_sequence}"
+            for spec, child_grant in zip(command.children, child_grants):
+                self._state.agent_sequence += 1
+                self._state.run_sequence += 1
+                agent_id = f"agent-{self._state.agent_sequence}"
+                run_id = f"agent-run-{self._state.run_sequence}"
                 agent = AgentNode(
                     agent_id=agent_id,
                     root_agent_id=parent_agent.root_agent_id,
@@ -717,13 +197,14 @@ class InMemoryRunTreeRepository:
                     input_payload=spec.input_payload,
                     required=spec.required,
                     priority=spec.priority,
+                    dependency_run_ids=tuple(dependency_ids[name] for name in spec.depends_on),
                     created_sequence=self._next_sequence(),
                 )
-                self._agents[agent_id] = agent
-                self._runs[run_id] = run
+                self._state.agents[agent_id] = agent
+                self._state.runs[run_id] = run
                 items.append(SpawnedAgent(agent=agent, run=run))
             receipt = SpawnAgentsReceipt(batch_id=batch_id, items=tuple(items))
-            self._spawn_receipts[key] = (digest, receipt)
+            self._state.spawn_receipts[key] = (digest, receipt)
             return receipt
 
     async def continue_agent(
@@ -741,7 +222,7 @@ class InMemoryRunTreeRepository:
                 "priority": command.priority,
             })
             key = (command.requester_run_id, command.idempotency_key)
-            replay = self._continue_receipts.get(key)
+            replay = self._state.continue_receipts.get(key)
             if replay is not None:
                 if replay[0] != digest:
                     _raise(
@@ -767,7 +248,7 @@ class InMemoryRunTreeRepository:
                 _raise("agent_busy", "Agent already has an active Run")
             participating = {
                 run.agent_id
-                for run in self._runs.values()
+                for run in self._state.runs.values()
                 if run.root_run_id == requester.root_run_id
             }
             root = self._require_active_agent(requester_agent.root_agent_id)
@@ -776,9 +257,9 @@ class InMemoryRunTreeRepository:
                 and len(participating) >= root.capability_grant.max_agents_per_root
             ):
                 _raise("agent_capacity_exceeded", "Root Agent capacity was exceeded")
-            self._run_sequence += 1
+            self._state.run_sequence += 1
             run = AgentTreeRun(
-                run_id=f"agent-run-{self._run_sequence}",
+                run_id=f"agent-run-{self._state.run_sequence}",
                 agent_id=target.agent_id,
                 root_run_id=requester.root_run_id,
                 parent_run_id=requester.run_id,
@@ -790,10 +271,10 @@ class InMemoryRunTreeRepository:
                 created_sequence=self._next_sequence(),
             )
             next_agent = replace(target, latest_run_id=run.run_id)
-            self._agents[target.agent_id] = next_agent
-            self._runs[run.run_id] = run
+            self._state.agents[target.agent_id] = next_agent
+            self._state.runs[run.run_id] = run
             receipt = ContinueAgentReceipt(agent=next_agent, run=run)
-            self._continue_receipts[key] = (digest, receipt)
+            self._state.continue_receipts[key] = (digest, receipt)
             return receipt
 
     async def claim_run(
@@ -816,6 +297,8 @@ class InMemoryRunTreeRepository:
             reclaimable = reclaimable or (run.status is AgentTreeRunStatus.WAITING and run.lease_owner_id is None and run.lease_epoch > 0)
             if run.status is not AgentTreeRunStatus.QUEUED and not reclaimable:
                 return None
+            if any(not self._require_run(dependency).terminal for dependency in run.dependency_run_ids):
+                return None
             root = self._require_active_agent(
                 self._require_run(run.root_run_id).agent_id
             )
@@ -823,7 +306,7 @@ class InMemoryRunTreeRepository:
                 item.root_run_id == run.root_run_id
                 and item.status is AgentTreeRunStatus.RUNNING
                 and not self._lease_expired_unlocked(item, now)
-                for item in self._runs.values()
+                for item in self._state.runs.values()
             )
             if active >= root.capability_grant.max_parallel_runs:
                 return None
@@ -834,7 +317,7 @@ class InMemoryRunTreeRepository:
                 lease_epoch=run.lease_epoch + 1,
                 lease_expires_at_ms=now + duration,
             )
-            self._runs[run.run_id] = claimed
+            self._state.runs[run.run_id] = claimed
             return claimed
 
     async def suspend_run(self, run_id: str, *, lease_owner_id: str, lease_epoch: int) -> AgentTreeRun:
@@ -842,7 +325,7 @@ class InMemoryRunTreeRepository:
             run = self._require_run(run_id)
             self._require_claim_unlocked(run, lease_owner_id=lease_owner_id, lease_epoch=lease_epoch)
             suspended = replace(run, status=AgentTreeRunStatus.WAITING, lease_owner_id=None, lease_expires_at_ms=None)
-            self._runs[run_id] = suspended
+            self._state.runs[run_id] = suspended
             return suspended
 
     async def renew_run_lease(
@@ -863,7 +346,7 @@ class InMemoryRunTreeRepository:
                 run,
                 lease_expires_at_ms=self._now_ms() + duration,
             )
-            self._runs[run.run_id] = renewed
+            self._state.runs[run.run_id] = renewed
             return renewed
 
     async def require_run_claim(
@@ -893,7 +376,7 @@ class InMemoryRunTreeRepository:
                 _raise("agent_run_state_conflict", "Agent Run state changed")
             self._require_claim_unlocked(run, lease_owner_id, lease_epoch)
             waiting = replace(run, status=AgentTreeRunStatus.WAITING)
-            self._runs[run.run_id] = waiting
+            self._state.runs[run.run_id] = waiting
             return waiting
 
     async def release_waiting(
@@ -915,7 +398,7 @@ class InMemoryRunTreeRepository:
                 item.root_run_id == run.root_run_id
                 and item.status is AgentTreeRunStatus.RUNNING
                 and not self._lease_expired_unlocked(item)
-                for item in self._runs.values()
+                for item in self._state.runs.values()
             )
             if active >= root.capability_grant.max_parallel_runs:
                 _raise(
@@ -923,7 +406,7 @@ class InMemoryRunTreeRepository:
                     "no root execution slot is available",
                 )
             resumed = replace(run, status=AgentTreeRunStatus.RUNNING)
-            self._runs[run.run_id] = resumed
+            self._state.runs[run.run_id] = resumed
             return resumed
 
     async def complete_run(
@@ -945,16 +428,16 @@ class InMemoryRunTreeRepository:
             if any(
                 not item.terminal
                 and self._is_causal_descendant(run.run_id, item.run_id)
-                for item in self._runs.values()
+                for item in self._state.runs.values()
                 if item.root_run_id == run.root_run_id
             ):
                 _raise("root_run_not_quiescent", "Run has unfinished children")
             agent = self._require_active_agent(run.agent_id)
             if agent.context_version != expected_context_version:
                 _raise("agent_context_conflict", "Agent context version changed")
-            self._checkpoint_sequence += 1
+            self._state.checkpoint_sequence += 1
             checkpoint = ContextCheckpoint(
-                checkpoint_id=f"context-{self._checkpoint_sequence}",
+                checkpoint_id=f"context-{self._state.checkpoint_sequence}",
                 agent_id=agent.agent_id,
                 version=agent.context_version + 1,
                 previous_checkpoint_id=agent.context_checkpoint_id,
@@ -969,9 +452,9 @@ class InMemoryRunTreeRepository:
                 lease_owner_id=None,
                 lease_expires_at_ms=None,
             )
-            self._runs[run.run_id] = completed
-            self._checkpoints[checkpoint.checkpoint_id] = checkpoint
-            self._agents[agent.agent_id] = replace(
+            self._state.runs[run.run_id] = completed
+            self._state.checkpoints[checkpoint.checkpoint_id] = checkpoint
+            self._state.agents[agent.agent_id] = replace(
                 agent,
                 context_version=checkpoint.version,
                 context_checkpoint_id=checkpoint.checkpoint_id,
@@ -999,13 +482,13 @@ class InMemoryRunTreeRepository:
                 lease_owner_id=None,
                 lease_expires_at_ms=None,
             )
-            self._runs[run.run_id] = failed
-            for item in self._runs.values():
+            self._state.runs[run.run_id] = failed
+            for item in self._state.runs.values():
                 if (
                     item.status in _ACTIVE_RUN_STATUSES
                     and self._is_causal_descendant(run.run_id, item.run_id)
                 ):
-                    self._runs[item.run_id] = replace(
+                    self._state.runs[item.run_id] = replace(
                         item,
                         status=AgentTreeRunStatus.CANCELED,
                         error_code="ancestor_run_failed",
@@ -1024,7 +507,7 @@ class InMemoryRunTreeRepository:
                 ordered.append(current)
                 pending.extend(
                     item.run_id
-                    for item in self._runs.values()
+                    for item in self._state.runs.values()
                     if (
                         item.root_run_id == root.root_run_id
                         and item.parent_run_id == current
@@ -1032,9 +515,9 @@ class InMemoryRunTreeRepository:
                 )
             canceled = []
             for current in ordered:
-                run = self._runs[current]
+                run = self._state.runs[current]
                 if run.status in _ACTIVE_RUN_STATUSES:
-                    self._runs[current] = replace(
+                    self._state.runs[current] = replace(
                         run,
                         status=AgentTreeRunStatus.CANCELED,
                         error_code="agent_run_canceled",
@@ -1096,7 +579,7 @@ class InMemoryRunTreeRepository:
             if self._has_active_run(agent.agent_id):
                 _raise("agent_busy", "Agent has an active Run")
             closed = replace(agent, state=AgentNodeState.CLOSED)
-            self._agents[agent.agent_id] = closed
+            self._state.agents[agent.agent_id] = closed
             return closed
 
     async def get_agent(self, agent_id: str) -> AgentNode:
@@ -1111,7 +594,7 @@ class InMemoryRunTreeRepository:
         checkpoint = required_text(checkpoint_id, "context checkpoint id")
         async with self._lock:
             try:
-                return self._checkpoints[checkpoint]
+                return self._state.checkpoints[checkpoint]
             except KeyError as error:
                 raise ContractViolationError(
                     "context checkpoint does not exist",
@@ -1125,9 +608,10 @@ class InMemoryRunTreeRepository:
             return tuple(sorted(
                 (
                     run
-                    for run in self._runs.values()
+                    for run in self._state.runs.values()
                     if (
                         run.root_run_id == root
+                        and all(self._require_run(dependency).terminal for dependency in run.dependency_run_ids)
                         and (
                             run.status is AgentTreeRunStatus.QUEUED
                             or (run.status is AgentTreeRunStatus.WAITING and run.lease_owner_id is None and run.lease_epoch > 0)
@@ -1141,6 +625,20 @@ class InMemoryRunTreeRepository:
                 key=lambda item: (-item.priority, item.created_sequence),
             ))
 
+    async def list_agent_descendants(
+        self, agent_id: str, *, after: str | None = None, limit: int = 21,
+    ) -> tuple[AgentNode, ...]:
+        if type(limit) is not int or not 1 <= limit <= 51:
+            raise ValueError("Agent page size must be between 1 and 51")
+        async with self._lock:
+            self._require_active_agent(agent_id)
+            return tuple(sorted((
+                agent for agent in self._state.agents.values()
+                if agent.agent_id != agent_id
+                and self._is_ancestor(agent_id, agent.agent_id)
+                and (after is None or agent.agent_id > after)
+            ), key=lambda agent: agent.agent_id)[:limit])
+
     async def list_descendants(self, run_id: str) -> tuple[AgentTreeRun, ...]:
         parent = required_text(run_id, "ancestor Run id")
         async with self._lock:
@@ -1148,7 +646,7 @@ class InMemoryRunTreeRepository:
             return tuple(sorted(
                 (
                     run
-                    for run in self._runs.values()
+                    for run in self._state.runs.values()
                     if self._is_causal_descendant(parent, run.run_id)
                 ),
                 key=lambda item: item.created_sequence,
@@ -1165,13 +663,13 @@ class InMemoryRunTreeRepository:
             if run.status not in expected:
                 _raise("agent_run_state_conflict", "Agent Run state changed")
             changed = replace(run, status=status)
-            self._runs[run.run_id] = changed
+            self._state.runs[run.run_id] = changed
             return changed
 
     def _require_agent(self, agent_id: str) -> AgentNode:
         agent = required_text(agent_id, "Agent id")
         try:
-            return self._agents[agent]
+            return self._state.agents[agent]
         except KeyError as error:
             raise ContractViolationError(
                 "Agent does not exist",
@@ -1187,7 +685,7 @@ class InMemoryRunTreeRepository:
     def _require_run(self, run_id: str) -> AgentTreeRun:
         run = required_text(run_id, "Agent Run id")
         try:
-            return self._runs[run]
+            return self._state.runs[run]
         except KeyError as error:
             raise ContractViolationError(
                 "Agent Run does not exist",
@@ -1260,7 +758,7 @@ class InMemoryRunTreeRepository:
     def _has_active_run(self, agent_id: str) -> bool:
         return any(
             run.agent_id == agent_id and run.status in _ACTIVE_RUN_STATUSES
-            for run in self._runs.values()
+            for run in self._state.runs.values()
         )
 
     def _is_ancestor(self, ancestor_id: str, descendant_id: str) -> bool:
@@ -1281,53 +779,9 @@ class InMemoryRunTreeRepository:
         return False
 
     def _next_sequence(self) -> int:
-        self._sequence += 1
-        return self._sequence
+        self._state.sequence += 1
+        return self._state.sequence
 
 
-def _digest(value: object) -> str:
-    return sha256(json.dumps(
-        value,
-        ensure_ascii=False,
-        allow_nan=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")).hexdigest()
 
 
-def _normalize_command_lease(command: object) -> None:
-    owner = str(getattr(command, "lease_owner_id", None) or "").strip() or None
-    epoch_value = getattr(command, "lease_epoch", None)
-    epoch = (
-        None
-        if epoch_value is None
-        else non_negative_int(epoch_value, "Agent Run lease epoch")
-    )
-    if (owner is None) != (epoch is None):
-        raise ValueError("Agent Run lease owner and epoch must be provided together")
-    object.__setattr__(command, "lease_owner_id", owner)
-    object.__setattr__(command, "lease_epoch", epoch)
-
-
-def _raise(code: str, message: str) -> None:
-    raise ContractViolationError(message, code=code)
-
-
-__all__ = [
-    "AgentCapabilityGrant",
-    "AgentNode",
-    "AgentNodeState",
-    "AgentRunAggregation",
-    "AgentTreeRun",
-    "AgentTreeRunStatus",
-    "BeginRootAgentCommand",
-    "ChildAgentSpec",
-    "ContextCheckpoint",
-    "ContinueAgentCommand",
-    "ContinueAgentReceipt",
-    "InMemoryRunTreeRepository",
-    "RunTreeRepository",
-    "SpawnAgentsCommand",
-    "SpawnAgentsReceipt",
-    "SpawnedAgent",
-]

@@ -342,6 +342,7 @@ export {
   InMemoryLongTaskRepository,
 } from "./durable/repository.js";
 export type {
+  BudgetExhaustionDisposition,
   ComponentBinding,
   DurableContinuation,
   DurableOptions,

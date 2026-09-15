@@ -7,6 +7,7 @@ from enum import StrEnum
 from typing import Any, Mapping
 
 from purra.contracts import ApprovalDecision, RunId
+from purra.errors import ContractViolationError
 from purra.normalization import required_text
 from purra.json_values import freeze_json_mapping
 
@@ -78,6 +79,16 @@ class AgentCommand:
                 raise ValueError("approval.resolve requires decision")
             payload["decision"] = decision.value
         object.__setattr__(self, "payload", freeze_json_mapping(payload))
+
+
+def bind_event_to_run(event: AgentEvent, run_id: RunId | None) -> AgentEvent:
+    if run_id is None:
+        raise ContractViolationError("active run has no id")
+    if event.run_id is None:
+        return AgentEvent(type=event.type, run_id=run_id, payload=event.payload)
+    if event.run_id != run_id:
+        raise ContractViolationError("runtime event belongs to another run")
+    return event
 
 
 __all__ = [

@@ -109,6 +109,12 @@ class _Dispatcher:
     def __init__(self) -> None:
         self.dispatches = 0
         self.executions = 0
+        self.continuations = []
+
+    async def prepare_continuation(
+        self, task_id, *, source_run_id, run_id,
+    ):
+        self.continuations.append((task_id, source_run_id, run_id))
 
     async def dispatch(
         self,

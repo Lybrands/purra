@@ -642,7 +642,7 @@ async def test_auto_request_plan_promotes_before_execution_and_stays_private():
     assert planner.calls == 1
     assert len(gateway.invocations) == 2
     assert {tool.name for tool in gateway.invocations[0].tools} == {
-        "delegateToAgents",
+        "delegateToAgents", "receiveAgentResults", "listAgents", "continueAgent", "getAgent",
         "request_plan",
     }
     assert gateway.invocations[1].tools == ()

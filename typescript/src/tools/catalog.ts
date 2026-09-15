@@ -149,7 +149,7 @@ export class ToolCatalog {
   public readToolNamesFor(enabledTools?: readonly string[]): readonly string[] {
     const enabled = this.#enabledNames(enabledTools);
     return Object.freeze([...enabled].filter((name) => (
-      name !== "delegateToAgents" && this.#tools.get(name)!.policy.mode === "read"
+      !["delegateToAgents", "receiveAgentResults", "continueAgent", "listAgents"].includes(name) && this.#tools.get(name)!.policy.mode === "read"
     )));
   }
 

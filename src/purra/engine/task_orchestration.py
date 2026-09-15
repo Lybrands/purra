@@ -7,7 +7,7 @@ from collections.abc import AsyncIterator
 from purra.cancellation import await_with_cancellation
 from purra.contracts import AgentRunRequest, ExecutionPlan
 from purra.engine.durable_execution import (
-    BufferedEventSink,
+    BufferedEventSinkProtocol,
     DurableExecutionCompletion,
     complete_admitted_task,
     complete_durable_continuation,
@@ -63,7 +63,7 @@ class TaskOrchestrationCapability:
         controller: AgentRunController,
         request: AgentRunRequest,
         continuation: DurableTaskContinuation,
-        sink: BufferedEventSink,
+        sink: BufferedEventSinkProtocol,
         signal: CancellationSignal | None,
         *,
         defer_successful_completion: bool = False,
@@ -86,7 +86,7 @@ class TaskOrchestrationCapability:
         request: AgentRunRequest,
         plan: ExecutionPlan,
         admission: TaskAdmissionDecision,
-        sink: BufferedEventSink,
+        sink: BufferedEventSinkProtocol,
         signal: CancellationSignal | None,
         defer_successful_completion: bool = False,
     ) -> AsyncIterator[AgentEvent | DurableExecutionCompletion]:

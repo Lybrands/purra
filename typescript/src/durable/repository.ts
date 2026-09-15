@@ -85,6 +85,7 @@ export class InMemoryLongTaskRepository implements LongTaskRepository {
       leaseExpiresAtMs: null,
       retryReadyAtMs: null,
       outputRef: null,
+      runId: null,
       artifactDigest: null,
       errorCode: null,
       usage: ZERO_USAGE,
@@ -105,6 +106,7 @@ export class InMemoryLongTaskRepository implements LongTaskRepository {
       maxParallelism: positiveInteger(command.maxParallelism ?? 1, "long task maxParallelism"),
       deadlineAtMs: nullablePositive(command.deadlineAtMs, "long task deadlineAtMs"),
       budgets: copyLongTaskBudgets(command.budgets),
+      budgetExhaustionDisposition: command.budgetExhaustionDisposition ?? "pause_recoverable",
       cancellationRequestedAtMs: null,
       usage: ZERO_USAGE,
       metadata: copyMapping(command.metadata ?? {}),
@@ -183,8 +185,23 @@ export class InMemoryLongTaskRepository implements LongTaskRepository {
     workerId: string,
     leaseDurationMs: number,
   ): Promise<LongTaskUnitRecord | undefined> {
+    return this.#claimUnit(taskId, workerId, leaseDurationMs);
+  }
+
+  public async claimUnit(
+    taskId: string, unitId: string, workerId: string, leaseDurationMs: number,
+  ): Promise<LongTaskUnitRecord | undefined> {
+    return this.#claimUnit(taskId, workerId, leaseDurationMs,
+      requiredText(unitId, "long task unitId"));
+  }
+
+  #claimUnit(
+    taskId: string, workerId: string, leaseDurationMs: number, unitId?: string,
+  ): LongTaskUnitRecord | undefined {
     const state = this.#require(taskId);
-    if (state.record.status !== "running") return undefined;
+    if (state.record.status !== "running" || state.record.cancellationRequestedAtMs !== null) {
+      return undefined;
+    }
     this.#assertDeadline(state);
     const budgetKind = this.#budgetKind(state, true);
     if (budgetKind !== undefined) {
@@ -222,13 +239,15 @@ export class InMemoryLongTaskRepository implements LongTaskRepository {
     const candidate = [...state.units.values()]
       .sort((a, b) => a.position - b.position)
       .find((unit) => (
-        unit.status === "pending"
+        (unitId === undefined || unit.id === unitId)
+        && unit.status === "pending"
         && unit.attempt < unit.maxAttempts
         && unit.dependencies.every((dependency) => completed.has(dependency))
       ));
     if (candidate === undefined) return undefined;
     const claimed = Object.freeze({
       ...candidate,
+      runId: null,
       status: "claimed" as const,
       attempt: candidate.attempt + 1,
       workerId: requiredText(workerId, "long task workerId"),
@@ -248,6 +267,22 @@ export class InMemoryLongTaskRepository implements LongTaskRepository {
     state.units.set(unit.id, running);
     this.#touch(state);
     return running;
+  }
+
+  public async bindUnitRun(claim: LongTaskClaim, runId: string): Promise<LongTaskUnitRecord> {
+    const {state, unit} = this.#requireClaim(claim);
+    const id = requiredText(runId, "Unit Run id");
+    if (unit.runId !== null) {
+      if (unit.runId !== id) throw new AgentError("long_task_unit_run_conflict", "A Unit attempt cannot change its Run");
+      return unit;
+    }
+    if ([...state.units.values()].some(other => other.id !== unit.id && other.runId === id)) {
+      throw new AgentError("long_task_unit_run_conflict", "A Run cannot belong to two task Units");
+    }
+    const bound = Object.freeze({...unit, runId:id, status:"running" as const});
+    state.units.set(unit.id, bound);
+    this.#touch(state);
+    return bound;
   }
 
   public async heartbeat(
@@ -297,7 +332,7 @@ export class InMemoryLongTaskRepository implements LongTaskRepository {
     const budgetKind = this.#budgetKind(state, false);
     if (budgetKind !== undefined) {
       this.#failBudget(state, budgetKind);
-      throw new AgentError("runtime_budget_exceeded", `Long task ${budgetKind} budget is exhausted`);
+      return state.units.get(unit.id)!;
     }
     this.#touch(state);
     return updated;
@@ -318,9 +353,20 @@ export class InMemoryLongTaskRepository implements LongTaskRepository {
           "Unit settlement key belongs to another unit",
         );
       }
+      const unit = state.units.get(settledUnitId)!;
+      if (result.runId !== undefined && result.runId !== unit.runId) {
+        throw new AgentError("long_task_unit_run_conflict", "Unit result belongs to a different Run");
+      }
       return state.units.get(settledUnitId)!;
     }
     const required = this.#requireClaim(claim);
+    if (required.unit.runId !== null && result.runId !== undefined && result.runId !== required.unit.runId) {
+      throw new AgentError("long_task_unit_run_conflict", "Unit result belongs to a different Run");
+    }
+    const selectedRun = result.runId === undefined ? required.unit.runId : requiredText(result.runId, "Unit result Run id");
+    if (selectedRun !== null && [...state.units.values()].some(other => other.id !== required.unit.id && other.runId === selectedRun)) {
+      throw new AgentError("long_task_unit_run_conflict", "A Run cannot belong to two task Units");
+    }
     const outputRef = requiredText(result.outputRef, "long task outputRef");
     const completed = Object.freeze({
       ...required.unit,
@@ -329,6 +375,7 @@ export class InMemoryLongTaskRepository implements LongTaskRepository {
       claimToken: null,
       leaseExpiresAtMs: null,
       outputRef,
+      runId: selectedRun,
       artifactDigest: result.artifactDigest ?? null,
       errorCode: null,
       metadata: copyMapping(result.metadata ?? required.unit.metadata),
@@ -533,6 +580,20 @@ export class InMemoryLongTaskRepository implements LongTaskRepository {
   }
 
   #failBudget(state: TaskState, budgetKind: string): void {
+    if (state.record.budgetExhaustionDisposition === "pause_recoverable") {
+      for (const [id, unit] of state.units) {
+        if (unit.status !== "completed" && unit.status !== "failed" && unit.status !== "canceled") {
+          state.units.set(id, Object.freeze({
+            ...clearClaim(unit, "blocked"),
+            errorCode: "runtime_budget_exceeded",
+            metadata: copyMapping({ ...unit.metadata, budgetKind }),
+          }));
+        }
+      }
+      this.#refreshCounts(state);
+      this.#setStatus(state, "paused");
+      return;
+    }
     for (const [id, unit] of state.units) {
       if (unit.status !== "completed" && unit.status !== "failed" && unit.status !== "canceled") {
         state.units.set(id, Object.freeze({

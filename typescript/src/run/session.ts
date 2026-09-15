@@ -12,6 +12,7 @@ import { AgentCanceledError, AgentError } from "../shared/errors.js";
 import { stableFingerprint } from "../shared/fingerprint.js";
 import type { ToolExecutionEvent } from "../tools/types.js";
 import { normalizeRunSnapshot, type RunRepository } from "./store.js";
+import { completedParentDeliveries } from "./parent-delivery.js";
 import type {
   AgentExecutionCheckpoint,
   InvocationReceiptInput,
@@ -40,8 +41,8 @@ interface PendingProviderDelta {
   readonly sourceChunkIndex: number;
   readonly sourcePartIndex: number;
   readonly kind: "provider.content_delta" | "provider.reasoning_delta" | "provider.progress_delta" | "provider.tool_call_delta";
-  readonly channel: "model" | "reasoning";
-  readonly visibility: "private";
+  readonly channel: "model" | "reasoning" | "commentary";
+  readonly visibility: "private" | "public";
   readonly payload: Readonly<Record<string, JsonValue>>;
 }
 
@@ -67,12 +68,18 @@ export class RunSession {
   readonly #rootRunId: string;
   readonly #agentId: string;
   readonly #parentRunId: string | undefined;
+  readonly #parentProgress = new Map<string, ModelInvocationReceipt>();
+  readonly #lastChunks = new Map<string, { index: number; content: string | undefined }>();
   readonly #outwardVisibility: "public" | "private";
   readonly #leaseClaim: RunLeaseClaim;
   readonly #batchLimits: OutputBatchLimits;
   #deadlineExceeded = false;
   #deadlineTimer: number | undefined;
   readonly #batches = new Map<string, PendingOutputBatch>();
+  #publicTail: Promise<void> = Promise.resolve();
+  #currentParentDelivery: string | undefined;
+  #parentFeedbackStreaming = false;
+  readonly #publicReleases = new Map<string, () => void>();
   readonly #receipts = new Map<string, ModelInvocationReceipt>();
 
   private constructor(
@@ -299,6 +306,7 @@ export class RunSession {
         this.#scheduleBatchFlush(receipt, batch);
       }
     });
+    this.#lastChunks.set(receipt.invocationId, { index, content: chunk.contentDelta });
     if (planningDelta) {
       await this.#persist({
         sourceKey: `planning-delta:${receipt.invocationId}:${index}`,
@@ -383,6 +391,7 @@ export class RunSession {
       ...(errorCode === undefined ? {} : { errorCode }),
     }, this.#leaseClaim);
     this.#receipts.delete(receipt.invocationId);
+    this.#lastChunks.delete(receipt.invocationId);
     this.#batches.delete(receipt.invocationId);
     await this.#publisher.publishCommitted(settled.event);
     if (settled.budgetError !== undefined) {
@@ -407,12 +416,71 @@ export class RunSession {
     return event?.visibility === "public";
   }
 
+  public async selectUndeliveredChildren(results: readonly Readonly<Record<string, JsonValue>>[]): Promise<readonly Readonly<Record<string, JsonValue>>[]> {
+    const delivered = await completedParentDeliveries(this.#repository, this.#runId);
+    return Object.freeze(results.filter(item => !delivered.has(String(item.runId))));
+  }
+
+  public async recordAgentFeedbackQueued(childRunId: string, agentId: string, executionStatus: string): Promise<void> {
+    await this.#persist({ sourceKey: `agent-feedback:${childRunId}:queued`,
+      kind: "commentary", channel: "commentary", visibility: "public",
+      payload: { schemaVersion: "purra.agent-feedback/v1", state: "queued", childRunId, agentId, executionStatus } });
+  }
+
+  public async recordParentDelivery(deliveryId: string, state: "started" | "completed" | "aborted", childRunIds: readonly string[]): Promise<void> {
+    if (this.#parentRunId !== undefined) throw new AgentError("parent_presentation_unavailable", "Child Runs cannot deliver public results");
+    if (state === "started") { this.#currentParentDelivery = deliveryId; this.#parentFeedbackStreaming = false; }
+    else this.#currentParentDelivery = undefined;
+    await this.#persist({ sourceKey: `parent-delivery:${deliveryId}:${state}`,
+      kind: "commentary", channel: "commentary", visibility: "private",
+      payload: { schemaVersion: "purra.parent-delivery/v1", deliveryId, state, childRunIds: [...childRunIds] } });
+    await this.#persist({ sourceKey: `agent-feedback:${deliveryId}:${state}`,
+      kind: "commentary", channel: "commentary", visibility: "public",
+      payload: { schemaVersion: "purra.agent-feedback/v1", state, childRunId: deliveryId } });
+
+  }
+
+  public async publishParentProgress(receipt: ModelInvocationReceipt, index: number, chunk: ModelStreamChunk): Promise<void> {
+    if (this.#parentRunId !== undefined || this.#receipts.get(receipt.invocationId) !== receipt) throw new AgentError("parent_presentation_unavailable", "Only the owning Root can publish stage progress");
+    const source = this.#lastChunks.get(receipt.invocationId);
+    if (!source || source.index !== index || source.content !== chunk.contentDelta) throw new AgentError("parent_progress_source_mismatch", "Parent progress must match its persisted Provider chunk");
+    if (!this.#parentProgress.has(receipt.invocationId)) {
+      const release = await this.#acquirePublicOutput();
+      this.#publicReleases.set(receipt.invocationId, release);
+    }
+    this.#parentProgress.set(receipt.invocationId, receipt);
+    if (chunk.contentDelta?.trim() && this.#currentParentDelivery && !this.#parentFeedbackStreaming) {
+      this.#parentFeedbackStreaming = true;
+      await this.#persist({ sourceKey: `agent-feedback:${this.#currentParentDelivery}:streaming`,
+        kind: "commentary", channel: "commentary", visibility: "public",
+        payload: { schemaVersion: "purra.agent-feedback/v1", state: "streaming", childRunId: this.#currentParentDelivery, invocationId: receipt.invocationId } });
+    }
+    await this.#flushInvocation(receipt);
+    const entries = providerDeltaEntries(index, chunk)
+      .filter(entry => entry.kind === "provider.content_delta")
+      .map(entry => ({ ...entry, channel: "commentary" as const, visibility: "public" as const }));
+    for (const draft of await providerBatchDrafts(receipt, entries)) await this.#persist(draft);
+  }
+
+  public async publishParentProgressState(receipt: ModelInvocationReceipt, state: "completed" | "aborted"): Promise<void> {
+    if (this.#parentRunId !== undefined || this.#parentProgress.get(receipt.invocationId) !== receipt) throw new AgentError("parent_presentation_unavailable", "Only the owning Root can close stage progress");
+    try { await this.#persist({ sourceKey: `parent-stage:${receipt.invocationId}:${state}`,
+      kind: "commentary", channel: "commentary", visibility: "public",
+      payload: { schemaVersion: "purra.parent-stage/v1", source: "runtime", invocationId: receipt.invocationId, state } });
+    } finally {
+    this.#parentProgress.delete(receipt.invocationId);
+    this.#publicReleases.get(receipt.invocationId)?.();
+    this.#publicReleases.delete(receipt.invocationId);
+    }
+  }
+
   public async publishModelCommentary(
     receipt: ModelInvocationReceipt,
     text: string,
   ): Promise<void> {
     if (text.trim() === "") return;
-    await this.#persist({
+    const release = await this.#acquirePublicOutput();
+    try { await this.#persist({
       sourceKey: `auto-planning-intent:${receipt.invocationId}`,
       kind: "commentary",
       channel: "commentary",
@@ -422,7 +490,16 @@ export class RunSession {
         invocationId: receipt.invocationId,
         text,
       },
-    });
+    }); } finally { release(); }
+  }
+
+  async #acquirePublicOutput(): Promise<() => void> {
+    const previous = this.#publicTail;
+    let release!: () => void;
+    this.#publicTail = new Promise<void>(resolve => { release = resolve; });
+    await previous;
+    if (this.signal.aborted) { release(); throw new AgentCanceledError(); }
+    return release;
   }
 
   public async recordModelDiagnostics(receipt: ModelInvocationReceipt, metrics: Readonly<Record<string, JsonValue>>): Promise<void> {

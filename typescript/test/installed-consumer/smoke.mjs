@@ -230,6 +230,17 @@ const durableDispatcher = new RecipeLongTaskDispatcher({
   idFactory: () => "installed-task",
 });
 const durableReceipt = await durableDispatcher.dispatch(durableInput());
+const durableTree = new InMemoryRunTreeRepository();
+await durableTree.beginRoot({
+  runId: "installed-run",
+  agentId: "installed-root",
+  name: "root",
+  title: "Root",
+  instruction: "Own the installed Recipe smoke test.",
+  objective: "Execute the installed Recipe.",
+  capabilityGrant: new AgentCapabilityGrant({ canSpawnAgents: true }),
+  idempotencyKey: "installed-root",
+});
 const durableResult = await durableDispatcher.execute({
   receipt: durableReceipt,
   runId: "installed-run",
@@ -307,7 +318,35 @@ const installedTreeAgent = new Agent({
     capabilities: {
       ...capabilities(),
       profileId: "installed-tree",
-      protocol: { ...capabilities().protocol, streaming: "unavailable" },
+      protocol: { ...capabilities().protocol, streaming: "supported" },
+    },
+    async stream(request) {
+      const presentation = request.messages.some((message) => (
+        typeof message.content === "string"
+        && message.content.includes("Provide a concise progress update")
+      ));
+      const turn = presentation ? null : await this.invoke(request);
+      return {
+        appliedGenerationLimit: request.outputBudget.maxGenerationTokens,
+        async *[Symbol.asyncIterator]() {
+          if (presentation) {
+            yield { contentDelta: "Installed Child results received.", finishReason: "stop" };
+            return;
+          }
+          yield {
+            contentDelta: turn.message.content,
+            ...(turn.message.toolCalls === undefined ? {} : {
+              toolCallDeltas: turn.message.toolCalls.map((call, index) => ({
+                index,
+                id: call.id,
+                name: call.name,
+                argumentsFragment: JSON.stringify(call.arguments),
+              })),
+            }),
+            finishReason: turn.finishReason,
+          };
+        },
+      };
     },
     async invoke(request) {
       const system = request.messages.find((message) => message.role === "system")?.content;
@@ -378,6 +417,7 @@ const installedParallelStarted = new Promise((resolve) => {
 const installedContinuationCommands = new RunCommandService(
   installedContinuationRepository,
   new AgentTreeRunSupervisor({
+    deliverResults: async () => {},
     repository: installedContinuationRepository,
     executor: {
       async execute(run, childAgent) {

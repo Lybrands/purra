@@ -9,9 +9,11 @@ from purra.contracts import AgentRunRequest, ExecutionPlan
 from purra.ports import CancellationSignal
 from purra.task_admission.contracts import (
     LongTaskDispatchReceipt,
+    TaskAdmissionDecision,
+)
+from purra.long_tasks.contracts import (
     LongTaskExecutionResult,
     LongTaskExecutionUpdate,
-    TaskAdmissionDecision,
 )
 
 

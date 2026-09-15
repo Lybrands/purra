@@ -135,21 +135,33 @@ def test_observability_is_derived_from_events_without_recovery_state():
 
 
 @pytest.mark.parametrize(
-    ("category", "retryable", "scope"),
+    ("category", "retryable", "scope", "expected"),
     (
-        (FailureCategory.MODEL_OUTPUT_INVALID, False, FailureScope.LOCAL),
-        (FailureCategory.TRANSIENT_PROVIDER, True, FailureScope.LOCAL),
+        (
+            FailureCategory.MODEL_OUTPUT_INVALID,
+            False,
+            FailureScope.LOCAL,
+            FailureDisposition.FAIL_PERMANENT,
+        ),
+        (
+            FailureCategory.TRANSIENT_PROVIDER,
+            True,
+            FailureScope.LOCAL,
+            FailureDisposition.PAUSE_RECOVERABLE,
+        ),
         (
             FailureCategory.PROTOCOL_INCOMPATIBLE,
             False,
             FailureScope.SYSTEMIC,
+            FailureDisposition.FAIL_PERMANENT,
         ),
     ),
 )
-def test_exhausted_failures_are_terminal_instead_of_implicitly_paused(
+def test_exhausted_failures_preserve_only_retryable_provider_work(
     category,
     retryable,
     scope,
+    expected,
 ):
     decision = decide_failure(
         FailureSignal(
@@ -161,7 +173,7 @@ def test_exhausted_failures_are_terminal_instead_of_implicitly_paused(
         attempts_remaining=0,
     )
 
-    assert decision.disposition is FailureDisposition.FAIL_PERMANENT
+    assert decision.disposition is expected
 
 
 def test_unsafe_effect_uncertainty_fails_without_automatic_replay():

@@ -4,9 +4,8 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass, field, replace
+from dataclasses import replace
 from datetime import datetime, timezone
-import json
 from typing import Protocol
 
 from purra.contracts import (
@@ -26,7 +25,6 @@ from purra.events import AgentEvent
 from purra.output.contracts import (
     AgentOutputEvent,
     AgentOutputEventDraft,
-    AgentOutputIntent,
     DomainEffectOutput,
     OutputChannel,
     OutputEventKind,
@@ -35,20 +33,23 @@ from purra.output.contracts import (
     OutputVisibility,
     AGENT_PROGRESS_SCHEMA,
     MAX_AGENT_PROGRESS_CHARS,
-    PROVIDER_DELTA_BATCH_SCHEMA,
     RunLifecycleOutputDraft,
     RuntimeOutputEvent,
     ToolOutputEvent,
-    provider_delta_batch_digest,
 )
 from purra.output.ports import (
     AgentOutputPolicy,
     AgentOutputPublisher,
     AgentOutputRepository,
 )
+from purra.output.buffering import OutputBatchLimits, ProviderOutputBuffer
+from purra.output.planning_projection import PlanningOutputProjection
 from purra.ports.run_lifecycle import RunBeginResult, RunCommit
 from purra.cancellation import raise_if_stopped
-from purra.planning_stream import PlanningProgress, PLANNING_STREAM_SCHEMA
+from purra.planning_stream import (
+    PlanningProgress,
+    PLANNING_STREAM_SCHEMA,
+)
 
 
 class OutputRecoveryObserver(Protocol):
@@ -59,64 +60,6 @@ class _AllowProviderChunks:
     async def authorize_provider_chunk(self, spec, chunk):
         del spec
         return chunk
-
-
-@dataclass(frozen=True, slots=True)
-class OutputBatchLimits:
-    max_payload_bytes: int = 16_384
-    max_fragments: int = 64
-    max_latency_ms: int = 25
-    max_background_latency_ms: int = 250
-
-    def __post_init__(self) -> None:
-        for name in (
-            "max_payload_bytes",
-            "max_fragments",
-            "max_latency_ms",
-            "max_background_latency_ms",
-        ):
-            value = int(getattr(self, name))
-            if value <= 0:
-                raise ValueError(f"{name.replace('_', ' ')} must be positive")
-            object.__setattr__(self, name, value)
-
-
-@dataclass(frozen=True, slots=True)
-class _PendingProviderDelta:
-    source_chunk_index: int
-    source_part_index: int
-    kind: OutputEventKind
-    channel: OutputChannel
-    visibility: OutputVisibility
-    payload: Mapping[str, object]
-    occurred_at: datetime
-
-    def entry(self) -> dict[str, object]:
-        return {
-            "sourceChunkIndex": self.source_chunk_index,
-            "sourcePartIndex": self.source_part_index,
-            "kind": self.kind.value,
-            "payload": dict(self.payload),
-        }
-
-
-@dataclass(slots=True)
-class _StreamBatch:
-    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    entries: list[_PendingProviderDelta] = field(default_factory=list)
-    payload_bytes: int = 0
-    timer: asyncio.Task[None] | None = None
-    background_error: BaseException | None = None
-
-
-def _canonical_json(value: object) -> bytes:
-    return json.dumps(
-        value,
-        ensure_ascii=False,
-        allow_nan=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
 
 
 def _validate_agent_progress_text(text: str) -> None:
@@ -149,12 +92,12 @@ class AgentOutputProcessor:
         self._publisher = publisher
         self._policy = policy or _AllowProviderChunks()
         self._recovery = recovery_observer
-        self._batch_limits = batch_limits or OutputBatchLimits()
-        if not callable(sleep):
-            raise TypeError("output batch sleep must be callable")
-        self._sleep = sleep
+        self._buffer = ProviderOutputBuffer(
+            limits=batch_limits or OutputBatchLimits(), sleep=sleep,
+            persist=self._persist_batch, publish=self._publish_if_visible,
+        )
+        self._planning = PlanningOutputProjection()
         self._streams: dict[str, OutputStreamSpec] = {}
-        self._stream_batches: dict[str, _StreamBatch] = {}
         self._chunk_indices: dict[str, int] = {}
         self._run_turn_ids: dict[str, str | None] = {}
 
@@ -183,8 +126,9 @@ class AgentOutputProcessor:
             )
         opened = await self._persist_open(spec)
         self._streams[spec.output_stream_id] = opened
-        self._stream_batches.setdefault(spec.output_stream_id, _StreamBatch())
+        self._buffer.open(spec.output_stream_id)
         self._chunk_indices.setdefault(spec.output_stream_id, 0)
+        self._planning.open(spec)
         try:
             await self._append(AgentOutputEventDraft(
                 run_id=spec.run_id,
@@ -207,8 +151,7 @@ class AgentOutputProcessor:
                 )
             finally:
                 self._streams.pop(spec.output_stream_id, None)
-                self._discard_batch(spec.output_stream_id)
-                self._chunk_indices.pop(spec.output_stream_id, None)
+                self._discard_stream_state(spec.output_stream_id)
             raise
         return opened
 
@@ -217,30 +160,16 @@ class AgentOutputProcessor:
         spec = self._require_stream(output_stream_id)
         if spec.output_protocol != PLANNING_STREAM_SCHEMA or spec.planning_scope is None:
             raise ContractViolationError("planning projection requires a bound planning stream")
-        batch = self._require_batch(output_stream_id)
+        batch = self._buffer.require(output_stream_id)
         async with batch.lock:
-            self._raise_background_error(batch)
+            self._buffer.raise_background_error(batch)
             raise_if_stopped(signal)
-            authorize = getattr(self._policy, "authorize_planning_progress", None)
-            if authorize is not None:
-                authorized = await authorize(spec, progress)
-                if authorized is None:
-                    return None
-                if authorized != progress:
-                    raise ContractViolationError("output policy cannot rewrite Provider planning progress")
-            await self._flush_batch_locked(spec, batch)
+            draft = await self._planning.progress_draft(spec, progress, policy=self._policy)
+            if draft is None:
+                return None
+            await self._buffer.flush_locked(spec, batch)
             raise_if_stopped(signal)
-            return await self._append(AgentOutputEventDraft(
-                run_id=spec.run_id, turn_id=spec.turn_id,
-                output_stream_id=spec.output_stream_id, invocation_id=spec.invocation_id,
-                source_event_key=f"planning:{spec.invocation_id}:{progress.record_index}",
-                source=OutputSource.PROVIDER, kind=OutputEventKind.PLANNING_PROGRESS,
-                channel=OutputChannel.COMMENTARY, visibility=OutputVisibility.PUBLIC,
-                payload={"schemaVersion": PLANNING_STREAM_SCHEMA,
-                         "operationId": spec.planning_scope.operation_id,
-                         "revision": spec.planning_scope.revision, "attempt": spec.planning_attempt,
-                         **progress.to_mapping()}, occurred_at=datetime.now(timezone.utc),
-            ))
+            return await self._append(draft)
 
     async def record_model_diagnostics(self, receipt, metrics):
         return await self._append(AgentOutputEventDraft(
@@ -272,6 +201,14 @@ class AgentOutputProcessor:
         await self._publish_if_visible(output)
         return begun
 
+    async def flush_model_stream(self, output_stream_id: str) -> tuple[AgentOutputEvent, ...]:
+        """Persist and publish pending increments without closing the stream."""
+        spec = self._require_stream(output_stream_id)
+        batch = self._buffer.require(output_stream_id)
+        async with batch.lock:
+            self._buffer.raise_background_error(batch)
+            return tuple(await self._buffer.flush_locked(spec, batch))
+
     async def accept_provider_chunk(
         self,
         output_stream_id: str,
@@ -299,60 +236,36 @@ class AgentOutputProcessor:
             _validate_agent_progress_text(authorized.progress_delta)
         if spec.output_protocol == PLANNING_STREAM_SCHEMA and authorized != chunk:
             raise ContractViolationError("output policy cannot rewrite planning Provider bytes")
-        batch = self._require_batch(output_stream_id)
+        batch = self._buffer.require(output_stream_id)
         async with batch.lock:
-            self._raise_background_error(batch)
+            self._buffer.raise_background_error(batch)
             chunk_index = self._chunk_indices[output_stream_id] + 1
             self._chunk_indices[output_stream_id] = chunk_index
             occurred_at = datetime.now(timezone.utc)
-            additions = self._pending_provider_deltas(
+            additions = self._buffer.pending_deltas(
                 spec,
                 authorized,
                 chunk_index,
                 occurred_at,
             )
-            batch.entries.extend(additions)
-            batch.payload_bytes += sum(
-                len(_canonical_json(entry.entry())) for entry in additions
-            )
-
-            planning_delta = (
-                spec.output_protocol == PLANNING_STREAM_SCHEMA
-                and spec.planning_scope is not None and bool(authorized.content_delta)
-            )
+            buffer_full = self._buffer.append(batch, additions)
+            planning_deltas = self._planning.feed(spec, authorized)
             events: list[AgentOutputEvent] = []
             must_flush = (
-                planning_delta or bool(authorized.progress_delta)
+                bool(planning_deltas) or bool(authorized.progress_delta)
                 or
                 authorized.usage is not None
                 or authorized.finish_reason is not None
-                or batch.payload_bytes >= self._batch_limits.max_payload_bytes
-                or len(batch.entries) >= self._batch_limits.max_fragments
+                or buffer_full
             )
             if must_flush:
-                events.extend(await self._flush_batch_locked(spec, batch))
+                events.extend(await self._buffer.flush_locked(spec, batch))
             elif additions:
-                self._schedule_batch_timer(spec, batch)
-            if planning_delta:
-                authorize_delta = getattr(self._policy, "authorize_planning_delta", None)
-                projected = authorized if authorize_delta is None else await authorize_delta(spec, authorized)
-                if projected is not None:
-                    if projected != authorized:
-                        raise ContractViolationError("output policy cannot rewrite planning Provider bytes")
-                    events.append(await self._append(AgentOutputEventDraft(
-                        run_id=spec.run_id, turn_id=spec.turn_id,
-                        output_stream_id=spec.output_stream_id, invocation_id=spec.invocation_id,
-                        source_event_key=f"planning-delta:{spec.invocation_id}:{chunk_index}",
-                        source=OutputSource.PROVIDER, kind=OutputEventKind.PLANNING_DELTA,
-                        channel=OutputChannel.COMMENTARY, visibility=OutputVisibility.PUBLIC,
-                        payload={"schemaVersion": PLANNING_STREAM_SCHEMA,
-                                 "operationId": spec.planning_scope.operation_id,
-                                 "revision": spec.planning_scope.revision,
-                                 "attempt": spec.planning_attempt,
-                                 "sourceChunkIndex": chunk_index,
-                                 "textDelta": authorized.content_delta},
-                        occurred_at=occurred_at,
-                    )))
+                self._buffer.schedule(spec, batch)
+            for draft in await self._planning.delta_drafts(
+                spec, authorized, planning_deltas, chunk_index, occurred_at, policy=self._policy,
+            ):
+                events.append(await self._append(draft))
             if authorized.usage is not None:
                 events.append(await self._append(self._provider_draft(
                     spec,
@@ -400,10 +313,10 @@ class AgentOutputProcessor:
         finish_reason: ModelFinishReason,
     ) -> AgentOutputEvent:
         spec = self._require_stream(output_stream_id)
-        batch = self._require_batch(output_stream_id)
+        batch = self._buffer.require(output_stream_id)
         async with batch.lock:
-            self._raise_background_error(batch)
-            await self._flush_batch_locked(spec, batch)
+            self._buffer.raise_background_error(batch)
+            await self._buffer.flush_locked(spec, batch)
         try:
             event = await self._repository.commit_stream(
                 output_stream_id,
@@ -413,7 +326,7 @@ class AgentOutputProcessor:
             raise
         except Exception as error:
             raise await self._persistence_error(spec.run_id, error) from error
-        self._discard_batch(output_stream_id)
+        self._discard_stream_state(output_stream_id)
         await self._publish_if_visible(event)
         return event
 
@@ -423,12 +336,12 @@ class AgentOutputProcessor:
         error_code: str,
     ) -> AgentOutputEvent:
         spec = self._require_stream(output_stream_id)
-        batch = self._require_batch(output_stream_id)
+        batch = self._buffer.require(output_stream_id)
         flush_error: BaseException | None = None
         try:
             async with batch.lock:
-                self._raise_background_error(batch)
-                await self._flush_batch_locked(spec, batch)
+                self._buffer.raise_background_error(batch)
+                await self._buffer.flush_locked(spec, batch)
         except BaseException as error:
             flush_error = error
         try:
@@ -441,7 +354,7 @@ class AgentOutputProcessor:
         except Exception as error:
             raise await self._persistence_error(spec.run_id, error) from error
         finally:
-            self._discard_batch(output_stream_id)
+            self._discard_stream_state(output_stream_id)
         await self._publish_if_visible(event)
         if flush_error is not None:
             raise flush_error
@@ -701,133 +614,6 @@ class AgentOutputProcessor:
             occurred_at=occurred_at,
         )
 
-    def _pending_provider_deltas(
-        self,
-        spec: OutputStreamSpec,
-        chunk: ModelStreamChunk,
-        chunk_index: int,
-        occurred_at: datetime,
-    ) -> tuple[_PendingProviderDelta, ...]:
-        pending: list[_PendingProviderDelta] = []
-        if chunk.content_delta:
-            channel, visibility = _content_destination(spec)
-            pending.append(_PendingProviderDelta(
-                chunk_index,
-                0,
-                OutputEventKind.PROVIDER_CONTENT_DELTA,
-                channel,
-                visibility,
-                {"delta": chunk.content_delta},
-                occurred_at,
-            ))
-        if chunk.reasoning_delta:
-            pending.append(_PendingProviderDelta(
-                chunk_index,
-                1,
-                OutputEventKind.PROVIDER_REASONING_DELTA,
-                OutputChannel.DIAGNOSTIC,
-                OutputVisibility.DIAGNOSTIC,
-                {"delta": chunk.reasoning_delta},
-                occurred_at,
-            ))
-        if chunk.tool_call_deltas:
-            pending.append(_PendingProviderDelta(
-                chunk_index,
-                2,
-                OutputEventKind.PROVIDER_TOOL_CALL_DELTA,
-                OutputChannel.DIAGNOSTIC,
-                OutputVisibility.PRIVATE,
-                {
-                    "deltas": [
-                        {
-                            "index": delta.index,
-                            "id": delta.id,
-                            "type": delta.type,
-                            "name": delta.name,
-                            "argumentsFragment": delta.arguments_fragment,
-                        }
-                        for delta in chunk.tool_call_deltas
-                    ]
-                },
-                occurred_at,
-            ))
-        if chunk.progress_delta:
-            pending.append(_PendingProviderDelta(
-                chunk_index,
-                3,
-                OutputEventKind.PROVIDER_PROGRESS_DELTA,
-                OutputChannel.DIAGNOSTIC,
-                OutputVisibility.PRIVATE,
-                {"delta": chunk.progress_delta},
-                occurred_at,
-            ))
-        return tuple(pending)
-
-    def _batch_drafts(
-        self,
-        spec: OutputStreamSpec,
-        entries: tuple[_PendingProviderDelta, ...],
-    ) -> tuple[AgentOutputEventDraft, ...]:
-        grouped: dict[
-            tuple[OutputChannel, OutputVisibility],
-            list[_PendingProviderDelta],
-        ] = {}
-        for entry in entries:
-            grouped.setdefault((entry.channel, entry.visibility), []).append(entry)
-        groups = sorted(
-            grouped.items(),
-            key=lambda item: (
-                item[1][0].source_chunk_index,
-                item[1][0].source_part_index,
-            ),
-        )
-        drafts = []
-        for (channel, visibility), values in groups:
-            normalized = [entry.entry() for entry in values]
-            start = min(entry.source_chunk_index for entry in values)
-            end = max(entry.source_chunk_index for entry in values)
-            payload = {
-                "schemaVersion": PROVIDER_DELTA_BATCH_SCHEMA,
-                "sourceChunkStart": start,
-                "sourceChunkEnd": end,
-                "entries": normalized,
-                "payloadDigest": provider_delta_batch_digest(normalized),
-            }
-            drafts.append(AgentOutputEventDraft(
-                run_id=spec.run_id,
-                turn_id=spec.turn_id,
-                output_stream_id=spec.output_stream_id,
-                invocation_id=spec.invocation_id,
-                source_event_key=(
-                    f"provider-batch:{spec.invocation_id}:"
-                    f"{channel.value}:{visibility.value}:{start}:{end}"
-                ),
-                source=OutputSource.PROVIDER,
-                kind=OutputEventKind.PROVIDER_DELTA_BATCH,
-                channel=channel,
-                visibility=visibility,
-                payload=payload,
-                occurred_at=values[0].occurred_at,
-            ))
-        return tuple(drafts)
-
-    async def _flush_batch_locked(
-        self,
-        spec: OutputStreamSpec,
-        batch: _StreamBatch,
-    ) -> tuple[AgentOutputEvent, ...]:
-        if not batch.entries:
-            self._cancel_batch_timer(batch)
-            return ()
-        drafts = self._batch_drafts(spec, tuple(batch.entries))
-        events = await self._persist_batch(spec.run_id, drafts)
-        batch.entries.clear()
-        batch.payload_bytes = 0
-        self._cancel_batch_timer(batch)
-        for event in events:
-            await self._publish_if_visible(event)
-        return events
-
     async def _persist_batch(
         self,
         run_id: str,
@@ -839,68 +625,6 @@ class AgentOutputProcessor:
             raise
         except Exception as error:
             raise await self._persistence_error(run_id, error) from error
-
-    def _schedule_batch_timer(
-        self,
-        spec: OutputStreamSpec,
-        batch: _StreamBatch,
-    ) -> None:
-        if batch.timer is None or batch.timer.done():
-            batch.timer = asyncio.create_task(
-                self._flush_after_latency(spec, batch)
-            )
-
-    async def _flush_after_latency(
-        self,
-        spec: OutputStreamSpec,
-        batch: _StreamBatch,
-    ) -> None:
-        current = asyncio.current_task()
-        try:
-            latency_ms = (
-                self._batch_limits.max_latency_ms
-                if spec.intent in {
-                    AgentOutputIntent.EXECUTION_PUBLIC,
-                    AgentOutputIntent.FINAL_PUBLIC,
-                }
-                else self._batch_limits.max_background_latency_ms
-            )
-            await self._sleep(latency_ms / 1000)
-            async with batch.lock:
-                self._raise_background_error(batch)
-                await self._flush_batch_locked(spec, batch)
-        except asyncio.CancelledError:
-            raise
-        except BaseException as error:
-            batch.background_error = error
-        finally:
-            if batch.timer is current:
-                batch.timer = None
-
-    @staticmethod
-    def _cancel_batch_timer(batch: _StreamBatch) -> None:
-        timer = batch.timer
-        if timer is not None and timer is not asyncio.current_task():
-            timer.cancel()
-        batch.timer = None
-
-    @staticmethod
-    def _raise_background_error(batch: _StreamBatch) -> None:
-        if batch.background_error is not None:
-            raise batch.background_error
-
-    def _require_batch(self, output_stream_id: str) -> _StreamBatch:
-        try:
-            return self._stream_batches[output_stream_id]
-        except KeyError as error:
-            raise ContractViolationError(
-                f"output stream {output_stream_id!r} is not open"
-            ) from error
-
-    def _discard_batch(self, output_stream_id: str) -> None:
-        batch = self._stream_batches.pop(output_stream_id, None)
-        if batch is not None:
-            self._cancel_batch_timer(batch)
 
     async def _append(self, draft: AgentOutputEventDraft) -> AgentOutputEvent:
         try:
@@ -947,6 +671,11 @@ class AgentOutputProcessor:
             details={"causeType": type(error).__name__},
         )
 
+    def _discard_stream_state(self, output_stream_id: str) -> None:
+        self._buffer.discard(output_stream_id)
+        self._planning.discard(output_stream_id)
+        self._chunk_indices.pop(output_stream_id, None)
+
     def _require_stream(self, output_stream_id: str) -> OutputStreamSpec:
         stream_id = str(output_stream_id or "").strip()
         spec = self._streams.get(stream_id)
@@ -955,16 +684,6 @@ class AgentOutputProcessor:
                 f"output stream {stream_id!r} is not open"
             )
         return spec
-
-
-def _content_destination(
-    spec: OutputStreamSpec,
-) -> tuple[OutputChannel, OutputVisibility]:
-    if spec.intent is AgentOutputIntent.EXECUTION_PUBLIC:
-        return OutputChannel.COMMENTARY, OutputVisibility.PUBLIC
-    if spec.intent is AgentOutputIntent.FINAL_PUBLIC:
-        return OutputChannel.FINAL, OutputVisibility.PUBLIC
-    return OutputChannel.DIAGNOSTIC, OutputVisibility.PRIVATE
 
 
 def _public_runtime_payload(
@@ -1000,9 +719,12 @@ _PUBLIC_RUNTIME_EVENT_TYPES = frozenset({
     "conversation.compaction.completed",
     "task.admission_decided",
     "long_task.dispatched",
+    "agent.feedback.queued",
+    "agent.feedback.state",
 })
 
 _PRIVATE_RUNTIME_EVENT_TYPES = frozenset({
+    "parent.stage.delivery",
     "agent.execution_checkpointed",
     "long_task.progress",
 })

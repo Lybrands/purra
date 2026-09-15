@@ -42,6 +42,7 @@ from purra.json_values import thaw_json_mapping, thaw_json_value
 from purra.model_invocation import (
     AgentModelCall,
     AgentModelInvocationManager,
+    create_model_invocation_manager,
     ModelInvocationContext,
 )
 from purra.model_invocation.manager import ModelInvocationOutputObserver
@@ -241,7 +242,7 @@ class AgentPlanner:
         model_manager: AgentModelInvocationManager | None = None,
         result_validator: PlanningResultValidator | None = None,
     ):
-        self._model_manager = model_manager or AgentModelInvocationManager(
+        self._model_manager = model_manager or create_model_invocation_manager(
             model_gateway,
             output_observer=output_observer,
             operation_controller=operation_controller,

@@ -64,6 +64,7 @@ class FailureDisposition(StrEnum):
 
     RETRY_ATTEMPT = "retry_attempt"
     RESUME_CHECKPOINT = "resume_checkpoint"
+    PAUSE_RECOVERABLE = "pause_recoverable"
     SPLIT_PART = "split_part"
     FAIL_PERMANENT = "fail_permanent"
     CANCEL = "cancel"

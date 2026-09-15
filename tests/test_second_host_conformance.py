@@ -24,19 +24,7 @@ from purra.api import (
     PromptSection,
     SpawnAgentsCommand,
 )
-from purra.artifacts import (
-    ArtifactAccessController,
-    ArtifactAccessMode,
-    ArtifactAccessRequest,
-    ArtifactAppendCommand,
-    ArtifactCreateCommand,
-    ArtifactFinalizeCommand,
-    ArtifactLifecycle,
-    ArtifactMutationLease,
-    ArtifactOwnerRef,
-    ArtifactResumeCandidate,
-)
-from purra.agent_tree_lease import bind_agent_run_lease
+from purra.agent_tree.lease import bind_agent_run_lease
 from purra.contracts import (
     AgentMessage,
     AgentRunRequest,
@@ -67,13 +55,6 @@ from purra.contracts import (
     ToolSchema,
 )
 from purra.model_protocol import generic_capability_snapshot
-from purra.long_tasks import (
-    LongTaskCoordinator,
-    LongTaskCreateCommand,
-    LongTaskStatus,
-    LongTaskUnitResult,
-    LongTaskUnitSpec,
-)
 from purra.run_recovery import RunRecoverySnapshot
 from purra.task_admission import (
     ExecutionMode,
@@ -99,72 +80,6 @@ def _context_binding():
     }
 
 
-class _IncidentDurableRunner:
-    def __init__(self, adapters: InMemoryAgentAdapters) -> None:
-        self._artifacts = ArtifactLifecycle(adapters.artifacts)
-        self._access = ArtifactAccessController(adapters.artifact_claims)
-
-    async def run_unit(self, task, unit, signal=None):
-        del signal
-        if unit.id == "collect":
-            return LongTaskUnitResult(output_ref="memory://incident/evidence")
-        artifact = await self._artifacts.begin(ArtifactCreateCommand(
-            namespace="operations.incident",
-            kind="incident_report",
-            owner_id=task.owner_id,
-            owner_ref=ArtifactOwnerRef("durable_task", task.id),
-            created_by_run_id=task.created_by_run_id,
-            expected_item_count=1,
-        ))
-        grant = await self._access.authorize(
-            ArtifactResumeCandidate(
-                artifact_id=artifact.id,
-                namespace=artifact.namespace,
-                kind=artifact.kind,
-                owner_id=artifact.owner_id,
-                owner_ref=artifact.owner_ref,
-                created_by_run_id=artifact.created_by_run_id,
-                status=artifact.status,
-                revision=artifact.revision,
-            ),
-            ArtifactAccessRequest(
-                artifact_id=artifact.id,
-                run_id=task.created_by_run_id,
-                mode=ArtifactAccessMode.WRITE,
-                expected_revision=artifact.revision,
-            ),
-            lease_duration_ms=30_000,
-        )
-        assert grant.write_claim is not None
-        lease = ArtifactMutationLease(
-            run_id=grant.write_claim.run_id,
-            claim_token=grant.write_claim.claim_token,
-        )
-        receipt = await self._artifacts.append(ArtifactAppendCommand(
-            artifact_id=artifact.id,
-            expected_revision=artifact.revision,
-            sequence=artifact.next_sequence,
-            batch_id="report",
-            idempotency_key="incident-report-v1",
-            items=({"status": "degraded", "failedHealthChecks": 1},),
-            coverage_keys=("incident-summary",),
-            write_lease=lease,
-        ))
-        finalized = await self._artifacts.finalize(ArtifactFinalizeCommand(
-            artifact_id=artifact.id,
-            expected_revision=receipt.committed_revision,
-            write_lease=lease,
-            expected_item_count=1,
-            expected_coverage_keys=("incident-summary",),
-            resource_ref=f"memory://artifact/{artifact.id}",
-        ))
-        return LongTaskUnitResult(
-            output_ref=finalized.resource_ref or "",
-            artifact_digest=finalized.coverage_digest,
-            validation_receipt={"accepted": True},
-        )
-
-
 def test_preset_cannot_mix_with_low_level_agent_composition_arguments():
     adapters = InMemoryAgentAdapters()
     preset = AgentPreset(
@@ -182,45 +97,6 @@ def test_preset_cannot_mix_with_low_level_agent_composition_arguments():
             preset=preset,
             context_provider=_IncidentContext(),
         )
-
-
-@pytest.mark.asyncio
-async def test_non_writing_host_runs_durable_task_into_finalized_artifact():
-    adapters = InMemoryAgentAdapters()
-    task = await adapters.long_tasks.create(
-        "incident-task-42",
-        LongTaskCreateCommand(
-            namespace="operations.incident",
-            kind="incident_report",
-            owner_id="incident-42",
-            created_by_run_id="incident-run-1",
-            units=(
-                LongTaskUnitSpec(id="collect", position=0),
-                LongTaskUnitSpec(
-                    id="report",
-                    position=1,
-                    dependencies=("collect",),
-                ),
-            ),
-        ),
-    )
-
-    completed = await LongTaskCoordinator(
-        adapters.long_tasks,
-        worker_id="operations-worker",
-        idle_poll_ms=1,
-    ).run(task.id, _IncidentDurableRunner(adapters))
-    artifact = await adapters.artifacts.find_for_owner(
-        namespace="operations.incident",
-        kind="incident_report",
-        owner_id="incident-42",
-        owner_ref=ArtifactOwnerRef("durable_task", task.id),
-    )
-
-    assert completed.status is LongTaskStatus.COMPLETED
-    assert artifact is not None
-    assert artifact.status.value == "finalized"
-    assert artifact.resource_ref == f"memory://artifact/{artifact.id}"
 
 
 @pytest.mark.asyncio
@@ -560,6 +436,9 @@ class _ChildAgentGateway:
         )
 
         async def chunks():
+            if any("Provide a concise progress update" in str(m.content) for m in messages):
+                yield ModelStreamChunk(content_delta="Available review received.", finish_reason=ModelFinishReason.STOP)
+                return
             if is_reviewer:
                 yield ModelStreamChunk(
                     content_delta="Review: the service is degraded, not down.",
@@ -627,6 +506,9 @@ class _RecursiveAgentTreeGateway:
         )
 
         async def chunks():
+            if any("Provide a concise progress update" in str(m.content) for m in messages):
+                yield ModelStreamChunk(content_delta="Available nested result received.", finish_reason=ModelFinishReason.STOP)
+                return
             if level_two:
                 yield ModelStreamChunk(
                     content_delta="level-two done",
@@ -861,7 +743,7 @@ async def test_agent_tree_delegation_executes_a_canonical_child_run():
 
     assert result.status is RunStatus.DONE
     assert result.final_response.startswith("Status: degraded")
-    assert len(gateway.rounds) == 3
+    assert len(gateway.rounds) == 4  # No implicit presentation model call.
     assert len(descendants) == 1
     assert descendants[0].status.value == "done"
     assert descendants[0].run_id != handle.run_id
@@ -891,7 +773,7 @@ async def test_agent_core_host_commands_continue_a_canonical_child_agent():
             )
 
             async def chunks():
-                if not is_child:
+                if not is_child and not any("Provide a concise progress update" in str(m.content) for m in messages):
                     await root_gate.wait()
                 yield ModelStreamChunk(
                     content_delta=(
@@ -1067,15 +949,22 @@ async def test_root_completion_is_rejected_before_final_when_child_is_pending():
 
 
 @pytest.mark.asyncio
-async def test_new_agent_core_rebinds_and_executes_a_committed_child_once():
+async def test_live_root_reconciles_committed_child_and_recovers_checkpoint_once():
     executions = 0
     now_ms = 100
+    root_started, root_gate = asyncio.Event(), asyncio.Event()
 
     class _RecoveryGateway:
         async def stream(self, messages, invocation, signal=None):
             nonlocal executions
-            del messages, signal
-            executions += 1
+            del signal
+            is_child = any(m.content == "Recover safely." for m in messages)
+            is_stage = any("Provide a concise progress update" in str(m.content) for m in messages)
+            if is_child:
+                executions += 1
+            elif not is_stage:
+                root_started.set()
+                await root_gate.wait()
 
             async def chunks():
                 yield ModelStreamChunk(
@@ -1102,40 +991,6 @@ async def test_new_agent_core_rebinds_and_executes_a_committed_child_once():
             )
 
     adapters = InMemoryAgentAdapters(agent_tree_clock_ms=lambda: now_ms)
-    root, _ = await adapters.outputs.begin_run_lifecycle(
-        RunCreateParams(
-            session_id=None,
-            prompt="recover",
-            mode="agent",
-            requested_run_id="recovered-root",
-            agent_id="recovered-root-agent",
-        ),
-        AgentEvent(type="run.started"),
-    )
-    await adapters.run_tree.begin_root(BeginRootAgentCommand(
-        run_id=root.run_id,
-        agent_id="recovered-root-agent",
-        name="root",
-        title="Root",
-        instruction="Own recovery.",
-        objective="Recover the Child Run.",
-        capability_grant=AgentCapabilityGrant(
-            can_spawn_agents=True,
-            max_parallel_runs=1,
-            allowed_models=("operations-model",),
-        ),
-        idempotency_key="recovered-root-begin",
-    ))
-    child = (await adapters.run_tree.spawn_agents(SpawnAgentsCommand(
-        parent_run_id=root.run_id,
-        idempotency_key="committed-before-crash",
-        children=(ChildAgentSpec(
-            name="recovered-child",
-            title="Recovered child",
-            instruction="Recover safely.",
-            objective="Execute exactly once.",
-        ),),
-    ))).items[0]
     core = AgentCore(
         model_gateway=_RecoveryGateway(),
         run_repository=adapters.runs,
@@ -1151,6 +1006,24 @@ async def test_new_agent_core_rebinds_and_executes_a_committed_child_once():
             agent_tree_policy=AgentTreePolicy(max_parallel_runs=1),
         ),
     )
+    handle = await core.submit(_request())
+    await asyncio.wait_for(root_started.wait(), 2)
+    root = await adapters.run_tree.get_run(handle.run_id)
+
+    async def recover_children():
+        descendants = await adapters.run_tree.list_descendants(root.run_id)
+        return await core.join_agent_runs(root.run_id, tuple(r.run_id for r in descendants))
+
+    child = (await adapters.run_tree.spawn_agents(SpawnAgentsCommand(
+        parent_run_id=root.run_id,
+        idempotency_key="committed-before-crash",
+        children=(ChildAgentSpec(
+            name="recovered-child",
+            title="Recovered child",
+            instruction="Recover safely.",
+            objective="Execute exactly once.",
+        ),),
+    ))).items[0]
     original_complete = adapters.run_tree.complete_run
     crashed = False
 
@@ -1165,22 +1038,13 @@ async def test_new_agent_core_rebinds_and_executes_a_committed_child_once():
     try:
         recovery_request = _request()
         with pytest.raises(OSError):
-            await core.recover_agent_tree_root(
-                root.run_id,
-                recovery_request,
-            )
+            await recover_children()
         assert (await adapters.runs.get(child.run.run_id)).status is RunStatus.DONE
         assert (await adapters.run_tree.get_run(root.run_id)).status.value == "waiting"
         now_ms = 30_100
         adapters.run_tree.complete_run = original_complete
-        aggregate = await core.recover_agent_tree_root(
-            root.run_id,
-            recovery_request,
-        )
-        replay = await core.recover_agent_tree_root(
-            root.run_id,
-            recovery_request,
-        )
+        aggregate = await recover_children()
+        replay = await recover_children()
         continued = await core.continue_agent(ContinueAgentCommand(
             requester_run_id=root.run_id,
             idempotency_key="resume-without-cursor",
@@ -1215,10 +1079,7 @@ async def test_new_agent_core_rebinds_and_executes_a_committed_child_once():
                 AgentEvent(type="run.started"),
             )
         now_ms += 10
-        gap = await core.recover_agent_tree_root(
-            root.run_id,
-            recovery_request,
-        )
+        gap = await recover_children()
         resumable = await core.continue_agent(ContinueAgentCommand(
             requester_run_id=root.run_id,
             idempotency_key="resume-from-model-ready-checkpoint",
@@ -1298,18 +1159,11 @@ async def test_new_agent_core_rebinds_and_executes_a_committed_child_once():
                 )),
             )
         now_ms += 10
-        resumed = await core.recover_agent_tree_root(
-            root.run_id,
-            recovery_request,
-        )
-        with pytest.raises(ContractViolationError) as binding_error:
-            await core.bind_agent_tree_root(
-                root.run_id,
-                replace(recovery_request, mode="different"),
-            )
-        assert binding_error.value.code == "run_identity_conflict"
+        resumed = await recover_children()
     finally:
         adapters.run_tree.complete_run = original_complete
+        root_gate.set()
+        await handle.wait()
         await core.close()
 
     assert aggregate.state == "ready"
@@ -1389,3 +1243,38 @@ async def test_agent_tree_allows_bounded_recursive_child_runs():
     assert len(checkpoint_events) == 1
     assert checkpoint_events[0].visibility.value == "private"
     assert checkpoint_events[0].run_id == descendants[0].run_id
+
+
+@pytest.mark.asyncio
+async def test_unbound_root_cannot_start_children_through_recovery_shortcut():
+    adapters = InMemoryAgentAdapters()
+    gateway = _ChildAgentGateway()
+    core = AgentCore(
+        model_gateway=gateway, run_repository=adapters.runs,
+        output_repository=adapters.outputs, output_publisher=adapters.publisher,
+        run_tree_repository=adapters.run_tree,
+        preset=AgentPreset(id="recovery-gate", revision="1",
+            runtime_limits=RuntimeLimits(max_run_generation_tokens=None),
+            tool_catalog=InMemoryToolCatalog(()), agent_tree_policy=AgentTreePolicy()),
+    )
+    try:
+        root = await adapters.run_tree.begin_root(BeginRootAgentCommand(
+            run_id="unbound-root", agent_id="root", name="root", title="Root",
+            instruction="Own the request", objective="Resume safely",
+            capability_grant=AgentCapabilityGrant(can_spawn_agents=True),
+            idempotency_key="root",
+        ))
+        child = (await adapters.run_tree.spawn_agents(SpawnAgentsCommand(
+            parent_run_id=root.run_id, idempotency_key="child",
+            children=(ChildAgentSpec(name="child", title="Child", instruction="Review", objective="Analyze"),),
+        ))).items[0]
+        with pytest.raises(ContractViolationError) as unbound:
+            await core.join_agent_runs(root.run_id, (child.run.run_id,))
+        assert unbound.value.code == "agent_tree_root_not_bound"
+        with pytest.raises(ContractViolationError) as unowned:
+            await core.resume(root.run_id, _request())
+        assert unowned.value.code == "run_lease_required"
+        assert (await adapters.run_tree.get_run(child.run.run_id)).status.value == "queued"
+        assert not gateway.rounds
+    finally:
+        await core.close()

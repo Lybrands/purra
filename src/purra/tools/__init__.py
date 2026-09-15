@@ -2,7 +2,7 @@
 
 from purra.cancellation import OperationCanceled, await_with_cancellation
 from purra.tools.approval import InMemoryApprovalGateway
-from purra.tools.contract import (
+from purra.tools.contracts import (
     ToolContractReport,
     inspect_tool_contract,
     validate_tool_contract,

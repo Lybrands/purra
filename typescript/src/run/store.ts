@@ -1350,7 +1350,7 @@ function isInputCheckpointUpdate(current: AgentExecutionCheckpoint, updated: Age
       && canonicalJson(updated.messages.slice(0, -1)) === canonicalJson(current.messages);
   }
   if (updated.messages.length !== current.messages.length) return false;
-  const calls = new Set(current.messages.flatMap(m => m.toolCalls ?? []).filter(c => c.name === "delegateToAgents").map(c => c.id));
+  const calls = new Set(current.messages.flatMap(m => m.toolCalls ?? []).filter(c => ["delegateToAgents", "receiveAgentResults", "continueAgent"].includes(c.name)).map(c => c.id));
   let changed = false;
   for (let i = 0; i < current.messages.length; i++) {
     const before = current.messages[i]!, after = updated.messages[i]!;

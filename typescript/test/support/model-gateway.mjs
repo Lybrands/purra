@@ -46,3 +46,27 @@ export function testGateway(delegate) {
     }),
   });
 }
+
+
+// Deterministic fixture adapter. Production presentation never buffers a turn.
+export function treeTestGateway(delegate) {
+  const base = delegate.capabilities ?? DEFAULT_CAPABILITIES;
+  return testGateway({
+    ...delegate,
+    capabilities: {...base, protocol: {...base.protocol, streaming: "supported"}},
+    async *stream(request, signal) {
+      if (request.messages.some(m => typeof m.content === "string" && m.content.includes("Provide a concise progress update"))) {
+        yield {contentDelta: "Available child ", appliedGenerationLimit: request.outputBudget.maxGenerationTokens};
+        yield {contentDelta: "result received.", finishReason: "stop"};
+        return;
+      }
+      const turn = await delegate.invoke(request, signal);
+      yield {
+        contentDelta: turn.message.content,
+        ...(turn.message.toolCalls === undefined ? {} : {toolCallDeltas: turn.message.toolCalls.map((c, index) => ({index, id:c.id, name:c.name, argumentsFragment:JSON.stringify(c.arguments)}))}),
+        finishReason: turn.finishReason,
+        ...(turn.usage === undefined ? {} : {usage:turn.usage}),
+      };
+    },
+  });
+}

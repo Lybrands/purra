@@ -47,7 +47,7 @@ from purra.agent_tree_execution import (
 )
 from purra.agent_tree_policy import AgentTreePolicy
 from purra.agent_execution_checkpoint import AgentExecutionCheckpoint, AgentToolExecutionCheckpoint
-from purra.agent_tree_lease import (
+from purra.agent_tree.lease import (
     AgentRunLeaseClaim,
     current_agent_run_lease,
 )
@@ -152,9 +152,9 @@ __all__ = [
 
 from purra.planning_context import PlanningContext, current_planning_context
 from purra.interaction import UserInputRequired
-from purra.planning_stream import PLANNING_STREAM_SCHEMA, PlanningScope, PlanningProgress, PlanningStreamParser, PlanningStreamError
+from purra.planning_stream import PLANNING_STREAM_SCHEMA, PlanningScope, PlanningProgress, PlanningTextDelta, PlanningTextDeltaParser, PlanningStreamParser, PlanningStreamError
 
-__all__ += ["PlanningContext", "current_planning_context", "PLANNING_STREAM_SCHEMA", "PlanningScope", "PlanningProgress", "PlanningStreamParser", "PlanningStreamError"]
+__all__ += ["PlanningContext", "current_planning_context", "PLANNING_STREAM_SCHEMA", "PlanningScope", "PlanningProgress", "PlanningTextDelta", "PlanningTextDeltaParser", "PlanningStreamParser", "PlanningStreamError"]
 __all__ += ["UserInputRequired"]
 
 from purra.structured import (
@@ -172,8 +172,20 @@ __all__ += ["json_identity_digest"]
 
 from purra.observability.inspection import build_recovery_inspection, inspect_recovery
 __all__ += ["build_recovery_inspection", "inspect_recovery"]
-from purra.testing import IntegrationCheck, check_integration
+
+# The conformance harness is public but loaded lazily: it transitively pulls
+# in engine/runtime phase modules, which should not load on plain `import
+# purra`. Keep `purra.testing` itself eager-free from this facade's graph.
+_LAZY_TESTING_EXPORTS = {"IntegrationCheck", "check_integration"}
 __all__ += ["IntegrationCheck", "check_integration"]
+
+
+def __getattr__(name: str):
+    if name in _LAZY_TESTING_EXPORTS:
+        from purra import testing
+
+        return getattr(testing, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 from purra.approvals import ApprovalRequired
 __all__ += ["AgentToolExecutionCheckpoint", "ApprovalRequired"]

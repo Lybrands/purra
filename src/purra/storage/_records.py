@@ -3,12 +3,7 @@
 Record identifiers are independent of Python import locations.
 """
 
-from purra.adapters.durable_memory import (
-    _LongTaskState,
-)
-from purra.adapters.memory import (
-    _RunRecord, _StreamRecord,
-)
+from purra.adapter_records import StoredRun, StoredStream, StoredLongTask
 from purra.agent_execution_checkpoint import (
     AgentExecutionCheckpoint, AgentToolExecutionCheckpoint,
 )
@@ -40,7 +35,7 @@ from purra.events import (
     AgentEvent,
 )
 from purra.long_tasks.contracts import (
-    LongTaskBudgetLimits, LongTaskRecord, LongTaskRunBinding, LongTaskRunRelation, LongTaskStatus, LongTaskUnitRecord, LongTaskUnitStatus, LongTaskUsage,
+    BudgetExhaustionDisposition, LongTaskBudgetLimits, LongTaskRecord, LongTaskRunBinding, LongTaskRunRelation, LongTaskStatus, LongTaskUnitRecord, LongTaskUnitStatus, LongTaskUsage,
 )
 from purra.model_protocol.capabilities import (
     AssistantContentWithToolCalls, ContinuationKind, ContinuationSafety, FeatureSupport, LengthReasonDetail, ModelCapabilitySnapshot, ModelProtocolCapabilities, ReasoningControl, ReasoningLimitKind, ReasoningReplayPolicy, ReasoningUsageDetail, ThinkingTokenAccounting, VisibleOutputReservation,
@@ -63,7 +58,7 @@ RECORDS = {
     "AgentNode": (AgentNode, ('agent_id', 'root_agent_id', 'parent_agent_id', 'depth', 'created_by_run_id', 'created_by_call_id', 'name', 'title', 'instruction', 'capability_grant', 'context_version', 'context_checkpoint_id', 'latest_run_id', 'state')),
     "AgentOutputEvent": (AgentOutputEvent, ('event_id', 'output_stream_id', 'run_id', 'turn_id', 'invocation_id', 'sequence', 'source', 'kind', 'channel', 'visibility', 'payload', 'occurred_at', 'emitted_at', 'root_run_id', 'agent_id', 'parent_run_id', 'root_sequence', 'source_event_key')),
     "AgentRunRequest": (AgentRunRequest, ('messages', 'model', 'domain_context', 'session_id', 'mode', 'context_window', 'tools_enabled', 'planning_mode', 'metadata')),
-    "AgentTreeRun": (AgentTreeRun, ('run_id', 'agent_id', 'root_run_id', 'parent_run_id', 'previous_run_id', 'spawn_batch_id', 'objective', 'input_payload', 'required', 'priority', 'status', 'result', 'error_code', 'created_sequence', 'lease_owner_id', 'lease_epoch', 'lease_expires_at_ms')),
+    "AgentTreeRun": (AgentTreeRun, ('run_id', 'agent_id', 'root_run_id', 'parent_run_id', 'previous_run_id', 'spawn_batch_id', 'objective', 'input_payload', 'required', 'priority', 'status', 'result', 'error_code', 'created_sequence', 'lease_owner_id', 'lease_epoch', 'lease_expires_at_ms', 'dependency_run_ids')),
     "ArtifactBatch": (ArtifactBatch, ('artifact_id', 'batch_id', 'idempotency_key', 'sequence', 'committed_revision', 'items', 'coverage_keys', 'content_digest')),
     "ArtifactBatchReceipt": (ArtifactBatchReceipt, ('artifact_id', 'batch_id', 'sequence', 'committed_revision', 'next_sequence', 'accepted_count', 'replayed')),
     "ArtifactOwnerRef": (ArtifactOwnerRef, ('kind', 'id')),
@@ -76,7 +71,7 @@ RECORDS = {
     "DomainEffect": (DomainEffect, ('type', 'payload')),
     "ExecutionPlan": (ExecutionPlan, ('title', 'steps', 'goal', 'task_spec', 'work_step_ids')),
     "LongTaskBudgetLimits": (LongTaskBudgetLimits, ('max_invocation_attempts', 'max_input_tokens', 'max_run_generation_tokens', 'max_reasoning_tokens')),
-    "LongTaskRecord": (LongTaskRecord, ('id', 'namespace', 'kind', 'owner_id', 'created_by_run_id', 'status', 'revision', 'total_units', 'completed_units', 'failed_units', 'max_parallelism', 'deadline_at_ms', 'budget_limits', 'cancellation_requested_at_ms', 'usage', 'metadata', 'create_time', 'update_time')),
+    "LongTaskRecord": (LongTaskRecord, ('id', 'namespace', 'kind', 'owner_id', 'created_by_run_id', 'status', 'revision', 'total_units', 'completed_units', 'failed_units', 'max_parallelism', 'deadline_at_ms', 'budget_limits', 'budget_exhaustion_disposition', 'cancellation_requested_at_ms', 'usage', 'metadata', 'create_time', 'update_time')),
     "LongTaskRunBinding": (LongTaskRunBinding, ('task_id', 'run_id', 'relation')),
     "LongTaskUnitRecord": (LongTaskUnitRecord, ('task_id', 'id', 'position', 'status', 'semantic_key', 'dependencies', 'parent_unit_id', 'required', 'attempt', 'max_attempts', 'worker_id', 'lease_epoch', 'lease_expires_at_ms', 'settled_by_worker_id', 'run_id', 'input_ref', 'output_ref', 'artifact_digest', 'validation_receipt', 'failure', 'disposition', 'error_code', 'metadata', 'create_time', 'update_time')),
     "LongTaskUsage": (LongTaskUsage, ('invocation_count', 'unreported_usage_attempts', 'input_tokens', 'generation_tokens', 'reasoning_tokens')),
@@ -99,9 +94,9 @@ RECORDS = {
     "ToolCall": (ToolCall, ('id', 'name', 'arguments_json')),
     "ToolHandlerResult": (ToolHandlerResult, ('content', 'from_cache', 'effects', 'context_evidence', 'error_code', 'step_disposition', 'planning_disposition', 'effect_state')),
     "TraceRecord": (TraceRecord, ('stage', 'outcome', 'details', 'duration_ms')),
-    "LongTaskState": (_LongTaskState, ('record', 'units', 'bindings', 'usage_by_run')),
-    "RunRecord": (_RunRecord, ('params', 'status', 'conversation_id', 'steps', 'execution_plan', 'final_response', 'validated_result', 'error', 'events', 'traces', 'model_attempt_ids', 'model_usage_by_invocation', 'provider_output_events', 'provider_output_bytes', 'execution_checkpoint', 'checkpoint_attempt_count')),
-    "StreamRecord": (_StreamRecord, ('spec', 'status', 'finish_reason', 'error_code')),
+    "LongTaskState": (StoredLongTask, ('record', 'units', 'bindings', 'usage_by_run')),
+    "RunRecord": (StoredRun, ('params', 'status', 'conversation_id', 'steps', 'execution_plan', 'final_response', 'validated_result', 'error', 'events', 'traces', 'model_attempt_ids', 'model_usage_by_invocation', 'provider_output_events', 'provider_output_bytes', 'execution_checkpoint', 'checkpoint_attempt_count')),
+    "StreamRecord": (StoredStream, ('spec', 'status', 'finish_reason', 'error_code')),
 }
 
 ENUMS = {
@@ -110,6 +105,7 @@ ENUMS = {
     "AgentTreeRunStatus": AgentTreeRunStatus,
     "ArtifactStatus": ArtifactStatus,
     "AssistantContentWithToolCalls": AssistantContentWithToolCalls,
+    "BudgetExhaustionDisposition": BudgetExhaustionDisposition,
     "ContinuationKind": ContinuationKind,
     "ContinuationSafety": ContinuationSafety,
     "FailureDisposition": FailureDisposition,

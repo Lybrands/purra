@@ -15,7 +15,6 @@ from purra.testing import (
     assert_long_task_repository_conforms,
 )
 from purra.long_tasks import (
-    LongTaskCoordinator,
     LongTaskCreateCommand,
     LongTaskSplitResult,
     LongTaskUnitResult,
@@ -23,6 +22,7 @@ from purra.long_tasks import (
     LongTaskStatus,
     LongTaskUnitStatus,
 )
+from purra.long_tasks.coordinator import LongTaskUnitSettlement
 from purra.errors import ContractViolationError
 from purra.recovery import (
     FailureCategory,
@@ -382,17 +382,24 @@ def test_heartbeat_lease_loss_cancels_executor_and_fails_after_attempts():
             ),
         )
         runner = BlockingRunner()
-        settled = await LongTaskCoordinator(
+        task = await base.start(task.id, expected_revision=task.revision)
+        unit = await base.claim_unit(
+            task.id,
+            "report",
+            worker_id="worker-1",
+            lease_duration_ms=3,
+        )
+        assert unit is not None
+        settled = await LongTaskUnitSettlement(
             LosingRepository(),
             worker_id="worker-1",
             lease_duration_ms=3,
-            idle_poll_ms=1,
-        ).run(task.id, runner)
+        ).settle_claimed(task, unit, runner, None)
         units = await base.list_units(task.id)
-        assert settled.status.value == "failed"
-        assert runner.cancellations == 2
-        assert units[0].status.value == "failed"
-        assert units[0].error_code == "lease_expired_attempts_exhausted"
+        assert settled.status.value == "running"
+        assert runner.cancellations == 1
+        assert units[0].status.value == "claimed"
+        assert units[0].attempt == 1
         assert units[0].output_ref is None
 
     asyncio.run(scenario())
@@ -429,11 +436,18 @@ def test_settlement_observer_failure_is_not_reclassified_as_unit_failure():
                 raise RuntimeError("checkpoint_observer_failed")
 
         with pytest.raises(RuntimeError, match="checkpoint_observer_failed"):
-            await LongTaskCoordinator(
+            task = await repository.start(task.id, expected_revision=task.revision)
+            unit = await repository.claim_unit(
+                task.id,
+                "first",
+                worker_id="worker-1",
+                lease_duration_ms=300_000,
+            )
+            assert unit is not None
+            await LongTaskUnitSettlement(
                 repository,
                 worker_id="worker-1",
-                idle_poll_ms=1,
-            ).run(task.id, Runner())
+            ).settle_claimed(task, unit, Runner(), None)
 
         units = await repository.list_units(task.id)
         assert units[0].status is LongTaskUnitStatus.COMPLETED

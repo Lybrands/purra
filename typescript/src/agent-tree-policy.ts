@@ -22,10 +22,13 @@ export interface AgentTreePolicyOptions {
   readonly maxDepth?: number;
   readonly maxAgentsPerRoot?: number;
   readonly allowRecursiveAgents?: boolean;
+  /** Host-owned instruction; omit or use null to receive results without automatic presentation. */
+  readonly resultPresentationInstruction?: string | null;
 }
 
 export interface AgentTreePolicySnapshot {
   readonly enabled: true;
+  readonly resultPresentationInstruction: string | null;
   readonly maxChildrenPerCall: number;
   readonly maxParallelRuns: number;
   readonly maxAgentNameChars: number;
@@ -41,6 +44,8 @@ export class AgentTreePolicy {
   readonly #snapshot: AgentTreePolicySnapshot;
 
   public constructor(options: AgentTreePolicyOptions = {}) {
+    const resultPresentationInstruction = options.resultPresentationInstruction ?? null;
+    if (resultPresentationInstruction !== null && (typeof resultPresentationInstruction !== "string" || !resultPresentationInstruction.trim() || [...resultPresentationInstruction].length > 4000)) throw new TypeError("Invalid parent presentation instruction");
     const maxChildrenPerCall = positive(
       options.maxChildrenPerCall ?? 3,
       "maxChildrenPerCall",
@@ -61,6 +66,7 @@ export class AgentTreePolicy {
       throw new TypeError("allowRecursiveAgents must be boolean");
     }
     this.#snapshot = Object.freeze({
+      resultPresentationInstruction,
       enabled: true,
       maxChildrenPerCall,
       maxParallelRuns,

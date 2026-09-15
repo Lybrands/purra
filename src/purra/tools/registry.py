@@ -8,7 +8,7 @@ from types import MappingProxyType
 from purra.contracts import AgentRunRequest, ToolSchema
 from purra.errors import ContractViolationError
 from purra.ports import ToolRegistration
-from purra.tools.contract import validate_tool_contract
+from purra.tools.contracts import validate_tool_contract
 
 
 ToolEnablement = Callable[[AgentRunRequest], Iterable[str]]

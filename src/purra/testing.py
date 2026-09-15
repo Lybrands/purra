@@ -1229,10 +1229,12 @@ async def assert_long_task_repository_conforms(
     ) is None
     budget_task = await repository.load(budget_task.id)
     assert budget_task is not None
-    assert budget_task.status is LongTaskStatus.FAILED
+    assert budget_task.status is LongTaskStatus.PAUSED
     budget_units = await repository.list_units(budget_task.id)
     assert all(
-        unit.error_code == "runtime_budget_exceeded" for unit in budget_units
+        unit.error_code == "runtime_budget_exceeded"
+        and unit.status is LongTaskUnitStatus.BLOCKED
+        for unit in budget_units
     )
 
 
@@ -1256,6 +1258,14 @@ class _ContinuationDispatcher:
     async def dispatch(self, *args, **kwargs):
         del args, kwargs
         raise AssertionError("durable continuation must not dispatch again")
+
+    async def prepare_continuation(self, *args, **kwargs):
+        prepare = getattr(self._delegate, "prepare_continuation", None)
+        if not callable(prepare):
+            raise AssertionError(
+                "durable continuation dispatcher must bind its new Root"
+            )
+        return await prepare(*args, **kwargs)
 
     async def execute(self, *args, **kwargs):
         return await self._delegate.execute(*args, **kwargs)

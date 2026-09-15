@@ -1,14 +1,15 @@
-"""Generic coordinator for checkpointed long-task execution units."""
+"""Scheduling and settlement of operations within their owning Run."""
 
 from __future__ import annotations
 
 import asyncio
 
 from purra.cancellation import ExecutionStopSignal, stop_reason
+from purra.ports import CancellationSignal
 from purra.errors import ContractViolationError
 from purra.long_tasks.contracts import LongTaskStatus
-from purra.long_tasks.ports import LongTaskRepository, LongTaskUnitRunner
-from purra.ports import CancellationSignal
+from purra.long_tasks.ports import LongTaskRepository
+from purra.long_tasks.failure_policy import UnitFailurePolicy
 from purra.recovery import (
     FailureCategory,
     FailureDisposition,
@@ -17,7 +18,9 @@ from purra.recovery import (
 )
 
 
-class LongTaskCoordinator:
+class LongTaskUnitSettlement:
+    """Schedule operations within one Run and settle their durable attempts."""
+
     def __init__(
         self,
         repository: LongTaskRepository,
@@ -27,6 +30,7 @@ class LongTaskCoordinator:
         retry_backoff_ms: tuple[int, ...] = (),
         idle_poll_ms: int = 100,
     ) -> None:
+        self._idle_poll_ms = max(1, int(idle_poll_ms))
         self._repository = repository
         self._worker_id = str(worker_id or "").strip()
         if not self._worker_id:
@@ -37,12 +41,11 @@ class LongTaskCoordinator:
         self._retry_backoff_ms = tuple(
             max(0, int(value)) for value in retry_backoff_ms
         )
-        self._idle_poll_ms = max(1, int(idle_poll_ms))
 
     async def run(
         self,
         task_id: str,
-        runner: LongTaskUnitRunner,
+        runner,
         signal: CancellationSignal | None = None,
     ):
         task = await self._require(task_id)
@@ -64,6 +67,9 @@ class LongTaskCoordinator:
             )
         active: dict[asyncio.Task, object] = {}
         try:
+            # Restored completed Units can make a host checkpoint ready before
+            # another Unit is claimable. Publish that state before scheduling.
+            await self._notify_settled(runner, task.id)
             while task.status is LongTaskStatus.RUNNING:
                 if signal is not None and signal.is_set():
                     if stop_reason(signal) == "long_task_deadline_exceeded":
@@ -86,7 +92,7 @@ class LongTaskCoordinator:
                     if unit is None:
                         break
                     execution = asyncio.create_task(
-                        self._run_claimed_unit(task, unit, runner, signal)
+                        self.settle_claimed(task, unit, runner, signal)
                     )
                     active[execution] = unit
 
@@ -100,6 +106,7 @@ class LongTaskCoordinator:
                 done, _ = await asyncio.wait(
                     tuple(active),
                     return_when=asyncio.FIRST_COMPLETED,
+                    timeout=self._idle_poll_ms / 1000,
                 )
                 for execution in done:
                     active.pop(execution, None)
@@ -113,12 +120,53 @@ class LongTaskCoordinator:
             return task
         except asyncio.CancelledError:
             return await self._stop_active(task.id, active)
+        except BaseException:
+            await self._stop_active(task.id, active)
+            raise
         finally:
             task_stop.close()
             if active:
                 await self._cancel_active(active)
 
-    async def _run_claimed_unit(self, task, unit, runner, signal):
+    async def _stop_active(self, task_id: str, active: dict):
+        await self._cancel_active(active)
+        current = await self._require(task_id)
+        if current.cancellation_requested_at_ms is not None:
+            return await self._repository.cancel(task_id)
+        if current.status in {
+            LongTaskStatus.PAUSED,
+            LongTaskStatus.CANCELED,
+        }:
+            return current
+        if current.status is LongTaskStatus.RUNNING:
+            if current.cancellation_requested_at_ms is not None:
+                return await self._repository.cancel(task_id)
+            return await self._repository.pause(task_id)
+        return current
+
+
+    async def _cancel_active(self, active: dict) -> None:
+        pending = tuple(active)
+        active.clear()
+        for execution in pending:
+            if not execution.done():
+                execution.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+
+    async def _wait_for_idle_work(self, signal) -> None:
+        delay = self._idle_poll_ms / 1000
+        if signal is None:
+            await asyncio.sleep(delay)
+            return
+        try:
+            await asyncio.wait_for(signal.wait(), timeout=delay)
+        except TimeoutError:
+            return
+
+
+    async def settle_claimed(self, task, unit, runner, signal):
         settled = await self._settle_claimed_unit(task, unit, runner, signal)
         # Settlement observers run after the Unit's durable transition. Their
         # failures are execution-boundary failures, not Unit failures: trying
@@ -173,33 +221,14 @@ class LongTaskCoordinator:
                     unit.id,
                     unit.lease_epoch,
                 )
-            classifier = getattr(runner, "classify_unit_failure", None)
-            failure = None
-            if callable(classifier):
-                try:
-                    candidate = classifier(task, unit, error)
-                    if isinstance(candidate, FailureSignal):
-                        failure = candidate
-                except Exception:
-                    failure = None
-            if failure is None:
-                failure = FailureSignal(
-                    category=FailureCategory.BUSINESS_INVARIANT,
-                    code=_error_code(error),
-                    retryable=False,
-                )
+            policy = UnitFailurePolicy(runner)
+            failure = policy.classify(task, unit, error)
             decision = decide_failure(
                 failure,
                 attempts_remaining=max(0, unit.max_attempts - unit.attempt),
             )
             if decision.disposition is FailureDisposition.SPLIT_PART:
-                splitter = getattr(runner, "split_unit", None)
-                split = None
-                if callable(splitter):
-                    try:
-                        split = splitter(task, unit, error)
-                    except Exception:
-                        split = None
+                split = policy.split(task, unit, error)
                 if split is not None and split.children:
                     settled = await self._repository.expand_unit(
                         task.id,
@@ -319,30 +348,6 @@ class LongTaskCoordinator:
         if callable(callback):
             await callback(task_id)
 
-    async def _stop_active(self, task_id: str, active: dict):
-        await self._cancel_active(active)
-        current = await self._require(task_id)
-        if current.status in {
-            LongTaskStatus.PAUSED,
-            LongTaskStatus.CANCELED,
-        }:
-            return current
-        if current.status is LongTaskStatus.RUNNING:
-            if current.cancellation_requested_at_ms is not None:
-                return await self._repository.cancel(task_id)
-            return await self._repository.pause(task_id)
-        return current
-
-    @staticmethod
-    async def _cancel_active(active: dict) -> None:
-        pending = tuple(active)
-        active.clear()
-        for execution in pending:
-            if not execution.done():
-                execution.cancel()
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
-
     async def _wait_before_retry(self, attempt: int, signal) -> None:
         if not self._retry_backoff_ms:
             return
@@ -358,26 +363,11 @@ class LongTaskCoordinator:
         except TimeoutError:
             return
 
-    async def _wait_for_idle_work(self, signal) -> None:
-        delay = self._idle_poll_ms / 1000
-        if signal is None:
-            await asyncio.sleep(delay)
-            return
-        try:
-            await asyncio.wait_for(signal.wait(), timeout=delay)
-        except TimeoutError:
-            return
-
     async def _require(self, task_id: str):
         task = await self._repository.load(str(task_id or "").strip())
         if task is None:
             raise LookupError("long task does not exist")
         return task
-
-
-def _error_code(error: Exception) -> str:
-    code = str(getattr(error, "code", "") or "").strip()
-    return (code or str(error) or type(error).__name__)[:240]
 
 
 class _CombinedCancellationSignal:
@@ -418,4 +408,4 @@ def _is_lease_lost(error: BaseException) -> bool:
     return getattr(error, "code", None) == "long_task_unit_lease_lost"
 
 
-__all__ = ["LongTaskCoordinator"]
+__all__ = ["LongTaskUnitSettlement"]

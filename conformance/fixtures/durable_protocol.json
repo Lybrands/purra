@@ -23,6 +23,13 @@
     "budgetExceeded": "runtime_budget_exceeded",
     "streamLimit": "model_stream_limit_exceeded"
   },
+  "budgetExhaustionPolicy": {
+    "defaultDisposition": "pause_recoverable",
+    "optOutDisposition": "fail_permanent",
+    "pausedTaskStatus": "paused",
+    "unfinishedUnitStatus": "blocked",
+    "errorCode": "runtime_budget_exceeded"
+  },
   "budgetCases": [
     {
       "name": "attempt equality blocks the next claim",

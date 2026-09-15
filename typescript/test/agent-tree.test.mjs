@@ -11,7 +11,7 @@ import {
   InMemoryRunTreeRepository,
   RunCommandService,
 } from "../dist/index.js";
-import { testGateway } from "./support/model-gateway.mjs";
+import { treeTestGateway as testGateway } from "./support/model-gateway.mjs";
 
 const fixture = JSON.parse(readFileSync(
   new URL("../../conformance/fixtures/agent_tree_protocol.json", import.meta.url),
@@ -187,7 +187,7 @@ test("Agent executes delegateToAgents through canonical Child Runs", async () =>
   let modelCalls = 0;
   const invocationBudgets = [];
   const agent = new Agent({
-    model: {
+    model: testGateway({
       capabilities: modelCapabilities(),
       async invoke(request) {
         modelCalls += 1;
@@ -197,7 +197,7 @@ test("Agent executes delegateToAgents through canonical Child Runs", async () =>
           appliedGenerationLimit: request.outputBudget?.maxGenerationTokens,
         });
         if (request.messages.at(-1)?.attributes?.publicPresentation === true) {
-          throw new Error("Agent Tree unexpectedly entered public presentation");
+          return { message: { role: "assistant", content: "Main Agent feedback" }, finishReason: "stop", appliedGenerationLimit: request.outputBudget?.maxGenerationTokens };
         }
         if (request.messages.some((message) => message.content === "Review evidence.")) {
           return acknowledged({
@@ -231,7 +231,7 @@ test("Agent executes delegateToAgents through canonical Child Runs", async () =>
           finishReason: "tool_calls",
         });
       },
-    },
+    }),
     runRepository: adapters.runs,
     outputPublisher: adapters.outputs,
     agentTree: {
@@ -250,7 +250,7 @@ test("Agent executes delegateToAgents through canonical Child Runs", async () =>
   const journal = await adapters.runs.listRootEvents(handle.runId, 0);
 
   assert.equal(result.output, "root done");
-  assert.equal(modelCalls, 3);
+  assert.equal(modelCalls, 3); // The fixture streams feedback separately.
   assert.deepEqual(
     invocationBudgets.map((budget) => [budget.maxGenerationTokens, budget.generationSource]),
     [[200, "user"], [200, "user"], [200, "user"]],
@@ -285,7 +285,7 @@ test("Agent permits bounded recursive Child Runs", async () => {
         const system = request.messages.find((message) => message.role === "system")?.content;
         const afterTool = request.messages.at(-1)?.role === "tool";
         if (request.messages.at(-1)?.attributes?.publicPresentation === true) {
-          throw new Error("Agent Tree unexpectedly entered public presentation");
+          return { message: { role: "assistant", content: "Main Agent feedback" }, finishReason: "stop", appliedGenerationLimit: request.outputBudget?.maxGenerationTokens };
         }
         if (system === "Nested worker.") {
           return {
@@ -473,74 +473,20 @@ test("Root completion is rejected before final output while a Child Run is pendi
   assert.equal(events.some((event) => event.kind === "run.completed"), false);
 });
 
-test("new Agent instance rebinds and executes one committed Child Run", async () => {
+test("live Root reconciles committed Child and resumes its checkpoint once", async (t) => {
   let now = 100;
   const adapters = new InMemoryAgentAdapters({ agentTreeClockMs: () => now });
-  const rootRunId = "rebound-root";
-  await adapters.runs.begin({
-    requestedRunId: rootRunId,
-    agentId: "rebound-root-agent",
-    preset: {
-      schemaVersion: 5,
-      presetId: "rebound",
-      presetRevision: "1",
-      promptFingerprint: "prompt",
-      toolFingerprint: "tools",
-      capabilityProfileId: null,
-      compositionFingerprint: "composition",
-      runtimeLimits: {
-        runTimeoutMs: 900_000,
-        activityIdleTimeoutMs: 30_000,
-        progressIdleTimeoutMs: 60_000,
-        invocationTimeoutMs: 300_000,
-        maxChunks: 100_000,
-        maxContentChars: 1_000_000,
-        maxReasoningChars: 1_000_000,
-        maxToolArgumentChars: 1_000_000,
-      },
-      agentTree: { protocolVersion: 1, enabled: false },
-    },
-    deadlineAt: null,
-    budgets: {
-      maxModelAttempts: 4,
-      maxInputTokens: null,
-      maxRunGenerationTokens: null,
-      maxReasoningTokens: null,
-      maxOutputBytes: 10_000,
-      maxOutputEvents: 100,
-    },
-    metadata: {},
-  });
-  await adapters.runTree.beginRoot({
-    runId: rootRunId,
-    agentId: "rebound-root-agent",
-    name: "root",
-    title: "Root",
-    instruction: "Own recovery.",
-    objective: "Recover a Child Run.",
-    capabilityGrant: grant({
-      maxParallelRuns: 1,
-      allowedTools: [],
-      allowedModels: ["configured:model"],
-    }),
-    idempotencyKey: "rebound-root-begin",
-  });
-  const child = (await adapters.runTree.spawnAgents({
-    parentRunId: rootRunId,
-    idempotencyKey: "committed-before-crash",
-    children: [{
-      name: "rebound-child",
-      title: "Rebound child",
-      instruction: "Recover safely.",
-      objective: "Execute once.",
-    }],
-  })).items[0];
   let executions = 0;
+  let releaseRoot, rootEntered;
+  const rootGate = new Promise(resolve => { releaseRoot = resolve; });
+  const rootStarted = new Promise(resolve => { rootEntered = resolve; });
+  t.after(() => releaseRoot());
   const agent = new Agent({
     model: testGateway({
       capabilities: { ...modelCapabilities(), profileId: "configured:model" },
-      async invoke() {
-        executions += 1;
+      async invoke(request) {
+        if (request.messages.some(m => m.content === "Recover safely.")) executions += 1;
+        else { rootEntered(); await rootGate; }
         return {
           message: { role: "assistant", content: "rebound child done" },
           finishReason: "stop",
@@ -558,6 +504,22 @@ test("new Agent instance rebinds and executes one committed Child Run", async ()
   const recoveryRequest = {
     messages: [{ role: "user", content: "Recover." }],
   };
+  const handle = await agent.submit(recoveryRequest, RUN_OPTIONS);
+  handle.result.catch(() => undefined);
+  await rootStarted;
+  const rootRunId = handle.runId;
+  const recoverChildren = async () => agent.joinAgentRuns(rootRunId,
+    (await adapters.runTree.listDescendants(rootRunId)).map(run => run.runId));
+  const child = (await adapters.runTree.spawnAgents({
+    parentRunId: rootRunId,
+    idempotencyKey: "committed-before-crash",
+    children: [{
+      name: "rebound-child",
+      title: "Rebound child",
+      instruction: "Recover safely.",
+      objective: "Execute once.",
+    }],
+  })).items[0];
   const originalComplete = adapters.runTree.completeRun.bind(adapters.runTree);
   let crashed = false;
   adapters.runTree.completeRun = async (runId, options) => {
@@ -567,13 +529,13 @@ test("new Agent instance rebinds and executes one committed Child Run", async ()
     }
     return originalComplete(runId, options);
   };
-  await assert.rejects(agent.recoverAgentTreeRoot(rootRunId, recoveryRequest, RUN_OPTIONS));
+  await assert.rejects(recoverChildren());
   assert.equal((await adapters.runs.get(child.run.runId)).status, "completed");
   assert.equal((await adapters.runTree.getRun(rootRunId)).status, "waiting");
   now = 30_100;
   adapters.runTree.completeRun = originalComplete;
-  const aggregate = await agent.recoverAgentTreeRoot(rootRunId, recoveryRequest, RUN_OPTIONS);
-  const replay = await agent.recoverAgentTreeRoot(rootRunId, recoveryRequest, RUN_OPTIONS);
+  const aggregate = await recoverChildren();
+  const replay = await recoverChildren();
   const continued = await agent.continueAgent({
     requesterRunId: rootRunId,
     idempotencyKey: "resume-without-cursor",
@@ -601,7 +563,7 @@ test("new Agent instance rebinds and executes one committed Child Run", async ()
     metadata: {},
   });
   now += 10;
-  const gap = await agent.recoverAgentTreeRoot(rootRunId, recoveryRequest, RUN_OPTIONS);
+  const gap = await recoverChildren();
   const resumable = await agent.continueAgent({
     requesterRunId: rootRunId,
     idempotencyKey: "resume-from-model-ready-checkpoint",
@@ -654,11 +616,7 @@ test("new Agent instance rebinds and executes one committed Child Run", async ()
     leaseEpoch: checkpointed.leaseEpoch,
   });
   now += 10;
-  const resumed = await agent.recoverAgentTreeRoot(rootRunId, recoveryRequest, RUN_OPTIONS);
-  await rejectsCode(agent.bindAgentTreeRoot(rootRunId, {
-    ...recoveryRequest,
-    metadata: { binding: "different" },
-  }, RUN_OPTIONS), "run_identity_conflict");
+  const resumed = await recoverChildren();
   const recoveredRun = await adapters.runTree.getRun(child.run.runId);
 
   assert.equal(
@@ -683,6 +641,8 @@ test("new Agent instance rebinds and executes one committed Child Run", async ()
   );
   assert.equal((await adapters.runs.get(resumable.run.runId)).status, "completed");
   assert.equal((await adapters.runTree.getRun(resumable.run.runId)).status, "done");
+  releaseRoot();
+  await handle.result.catch(() => undefined);
 });
 
 test("spawn is idempotent and globally scheduled by priority", async () => {
@@ -1091,7 +1051,7 @@ test("Run command service releases waiting slots for recursive execution", async
       };
     },
   };
-  const supervisor = new AgentTreeRunSupervisor({ repository, executor });
+  const supervisor = new AgentTreeRunSupervisor({ repository, executor, deliverResults: async (rootId, results) => { assert.ok(results.length); } });
   commands = new RunCommandService(repository, supervisor);
   const receipt = await commands.spawnAgents({
     parentRunId: rootRun.runId,
@@ -1147,6 +1107,7 @@ test("new supervisor reclaims one committed Child Run after worker crash", async
   const executions = [];
   now = 110;
   const recovered = new RunCommandService(repository, new AgentTreeRunSupervisor({
+    deliverResults: async (rootId, results) => { assert.ok(results.length); },
     repository,
     ownerId: "recovery-worker",
     leaseDurationMs: 10,
@@ -1182,6 +1143,7 @@ test("join cancellation wakes when an executor ignores AbortSignal", async () =>
     grant: grant({ maxParallelRuns: 1 }),
   });
   const supervisor = new AgentTreeRunSupervisor({
+    deliverResults: async (rootId, results) => { assert.ok(results.length); },
     repository,
     executor: {
       async execute() {
@@ -1203,4 +1165,124 @@ test("join cancellation wakes when an executor ignores AbortSignal", async () =>
   await rejectsCode(joined, "child_run_join_canceled");
   assert.equal((await repository.getRun(child.run.runId)).status, "canceled");
   assert.equal((await repository.getRun(rootRun.runId)).status, "running");
+});
+
+test('unbound Root cannot start Children through a recovery shortcut', async () => {
+  const adapters = new InMemoryAgentAdapters();
+  let calls = 0;
+  const agent = new Agent({
+    model: testGateway({async invoke() { calls++; throw Error('must not invoke'); }}),
+    runRepository: adapters.runs, outputPublisher: adapters.outputs,
+    agentTree:{repository:adapters.runTree},
+  });
+  const savedRoot = await root(adapters.runTree);
+  const child = (await adapters.runTree.spawnAgents({parentRunId:savedRoot.runId,
+    idempotencyKey:'queued-child',children:[spec('child')]})).items[0];
+  assert.equal('bindAgentTreeRoot' in agent, false);
+  assert.equal('recoverAgentTreeRoot' in agent, false);
+  await rejectsCode(agent.joinAgentRuns(savedRoot.runId,[child.run.runId]), 'parent_presentation_unavailable');
+  await rejectsCode(agent.resume(savedRoot.runId,{messages:[{role:'user',content:'Resume'}]}), 'run_lease_required');
+  assert.equal((await adapters.runTree.getRun(child.run.runId)).status, 'queued');
+  assert.equal(calls, 0);
+});
+
+test("Agent result inbox returns early with individual feedback", { timeout: 2000 }, async () => {
+  const repository = new InMemoryRunTreeRepository();
+  const parent = await root(repository);
+  let release;
+  const slow = new Promise(resolve => { release = resolve; });
+  const calls = [];
+  const commands = new RunCommandService(repository, new AgentTreeRunSupervisor({
+    repository,
+    deliverResults: async (owner, results) => { assert.equal(owner, parent.runId); assert.equal(results.length, 1); },
+    executor: { async execute(run, agent) {
+      calls.push(agent.name);
+      if (agent.name === "slow") await slow;
+      return { status: "done", result: agent.name, contentRef: `memory://${run.runId}`, fingerprint: agent.name };
+    } },
+  }));
+  const receipt = await commands.spawnAgents({ parentRunId: parent.runId, idempotencyKey: "inbox", children: [spec("fast"), spec("slow")] });
+  const ids = receipt.items.map(item => item.run.runId);
+  try {
+    const first = await commands.receiveRuns(parent.runId, ids);
+    assert.deepEqual(first.results.map(item => item.runId), [ids[0]]);
+    assert.deepEqual(first.pendingRunIds, [ids[1]]);
+    release();
+    const second = await commands.receiveRuns(parent.runId, ids, undefined, {}, [ids[0]]);
+    assert.equal(second.state, "ready");
+    assert.deepEqual(second.results.map(item => item.runId), [ids[1]]);
+    assert.deepEqual(calls, ["fast", "slow"]);
+  } finally { release(); await commands.closeReceivers(); }
+});
+
+test("independent joins wait for shared root capacity", async () => {
+  const repository = new InMemoryRunTreeRepository();
+  const owner = await root(repository, { grant: grant({ maxParallelRuns: 1 }) });
+  let active = 0;
+  let peak = 0;
+  const executor = {
+    async execute(run) {
+      active += 1;
+      peak = Math.max(peak, active);
+      await new Promise(resolve => setTimeout(resolve, 20));
+      active -= 1;
+      return { status: "done", result: run.runId, contentRef: `memory://${run.runId}`, fingerprint: run.runId };
+    },
+  };
+  const results = await Promise.all(Array.from({ length: 6 }, async (_, index) => {
+    const commands = new RunCommandService(repository, new AgentTreeRunSupervisor({ repository, executor }));
+    const receipt = await commands.spawnAgents({ parentRunId: owner.runId, idempotencyKey: `parallel:${index}`, children: [spec(`parallel-${index}`)] });
+    return commands.joinRuns(owner.runId, receipt.items.map(item => item.run.runId));
+  }));
+  assert.ok(results.every(result => result.state === "ready"));
+  assert.equal(peak, 1);
+});
+
+test("model continues an existing Agent with prior task and result context", async () => {
+  const adapters = new InMemoryAgentAdapters();
+  const childInputs = [];
+  const agent = new Agent({
+    model: testGateway({
+      async invoke(request) {
+        const texts = request.messages.map(m => m.content);
+        if (texts.includes("SPECIALIST")) {
+          childInputs.push(texts);
+          if (texts.includes("Follow up")) {
+            assert.ok(texts.some(text => typeof text === "string" && text.startsWith("First task")));
+            assert.ok(texts.includes("Remember cobalt"));
+            assert.ok(texts.some(text => typeof text === "string" && text.includes('"source":"fixture"')));
+          }
+          return { message: { role: "assistant", content: "Remember cobalt" }, finishReason: "stop" };
+        }
+        const receipts = request.messages.filter(m => m.role === "tool")
+          .map(m => typeof m.content === "string" ? JSON.parse(m.content) : m.content);
+        let name, args;
+        if (receipts.length === 0) {
+          name = "delegateToAgents";
+          args = { children: [{ name: "specialist", title: "Specialist", instruction: "SPECIALIST", objective: "First task", input: { source: "fixture" } }] };
+        } else if (receipts.length === 1) {
+          name = "listAgents"; args = {};
+        } else if (receipts.length === 2) {
+          assert.ok(receipts.at(-1).agents, JSON.stringify(receipts));
+          const child = receipts.at(-1).agents[0];
+          assert.equal(child.contextVersion, 1);
+          name = "continueAgent";
+          args = { agentId: child.agentId, expectedContextVersion: child.contextVersion, message: "Follow up" };
+        } else {
+          assert.equal(receipts.at(-1).agents[0].contextVersion, 2);
+          return { message: { role: "assistant", content: "Combined answer" }, finishReason: "stop" };
+        }
+        return { message: { role: "assistant", content: "", toolCalls: [{ id: `call-${receipts.length}`, name, arguments: args }] }, finishReason: "tool_calls" };
+      },
+    }),
+    runRepository: adapters.runs, outputPublisher: adapters.outputs,
+    agentTree: { repository: adapters.runTree },
+  });
+  const handle = await agent.submit({ messages: [{ role: "user", content: "Review and follow up." }],
+    enabledTools: ["delegateToAgents", "receiveAgentResults", "listAgents", "continueAgent"] }, RUN_OPTIONS);
+  assert.equal((await handle.result).output, "Combined answer");
+  const descendants = await adapters.runTree.listDescendants(handle.runId);
+  assert.equal(descendants.length, 2);
+  assert.equal(new Set(descendants.map(run => run.agentId)).size, 1);
+  assert.equal(childInputs.length, 2);
 });
