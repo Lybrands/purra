@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "purra-anthropic"
-version = "1.0.0"
+version = "1.0.1"
 description = "Official Anthropic Messages SDK adapter for PurrA"
 requires-python = ">=3.11"
-dependencies = ["purra==1.0.0", "anthropic==1.3.0"]
+dependencies = ["purra==1.0.1", "anthropic==1.3.0"]
 readme = "README.md"
 license = "MIT"
 
