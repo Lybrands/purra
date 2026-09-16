@@ -279,6 +279,9 @@ class PlanningStreamParser:
     def _accept_record(self, line: str, size: int) -> PlanningProgress | None:
         if size > 262_144:
             raise PlanningStreamError("record byte limit")
+        if not line.strip():
+            self._consumed += size
+            return None
         if self._plan is not None:
             raise PlanningStreamError("record after final plan")
         try:

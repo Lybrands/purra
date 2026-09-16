@@ -92,6 +92,10 @@ export class PlanningStreamParser {
 
   #acceptRecord(line: string, size: number): PlanningProgress | undefined {
     if (size > 262_144) throw invalid("record byte limit");
+    if (line.trim() === "") {
+      this.#consumed += size;
+      return undefined;
+    }
     if (this.#plan !== undefined) throw invalid("record after final plan");
     let row: Record<string, unknown>;
     try { row = JSON.parse(line); } catch { throw invalid("invalid JSON record"); }

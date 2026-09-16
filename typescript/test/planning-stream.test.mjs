@@ -91,6 +91,12 @@ for (const row of fixture.invalid) test(`planning stream rejects: ${row.name}`, 
   }, (error) => error.code === "invalid_planning_stream");
 });
 
+test("planning stream ignores trailing blank records", () => {
+  const parser = new PlanningStreamParser();
+  parser.feed(`${wire()}\n`);
+  assert.deepEqual(parser.finish(), plan);
+});
+
 test("public planning is committed before plan arrival, replayable, and private data never leaks", async () => {
   const gate = deferred();
   const { agent, adapters, state } = managed([[{ reasoningDelta: "PRIVATE_REASONING" }, wire("准备核对证据。"), gate, wire().slice(0, -1)]]);

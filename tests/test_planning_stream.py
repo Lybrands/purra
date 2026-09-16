@@ -701,6 +701,14 @@ def test_json_byte_ceiling_applies_across_multiple_records():
         parser.feed(record)
 
 
+def test_planning_stream_ignores_trailing_blank_records():
+    parser = PlanningStreamParser()
+
+    parser.feed(wire() + "\n")
+
+    assert parser.finish()["needsTodos"] is False
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize('case', FIXTURE['managedRuns'], ids=lambda case: case['name'])
 async def test_shared_managed_planning_lifecycle(case):
