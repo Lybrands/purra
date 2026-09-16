@@ -57,8 +57,17 @@ class InMemoryRunTreeRepository:
         transaction_lock: asyncio.Lock | None = None,
         clock_ms=None,
         state: AgentTreeState[AgentNode, AgentTreeRun, ContextCheckpoint, SpawnAgentsReceipt, ContinueAgentReceipt] | None = None,
+        initial_run_sequence: int = 0,
     ) -> None:
-        self._state = state if state is not None else AgentTreeState()
+        if type(initial_run_sequence) is not int or initial_run_sequence < 0:
+            raise ValueError("initial_run_sequence must be a non-negative integer")
+        if state is not None and initial_run_sequence:
+            raise ValueError("state and initial_run_sequence are mutually exclusive")
+        self._state = (
+            state
+            if state is not None
+            else AgentTreeState(run_sequence=initial_run_sequence)
+        )
         self._lock = transaction_lock or asyncio.Lock()
         self._clock_ms = clock_ms or (lambda: int(time.time() * 1000))
         if not callable(self._clock_ms):
@@ -781,7 +790,6 @@ class InMemoryRunTreeRepository:
     def _next_sequence(self) -> int:
         self._state.sequence += 1
         return self._state.sequence
-
 
 
 

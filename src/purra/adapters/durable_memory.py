@@ -973,8 +973,19 @@ class InMemoryLongTaskRepository(
         normalized_reason = _required(reason_code, "restart recovery reason")
         async with self._lock:
             recovered: list[str] = []
+            now_ms = int(time.time() * 1000)
             for state in self._state.tasks.values():
                 if state.record.status is not LongTaskStatus.RUNNING:
+                    continue
+                if any(
+                    unit.status in {
+                        LongTaskUnitStatus.CLAIMED,
+                        LongTaskUnitStatus.RUNNING,
+                    }
+                    and unit.lease_expires_at_ms is not None
+                    and unit.lease_expires_at_ms > now_ms
+                    for unit in state.units.values()
+                ):
                     continue
                 recovered.append(state.record.id)
                 if state.record.cancellation_requested_at_ms is not None:

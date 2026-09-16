@@ -776,15 +776,6 @@ class AgentRuntime:
                 error_code=authorization.error_code,
             )
             return
-        if loop.round_index >= loop.round_limit - 1:
-            loop.terminal_result = _runtime_result(
-                run_id,
-                RuntimeOutcome.FAILED,
-                loop.used_model,
-                loop.round_number,
-                error_code="max_model_rounds",
-            )
-            return
         if publish_model_commentary:
             await self._model_manager.publish_model_stream_commentary(
                 loop.stream.receipt.output_stream_id

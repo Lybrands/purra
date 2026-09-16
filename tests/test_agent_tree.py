@@ -169,6 +169,20 @@ def test_shared_agent_tree_protocol_matches_python_contracts():
 
 
 @pytest.mark.asyncio
+async def test_initial_run_sequence_seeds_public_reference_repository():
+    repository = InMemoryRunTreeRepository(initial_run_sequence=41)
+
+    root = await _root(repository)
+    created = await repository.spawn_agents(SpawnAgentsCommand(
+        parent_run_id=root.run_id,
+        idempotency_key="seeded-child",
+        children=(_spec("seeded"),),
+    ))
+
+    assert created.items[0].run.run_id == "agent-run-42"
+
+
+@pytest.mark.asyncio
 async def test_spawn_is_atomic_idempotent_and_globally_scheduled():
     repository = InMemoryRunTreeRepository()
     root = await _root(repository)

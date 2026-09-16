@@ -1153,9 +1153,10 @@ async def assert_long_task_repository_conforms(
     second = await repository.claim_ready_unit(
         task_id,
         worker_id="worker-c",
-        lease_duration_ms=30_000,
+        lease_duration_ms=1,
     )
     assert second is not None and second.id == "summarize"
+    await asyncio.sleep(0.01)
     recovered = await repository.recover_after_restart()
     assert task_id in recovered
     paused = await repository.load(task_id)

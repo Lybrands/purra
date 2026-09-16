@@ -220,7 +220,7 @@ class LongTaskRepository(Protocol):
         *,
         reason_code: str = "execution_recovery_after_restart",
     ) -> Sequence[str]:
-        """Pause running tasks and release process-owned unit leases."""
+        """Pause running tasks after their persisted execution leases expire."""
         ...
 
 
