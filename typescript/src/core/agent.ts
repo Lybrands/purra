@@ -176,7 +176,6 @@ export interface AgentOptions {
 
 export interface AgentRuntimeLimits extends ModelStreamLimits {
   readonly runTimeoutMs: number | null;
-  readonly maxIdenticalToolBatches: number;
 }
 
 export interface AgentRunInput {
@@ -1217,8 +1216,6 @@ export class Agent {
       ? this.#maxRounds
       : resumeCheckpoint.roundLimit;
     let finalizationOnly = resumeCheckpoint?.finalizationOnly ?? false;
-    let lastToolBatchDigest = resumeCheckpoint?.lastToolBatchDigest ?? "";
-    let identicalToolBatchCount = resumeCheckpoint?.identicalToolBatchCount ?? 0;
     const planningMode = resolvePlanningMode(input.planningMode);
     const planningRequiredToolNames = new Set(
       this.#tools.planningRequiredNamesFor(input.enabledTools),
@@ -1619,7 +1616,7 @@ export class Agent {
           schemaVersion: 3, runId: session.runId, phase: "tool_ready",
           executionProfile: planning?.state === undefined ? planningMode : "planned",
           ...(planning?.state === undefined ? {} : { planning: planning.checkpoint() }),
-          roundLimit, finalizationOnly, lastToolBatchDigest, identicalToolBatchCount,
+          roundLimit, finalizationOnly,
           initialPlanningOpen: autoPlanningPhase === "initial", nextRound: round,
           messages: messages.slice(0, -1), assistant, invocationId: receipt!.invocationId, appliedGenerationLimit: turn.appliedGenerationLimit,
           allowedToolNames: businessTools.map(tool => tool.name),
@@ -1678,23 +1675,6 @@ export class Agent {
         }
         throw error;
       }
-      const toolBatchDigest = await stableFingerprint(calls.map((call, index) => ({
-        name: call.name,
-        arguments: call.arguments,
-        result: batch.messages[index]?.content ?? null,
-      })) as JsonValue);
-      if (toolBatchDigest === lastToolBatchDigest) {
-        identicalToolBatchCount += 1;
-      } else {
-        lastToolBatchDigest = toolBatchDigest;
-        identicalToolBatchCount = 1;
-      }
-      if (identicalToolBatchCount > this.#runtimeLimits.maxIdenticalToolBatches) {
-        throw new AgentError(
-          "agent_no_progress",
-          "Agent repeated an identical tool batch without progress",
-        );
-      }
       messages.push(...batch.messages);
       if (autoPlanningPhase === "initial") autoPlanningPhase = "remaining";
       activeEvidence = mergeEvidence(activeEvidence, batch.contextEvidence);
@@ -1739,7 +1719,7 @@ export class Agent {
           executionProfile: planning?.state === undefined ? planningMode : "planned",
           ...(planning?.state === undefined ? {} : { planning: planning.checkpoint() }),
           ...(pendingReplan === undefined ? {} : { pendingReplan }),
-          roundLimit, finalizationOnly, lastToolBatchDigest, identicalToolBatchCount,
+          roundLimit, finalizationOnly,
           initialPlanningOpen: false, nextRound: round + 1,
           messages: Object.freeze(copyMessages(messages)), context: context?.snapshot() ?? null,
           contextEvidence: activeEvidence, responseAttempts, recoveryAttempts: recovery.snapshot(),
@@ -2758,11 +2738,6 @@ function resolveRuntimeLimits(
 ): AgentRuntimeLimits {
   return Object.freeze({
     runTimeoutMs: nullableLimit(value?.runTimeoutMs, 900_000, "runTimeoutMs"),
-    maxIdenticalToolBatches: positiveLimit(
-      value?.maxIdenticalToolBatches,
-      2,
-      "maxIdenticalToolBatches",
-    ),
     activityIdleTimeoutMs: nullableLimit(
       value?.activityIdleTimeoutMs,
       30_000,

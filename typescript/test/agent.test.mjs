@@ -135,33 +135,6 @@ test("open-ended rounds continue beyond the former fixed limit while evidence ch
   assert.equal(calls, 9);
 });
 
-test("open-ended rounds stop repeated identical tool evidence", async () => {
-  let callId = 0;
-  const agent = new Agent({
-    maxRounds: null,
-    runtimeLimits: { maxIdenticalToolBatches: 2 },
-    model: testGateway({
-      async invoke() {
-        callId += 1;
-        return {
-          message: {
-            role: "assistant",
-            content: "",
-            toolCalls: [{ id: `call-${callId}`, name: "lookup", arguments: {} }],
-          },
-          finishReason: "tool_calls",
-        };
-      },
-    }),
-    tools: [readTool("lookup", () => ({ content: "same", effectState: "not_started" }))],
-  });
-
-  await assert.rejects(
-    agent.invoke({ messages: [{ role: "user", content: "Loop" }] }),
-    (error) => error instanceof AgentError && error.code === "agent_no_progress",
-  );
-});
-
 test("Agent rejects an invalid tool batch before any handler runs", async () => {
   let executions = 0;
   const agent = new Agent({

@@ -9,8 +9,6 @@ domain concepts and concrete tool handlers stay behind ports.
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import json
 from dataclasses import dataclass, replace
 from time import perf_counter
 from typing import Any, AsyncIterator, Awaitable, Callable, Mapping, Sequence
@@ -177,37 +175,6 @@ def _match_tool_retry_links(
     return links
 
 
-def _stable_json_text(value: str) -> str:
-    try:
-        return json.dumps(
-            json.loads(value),
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-    except (TypeError, ValueError):
-        return value
-
-
-def _tool_batch_digest(calls, results) -> str:
-    payload = [
-        (
-            call.name,
-            _stable_json_text(call.arguments_json),
-            _stable_json_text(result.content),
-            result.error,
-        )
-        for call, result in zip(calls, results)
-    ]
-    return hashlib.sha256(
-        json.dumps(
-            payload,
-            ensure_ascii=False,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    ).hexdigest()
-
-
 @dataclass(slots=True)
 class _RuntimeLoopState:
     messages: list[AgentMessage]
@@ -260,8 +227,6 @@ class _RuntimeLoopState:
     emitted_delta_count: int = 0
     initial_planning_open: bool = True
     finalization_only: bool = False
-    last_tool_batch_digest: str = ""
-    identical_tool_batch_count: int = 0
 
 
 class AgentRuntime:
@@ -722,8 +687,6 @@ class AgentRuntime:
         loop.pending_tool_input_retries = checkpoint.pending_tool_input_retries
         loop.initial_planning_open = checkpoint.initial_planning_open
         loop.finalization_only = checkpoint.finalization_only
-        loop.last_tool_batch_digest = checkpoint.last_tool_batch_digest
-        loop.identical_tool_batch_count = checkpoint.identical_tool_batch_count
         loop.dynamic_replan_pending = checkpoint.dynamic_replan_pending
         loop.pending_recovery_error_code = checkpoint.pending_recovery_error_code
         loop.failed_tool_recovery_error_code = checkpoint.failed_tool_recovery_error_code
@@ -760,8 +723,6 @@ class AgentRuntime:
                 pending_tool_input_retries=loop.pending_tool_input_retries,
                 initial_planning_open=loop.initial_planning_open,
                 finalization_only=loop.finalization_only,
-                last_tool_batch_digest=loop.last_tool_batch_digest,
-                identical_tool_batch_count=loop.identical_tool_batch_count,
                 dynamic_replan_pending=loop.dynamic_replan_pending,
                 pending_recovery_error_code=loop.pending_recovery_error_code,
                 failed_tool_recovery_error_code=loop.failed_tool_recovery_error_code,
@@ -1032,24 +993,6 @@ class AgentRuntime:
                 loop.used_model,
                 loop.round_number,
                 error_code="invalid_tool_results",
-            )
-            return
-        digest = _tool_batch_digest(loop.calls, batch_result.results)
-        if digest == loop.last_tool_batch_digest:
-            loop.identical_tool_batch_count += 1
-        else:
-            loop.last_tool_batch_digest = digest
-            loop.identical_tool_batch_count = 1
-        if (
-            loop.identical_tool_batch_count
-            > self._limits.max_identical_tool_batches
-        ):
-            loop.terminal_result = _runtime_result(
-                run_id,
-                RuntimeOutcome.FAILED,
-                loop.used_model,
-                loop.round_number,
-                error_code="agent_no_progress",
             )
             return
         if scope_tools_to_observer and self._observer is not None:

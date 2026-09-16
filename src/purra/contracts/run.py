@@ -299,7 +299,7 @@ class RuntimeLimits:
 
     ``max_model_rounds`` is the base budget for planned transitions,
     corrections, and the final response. ``None`` leaves the run governed by
-    invocation, time, token, output, cancellation, and no-progress limits. A
+    invocation, time, token, output, and cancellation limits. A
     ``PROGRESSED`` tool result has a
     stronger contract: it committed valid partial work while keeping the same
     plan step active. Such rounds may unlock the separately bounded progress
@@ -313,7 +313,6 @@ class RuntimeLimits:
     max_run_generation_tokens: int | None
     max_model_rounds: int | None = 6
     max_progress_rounds: int = 32
-    max_identical_tool_batches: int = 2
     provider_activity_idle_timeout_ms: int | None = 30_000
     provider_progress_idle_timeout_ms: int | None = 60_000
     provider_invocation_timeout_ms: int | None = 300_000
@@ -339,7 +338,6 @@ class RuntimeLimits:
             non_negative_int(self.max_progress_rounds, "max progress rounds"),
         )
         for name in (
-            "max_identical_tool_batches",
             "max_model_invocation_attempts",
             "max_provider_output_events",
             "max_provider_output_bytes",

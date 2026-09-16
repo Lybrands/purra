@@ -1401,12 +1401,6 @@ function copyExecutionCheckpoint(
   if (copied.finalizationOnly !== undefined && typeof copied.finalizationOnly !== "boolean") {
     throw new TypeError("Invalid checkpoint finalization state");
   }
-  if (copied.lastToolBatchDigest !== undefined && typeof copied.lastToolBatchDigest !== "string") {
-    throw new TypeError("Invalid checkpoint tool batch digest");
-  }
-  if (copied.identicalToolBatchCount !== undefined) {
-    nonNegativeInteger(copied.identicalToolBatchCount, "checkpoint identical tool batch count");
-  }
   if (!Array.isArray(copied.recoveryAttempts)) {
     throw new TypeError("Agent execution checkpoint recovery attempts are invalid");
   }

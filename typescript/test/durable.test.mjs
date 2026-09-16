@@ -120,7 +120,6 @@ test("shared Runtime and output batch defaults stay aligned", async () => {
   );
   assert.deepEqual(snapshot.preset.runtimeLimits, {
     runTimeoutMs: 900_000,
-    maxIdenticalToolBatches: 2,
     activityIdleTimeoutMs: durableFixture.runtimeDefaults.providerActivityIdleTimeoutMs,
     progressIdleTimeoutMs: durableFixture.runtimeDefaults.providerProgressIdleTimeoutMs,
     invocationTimeoutMs: durableFixture.runtimeDefaults.providerInvocationTimeoutMs,

@@ -1033,43 +1033,6 @@ async def test_open_ended_rounds_continue_past_six_while_evidence_changes():
 
 
 @pytest.mark.asyncio
-async def test_identical_tool_evidence_stops_as_no_progress():
-    async def lookup(state, arguments, signal=None):
-        del state, arguments, signal
-        return ToolHandlerResult(content="same", effect_state="not_started")
-
-    gateway = _ScriptedToolGateway(("lookup", "lookup", "lookup", None))
-    core = _core(
-        gateway=gateway,
-        context=_Context(),
-        runtime_limits=RuntimeLimits(
-            max_model_rounds=None,
-            max_run_generation_tokens=None,
-            max_identical_tool_batches=2,
-        ),
-        tool_catalog=InMemoryToolCatalog((ToolRegistration(
-            schema=ToolSchema(
-                name="lookup",
-                description="Look up data.",
-                parameters={"type": "object", "properties": {}},
-            ),
-            handler=lookup,
-            policy=ToolPolicy(mode="read", title="Lookup"),
-        ),)),
-    )
-    try:
-        result = await (await core.submit(replace(
-            _request(), tools_enabled=True, context_window=32_768
-        ))).wait()
-    finally:
-        await core.close()
-
-    assert result.status is RunStatus.FAILED
-    assert result.error == "agent_no_progress"
-    assert len(gateway.invocations) == 3
-
-
-@pytest.mark.asyncio
 async def test_planned_run_fails_closed_without_a_configured_planner():
     gateway = _Gateway("must not run")
     context = _Context()
