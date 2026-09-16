@@ -360,8 +360,14 @@ async def _promote_auto_run(
         return None, ()
     if remaining_checkpoint is not None:
         request = replace(request, messages=remaining_checkpoint.messages)
+    open_ended_rounds = core._runtime_limits.max_model_rounds is None
     remaining_model_rounds = (
-        core._runtime_limits.max_model_rounds - activation.round_count
+        (
+            core._runtime_limits.max_model_invocation_attempts
+            if open_ended_rounds
+            else core._runtime_limits.max_model_rounds
+        )
+        - activation.round_count
     )
     if remaining_model_rounds < 1:
         await controller.record_trace(TraceRecord(
@@ -373,7 +379,7 @@ async def _promote_auto_run(
         return None, ()
     promoted_limits = replace(
         core._runtime_limits,
-        max_model_rounds=remaining_model_rounds,
+        max_model_rounds=(None if open_ended_rounds else remaining_model_rounds),
     )
     pre_planning_compaction: dict[str, Any] = {
         "outcome": "not_configured"
@@ -543,7 +549,9 @@ async def _promote_auto_run(
             planning_mode=PlanningMode.PLANNED,
             planning_available=True,
             planning_required_tool_names=frozenset(),
-            model_round_limit=resume_checkpoint.round_limit,
+            model_round_limit=(
+                None if open_ended_rounds else resume_checkpoint.round_limit
+            ),
             signal=signal,
             resume_checkpoint=resume_checkpoint,
         )
@@ -615,7 +623,7 @@ async def _promote_auto_run(
         planning_mode=PlanningMode.PLANNED,
         planning_available=True,
         planning_required_tool_names=frozenset(),
-        model_round_limit=remaining_model_rounds,
+        model_round_limit=(None if open_ended_rounds else remaining_model_rounds),
         signal=signal,
     )
     events.extend(runtime_events)

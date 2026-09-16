@@ -426,6 +426,7 @@ class AgentPreset:
             "runtimeLimits": {
                 "maxModelRounds": self.runtime_limits.max_model_rounds,
                 "maxProgressRounds": self.runtime_limits.max_progress_rounds,
+                "maxIdenticalToolBatches": self.runtime_limits.max_identical_tool_batches,
                 "providerActivityIdleTimeoutMs": self.runtime_limits.provider_activity_idle_timeout_ms,
                 "providerProgressIdleTimeoutMs": self.runtime_limits.provider_progress_idle_timeout_ms,
                 "providerInvocationTimeoutMs": self.runtime_limits.provider_invocation_timeout_ms,

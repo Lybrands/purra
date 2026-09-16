@@ -9,6 +9,8 @@ domain concepts and concrete tool handlers stay behind ports.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 from dataclasses import dataclass, replace
 from time import perf_counter
 from typing import Any, AsyncIterator, Awaitable, Callable, Mapping, Sequence
@@ -175,6 +177,37 @@ def _match_tool_retry_links(
     return links
 
 
+def _stable_json_text(value: str) -> str:
+    try:
+        return json.dumps(
+            json.loads(value),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError):
+        return value
+
+
+def _tool_batch_digest(calls, results) -> str:
+    payload = [
+        (
+            call.name,
+            _stable_json_text(call.arguments_json),
+            _stable_json_text(result.content),
+            result.error,
+        )
+        for call, result in zip(calls, results)
+    ]
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
 @dataclass(slots=True)
 class _RuntimeLoopState:
     messages: list[AgentMessage]
@@ -193,6 +226,7 @@ class _RuntimeLoopState:
     recovery_ledger: RecoveryLedger
     round_limit: int
     absolute_round_limit: int
+    enforce_model_round_limit: bool
     declined_response_pending: bool = False
     response_repair_pending: bool = False
     public_presentation_pending: bool = False
@@ -225,6 +259,9 @@ class _RuntimeLoopState:
     request_fingerprint: str = ""
     emitted_delta_count: int = 0
     initial_planning_open: bool = True
+    finalization_only: bool = False
+    last_tool_batch_digest: str = ""
+    identical_tool_batch_count: int = 0
 
 
 class AgentRuntime:
@@ -351,7 +388,11 @@ class AgentRuntime:
                     RuntimeOutcome.FAILED,
                     loop.used_model,
                     start_round_index,
-                    error_code="max_model_rounds",
+                    error_code=(
+                        "max_model_rounds"
+                        if loop.enforce_model_round_limit
+                        else "max_model_invocation_attempts_exceeded"
+                    ),
                 )
                 return
         budget_error = _context_budget_contract_error(
@@ -393,7 +434,11 @@ class AgentRuntime:
                     RuntimeOutcome.FAILED,
                     loop.used_model,
                     round_index,
-                    error_code="max_model_rounds",
+                    error_code=(
+                        "max_model_rounds"
+                        if loop.enforce_model_round_limit
+                        else "max_model_invocation_attempts_exceeded"
+                    ),
                 )
                 return
             if _is_canceled(signal):
@@ -552,7 +597,11 @@ class AgentRuntime:
             RuntimeOutcome.FAILED,
             loop.used_model,
             loop.round_limit,
-            error_code="max_model_rounds",
+            error_code=(
+                "max_model_rounds"
+                if loop.enforce_model_round_limit
+                else "max_model_invocation_attempts_exceeded"
+            ),
         )
 
     async def _resolve_planning_activation(
@@ -672,6 +721,9 @@ class AgentRuntime:
         loop.last_tool_outcome = checkpoint.last_tool_outcome
         loop.pending_tool_input_retries = checkpoint.pending_tool_input_retries
         loop.initial_planning_open = checkpoint.initial_planning_open
+        loop.finalization_only = checkpoint.finalization_only
+        loop.last_tool_batch_digest = checkpoint.last_tool_batch_digest
+        loop.identical_tool_batch_count = checkpoint.identical_tool_batch_count
         loop.dynamic_replan_pending = checkpoint.dynamic_replan_pending
         loop.pending_recovery_error_code = checkpoint.pending_recovery_error_code
         loop.failed_tool_recovery_error_code = checkpoint.failed_tool_recovery_error_code
@@ -707,6 +759,9 @@ class AgentRuntime:
                 last_tool_outcome=loop.last_tool_outcome,
                 pending_tool_input_retries=loop.pending_tool_input_retries,
                 initial_planning_open=loop.initial_planning_open,
+                finalization_only=loop.finalization_only,
+                last_tool_batch_digest=loop.last_tool_batch_digest,
+                identical_tool_batch_count=loop.identical_tool_batch_count,
                 dynamic_replan_pending=loop.dynamic_replan_pending,
                 pending_recovery_error_code=loop.pending_recovery_error_code,
                 failed_tool_recovery_error_code=loop.failed_tool_recovery_error_code,
@@ -776,6 +831,13 @@ class AgentRuntime:
                 error_code=authorization.error_code,
             )
             return
+        if (
+            loop.enforce_model_round_limit
+            and loop.round_index >= loop.round_limit - 1
+        ):
+            loop.round_limit += 1
+            loop.absolute_round_limit += 1
+            loop.finalization_only = True
         if publish_model_commentary:
             await self._model_manager.publish_model_stream_commentary(
                 loop.stream.receipt.output_stream_id
@@ -970,6 +1032,24 @@ class AgentRuntime:
                 loop.used_model,
                 loop.round_number,
                 error_code="invalid_tool_results",
+            )
+            return
+        digest = _tool_batch_digest(loop.calls, batch_result.results)
+        if digest == loop.last_tool_batch_digest:
+            loop.identical_tool_batch_count += 1
+        else:
+            loop.last_tool_batch_digest = digest
+            loop.identical_tool_batch_count = 1
+        if (
+            loop.identical_tool_batch_count
+            > self._limits.max_identical_tool_batches
+        ):
+            loop.terminal_result = _runtime_result(
+                run_id,
+                RuntimeOutcome.FAILED,
+                loop.used_model,
+                loop.round_number,
+                error_code="agent_no_progress",
             )
             return
         if scope_tools_to_observer and self._observer is not None:
@@ -1797,6 +1877,7 @@ class AgentRuntime:
                 loop.declined_response_pending
                 or loop.response_repair_pending
                 or loop.public_presentation_pending
+                or loop.finalization_only
             )
             else tuple(
                 schema
@@ -2065,13 +2146,19 @@ class AgentRuntime:
                 details={"receiptCount": len(context_receipts)},
             )
         configured_tools = tuple(tools) if request.tools_enabled else ()
-        resolved_round_limit = (
+        configured_round_limit = (
             self._limits.max_model_rounds
             if model_round_limit is None
             else int(model_round_limit)
         )
-        if resolved_round_limit < 1:
+        if configured_round_limit is not None and configured_round_limit < 1:
             raise ValueError("model round limit must be positive")
+        enforce_model_round_limit = configured_round_limit is not None
+        resolved_round_limit = (
+            configured_round_limit
+            if configured_round_limit is not None
+            else self._limits.max_model_invocation_attempts
+        )
         return _RuntimeLoopState(
             messages=messages,
             invocation_context=ModelInvocationContext(
@@ -2115,6 +2202,7 @@ class AgentRuntime:
             provider_required_tool_choice_enabled=bool(force_tool_choice),
             recovery_ledger=RecoveryLedger(self._recovery_policy),
             round_limit=resolved_round_limit,
+            enforce_model_round_limit=enforce_model_round_limit,
             absolute_round_limit=(
                 resolved_round_limit
                 + self._limits.max_progress_rounds

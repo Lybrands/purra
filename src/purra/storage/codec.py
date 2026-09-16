@@ -12,7 +12,15 @@ _ENUM_IDS = {cls: name for name, cls in ENUMS.items()}
 
 # Additive media capability: absent in older text-only checkpoints. Omit unknown
 # when writing so their canonical encoding and identity remain unchanged.
-_OPTIONAL_FIELDS = {"ModelProtocolCapabilities": {"image_input": "unknown"}}
+_OPTIONAL_FIELDS = {
+    "AgentExecutionCheckpoint": {
+        "finalization_only": False,
+        "last_tool_batch_digest": "",
+        "identical_tool_batch_count": 0,
+    },
+    "ModelProtocolCapabilities": {"image_input": "unknown"},
+    "RuntimeLimits": {"max_identical_tool_batches": 2},
+}
 
 
 def _encode(value):
