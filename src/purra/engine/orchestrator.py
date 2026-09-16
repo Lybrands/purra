@@ -433,6 +433,19 @@ def _require_runtime_limits(value: RuntimeLimits | None) -> RuntimeLimits:
     return value
 
 
+def _remaining_model_round_budget(
+    limits: RuntimeLimits,
+    rounds_used: int,
+) -> tuple[int, bool]:
+    open_ended = limits.max_model_rounds is None
+    budget = (
+        limits.max_model_invocation_attempts
+        if open_ended
+        else limits.max_model_rounds
+    )
+    return budget - rounds_used, open_ended
+
+
 class AgentCore:
     """Compose context, model/tool runtime and optional execution capabilities.
 
@@ -1764,9 +1777,7 @@ class AgentCore:
             return None, ()
         if remaining_checkpoint is not None:
             request = replace(request, messages=remaining_checkpoint.messages)
-        remaining_model_rounds = (
-            self._runtime_limits.max_model_rounds - activation.round_count
-        )
+        remaining_model_rounds, open_ended_rounds = _remaining_model_round_budget(self._runtime_limits, activation.round_count)
         if remaining_model_rounds < 1:
             await controller.record_trace(TraceRecord(
                 stage="planning_activation",
@@ -1777,7 +1788,7 @@ class AgentCore:
             return None, ()
         promoted_limits = replace(
             self._runtime_limits,
-            max_model_rounds=remaining_model_rounds,
+            max_model_rounds=(None if open_ended_rounds else remaining_model_rounds),
         )
         pre_planning_compaction: dict[str, Any] = {
             "outcome": "not_configured"
@@ -1947,7 +1958,9 @@ class AgentCore:
                 planning_mode=PlanningMode.PLANNED,
                 planning_available=True,
                 planning_required_tool_names=frozenset(),
-                model_round_limit=resume_checkpoint.round_limit,
+                model_round_limit=(
+                    None if open_ended_rounds else resume_checkpoint.round_limit
+                ),
                 signal=signal,
                 resume_checkpoint=resume_checkpoint,
             )
@@ -2019,7 +2032,7 @@ class AgentCore:
             planning_mode=PlanningMode.PLANNED,
             planning_available=True,
             planning_required_tool_names=frozenset(),
-            model_round_limit=remaining_model_rounds,
+            model_round_limit=(None if open_ended_rounds else remaining_model_rounds),
             signal=signal,
         )
         events.extend(runtime_events)

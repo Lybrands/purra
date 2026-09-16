@@ -222,7 +222,12 @@ class PlanningCapability:
                         constraints=constraints,
                         max_tool_steps=max(
                             0,
-                            self._runtime_limits.max_model_rounds - 2,
+                            (
+                                self._runtime_limits.max_model_rounds
+                                if self._runtime_limits.max_model_rounds
+                                is not None
+                                else self._runtime_limits.max_model_invocation_attempts
+                            ) - 2,
                         ),
                     )
                     if self._task_orchestration is not None:

@@ -7,7 +7,15 @@ import sys
 
 import pytest
 
-from purra.contracts import RunCreateParams, ToolCall, ToolHandlerResult
+from purra.agent_execution_checkpoint import AgentExecutionCheckpoint
+from purra.contracts import (
+    AgentMessage,
+    MessageRole,
+    RunCreateParams,
+    RuntimeLimits,
+    ToolCall,
+    ToolHandlerResult,
+)
 from purra.events import AgentEvent
 from purra.storage import StorageSession, dump_storage_value, load_storage_value
 
@@ -47,6 +55,25 @@ def test_codec_uses_only_explicit_record_ids_even_if_other_dataclasses_are_impor
     encoded[1] = "purra.contracts.ToolCall"
     with pytest.raises(ValueError):
         load_storage_value(json.dumps(encoded))
+
+
+def test_additive_runtime_fields_are_optional_in_persisted_records():
+    limits_body = dump_storage_value(RuntimeLimits(max_run_generation_tokens=None))
+    checkpoint_body = dump_storage_value(AgentExecutionCheckpoint(
+        run_id="run-1",
+        next_round=1,
+        round_limit=6,
+        messages=(AgentMessage(role=MessageRole.USER, content="继续"),),
+    ))
+
+    assert "max_identical_tool_batches" not in limits_body
+    assert "finalization_only" not in checkpoint_body
+    assert "last_tool_batch_digest" not in checkpoint_body
+    assert load_storage_value(limits_body).max_identical_tool_batches == 2
+    restored = load_storage_value(checkpoint_body)
+    assert restored.finalization_only is False
+    assert restored.last_tool_batch_digest == ""
+    assert restored.identical_tool_batch_count == 0
 
 
 @pytest.mark.parametrize("change", [

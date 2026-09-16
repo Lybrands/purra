@@ -10,6 +10,14 @@ from ._records import ENUMS, RECORDS
 _RECORD_IDS = {cls: (name, names) for name, (cls, names) in RECORDS.items()}
 _ENUM_IDS = {cls: name for name, cls in ENUMS.items()}
 
+_OPTIONAL_FIELDS = {
+    "AgentExecutionCheckpoint": {
+        "finalization_only": False,
+        "last_tool_batch_digest": "",
+        "identical_tool_batch_count": 0,
+    },
+    "RuntimeLimits": {"max_identical_tool_batches": 2},
+}
 
 def _encode(value):
     if isinstance(value, Enum):
@@ -24,7 +32,12 @@ def _encode(value):
         return ["datetime", value.isoformat()]
     if type(value) in _RECORD_IDS:
         name, names = _RECORD_IDS[type(value)]
-        return ["record", name, {key: _encode(getattr(value, key)) for key in names}]
+        defaults = _OPTIONAL_FIELDS.get(name, {})
+        return ["record", name, {
+            key: _encode(getattr(value, key))
+            for key in names
+            if key not in defaults or getattr(value, key) != defaults[key]
+        }]
     if isinstance(value, Mapping):
         return ["map", [[_encode(k), _encode(v)] for k, v in value.items()]]
     if isinstance(value, (list, tuple, set, frozenset)):
@@ -51,9 +64,21 @@ def _decode(row, depth=0):
         return ENUMS[row[1]](row[2])
     if kind == "record":
         cls, names = RECORDS[row[1]]
-        if not isinstance(row[2], dict) or set(row[2]) != set(names):
+        optional = _OPTIONAL_FIELDS.get(row[1], {})
+        if (
+            not isinstance(row[2], dict)
+            or set(row[2]) - set(names)
+            or set(names) - set(row[2]) - set(optional)
+        ):
             raise ValueError("invalid storage record fields")
-        return cls(**{key: _decode(row[2][key], depth + 1) for key in names})
+        return cls(**{
+            key: (
+                _decode(row[2][key], depth + 1)
+                if key in row[2]
+                else optional[key]
+            )
+            for key in names
+        })
     if kind == "map":
         if not isinstance(row[1], list):
             raise ValueError("invalid storage map")

@@ -1720,7 +1720,9 @@ class RuntimeLimits:
     """Bound stalled execution separately from monotonic partial progress.
 
     ``max_model_rounds`` is the base budget for planned transitions,
-    corrections, and the final response. A ``PROGRESSED`` tool result has a
+    corrections, and the final response. ``None`` leaves the run governed by
+    invocation, time, token, output, cancellation, and no-progress limits. A
+    ``PROGRESSED`` tool result has a
     stronger contract: it committed valid partial work while keeping the same
     plan step active. Such rounds may unlock the separately bounded progress
     allowance without turning malformed or stalled loops into unbounded runs.
@@ -1731,8 +1733,9 @@ class RuntimeLimits:
     """
 
     max_run_generation_tokens: int | None
-    max_model_rounds: int = 6
+    max_model_rounds: int | None = None
     max_progress_rounds: int = 32
+    max_identical_tool_batches: int = 2
     provider_activity_idle_timeout_ms: int | None = 30_000
     provider_progress_idle_timeout_ms: int | None = 60_000
     provider_invocation_timeout_ms: int | None = 300_000
@@ -1747,15 +1750,18 @@ class RuntimeLimits:
     max_stream_chunks: int = 100_000
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "max_model_rounds", positive_int(
-            self.max_model_rounds, "max model rounds"
-        ))
+        object.__setattr__(
+            self,
+            "max_model_rounds",
+            optional_positive_int(self.max_model_rounds, "max model rounds"),
+        )
         object.__setattr__(
             self,
             "max_progress_rounds",
             non_negative_int(self.max_progress_rounds, "max progress rounds"),
         )
         for name in (
+            "max_identical_tool_batches",
             "max_model_invocation_attempts",
             "max_provider_output_events",
             "max_provider_output_bytes",

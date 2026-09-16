@@ -948,6 +948,126 @@ async def test_auto_planning_activation_uses_the_run_model_round_budget():
 
 
 @pytest.mark.asyncio
+async def test_last_finite_round_tool_call_gets_tool_free_finalization_round():
+    calls = []
+
+    async def lookup(state, arguments, signal=None):
+        del state, arguments, signal
+        calls.append("lookup")
+        return ToolHandlerResult(content="evidence", effect_state="not_started")
+
+    gateway = _ScriptedToolGateway(("lookup", None))
+    core = _core(
+        gateway=gateway,
+        context=_Context(),
+        runtime_limits=RuntimeLimits(
+            max_model_rounds=1,
+            max_run_generation_tokens=None,
+        ),
+        tool_catalog=InMemoryToolCatalog((ToolRegistration(
+            schema=ToolSchema(
+                name="lookup",
+                description="Look up data.",
+                parameters={"type": "object", "properties": {}},
+            ),
+            handler=lookup,
+            policy=ToolPolicy(mode="read", title="Lookup"),
+        ),)),
+    )
+    try:
+        result = await (await core.submit(replace(
+            _request(), tools_enabled=True, context_window=32_768
+        ))).wait()
+    finally:
+        await core.close()
+
+    assert result.status is RunStatus.DONE
+    assert calls == ["lookup"]
+    assert len(gateway.invocations) == 2
+    assert gateway.invocations[1].tools == ()
+
+
+@pytest.mark.asyncio
+async def test_open_ended_rounds_continue_past_six_while_evidence_changes():
+    call_count = 0
+
+    async def lookup(state, arguments, signal=None):
+        nonlocal call_count
+        del state, arguments, signal
+        call_count += 1
+        return ToolHandlerResult(
+            content=f"evidence-{call_count}",
+            effect_state="not_started",
+        )
+
+    gateway = _ScriptedToolGateway((*(["lookup"] * 7), None, None))
+    core = _core(
+        gateway=gateway,
+        context=_Context(),
+        runtime_limits=RuntimeLimits(
+            max_model_rounds=None,
+            max_run_generation_tokens=None,
+        ),
+        tool_catalog=InMemoryToolCatalog((ToolRegistration(
+            schema=ToolSchema(
+                name="lookup",
+                description="Look up data.",
+                parameters={"type": "object", "properties": {}},
+            ),
+            handler=lookup,
+            policy=ToolPolicy(mode="read", title="Lookup"),
+        ),)),
+    )
+    try:
+        result = await (await core.submit(replace(
+            _request(), tools_enabled=True, context_window=32_768
+        ))).wait()
+    finally:
+        await core.close()
+
+    assert result.status is RunStatus.DONE
+    assert call_count == 7
+    assert len(gateway.invocations) == 9
+
+
+@pytest.mark.asyncio
+async def test_identical_tool_evidence_stops_as_no_progress():
+    async def lookup(state, arguments, signal=None):
+        del state, arguments, signal
+        return ToolHandlerResult(content="same", effect_state="not_started")
+
+    gateway = _ScriptedToolGateway(("lookup", "lookup", "lookup", None))
+    core = _core(
+        gateway=gateway,
+        context=_Context(),
+        runtime_limits=RuntimeLimits(
+            max_model_rounds=None,
+            max_run_generation_tokens=None,
+            max_identical_tool_batches=2,
+        ),
+        tool_catalog=InMemoryToolCatalog((ToolRegistration(
+            schema=ToolSchema(
+                name="lookup",
+                description="Look up data.",
+                parameters={"type": "object", "properties": {}},
+            ),
+            handler=lookup,
+            policy=ToolPolicy(mode="read", title="Lookup"),
+        ),)),
+    )
+    try:
+        result = await (await core.submit(replace(
+            _request(), tools_enabled=True, context_window=32_768
+        ))).wait()
+    finally:
+        await core.close()
+
+    assert result.status is RunStatus.FAILED
+    assert result.error == "agent_no_progress"
+    assert len(gateway.invocations) == 3
+
+
+@pytest.mark.asyncio
 async def test_planned_run_fails_closed_without_a_configured_planner():
     gateway = _Gateway("must not run")
     context = _Context()

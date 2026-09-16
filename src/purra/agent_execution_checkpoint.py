@@ -47,6 +47,9 @@ class AgentExecutionCheckpoint:
     last_tool_outcome: ToolBatchOutcome = ToolBatchOutcome.COMPLETED
     pending_tool_input_retries: tuple[tuple[str, str], ...] = ()
     initial_planning_open: bool = True
+    finalization_only: bool = False
+    last_tool_batch_digest: str = ""
+    identical_tool_batch_count: int = 0
     schema_version: int = 2
     phase: str = "model_ready"
     execution_profile: str = "reactive"
@@ -106,11 +109,17 @@ class AgentExecutionCheckpoint:
             "logical_round_number",
             "progress_rounds",
             "tool_input_recovery_epoch",
+            "identical_tool_batch_count",
         ):
             value = int(getattr(self, name))
             if value < 0 or (name == "round_limit" and value == 0):
                 raise ValueError(f"checkpoint {name} is invalid")
             object.__setattr__(self, name, value)
+        object.__setattr__(
+            self,
+            "last_tool_batch_digest",
+            str(self.last_tool_batch_digest or "").strip(),
+        )
         for name in (
             "logical_required_tool_call_enabled",
             "provider_required_tool_choice_enabled",
@@ -118,6 +127,7 @@ class AgentExecutionCheckpoint:
             "response_repair_pending",
             "public_presentation_pending",
             "initial_planning_open",
+            "finalization_only",
         ):
             object.__setattr__(self, name, bool(getattr(self, name)))
         object.__setattr__(
@@ -178,6 +188,9 @@ class AgentExecutionCheckpoint:
                 for call_id, tool_name in self.pending_tool_input_retries
             ],
             "initialPlanningOpen": self.initial_planning_open,
+            "finalizationOnly": self.finalization_only,
+            "lastToolBatchDigest": self.last_tool_batch_digest,
+            "identicalToolBatchCount": self.identical_tool_batch_count,
             "planningState": thaw_json_mapping(self.planning_state),
             "dynamicReplanPending": self.dynamic_replan_pending,
             "pendingRecoveryErrorCode": self.pending_recovery_error_code,
@@ -257,6 +270,11 @@ class AgentExecutionCheckpoint:
                 if isinstance(item, Mapping)
             ),
             initial_planning_open=value["initialPlanningOpen"],
+            finalization_only=bool(value.get("finalizationOnly")),
+            last_tool_batch_digest=str(value.get("lastToolBatchDigest") or ""),
+            identical_tool_batch_count=int(
+                value.get("identicalToolBatchCount") or 0
+            ),
             planning_state=_mapping(value.get("planningState"), "checkpoint planning state"),
             dynamic_replan_pending=bool(value.get("dynamicReplanPending", False)),
             pending_recovery_error_code=value.get("pendingRecoveryErrorCode"),
