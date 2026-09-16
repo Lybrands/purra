@@ -40,16 +40,24 @@ npm --prefix typescript run check
 包安装与外部调用检查见 [SDK 冒烟检查](../sdk-parity-smoke/README.zh-CN.md)。
 
 
-## Object output, MCP and recovery inspection
+## 能力契约与测试
 
-- [Structured output](structured-output.md): `structured_output.json`,
-  `structured_model_task.json`, and `native_output_schema.json`.
-- [Safe read concurrency](tool-concurrency.md): `tool_concurrency.json`.
-- [Integration checks and read-only diagnosis](integration-inspection.md):
-  `recovery_inspection.json`.
-- MCP protocol and selected-schema rejection vectors live in
-  `integrations/mcp/fixtures/tools.json` and run in both optional package suites.
+- [结构化输出](../docs/structured-output.md)：`structured_output.json`、`structured_model_task.json`、`native_output_schema.json`。
+- [计划逐片段输出](../docs/planning-output.md)：`planning_stream.json`。
+- [只读工具并发](../docs/tool-concurrency.md)：`tool_concurrency.json`。
+- [接入报告与恢复诊断](../docs/integration-inspection.md)：`recovery_inspection.json`。
+- MCP 协议与 Schema 拒绝用例位于 `integrations/mcp/fixtures/tools.json`，由两端可选包测试读取。
 
-Protocol fixtures and SDK transport tests do not certify a live model or remote
-server. Record deterministic, installed-artifact, real-service and downstream
-results separately. See each contract for supported dialects and unknown states.
+本目录保留共享测试数据和测试运行指南；功能契约位于 `docs/`，
+升级步骤见[迁移指南](../docs/migrations/1.0.zh-CN.md)。
+确定性测试、安装包检查、真实服务验证和使用方验收应分别记录，不能互相替代。
+
+## 仓库文档边界
+
+Git 保留安装指南、公开契约、可复现的测试用法及第三方许可声明。
+实施计划、单次验收证据、发布清单和本机环境记录放在已忽略的 `docs/plans/`、`docs/prd/` 或
+`conformance/reports/`，不要强制加入跟踪。删除当前文件不会清除旧提交中的副本。
+
+SQLite 多进程／负载检查使用临时合成数据库：
+`PYTHONPATH=src:integrations/sqlite/python/src python integrations/sqlite/python/scripts/verify_load.py --output /tmp/purra-load.json`。
+先构建 TypeScript Core 和 SQLite；此检查不验证真实 Provider 延迟。

@@ -1,12 +1,9 @@
-# PurrA 1.0.0 candidate: support and upgrades
+# PurrA 1.0.0: support and upgrades
 
 English | [简体中文](release-1.0.zh-CN.md)
 
-The package metadata in this checkout is 1.0.0. This is an **unreleased
-candidate**, not a publication announcement. Registry installation commands may
-still select an earlier published version. Candidate consumers must use the
-exact wheel or npm tarball supplied with their candidate manifest. Install Core
-and optional PurrA packages at the same version.
+The package metadata in this checkout is 1.0.0. Install Core and optional
+PurrA packages at the same `1.0.0` version from their registries.
 
 ## Included capabilities
 
@@ -84,14 +81,14 @@ and [TypeScript](../integrations/mcp/typescript/README.md) MCP contracts.
 ## Moving from 0.x
 
 There are no 0.x aliases, fallback codecs, or automatic migrations promised by
-this candidate. Do not upgrade an active production Run in place.
+this release. Do not upgrade an active production Run in place.
 
 1. Inventory the installed SDK and optional-package versions, storage formats,
    invocation receipts, presets, model/tool bindings, and active Runs. Retain a
    backup and an environment capable of reading the original data.
 2. Finish or explicitly cancel active Runs in the old runtime and reconcile
    external effects. A canceled local wait does not prove a remote effect stopped.
-3. Install the exact candidate in a separate environment. Start with a new
+3. Install the exact release in a separate environment. Start with a new
    database, or a disposable backup copy when assessing historical readability.
    Do not point a validation harness at the only production copy.
 4. Check historical reads and new Run execution independently. Restart the host,
@@ -101,7 +98,7 @@ SQLite storage is v4 and rejects other storage versions; Python and TypeScript
 snapshots are not interchangeable. New invocation receipts use schema v3.
 TypeScript imports reject unsupported receipt versions. Matching SQLite v4 alone
 therefore does not establish that a 0.x history or active checkpoint is compatible.
-No general 0.x history migration is supplied here; using a new database does not
+No general 0.x history migration is supplied in this release; using a new database does not
 authorize deleting the old one. Recovery inspection never grants resume authority.
 
 For future 1.x storage changes, release notes must distinguish historical reads,
@@ -109,13 +106,12 @@ validated offline migration, and continuation of active Runs. Requiring active
 Runs to drain is explicit; silently discarding them or their history is not an
 upgrade policy. Any migration must be verified before it is described as supported.
 
-## Candidate verification and publication
+## Release verification and publication
 
-Validate the exact candidate commit and all package artifacts, including exported
+Validate the exact release commit and all package artifacts, including exported
 APIs, dependency pins, file inventories, and hashes. Run the supported CI runtime
 matrix separately from a single local platform check. A successful local build
 or package version does not mean CI ran or a registry received an upload.
 
 Publication requires a matching `v1.0.0` tag, package metadata, release notes and
 artifacts, plus completion or explicit disposition of the open support gates.
-Preparation does not create a tag, push a branch, or publish packages.

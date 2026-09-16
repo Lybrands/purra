@@ -4,9 +4,10 @@ __pycache__/
 .venv/
 build/
 dist/
-docs/
+# Local implementation plans and one-off verification/release evidence.
+/docs/plans/
+/docs/prd/
 conformance/reports/
 node_modules/
-typescript/dist/
 typescript/.example-dist/
 typescript/*.tgz

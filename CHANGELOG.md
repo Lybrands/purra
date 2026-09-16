@@ -1,6 +1,13 @@
 # Changelog
 
-## 1.0.0 — Unreleased candidate
+## 1.0.0 — 2026-09-16
+
+
+- Emit provisional `planning.delta` events for each nonempty planning content chunk,
+  before complete JSON records arrive. Persist and validate exact source evidence
+  in memory and SQLite; preserve final plan admission and private reasoning.
+  Planning content is now publicly previewable, including invalid/retried fragments.
+  See [chunk streaming contract](docs/planning-output.md).
 
 - Add versioned strict object output contracts, shared JSON identity, and Run-bound
   structured model tasks with local/native-required modes and explicit bounded repairs.
@@ -16,8 +23,13 @@
   Unknown usage, permissions and effects remain unknown; diagnosis grants no
   execution authority. Include public examples and external package consumers.
 
-Candidate support and upgrade boundaries: [English](conformance/release-1.0.md) ·
-[简体中文](conformance/release-1.0.zh-CN.md). This entry does not indicate publication.
+### Upgrade notes
+
+SQLite storage moves from v3 to v4 without automatic migration. Complete or cancel
+active Runs before upgrading and retain the old data and runtime for rollback.
+See the [upgrade guide](docs/migrations/1.0.md) / [升级指南](docs/migrations/1.0.zh-CN.md),
+and the [release support guide](conformance/release-1.0.md) /
+[发布支持说明](conformance/release-1.0.zh-CN.md).
 
 ## 0.5.0 — 2026-09-06
 

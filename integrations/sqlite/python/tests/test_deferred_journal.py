@@ -86,7 +86,8 @@ async def test_deferred_writes_reject_missing_or_discontinuous_journals(tmp_path
 
 
 @pytest.mark.asyncio
-async def test_planning_reads_persisted_provider_evidence_and_terminal_closes_operation(tmp_path, monkeypatch):
+@pytest.mark.parametrize("kind", ["planning.progress", "planning.delta"])
+async def test_planning_reads_persisted_provider_evidence_and_terminal_closes_operation(tmp_path, monkeypatch, kind):
     storage = SqliteAgentAdapters(tmp_path / "planning.db", scope="deferred")
     try:
         run = await begin(storage)
@@ -105,19 +106,19 @@ async def test_planning_reads_persisted_provider_evidence_and_terminal_closes_op
         wire = '{"v":1,"type":"progress","text":"核对资料。"}\n'
         progress = PlanningStreamParser().feed(wire)[0]
         entries = ({"sourceChunkIndex": 1, "kind": "provider.content_delta", "payload": {"delta": wire}},)
-        raw = draft(run, "raw", source="provider", kind="provider.delta_batch",
+        raw = draft(run, "provider-batch:invoke:diagnostic:private:1:1", source="provider", kind="provider.delta_batch",
             output_stream_id="stream", invocation_id="invoke", payload={
                 "schemaVersion": "purra.provider-delta-batch/v1", "entries": entries,
                 "sourceChunkStart": 1, "sourceChunkEnd": 1, "payloadDigest": provider_delta_batch_digest(entries),
             })
-        projected = draft(run, "planning:invoke:1", source="provider", kind="planning.progress",
+        projected = draft(run, "planning-delta:invoke:1" if kind == "planning.delta" else "planning:invoke:1", source="provider", kind=kind,
             output_stream_id="stream", invocation_id="invoke", channel="commentary", visibility="public",
             payload={"schemaVersion": PLANNING_STREAM_SCHEMA, "operationId": "plan", "revision": 0,
-                "attempt": 1, **progress.to_mapping()})
+                "attempt": 1, **({"sourceChunkIndex": 1, "textDelta": wire} if kind == "planning.delta" else progress.to_mapping())})
         await storage.outputs.append_event(raw)
         before = await storage.outputs.list_events(run, after_sequence=0)
-        with pytest.raises(ContractViolationError, match="Provider source"):
-            await storage.outputs.append_event(replace(projected, payload={**projected.payload, "text": "伪造内容"}))
+        with pytest.raises(ContractViolationError):
+            await storage.outputs.append_event(replace(projected, payload={**projected.payload, ("textDelta" if kind == "planning.delta" else "text"): "伪造内容"}))
         assert await storage.outputs.list_events(run, after_sequence=0) == before
         accepted = await storage.outputs.append_event(projected)
         assert await storage.outputs.append_event(projected) == accepted

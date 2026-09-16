@@ -165,6 +165,7 @@ function sourceEvent(run: StoredRun, key: string, root = true): OutputEvent | un
 
 const METERED_KINDS = new Set([
   "planning.progress",
+  "planning.delta",
   "model.delta",
   "provider.delta_batch",
   "reasoning.delta",
@@ -1045,6 +1046,30 @@ function validatePlanningProjection(run: StoredRun, draft: OutputEventDraft): vo
         "Agent progress lacks exact persisted Provider authority",
       );
     }
+  }
+  if (draft.kind === "planning.delta") {
+    const p = draft.payload ?? {};
+    const id = p.invocationId;
+    const index = p.sourceChunkIndex;
+    const receipt = typeof id === "string" ? run.invocationReceipts.get(id) : undefined;
+    const scope = receipt?.planningScope;
+    const source = sourceEvent(run, `provider-batch:${id}:model:private:${index}:${index}`);
+    const entries = source?.payload.entries as readonly { kind: string; sourceChunkIndex: number; payload: { delta?: string } }[] | undefined;
+    if (receipt === undefined || scope === undefined || !run.openInvocations.has(receipt.invocationId)
+      || receipt.outputProtocol !== PLANNING_STREAM_SCHEMA || p.schemaVersion !== PLANNING_STREAM_SCHEMA
+      || p.source !== "provider" || draft.channel !== "commentary"
+      || p.operationId !== scope.operationId || p.revision !== scope.revision || p.attempt !== (receipt.planningAttempt ?? 0)
+      || !Number.isSafeInteger(index) || (index as number) < 0
+      || typeof p.textDelta !== "string" || p.textDelta.length === 0
+      || Object.keys(p).sort().join(",") !== "attempt,invocationId,operationId,revision,schemaVersion,source,sourceChunkIndex,textDelta"
+      || draft.sourceKey !== `planning-delta:${id}:${index}`
+      || source?.runId !== run.runId || source?.kind !== "provider.delta_batch" || source?.visibility !== "private"
+      || source?.payload.invocationId !== id
+      || !entries?.some((entry) => entry.kind === "provider.content_delta" && entry.sourceChunkIndex === index && entry.payload.delta === p.textDelta)) {
+      throw new AgentError("planning_projection_invalid", "Planning delta differs from persisted Provider chunk");
+    }
+    requirePlanningOperation(run, scope.operationId);
+    return;
   }
   if (draft.kind !== "planning.progress") return;
   const p = draft.payload ?? {};

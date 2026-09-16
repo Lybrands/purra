@@ -132,7 +132,7 @@ for (const corruption of ["DELETE FROM purra_output_events WHERE sequence=2", "D
   });
 }
 
-test("planning and terminal settlement read persisted evidence and reject forged progress", async (t) => {
+for (const kind of ["planning.progress", "planning.delta"]) test(`planning persisted evidence rejects forgery: ${kind}`, async (t) => {
   const dir = mkdtempSync(join(tmpdir(), "purra-deferred-planning-"));
   const storage = new SqliteAgentAdapters(join(dir, "agent.db"), { scope: "deferred" });
   try {
@@ -142,11 +142,11 @@ test("planning and terminal settlement read persisted evidence and reject forged
     await storage.runs.openInvocation("root", { ...invocation(), outputProtocol: "purra.planning-stream/v1", planningScope: { runId: "root", operationId: "plan", revision: 0 }, planningAttempt: 1 });
     const wire = JSON.stringify({ v: 1, type: "progress", text: "核对资料。" }) + "\n";
     const progress = new PlanningStreamParser().feed(wire)[0];
-    await storage.runs.appendEvent("root", { ...draft("raw"), kind: "provider.delta_batch", payload: { invocationId: "invoke", entries: [{ kind: "provider.content_delta", payload: { delta: wire } }] } });
-    const projection = { sourceKey: `planning:invoke:${progress.recordIndex}`, kind: "planning.progress", channel: "commentary", visibility: "public",
-      payload: { schemaVersion: "purra.planning-stream/v1", source: "provider", invocationId: "invoke", operationId: "plan", revision: 0, attempt: 1, ...progress } };
+    await storage.runs.appendEvent("root", { ...draft("provider-batch:invoke:model:private:1:1"), kind: "provider.delta_batch", payload: { invocationId: "invoke", entries: [{ sourceChunkIndex: 1, kind: "provider.content_delta", payload: { delta: wire } }] } });
+    const projection = { sourceKey: kind === "planning.delta" ? "planning-delta:invoke:1" : `planning:invoke:${progress.recordIndex}`, kind, channel: "commentary", visibility: "public",
+      payload: { schemaVersion: "purra.planning-stream/v1", source: "provider", invocationId: "invoke", operationId: "plan", revision: 0, attempt: 1, ...(kind === "planning.delta" ? { sourceChunkIndex: 1, textDelta: wire } : progress) } };
     const before = await storage.runs.listEvents("root", 0);
-    await assert.rejects(storage.runs.appendEvent("root", { ...projection, payload: { ...projection.payload, text: "forged" } }), { code: "planning_projection_invalid" });
+    await assert.rejects(storage.runs.appendEvent("root", { ...projection, payload: { ...projection.payload, [kind === "planning.delta" ? "textDelta" : "text"]: "forged" } }), { code: "planning_projection_invalid" });
     assert.deepEqual(await storage.runs.listEvents("root", 0), before);
     const accepted = await storage.runs.appendEvent("root", projection);
     assert.deepEqual(await storage.runs.appendEvent("root", projection), accepted);

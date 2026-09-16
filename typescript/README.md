@@ -6,12 +6,13 @@ An ESM Agent runtime for Node.js 22+. Applications provide a `ModelGateway` and
 compose tools, context, planning, and persistence through the public `purra` exports.
 
 
-## 1.0.0 candidate status
+## 1.0.0 release
 
-This checkout contains an unreleased 1.0.0 candidate. Install the exact local
-artifacts from its candidate manifest; registry commands do not identify this candidate.
-See the [candidate support and upgrade guide](../conformance/release-1.0.md)
-for structured tasks, read-only MCP, safe read concurrency, inspection, and 1.x compatibility.
+This checkout is the 1.0.0 release. Install matching Core and optional PurrA
+packages at `1.0.0` from their registries.
+See the [release support and upgrade guide](../conformance/release-1.0.md),
+[upgrade notes](../docs/migrations/1.0.md), and
+[public compatibility](../ARCHITECTURE.md#public-compatibility) before upgrading.
 
 ## Install
 
@@ -84,7 +85,10 @@ Run requests accept `planningMode`:
 | `planned` | Plan before executing the task. |
 
 The planner requires a streaming gateway. Subscribe to Run events for public
-`planning.progress`; private plans and reasoning are excluded. See the
+`planning.delta` for each nonempty raw planning content chunk, without waiting
+for complete JSON, and `planning.progress` for complete progress records. Raw
+previews may include invalid plan fragments; execution still requires validation.
+Reasoning remains private. See the [output contract](../docs/planning-output.md) and
 [planning example](examples/planner-streaming.ts) for subscription and replay.
 
 ## Budgets and persistence

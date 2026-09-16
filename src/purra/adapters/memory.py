@@ -329,6 +329,7 @@ _PROVIDER_OUTPUT_BUDGET_KINDS = frozenset({
     OutputEventKind.PROVIDER_TOOL_CALL_DELTA,
     OutputEventKind.PROVIDER_DELTA_BATCH,
     OutputEventKind.PLANNING_PROGRESS,
+    OutputEventKind.PLANNING_DELTA,
 })
 
 
@@ -412,9 +413,9 @@ def _validate_new_event(
                 "canonical event does not match its output stream"
             )
         if (stream.spec.output_protocol is not None and draft.visibility is OutputVisibility.PUBLIC
-                and draft.kind is not OutputEventKind.PLANNING_PROGRESS):
+                and draft.kind not in {OutputEventKind.PLANNING_PROGRESS, OutputEventKind.PLANNING_DELTA}):
             raise ContractViolationError("planning bytes cannot be published as ordinary text")
-    if draft.kind is OutputEventKind.PLANNING_PROGRESS:
+    if draft.kind in {OutputEventKind.PLANNING_PROGRESS, OutputEventKind.PLANNING_DELTA}:
         if run.status is not RunStatus.RUNNING:
             raise ContractViolationError("terminal Run cannot accept planning progress")
         _validate_planning_projection(state, draft)
@@ -437,7 +438,10 @@ def _validate_planning_projection(state: _MemoryState, draft: AgentOutputEventDr
     if (scope is None or payload.get("operationId") != scope.operation_id
             or payload.get("revision") != scope.revision
             or payload.get("attempt") != stream.spec.planning_attempt
-            or draft.source_event_key != f"planning:{draft.invocation_id}:{payload.get('recordIndex')}"):
+            or draft.source_event_key != (
+                f"planning-delta:{draft.invocation_id}:{payload.get('sourceChunkIndex')}"
+                if draft.kind is OutputEventKind.PLANNING_DELTA
+                else f"planning:{draft.invocation_id}:{payload.get('recordIndex')}")):
         raise ContractViolationError("planning projection scope mismatch")
     events = state.output_events.get(draft.run_id, [])
     stage = [e for e in events if e.payload.get("operationId") == scope.operation_id
@@ -445,6 +449,20 @@ def _validate_planning_projection(state: _MemoryState, draft: AgentOutputEventDr
     if (not stage or stage[-1].kind is not OutputEventKind.OPERATION_STARTED
             or stage[-1].payload.get("kind") != "planning"):
         raise ContractViolationError("planning operation is not active")
+    if draft.kind is OutputEventKind.PLANNING_DELTA:
+        index = payload["sourceChunkIndex"]
+        source = state.events_by_source_key.get(
+            f"provider-batch:{draft.invocation_id}:diagnostic:private:{index}:{index}"
+        )
+        if (source is None or source.run_id != draft.run_id
+                or source.invocation_id != draft.invocation_id
+                or source.visibility is not OutputVisibility.PRIVATE
+                or not any(entry.get("kind") == OutputEventKind.PROVIDER_CONTENT_DELTA.value
+                           and entry.get("sourceChunkIndex") == index
+                           and entry.get("payload", {}).get("delta") == payload["textDelta"]
+                           for entry in _batched_provider_entries(source))):
+            raise ContractViolationError("planning delta does not match Provider source")
+        return
     # ponytail: bounded replay (1 MiB, 16 projections); index record spans only if
     # profiling shows this small per-invocation verification dominates persistence.
     raw = "".join(str(entry["payload"].get("delta", ""))

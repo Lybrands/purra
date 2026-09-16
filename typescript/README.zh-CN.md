@@ -6,11 +6,12 @@
 组合工具、上下文、规划和持久化能力。
 
 
-## 1.0.0 候选状态
+## 1.0.0 正式发布
 
-当前源码为尚未发布的 1.0.0 候选。请按候选清单安装准确本地产物；注册表安装命令不保证获取本候选。
+当前源码为 1.0.0 正式发布版本。请从注册表安装版本严格一致的 Core 与可选 PurrA 包。
 首发结构化任务、MCP 只读工具、安全读批次并行及只读诊断的支持范围，
-以及 0.x 升级和 1.x 兼容承诺，见[候选说明](../conformance/release-1.0.zh-CN.md)。
+以及 0.x 升级和 1.x 兼容承诺，见[发布支持说明](../conformance/release-1.0.zh-CN.md)
+和[升级说明](../docs/migrations/1.0.zh-CN.md)。
 
 ## 安装
 
@@ -77,8 +78,9 @@ Run 请求通过 `planningMode` 选择模式：
 | `reactive` | 通过模型与工具循环执行，不激活规划。 |
 | `planned` | 执行任务前先规划。 |
 
-Planner 要求网关支持流式输出。订阅 Run 事件可接收公开的 `planning.progress`，
-其中不包含私有计划和推理。订阅与重放用法见[规划示例](examples/planner-streaming.ts)。
+Planner 要求网关支持流式输出。订阅 Run 事件可逐片段接收 `planning.delta`，无需等待完整 JSON；
+`planning.progress` 保留完整进度记录的语义。原始预览可能包含无效计划片段，执行仍须通过校验，推理保持私有。
+契约见[计划输出](../docs/planning-output.md)，订阅与重放用法见[规划示例](examples/planner-streaming.ts)。
 
 ## 预算与持久化
 
@@ -103,3 +105,5 @@ Core 会保留“未知”状态，而不会把它记成 0。
 - [示例](../examples/README.zh-CN.md)
 - [可选包](../integrations/README.zh-CN.md)
 - [MIT 许可证](LICENSE)
+
+长期公共接口约定见[兼容承诺](../ARCHITECTURE.md#public-compatibility)。
