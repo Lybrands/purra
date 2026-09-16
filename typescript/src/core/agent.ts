@@ -155,7 +155,7 @@ export interface AgentOptions {
   readonly approval?: ToolApprovalGateway;
   readonly idempotency?: ToolIdempotencyGateway;
   readonly toolLimits?: ToolExecutionLimits;
-  readonly maxRounds?: number;
+  readonly maxRounds?: number | null;
   readonly preset?: AgentPreset;
   readonly runRepository?: RunRepository;
   readonly outputPublisher?: OutputPublisher;
@@ -176,6 +176,7 @@ export interface AgentOptions {
 
 export interface AgentRuntimeLimits extends ModelStreamLimits {
   readonly runTimeoutMs: number | null;
+  readonly maxIdenticalToolBatches: number;
 }
 
 export interface AgentRunInput {
@@ -223,7 +224,7 @@ interface AutoPlanningPreparation {
 export class Agent {
   readonly #model: ModelGateway;
   readonly #tools: ToolCatalog;
-  readonly #maxRounds: number;
+  readonly #maxRounds: number | null;
   readonly #runtimeLimits: AgentRuntimeLimits;
   readonly #outputBatchLimits: OutputBatchLimits;
   readonly #capabilities: ModelCapabilitySnapshot;
@@ -264,8 +265,8 @@ export class Agent {
     if (typeof options.model?.invoke !== "function") {
       throw new TypeError("Agent requires a model gateway");
     }
-    const maxRounds = options.maxRounds ?? 8;
-    if (!Number.isSafeInteger(maxRounds) || maxRounds < 1) {
+    const maxRounds = options.maxRounds === undefined ? 8 : options.maxRounds;
+    if (maxRounds !== null && (!Number.isSafeInteger(maxRounds) || maxRounds < 1)) {
       throw new TypeError("maxRounds must be a positive integer");
     }
     this.#model = options.model;
@@ -574,7 +575,9 @@ export class Agent {
     } else {
       budgets = resolveBudgets(
         options.budgets,
-        this.#maxRounds + (treeGrant === undefined ? 1 : 0),
+        this.#maxRounds === null
+          ? null
+          : this.#maxRounds + (treeGrant === undefined ? 1 : 0),
       );
     }
     const metadata = copyMapping(request.metadata ?? {}, "Run metadata");
@@ -1210,7 +1213,12 @@ export class Agent {
     let pendingReplan = resumeCheckpoint?.pendingReplan;
     let responseAttempts = resumeCheckpoint?.responseAttempts ?? 0;
     let publicPresentationPending = false;
-    let roundLimit = resumeCheckpoint?.roundLimit ?? this.#maxRounds;
+    let roundLimit = resumeCheckpoint?.roundLimit === undefined
+      ? this.#maxRounds
+      : resumeCheckpoint.roundLimit;
+    let finalizationOnly = resumeCheckpoint?.finalizationOnly ?? false;
+    let lastToolBatchDigest = resumeCheckpoint?.lastToolBatchDigest ?? "";
+    let identicalToolBatchCount = resumeCheckpoint?.identicalToolBatchCount ?? 0;
     const planningMode = resolvePlanningMode(input.planningMode);
     const planningRequiredToolNames = new Set(
       this.#tools.planningRequiredNamesFor(input.enabledTools),
@@ -1249,7 +1257,7 @@ export class Agent {
 
     for (
       let round = resumeCheckpoint?.nextRound ?? 1;
-      round <= roundLimit;
+      roundLimit === null || round <= roundLimit;
       round += 1
     ) {
       const pendingTool = resumeCheckpoint?.phase === "tool_ready" && round === resumeCheckpoint.nextRound ? resumeCheckpoint : undefined;
@@ -1266,7 +1274,7 @@ export class Agent {
         ? input.enabledTools
         : transition?.allowedToolNames ?? [];
       if (pendingTool !== undefined) enabledTools = pendingTool.allowedToolNames.filter(name => enabledTools === undefined || enabledTools.includes(name));
-      if (publicPresentationPending) enabledTools = Object.freeze([]);
+      if (publicPresentationPending || finalizationOnly) enabledTools = Object.freeze([]);
       const businessTools = this.#tools.specsFor(enabledTools);
       const tools = Object.freeze([
         ...businessTools,
@@ -1385,7 +1393,7 @@ export class Agent {
             const decision = await this.#decideRecovery(recovery, {
               cause,
               action: "retry_model",
-              remainingModelRounds: roundLimit - round + 1,
+              remainingModelRounds: remainingModelRounds(roundLimit, round, true),
               cancellationRequested: input.signal?.aborted === true,
               visibleOutputEmitted,
             }, round, session);
@@ -1409,6 +1417,12 @@ export class Agent {
           "Tool calls are forbidden during public presentation",
         );
       }
+      if (finalizationOnly && calls.length > 0) {
+        throw new AgentError(
+          "max_rounds_exceeded",
+          "Agent exceeded its model round limit",
+        );
+      }
       if (calls.length === 0) {
         if (turn.finishReason === "tool_calls") {
           throw new AgentError("invalid_model_response", "finishReason=tool_calls requires a tool call");
@@ -1420,7 +1434,7 @@ export class Agent {
             cause: "missing_required_tool_call",
             action: "retry_model",
             scope,
-            remainingModelRounds: roundLimit - round,
+            remainingModelRounds: remainingModelRounds(roundLimit, round),
             cancellationRequested: input.signal?.aborted === true,
             visibleOutputEmitted,
           }, round, session);
@@ -1433,7 +1447,7 @@ export class Agent {
             cause: "missing_required_tool_call_replan",
             action: "replan",
             scope,
-            remainingModelRounds: roundLimit - round,
+            remainingModelRounds: remainingModelRounds(roundLimit, round),
             cancellationRequested: input.signal?.aborted === true,
             visibleOutputEmitted,
           }, round, session);
@@ -1454,7 +1468,7 @@ export class Agent {
           const decision = await this.#decideRecovery(recovery, {
             cause: "empty_model_response",
             action: "retry_model",
-            remainingModelRounds: roundLimit - round,
+            remainingModelRounds: remainingModelRounds(roundLimit, round),
             cancellationRequested: input.signal?.aborted === true,
             visibleOutputEmitted,
           }, round, session);
@@ -1475,7 +1489,7 @@ export class Agent {
           const decision = await this.#decideRecovery(recovery, {
             cause: rejection.recoveryCause,
             action: "retry_model",
-            remainingModelRounds: roundLimit - round,
+            remainingModelRounds: remainingModelRounds(roundLimit, round),
             retryable: responseAttempts < responseValidation.maxAttempts,
             cancellationRequested: input.signal?.aborted === true,
             visibleOutputEmitted,
@@ -1500,7 +1514,7 @@ export class Agent {
           messages.pop();
           messages.push(...publicPresentationMessages(assistant));
           publicPresentationPending = true;
-          roundLimit += 1;
+          if (roundLimit !== null) roundLimit += 1;
           continue;
         }
         planning?.state?.completeFinal();
@@ -1564,7 +1578,7 @@ export class Agent {
           cause: "unauthorized_tool",
           action: "retry_model",
           scope,
-          remainingModelRounds: roundLimit - round,
+          remainingModelRounds: remainingModelRounds(roundLimit, round),
           cancellationRequested: input.signal?.aborted === true,
           visibleOutputEmitted,
           effectState: "not_started",
@@ -1579,7 +1593,7 @@ export class Agent {
           cause: "unauthorized_tool_replan",
           action: "replan",
           scope,
-          remainingModelRounds: roundLimit - round,
+          remainingModelRounds: remainingModelRounds(roundLimit, round),
           cancellationRequested: input.signal?.aborted === true,
           visibleOutputEmitted,
           effectState: "not_started",
@@ -1605,7 +1619,8 @@ export class Agent {
           schemaVersion: 3, runId: session.runId, phase: "tool_ready",
           executionProfile: planning?.state === undefined ? planningMode : "planned",
           ...(planning?.state === undefined ? {} : { planning: planning.checkpoint() }),
-          roundLimit, initialPlanningOpen: autoPlanningPhase === "initial", nextRound: round,
+          roundLimit, finalizationOnly, lastToolBatchDigest, identicalToolBatchCount,
+          initialPlanningOpen: autoPlanningPhase === "initial", nextRound: round,
           messages: messages.slice(0, -1), assistant, invocationId: receipt!.invocationId, appliedGenerationLimit: turn.appliedGenerationLimit,
           allowedToolNames: businessTools.map(tool => tool.name),
           context: context?.snapshot() ?? null, contextEvidence: activeEvidence,
@@ -1648,7 +1663,7 @@ export class Agent {
           cause,
           action: "retry_model",
           scope: cause === "tool_input_invalid" ? "tool-input-sequence" : "tool-authorization-sequence",
-          remainingModelRounds: roundLimit - round,
+          remainingModelRounds: remainingModelRounds(roundLimit, round),
           cancellationRequested: input.signal?.aborted === true,
           visibleOutputEmitted,
           effectState: "not_started",
@@ -1662,6 +1677,23 @@ export class Agent {
           continue;
         }
         throw error;
+      }
+      const toolBatchDigest = await stableFingerprint(calls.map((call, index) => ({
+        name: call.name,
+        arguments: call.arguments,
+        result: batch.messages[index]?.content ?? null,
+      })) as JsonValue);
+      if (toolBatchDigest === lastToolBatchDigest) {
+        identicalToolBatchCount += 1;
+      } else {
+        lastToolBatchDigest = toolBatchDigest;
+        identicalToolBatchCount = 1;
+      }
+      if (identicalToolBatchCount > this.#runtimeLimits.maxIdenticalToolBatches) {
+        throw new AgentError(
+          "agent_no_progress",
+          "Agent repeated an identical tool batch without progress",
+        );
       }
       messages.push(...batch.messages);
       if (autoPlanningPhase === "initial") autoPlanningPhase = "remaining";
@@ -1679,7 +1711,7 @@ export class Agent {
           cause: "tool_execution_failed_replan",
           action: "replan",
           scope: `tool-round:${round}`,
-          remainingModelRounds: roundLimit - round,
+          remainingModelRounds: remainingModelRounds(roundLimit, round),
           cancellationRequested: input.signal?.aborted === true,
           visibleOutputEmitted,
           effectState,
@@ -1697,13 +1729,18 @@ export class Agent {
       } else {
         planning?.state?.completeToolRound();
       }
+      if (roundLimit !== null && round >= roundLimit) {
+        roundLimit += 1;
+        finalizationOnly = true;
+      }
       if (session !== undefined && (session.parentRunId !== undefined || this.#checkpointHandler !== undefined || this.#toolCheckpointHandler !== undefined)) {
         const checkpoint: AgentExecutionCheckpoint = Object.freeze({
           schemaVersion: 2, runId: session.runId, phase: "model_ready",
           executionProfile: planning?.state === undefined ? planningMode : "planned",
           ...(planning?.state === undefined ? {} : { planning: planning.checkpoint() }),
           ...(pendingReplan === undefined ? {} : { pendingReplan }),
-          roundLimit, initialPlanningOpen: false, nextRound: round + 1,
+          roundLimit, finalizationOnly, lastToolBatchDigest, identicalToolBatchCount,
+          initialPlanningOpen: false, nextRound: round + 1,
           messages: Object.freeze(copyMessages(messages)), context: context?.snapshot() ?? null,
           contextEvidence: activeEvidence, responseAttempts, recoveryAttempts: recovery.snapshot(),
         });
@@ -1968,7 +2005,9 @@ export class Agent {
       }),
       registrations: this.#tools.planningRegistrationsFor(input.enabledTools),
       planningContext: resumeCheckpoint?.planning?.capabilities.planningContext ?? staged?.planning.blocks ?? context?.snapshot().blocks ?? [],
-      maxRounds: resumeCheckpoint?.planning?.maxRounds ?? this.#maxRounds,
+      maxRounds: resumeCheckpoint?.planning?.maxRounds
+        ?? this.#maxRounds
+        ?? Number.MAX_SAFE_INTEGER,
       roundOffset: resumeCheckpoint?.planning?.roundOffset ?? 0,
     });
     if (resumeCheckpoint?.planning !== undefined) {
@@ -2022,7 +2061,9 @@ export class Agent {
     readonly context?: PreparedContext;
     readonly planning: PlannedExecutionCoordinator;
   }> {
-    const remainingRounds = this.#maxRounds - input.roundsUsed;
+    const remainingRounds = this.#maxRounds === null
+      ? Number.MAX_SAFE_INTEGER
+      : this.#maxRounds - input.roundsUsed;
     if (remainingRounds < 1) {
       throw new AgentError(
         "planning_activation_budget_exhausted",
@@ -2641,7 +2682,7 @@ async function awaitWithSignal<T>(promise: Promise<T>, signal: AbortSignal): Pro
 
 function resolveBudgets(
   value: RunOptions["budgets"],
-  maxRounds: number,
+  maxRounds: number | null,
 ): RunBudgets {
   if (value === null || typeof value !== "object") {
     throw new TypeError("Run options.budgets is required");
@@ -2717,6 +2758,11 @@ function resolveRuntimeLimits(
 ): AgentRuntimeLimits {
   return Object.freeze({
     runTimeoutMs: nullableLimit(value?.runTimeoutMs, 900_000, "runTimeoutMs"),
+    maxIdenticalToolBatches: positiveLimit(
+      value?.maxIdenticalToolBatches,
+      2,
+      "maxIdenticalToolBatches",
+    ),
     activityIdleTimeoutMs: nullableLimit(
       value?.activityIdleTimeoutMs,
       30_000,
@@ -2794,6 +2840,16 @@ function nullableLimit(
 ): number | null {
   if (value === null) return null;
   return positiveLimit(value, fallback, label);
+}
+
+function remainingModelRounds(
+  roundLimit: number | null,
+  round: number,
+  includeCurrent = false,
+): number {
+  return roundLimit === null
+    ? Number.MAX_SAFE_INTEGER
+    : Math.max(0, roundLimit - round + (includeCurrent ? 1 : 0));
 }
 
 function copyMapping(

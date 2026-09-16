@@ -69,6 +69,99 @@ test("Agent completes one validated model/tool loop", async () => {
   });
 });
 
+test("finite last-round tool call receives one tool-free finalization round", async () => {
+  let calls = 0;
+  const requests = [];
+  const agent = new Agent({
+    maxRounds: 1,
+    model: testGateway({
+      async invoke(request) {
+        requests.push(request);
+        if (requests.length === 1) {
+          return {
+            message: {
+              role: "assistant",
+              content: "",
+              toolCalls: [{ id: "call-1", name: "lookup", arguments: {} }],
+            },
+            finishReason: "tool_calls",
+          };
+        }
+        return { message: { role: "assistant", content: "done" }, finishReason: "stop" };
+      },
+    }),
+    tools: [readTool("lookup", () => {
+      calls += 1;
+      return { content: "evidence", effectState: "not_started" };
+    })],
+  });
+
+  const result = await agent.invoke({ messages: [{ role: "user", content: "Lookup" }] });
+
+  assert.equal(result.output, "done");
+  assert.equal(calls, 1);
+  assert.equal(requests.length, 2);
+  assert.deepEqual(requests[1].tools, []);
+});
+
+test("open-ended rounds continue beyond the former fixed limit while evidence changes", async () => {
+  let calls = 0;
+  const agent = new Agent({
+    maxRounds: null,
+    model: testGateway({
+      async invoke() {
+        if (calls < 9) {
+          return {
+            message: {
+              role: "assistant",
+              content: "",
+              toolCalls: [{ id: `call-${calls}`, name: "lookup", arguments: { index: calls } }],
+            },
+            finishReason: "tool_calls",
+          };
+        }
+        return { message: { role: "assistant", content: "done" }, finishReason: "stop" };
+      },
+    }),
+    tools: [readTool("lookup", ({ index }) => {
+      calls += 1;
+      return { content: `evidence-${index}`, effectState: "not_started" };
+    }, { inputSchema: objectSchema({ index: { type: "integer" } }, ["index"]) })],
+  });
+
+  const result = await agent.invoke({ messages: [{ role: "user", content: "Continue" }] });
+
+  assert.equal(result.output, "done");
+  assert.equal(calls, 9);
+});
+
+test("open-ended rounds stop repeated identical tool evidence", async () => {
+  let callId = 0;
+  const agent = new Agent({
+    maxRounds: null,
+    runtimeLimits: { maxIdenticalToolBatches: 2 },
+    model: testGateway({
+      async invoke() {
+        callId += 1;
+        return {
+          message: {
+            role: "assistant",
+            content: "",
+            toolCalls: [{ id: `call-${callId}`, name: "lookup", arguments: {} }],
+          },
+          finishReason: "tool_calls",
+        };
+      },
+    }),
+    tools: [readTool("lookup", () => ({ content: "same", effectState: "not_started" }))],
+  });
+
+  await assert.rejects(
+    agent.invoke({ messages: [{ role: "user", content: "Loop" }] }),
+    (error) => error instanceof AgentError && error.code === "agent_no_progress",
+  );
+});
+
 test("Agent rejects an invalid tool batch before any handler runs", async () => {
   let executions = 0;
   const agent = new Agent({

@@ -1394,7 +1394,19 @@ function copyExecutionCheckpoint(
   }
   nonNegativeInteger(copied.responseAttempts, "checkpoint response attempts");
   if (copied.executionProfile === "planned" && copied.planning === undefined) throw new TypeError("Planned checkpoint requires its coordinator");
-  if (copied.roundLimit !== undefined && (!Number.isSafeInteger(copied.roundLimit) || copied.roundLimit < 1)) throw new TypeError("Invalid checkpoint round limit");
+  if (copied.roundLimit !== undefined && copied.roundLimit !== null
+    && (!Number.isSafeInteger(copied.roundLimit) || copied.roundLimit < 1)) {
+    throw new TypeError("Invalid checkpoint round limit");
+  }
+  if (copied.finalizationOnly !== undefined && typeof copied.finalizationOnly !== "boolean") {
+    throw new TypeError("Invalid checkpoint finalization state");
+  }
+  if (copied.lastToolBatchDigest !== undefined && typeof copied.lastToolBatchDigest !== "string") {
+    throw new TypeError("Invalid checkpoint tool batch digest");
+  }
+  if (copied.identicalToolBatchCount !== undefined) {
+    nonNegativeInteger(copied.identicalToolBatchCount, "checkpoint identical tool batch count");
+  }
   if (!Array.isArray(copied.recoveryAttempts)) {
     throw new TypeError("Agent execution checkpoint recovery attempts are invalid");
   }
@@ -1419,7 +1431,8 @@ export function copyToolExecutionCheckpoint(value: AgentToolExecutionCheckpoint)
   if (!Number.isSafeInteger(value.appliedGenerationLimit) || value.appliedGenerationLimit < 1) throw new TypeError("Invalid settled generation limit");
   for (const attempt of copied.recoveryAttempts) nonNegativeInteger(attempt.attempts, "checkpoint recovery attempts");
   if (assistant.role !== "assistant" || calls.length !== 1 || copied.pendingReplan !== undefined
-    || copied.roundLimit === undefined || copied.nextRound >= copied.roundLimit
+    || copied.roundLimit === undefined
+    || (copied.roundLimit !== null && copied.nextRound >= copied.roundLimit)
     || !Array.isArray(allowedToolNames) || allowedToolNames.some(name => typeof name !== "string" || !name.trim())
     || new Set(allowedToolNames).size !== allowedToolNames.length || !allowedToolNames.includes(calls[0]!.name)
     || messages.some(message => message.toolCallId === calls[0]!.id || message.toolCalls?.some(call => call.id === calls[0]!.id))) {

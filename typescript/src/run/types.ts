@@ -156,7 +156,10 @@ export interface AgentExecutionCheckpoint {
   readonly phase: "model_ready";
   readonly executionProfile: "reactive" | "auto" | "planned";
   readonly planning?: import("../planning/coordinator.js").PlanningCheckpoint;
-  readonly roundLimit?: number;
+  readonly roundLimit?: number | null;
+  readonly finalizationOnly?: boolean;
+  readonly lastToolBatchDigest?: string;
+  readonly identicalToolBatchCount?: number;
   readonly pendingReplan?: { readonly round: number; readonly reason: string; readonly errorCode?: string };
   readonly initialPlanningOpen: boolean;
   readonly nextRound: number;
