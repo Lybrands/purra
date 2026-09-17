@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.0.2 — Recoverable mixed tool batches
+
+- Mixed read/write multi-call batches no longer terminate the run with a
+  terminal `REJECTED` outcome. The executor now fails the batch with
+  per-call error results and recovery guidance (`multi_call_batch_requires_read_only_tools`
+  joins the recoverable tool-input error set), so the runtime feeds the
+  rejection back to the model for a bounded serial re-issue via the
+  recovery ledger. Authorization and scope rejections remain fail-closed.
+
 ## 1.0.0 — Unreleased development
 
 - Internal restructuring with no public API or behavior change: split
