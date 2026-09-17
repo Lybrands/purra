@@ -34,6 +34,8 @@ _RECOVERABLE_TOOL_INPUT_ERROR_CODES = frozenset({
     "invalid_tool_arguments_value",
     "invalid_tool_call_id",
     "invalid_tool_name",
+    # 模型并行混发读写工具：可由模型拆批重发自愈，走有界 RETRY_MODEL。
+    "multi_call_batch_requires_read_only_tools",
     "too_many_tool_calls",
     "tool_arguments_too_large",
     "tool_input_invalid",

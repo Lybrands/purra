@@ -168,14 +168,20 @@ class CoreToolExecutor:
                 self._registrations,
             )
         ):
+            # 并行混发读写工具是模型侧可自行纠正的协议偏差（偏好并行多调用
+            # 的模型常见），按 FAILED 回传逐调用错误，让运行时走有界重试让
+            # 模型拆批重发；授权类拒绝（scope/authorization）仍保持 REJECTED
+            # 终态，fail-closed 姿态不变。
             return _whole_batch_failure(
                 request.calls,
-                outcome=ToolBatchOutcome.REJECTED,
+                outcome=ToolBatchOutcome.FAILED,
                 code="multi_call_batch_requires_read_only_tools",
                 message=(
                     "A batch with multiple tool calls is allowed only when every "
                     "tool is read-only, or when every call targets the same "
-                    "host-durable recoverable artifact batch tool."
+                    "host-durable recoverable artifact batch tool. Re-issue the "
+                    "rejected calls: keep read-only tools in parallel batches and "
+                    "send each non-read tool in its own round."
                 ),
             )
 
