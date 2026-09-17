@@ -1,6 +1,6 @@
 {
   "name": "purra",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Business-agnostic, host-embedded Agent runtime for JavaScript and TypeScript",
   "license": "MIT",
   "author": "Lybrands",
