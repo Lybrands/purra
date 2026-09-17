@@ -111,10 +111,10 @@ async def test_planning_reads_persisted_provider_evidence_and_terminal_closes_op
                 "schemaVersion": "purra.provider-delta-batch/v1", "entries": entries,
                 "sourceChunkStart": 1, "sourceChunkEnd": 1, "payloadDigest": provider_delta_batch_digest(entries),
             })
-        projected = draft(run, "planning-delta:invoke:1" if kind == "planning.delta" else "planning:invoke:1", source="provider", kind=kind,
+        projected = draft(run, "planning-delta:invoke:1:1" if kind == "planning.delta" else "planning:invoke:1", source="provider", kind=kind,
             output_stream_id="stream", invocation_id="invoke", channel="commentary", visibility="public",
             payload={"schemaVersion": PLANNING_STREAM_SCHEMA, "operationId": "plan", "revision": 0,
-                "attempt": 1, **({"sourceChunkIndex": 1, "textDelta": wire} if kind == "planning.delta" else progress.to_mapping())})
+                "attempt": 1, **({"sourceChunkIndex": 1, "sourcePartIndex": 1, "recordIndex": 1, "textDelta": progress.text} if kind == "planning.delta" else progress.to_mapping())})
         await storage.outputs.append_event(raw)
         before = await storage.outputs.list_events(run, after_sequence=0)
         with pytest.raises(ContractViolationError):

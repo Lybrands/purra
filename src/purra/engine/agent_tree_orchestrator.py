@@ -159,9 +159,9 @@ class _AgentCoreTreeRunExecutor:
                 agent.capability_grant.allowed_tools
                 or agent.capability_grant.can_spawn_agents
             ),
-            # Child Runs execute the objective delegated by their parent. They
-            # do not open a second planning protocol inside that bounded task.
-            planning_mode=PlanningMode.REACTIVE,
+            # Child Runs execute the objective delegated by their parent; with a
+            # planner bound they may still auto-promote their own bounded plan.
+            planning_mode=PlanningMode.AUTO,
             metadata={
                 **thaw_json_mapping(binding.request.metadata),
                 "agentId": agent.agent_id,

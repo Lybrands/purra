@@ -82,8 +82,8 @@ class _Gateway:
     async def stream(self, messages, invocation, signal=None):
         planning = any("planning component" in message.content for message in messages)
         async def planned():
-            yield ModelStreamChunk(content_delta=json.dumps({"v": 1, "type": "progress", "text": "I will check the scope."}) + "\n")
-            yield ModelStreamChunk(content_delta=json.dumps({"v": 1, "type": "plan", "plan": {"needsTodos": False, "reason": "PRIVATE_PLAN"}}) + "\n", finish_reason=ModelFinishReason.STOP)
+            yield ModelStreamChunk(content_delta=json.dumps({"v": 1, "type": "progress", "text": "I will check the scope."}, separators=(",", ":")) + "\n")
+            yield ModelStreamChunk(content_delta=json.dumps({"v": 1, "type": "plan", "plan": {"needsTodos": False, "reason": "PRIVATE_PLAN"}}, separators=(",", ":")) + "\n", finish_reason=ModelFinishReason.STOP)
         return ModelStream(
             chunks=planned() if planning else _chunks(),
             model="smoke-model",

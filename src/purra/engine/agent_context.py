@@ -50,6 +50,7 @@ def child_run_options(parent, run, agent, checkpoint):
         force_planned_tool_choice=parent.force_planned_tool_choice,
         reasoning_mode=parent.reasoning_mode,
         deadline_at_ms=parent.deadline_at_ms,
+        checkpoint_handler=parent.checkpoint_handler,
         turn_id=f"agent-tree:{run.run_id}",
         response_transaction_policy=ResponseTransactionPolicy(
             mode=ResponseTransactionMode.VALIDATED_RESULT,
