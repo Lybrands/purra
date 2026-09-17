@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.1.1 — Unreleased candidate: recoverable mixed tool batches
+## 1.1.1 — 2026-09-18: recoverable mixed tool batches
 
 - Mixed read/write multi-call batches no longer terminate the run with a
   terminal `REJECTED` outcome. The executor now fails the batch with
@@ -9,7 +9,7 @@
   rejection back to the model for a bounded serial re-issue via the
   recovery ledger. Authorization and scope rejections remain fail-closed.
 
-## 1.0.0 — Unreleased development
+## 1.0.0 — 2026-09-16
 
 - Internal restructuring with no public API or behavior change: split
   `purra/contracts/__init__.py` into per-domain modules behind an unchanged
