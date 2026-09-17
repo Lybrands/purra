@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.1.1 — 2026-09-18: recoverable mixed tool batches
+## 1.0.1 — 2026-09-18: recoverable mixed tool batches
 
 - Mixed read/write multi-call batches no longer terminate the run with a
   terminal `REJECTED` outcome. The executor now fails the batch with

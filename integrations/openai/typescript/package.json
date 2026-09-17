@@ -1,6 +1,6 @@
 {
   "name": "purra-openai",
-  "version": "1.1.1",
+  "version": "1.0.1",
   "type": "module",
   "license": "MIT",
   "description": "Official OpenAI Responses and Chat Completions SDK adapter for PurrA",
@@ -20,7 +20,7 @@
     "openai": "7.9.0"
   },
   "peerDependencies": {
-    "purra": "1.1.1"
+    "purra": "1.0.1"
   },
   "devDependencies": {
     "purra": "file:../../../typescript",

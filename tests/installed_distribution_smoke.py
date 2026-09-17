@@ -118,7 +118,7 @@ class _InstalledRetriever:
 async def _run() -> None:
     package_path = Path(purra.__file__).resolve()
     assert "site-packages" in package_path.parts, package_path
-    assert version("purra") == "1.1.1"
+    assert version("purra") == "1.0.1"
     assert PlanningMode.AUTO.value == "auto"
     assert ToolPlanningRequirement.REQUIRED.value == "required"
 
