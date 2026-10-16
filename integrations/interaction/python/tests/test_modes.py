@@ -18,6 +18,8 @@ from purra_sqlite import SqliteAgentAdapters
 from purra_interaction import SqliteClarification
 
 QUESTION = {"questions": [{"id": "detail", "prompt": "Choose a detail", "choices": ["yes", "no"], "allowFreeform": False}]}
+# Nested Runs persist checkpoints and journals; this bounds hangs, not SQLite latency.
+TREE_WAIT_TIMEOUT = 30
 
 def plan(ask=True, suffix=""):
     steps = [WorkStep(id="ask" + suffix, title="Ask", type="read", executor="tool", capability_names=("request_user_input",))] if ask else []
@@ -131,15 +133,15 @@ def tree_script(messages, count):
 async def test_nested_tree_questions_restart_and_cancel(tmp_path, cancel):
     path = tmp_path / "tree.db"
     storage, interaction, gateway, core, request = compose(path, tree_script, tree=True)
-    handle = await interaction.submit(core, request)
-    with pytest.raises(UserInputRequired): await asyncio.wait_for(handle.wait(), 8)
-    questions = await interaction.list_waiting()
-    assert len(questions) == 2
-    descendants = await storage.run_tree.list_descendants(handle.run_id)
-    assert len(descendants) == 3 and all(run.status.value == "waiting" and run.lease_owner_id is None for run in descendants)
-    await core.close(); storage.close()
-    storage, interaction, gateway, core, _ = compose(path, tree_script, tree=True)
     try:
+        handle = await interaction.submit(core, request)
+        with pytest.raises(UserInputRequired): await asyncio.wait_for(handle.wait(), TREE_WAIT_TIMEOUT)
+        questions = await interaction.list_waiting()
+        assert len(questions) == 2
+        descendants = await storage.run_tree.list_descendants(handle.run_id)
+        assert len(descendants) == 3 and all(run.status.value == "waiting" and run.lease_owner_id is None for run in descendants)
+        await core.close(); storage.close()
+        storage, interaction, gateway, core, _ = compose(path, tree_script, tree=True)
         if cancel:
             assert await interaction.cancel(questions[0]["id"])
             assert (await storage.runs.get(handle.run_id)).status.value == "canceled"
@@ -148,7 +150,7 @@ async def test_nested_tree_questions_restart_and_cancel(tmp_path, cancel):
         else:
             for q in questions: await interaction.answer(q["id"], revision=1, key="answer", answers={"detail": "yes"})
             resumed = await interaction.resume(core, questions[0]["id"])
-            result = await asyncio.wait_for(resumed.wait(), 8)
+            result = await asyncio.wait_for(resumed.wait(), TREE_WAIT_TIMEOUT)
             assert result.status.value == "done", result
             assert resumed.run_id == handle.run_id
             assert all(run.status.value == "done" for run in await storage.run_tree.list_descendants(handle.run_id))

@@ -122,19 +122,27 @@ test("recovery requires a durable provider verdict, not just SDK IDs", async t =
   assert.equal((await memory.discardExtraction("verdict", { writerStopped: true })).state, "discarded");
 });
 
-for (const abort of [false, true]) test(`managed ${abort ? "abort" : "timeout"} stops later calls and records late usage`, async t => {
+for (const abort of [false, true]) test(`managed ${abort ? "abort" : "timeout"} stops later calls and records late usage`, { timeout: 5000 }, async t => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
   const { create } = fixture(t);
   const started = deferred(), release = deferred(), controller = new AbortController();
-  const memory = create({ timeoutMs: abort ? 2000 : 30, providers: { embed: async (texts, signal) => {
+  const timeoutMs = 60_000;
+  const memory = create({ timeoutMs, providers: { embed: async (texts, signal) => {
     started.resolve(); await release.promise; assert.equal(signal.aborted, true); return embed(texts);
   } } });
   const task = memory.extract(messages, { source, key: "late", signal: controller.signal });
   const rejected = assert.rejects(task, { code: abort ? "memory_cancelled" : "memory_timeout" });
-  await started.promise;
-  if (abort) controller.abort();
-  await rejected;
-  assert.equal(memory.operation("late").usage.unsettledCalls, 1);
-  release.resolve(); await memory.drain();
+  try {
+    await started.promise;
+    // Interrupt only after admission so this exercises an in-flight Provider.
+    if (abort) controller.abort();
+    else t.mock.timers.tick(timeoutMs);
+    await rejected;
+    assert.equal(memory.operation("late").usage.unsettledCalls, 1);
+  } finally {
+    release.resolve();
+    await memory.drain();
+  }
   const usage = memory.operation("late").usage;
   assert.equal(usage.unsettledCalls, 0); assert.equal(usage.llmCalls, 0); assert.equal(usage.reportedInputTokens, 3);
 });
