@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import tomllib
 from dataclasses import replace
 from importlib.metadata import version
 from pathlib import Path
@@ -118,7 +119,10 @@ class _InstalledRetriever:
 async def _run() -> None:
     package_path = Path(purra.__file__).resolve()
     assert "site-packages" in package_path.parts, package_path
-    assert version("purra") == "1.0.1"
+    expected_version = tomllib.loads(
+        (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text()
+    )["project"]["version"]
+    assert version("purra") == expected_version
     assert PlanningMode.AUTO.value == "auto"
     assert ToolPlanningRequirement.REQUIRED.value == "required"
 
