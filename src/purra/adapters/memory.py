@@ -115,11 +115,13 @@ def _run_scope_id(run_id: str, run: StoredRun) -> str:
 def _require_run_write(
     state: RunState,
     run_id: str,
+    *, control_cancellation: bool = False,
 ) -> StoredRun:
     run = _require_run(state, run_id)
     authority = state.run_tree_authority
     if (
-        authority is not None
+        not control_cancellation
+        and authority is not None
         and run.params.root_run_id != run_id
         and run.params.lease_epoch is not None
     ):
@@ -342,8 +344,9 @@ def _validate_new_event(
     draft: AgentOutputEventDraft,
     *,
     allow_committed_stream: bool,
+    control_cancellation: bool = False,
 ) -> StoredRun:
-    run = _require_run_write(state, draft.run_id)
+    run = _require_run_write(state, draft.run_id, control_cancellation=control_cancellation)
     if draft.output_stream_id is not None:
         try:
             stream = state.streams[draft.output_stream_id]
@@ -452,6 +455,7 @@ def _append_event(
     *,
     allow_committed_stream: bool = False,
     budget_prechecked: bool = False,
+    control_cancellation: bool = False,
 ) -> AgentOutputEvent:
     existing = _existing_event(state, draft)
     if existing is not None:
@@ -460,6 +464,7 @@ def _append_event(
         state,
         draft,
         allow_committed_stream=allow_committed_stream,
+        control_cancellation=control_cancellation,
     )
     event_count, payload_bytes = _provider_output_cost(draft)
     if not budget_prechecked:
@@ -803,6 +808,10 @@ class _InMemoryAgentOutputRepository:
         draft: RunLifecycleOutputDraft,
         related_drafts: tuple[AgentOutputEventDraft, ...] = (),
     ) -> tuple[AgentOutputEvent, ...]:
+        async with self._state.lock:
+            return self._prepare_run_lifecycle(run_id, commit, draft, related_drafts)()
+
+    def _prepare_run_lifecycle(self, run_id, commit, draft, related_drafts=(), *, control_cancellation=False):
         validate_run_commit_lifecycle(commit)
         expected_status = commit.terminal_status or RunStatus.RUNNING
         if draft.status != expected_status:
@@ -847,99 +856,101 @@ class _InMemoryAgentOutputRepository:
             if commit.validated_result is not None
             else None
         )
-        async with self._state.lock:
-            record = _require_run_write(self._state, run_id)
-            existing = _existing_event(self._state, lifecycle_draft)
-            if existing is not None:
-                if record.status is not RunStatus(expected_status):
-                    raise ContractViolationError(
-                        "canonical lifecycle event does not match Run state"
-                    )
-                validated_events = tuple(
-                    event
-                    for event in self._state.output_events.get(run_id, ())
-                    if event.kind is OutputEventKind.RUN_VALIDATED_RESULT
+        record = _require_run_write(self._state, run_id, control_cancellation=control_cancellation)
+        existing = _existing_event(self._state, lifecycle_draft)
+        if existing is not None:
+            if record.status is not RunStatus(expected_status):
+                raise ContractViolationError(
+                    "canonical lifecycle event does not match Run state"
                 )
-                if validated_draft is None and validated_events:
-                    raise ContractViolationError(
-                        "terminal replay changed the validated result identity"
-                    )
-                if validated_draft is not None and len(validated_events) != 1:
-                    raise ContractViolationError(
-                        "terminal replay requires exactly one validated result"
-                    )
-                replay_drafts = (
-                    *related_drafts,
-                    *((validated_draft,) if validated_draft is not None else ()),
-                )
-                replay = tuple(
-                    _existing_event(self._state, item) for item in replay_drafts
-                )
-                if any(event is None for event in replay):
-                    raise ContractViolationError(
-                        "partial canonical lifecycle commit already exists"
-                    )
-                terminal_aborts = _terminal_stream_abort_events(
-                    self._state,
-                    run_id,
-                    commit.terminal_status,
-                )
-                return (
-                    *(event for event in replay if event is not None),
-                    *terminal_aborts,
-                    existing,
-                )
-            terminal_abort_drafts = tuple(
-                _terminal_stream_abort_draft(
-                    stream.spec,
-                    commit.terminal_status,
-                    draft.occurred_at,
-                )
-                for stream in sorted(
-                    self._state.streams.values(),
-                    key=lambda item: item.spec.output_stream_id,
-                )
-                if commit.terminal_status is not None
-                and stream.spec.run_id == run_id
-                and stream.status == "open"
+            validated_events = tuple(
+                event
+                for event in self._state.output_events.get(run_id, ())
+                if event.kind is OutputEventKind.RUN_VALIDATED_RESULT
             )
-            operation_aborts = []
-            for started in self._state.output_events.get(run_id, ()):
-                if started.kind is not OutputEventKind.OPERATION_STARTED:
-                    continue
-                operation_id = started.payload["operationId"]
-                if any(e.kind is OutputEventKind.OPERATION_FINISHED and e.payload.get("operationId") == operation_id
-                       for e in self._state.output_events.get(run_id, ())):
-                    continue
-                operation_aborts.append(AgentOutputEventDraft(
-                    run_id=run_id, turn_id=started.turn_id, output_stream_id=None,
-                    invocation_id=started.invocation_id,
-                    source_event_key=f"operation:{operation_id}:finished", source=OutputSource.RUNTIME,
-                    kind=OutputEventKind.OPERATION_FINISHED, channel=OutputChannel.OPERATION,
-                    visibility=started.visibility, occurred_at=draft.occurred_at,
-                    payload={"operationId": operation_id, "parentOperationId": started.payload.get("parentOperationId"),
-                             "status": "canceled" if expected_status is RunStatus.CANCELED else "failed",
-                             "errorCode": "run_terminalized", "finishedAt": draft.occurred_at.isoformat(),
-                             "durationMs": max(0, round((draft.occurred_at - started.occurred_at).total_seconds() * 1000)),
-                             "timingSource": "recovery_wall_clock", "display": started.payload.get("display", {})},
-                ))
-            atomic_drafts = (
-                *operation_aborts,
+            if validated_draft is None and validated_events:
+                raise ContractViolationError(
+                    "terminal replay changed the validated result identity"
+                )
+            if validated_draft is not None and len(validated_events) != 1:
+                raise ContractViolationError(
+                    "terminal replay requires exactly one validated result"
+                )
+            replay_drafts = (
                 *related_drafts,
                 *((validated_draft,) if validated_draft is not None else ()),
-                *terminal_abort_drafts,
-                lifecycle_draft,
             )
-            if any(
-                _existing_event(self._state, item) is not None
-                for item in atomic_drafts[:-1]
-            ):
+            replay = tuple(
+                _existing_event(self._state, item) for item in replay_drafts
+            )
+            if any(event is None for event in replay):
                 raise ContractViolationError(
                     "partial canonical lifecycle commit already exists"
                 )
+            terminal_aborts = _terminal_stream_abort_events(
+                self._state,
+                run_id,
+                commit.terminal_status,
+            )
+            return lambda: (
+                *(event for event in replay if event is not None),
+                *terminal_aborts,
+                existing,
+            )
+        terminal_abort_drafts = tuple(
+            _terminal_stream_abort_draft(
+                stream.spec,
+                commit.terminal_status,
+                draft.occurred_at,
+            )
+            for stream in sorted(
+                self._state.streams.values(),
+                key=lambda item: item.spec.output_stream_id,
+            )
+            if commit.terminal_status is not None
+            and stream.spec.run_id == run_id
+            and stream.status == "open"
+        )
+        operation_aborts = []
+        for started in self._state.output_events.get(run_id, ()):
+            if started.kind is not OutputEventKind.OPERATION_STARTED:
+                continue
+            operation_id = started.payload["operationId"]
+            if any(e.kind is OutputEventKind.OPERATION_FINISHED and e.payload.get("operationId") == operation_id
+                   for e in self._state.output_events.get(run_id, ())):
+                continue
+            operation_aborts.append(AgentOutputEventDraft(
+                run_id=run_id, turn_id=started.turn_id, output_stream_id=None,
+                invocation_id=started.invocation_id,
+                source_event_key=f"operation:{operation_id}:finished", source=OutputSource.RUNTIME,
+                kind=OutputEventKind.OPERATION_FINISHED, channel=OutputChannel.OPERATION,
+                visibility=started.visibility, occurred_at=draft.occurred_at,
+                payload={"operationId": operation_id, "parentOperationId": started.payload.get("parentOperationId"),
+                         "status": "canceled" if expected_status is RunStatus.CANCELED else "failed",
+                         "errorCode": "run_terminalized", "finishedAt": draft.occurred_at.isoformat(),
+                         "durationMs": max(0, round((draft.occurred_at - started.occurred_at).total_seconds() * 1000)),
+                         "timingSource": "recovery_wall_clock", "display": started.payload.get("display", {})},
+            ))
+        atomic_drafts = (
+            *operation_aborts,
+            *related_drafts,
+            *((validated_draft,) if validated_draft is not None else ()),
+            *terminal_abort_drafts,
+            lifecycle_draft,
+        )
+        if any(
+            _existing_event(self._state, item) is not None
+            for item in atomic_drafts[:-1]
+        ):
+            raise ContractViolationError(
+                "partial canonical lifecycle commit already exists"
+            )
+        for item in atomic_drafts:
+            _validate_new_event(self._state, item, allow_committed_stream=False, control_cancellation=control_cancellation)
+        def apply():
             _apply_commit(record, commit)
             events = tuple(
-                _append_event(self._state, item) for item in atomic_drafts
+                _append_event(self._state, item, control_cancellation=control_cancellation) for item in atomic_drafts
             )
             for terminal_abort in terminal_abort_drafts:
                 stream = self._require_stream(terminal_abort.output_stream_id or "")
@@ -947,6 +958,8 @@ class _InMemoryAgentOutputRepository:
                 stream.finish_reason = None
                 stream.error_code = TERMINAL_STREAM_ABORT_ERROR_CODE
             return events
+
+        return apply
 
     async def commit_stream(
         self,
@@ -1489,6 +1502,29 @@ def _require_root_token_budgets(
             )
 
 
+def _prepare_child_cancellations(state, tree_runs, reason):
+    """Prepare every canonical cancellation before the tree authority changes."""
+    from purra.run_state import RunStateMachine
+    from purra.run_controller import _transition_events
+    repository = _InMemoryAgentOutputRepository(state)
+    writes = []
+    for tree_run in tree_runs:
+        record = state.runs.get(tree_run.run_id)
+        if tree_run.parent_run_id is None or record is None or record.status is not RunStatus.RUNNING:
+            continue
+        transition = RunStateMachine.cancel(_run_snapshot(tree_run.run_id, record), reason)
+        events = _transition_events(transition)
+        commit = RunCommit(terminal_status=RunStatus.CANCELED, step_updates=transition.step_updates, events=events)
+        terminal = events[-1]
+        writes.append(repository._prepare_run_lifecycle(tree_run.run_id, commit,
+            RunLifecycleOutputDraft(source_event_key=f"run:{tree_run.run_id}:canceled",
+                turn_id=record.params.turn_id, status=RunStatus.CANCELED,
+                payload=terminal.payload, occurred_at=_now()), control_cancellation=True))
+    def apply():
+        for write in writes: write()
+    return apply
+
+
 class InMemoryAgentAdapters:
     """Compose process-local implementations of PurrA's host storage ports."""
 
@@ -1501,6 +1537,7 @@ class InMemoryAgentAdapters:
             transaction_lock=state.lock,
             state=self.state.tree,
             clock_ms=agent_tree_clock_ms,
+            _cancel_children=lambda runs, reason: _prepare_child_cancellations(state, runs, reason),
         )
         state.run_tree_authority = self.run_tree
         durable = InMemoryDurableAdapters(artifact_state=self.state.artifact, task_state=self.state.task)

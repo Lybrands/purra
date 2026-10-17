@@ -273,6 +273,17 @@ codec; see the [approval storage boundary](conformance/durable-approval.md#persi
 checkpoint versions, preset versions and package versions evolve independently;
 Python and TypeScript snapshots are not interchangeable.
 
+Python shared reference storage cancels an active Child's canonical lifecycle and
+its tree state under the same transaction lock. It prepares every affected
+Child's lifecycle and output journal before applying any mutation; open streams
+and unfinished operations close through the ordinary terminal lifecycle rules.
+The Root controller remains responsible for its own terminal state. Completed
+Children stay completed; cancellation does not fabricate canonical Runs for
+unstarted tree nodes. Repeat cancellation adds no terminal events. Cancellation does not authorize a former execution lease
+to publish output, consume model budget, or commit a result. Durable adapters
+must persist the tree, canonical state, and output journal in one transaction.
+
+
 ## Public compatibility
 
 - Patch releases preserve documented public APIs and behavior. Minor releases

@@ -7,10 +7,10 @@ tool execution, planning, context, and recoverable Runs inside your application.
 The application supplies its models, tools, data sources, and access rules.
 
 
-## 1.0.0 development status
+## 1.0 release line
 
-This checkout is unreleased 1.0.0 development. Install matching local Core and
-integration artifacts; registry commands do not identify this development build.
+This source targets 1.0.2. Install matching Core and integration versions; see
+the [changelog](CHANGELOG.md) for the Python Child cancellation fix and its scope.
 The [durable approval contract](conformance/durable-approval.md) describes the
 work in progress. Both SDKs have deterministic approval recovery tests for Reactive,
 Planned and Auto Root Runs, plus host-authorized MCP writes with durable receipts.

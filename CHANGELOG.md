@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.0.2 — 2026-10-17: atomic Python Child cancellation
+
+- Python shared-storage tree cancellation and ancestor failure now commit active
+  Child canonical cancellation, lifecycle output, and tree lease invalidation
+  together. Completed Children retain their results; queued nodes without a
+  canonical Run do not gain a fabricated Run. Late worker writes remain fenced.
+- Validate the complete subtree before applying cancellation, preserving atomic
+  rollback, durable snapshot/journal replay, and unfinished-stream closure.
+- This fix covers Python shared-storage adapters. Standalone tree adapters and
+  TypeScript cancellation behavior are unchanged; existing historical inconsistent
+  snapshots are not automatically repaired. No public contract or storage format
+  changes. Core and integration package metadata use the same release version.
+
 ## 1.0.1 — 2026-09-18: recoverable mixed tool batches
 
 - Mixed read/write multi-call batches no longer terminate the run with a

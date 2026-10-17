@@ -58,6 +58,7 @@ class InMemoryRunTreeRepository:
         clock_ms=None,
         state: AgentTreeState[AgentNode, AgentTreeRun, ContextCheckpoint, SpawnAgentsReceipt, ContinueAgentReceipt] | None = None,
         initial_run_sequence: int = 0,
+        _cancel_children=None,
     ) -> None:
         if type(initial_run_sequence) is not int or initial_run_sequence < 0:
             raise ValueError("initial_run_sequence must be a non-negative integer")
@@ -69,6 +70,7 @@ class InMemoryRunTreeRepository:
             else AgentTreeState(run_sequence=initial_run_sequence)
         )
         self._lock = transaction_lock or asyncio.Lock()
+        self._cancel_children = _cancel_children
         self._clock_ms = clock_ms or (lambda: int(time.time() * 1000))
         if not callable(self._clock_ms):
             raise TypeError("Agent tree clock must be callable")
@@ -491,6 +493,11 @@ class InMemoryRunTreeRepository:
                 lease_owner_id=None,
                 lease_expires_at_ms=None,
             )
+            descendants = tuple(item for item in self._state.runs.values()
+                                if item.status in _ACTIVE_RUN_STATUSES
+                                and self._is_causal_descendant(run.run_id, item.run_id))
+            apply = self._cancel_children(descendants, "ancestor_run_failed") if self._cancel_children else None
+            if apply is not None: apply()
             self._state.runs[run.run_id] = failed
             for item in self._state.runs.values():
                 if (
@@ -522,6 +529,10 @@ class InMemoryRunTreeRepository:
                         and item.parent_run_id == current
                     )
                 )
+            active = tuple(self._state.runs[current] for current in ordered
+                           if self._state.runs[current].status in _ACTIVE_RUN_STATUSES)
+            apply = self._cancel_children(active, "agent_run_canceled") if self._cancel_children else None
+            if apply is not None: apply()
             canceled = []
             for current in ordered:
                 run = self._state.runs[current]
