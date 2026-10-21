@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.0.3 — 2026-10-21: independent Python presentation outcomes
+
+- Python model-live presentation records an optional `AgentRunResult.presentation`
+  receipt separately from execution status. A failed public reply preserves the
+  validated execution result, commits the Run as done with an empty public final
+  response, and persists presentation status in canonical lifecycle output.
+- Deterministic output truncation, contract failures, and interruption after
+  public content do not repeat the same presentation request. Only explicitly
+  retryable failures before public content retain the bounded retry policy.
+- Cancellation and execution deadlines retain their execution semantics; hosts
+  must not infer successful execution from a failed or interrupted candidate.
+- The optional presentation receipt is an additive Python public contract; hosts
+  can distinguish completed execution from unavailable public text without
+  repeating business execution.
+- This fix covers Python validated-result/model-live presentation. TypeScript
+  runtime behavior is unchanged. Core and integration metadata share version
+  1.0.3; historical Run snapshots are not automatically rewritten.
+
 ## 1.0.2 — 2026-10-17: atomic Python Child cancellation
 
 - Python shared-storage tree cancellation and ancestor failure now commit active

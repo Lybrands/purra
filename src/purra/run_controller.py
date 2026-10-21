@@ -40,6 +40,7 @@ class AgentRunController:
         self._repository = repository
         self._event_sink = event_sink
         self._snapshot: RunSnapshot | None = None
+        self._presentation: Mapping[str, object] | None = None
         self._mutation_lock = asyncio.Lock()
 
     @property
@@ -57,6 +58,10 @@ class AgentRunController:
     @property
     def snapshot(self) -> RunSnapshot | None:
         return self._snapshot
+
+    @property
+    def presentation(self) -> Mapping[str, object] | None:
+        return self._presentation
 
     async def start(
         self,
@@ -322,6 +327,7 @@ class AgentRunController:
         validated_result: str,
         *,
         final_response: str = "",
+        presentation: Mapping[str, object] | None = None,
     ) -> None:
         """Commit a private validated result without publishing it as text."""
 
@@ -330,6 +336,7 @@ class AgentRunController:
             await self._apply(
                 RunStateMachine.complete(state, final_response),
                 validated_result=str(validated_result),
+                presentation=presentation,
             )
 
     async def complete_durable_execution(
@@ -394,6 +401,7 @@ class AgentRunController:
         transition: RunTransition,
         *,
         validated_result: str | None = None,
+        presentation: Mapping[str, object] | None = None,
     ) -> None:
         if not transition.changed:
             return
@@ -402,6 +410,19 @@ class AgentRunController:
             raise RuntimeError("stale run transition")
 
         events = _transition_events(transition)
+        if presentation is not None:
+            # The public lifecycle receipt carries only presentation status;
+            # the independently validated execution result stays private.
+            from purra.contracts import AgentRunResult
+            presentation = AgentRunResult(
+                run_id=before.run_id, status=RunStatus.DONE,
+                presentation=presentation,
+            ).presentation
+            events = tuple(
+                replace(event, payload={**event.payload, "presentation": presentation})
+                if event.type == CoreEventType.RUN_COMPLETED else event
+                for event in events
+            )
         terminal_status = (
             transition.after.status
             if transition.after.status is not before.status
@@ -437,6 +458,7 @@ class AgentRunController:
         if self._snapshot is not before:
             raise RuntimeError("stale run transition")
         self._snapshot = transition.after
+        self._presentation = presentation
         _raise_if_canceled(canceled)
         await self._publish(persisted)
 

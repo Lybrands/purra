@@ -7,6 +7,7 @@ from contextlib import aclosing
 from dataclasses import replace
 from typing import Protocol
 
+from purra.cancellation import ExecutionDeadlineExceeded, OperationCanceled, raise_if_stopped
 from purra.contracts import (
     AgentMessage,
     AgentRunResult,
@@ -241,7 +242,12 @@ class AgentResponseTransaction:
                     output_budget=output_budget,
                     signal=signal,
                 )
+            except (OperationCanceled, ExecutionDeadlineExceeded):
+                raise
             except Exception as caught:
+                raise_if_stopped(signal)
+                if getattr(caught, "retryable", False) is not True:
+                    raise
                 error = caught
         assert error is not None
         raise error
@@ -300,6 +306,7 @@ class AgentResponseTransaction:
         output_budget: InvocationOutputBudget | None,
         signal: CancellationSignal | None,
     ) -> str:
+        raise_if_stopped(signal)
         stream = await self._models.stream(
             tuple(messages),
             AgentModelCall(
@@ -320,25 +327,38 @@ class AgentResponseTransaction:
         chunks = stream.chunks
         content: list[str] = []
         finish_reason: ModelFinishReason | None = None
-        async with aclosing(chunks):
-            async for chunk in chunks:
-                if not isinstance(chunk, ModelStreamChunk):
-                    raise ContractViolationError(
-                        "response model stream returned an invalid chunk"
-                    )
-                if chunk.tool_call_deltas:
-                    raise ContractViolationError(
-                        "response transaction model call returned tool calls"
-                    )
-                if chunk.content_delta:
-                    content.append(chunk.content_delta)
-                if chunk.finish_reason is not None:
-                    finish_reason = chunk.finish_reason
+        try:
+            async with aclosing(chunks):
+                async for chunk in chunks:
+                    if not isinstance(chunk, ModelStreamChunk):
+                        raise ContractViolationError(
+                            "response model stream returned an invalid chunk"
+                        )
+                    if chunk.tool_call_deltas:
+                        raise ContractViolationError(
+                            "response transaction model call returned tool calls"
+                        )
+                    if chunk.content_delta:
+                        content.append(chunk.content_delta)
+                    if chunk.finish_reason is not None:
+                        finish_reason = chunk.finish_reason
+        except (OperationCanceled, ExecutionDeadlineExceeded):
+            raise
+        except Exception as error:
+            raise_if_stopped(signal)
+            if intent is AgentOutputIntent.FINAL_PUBLIC and content:
+                raise ModelGatewayError(
+                    "public response stream interrupted after visible output",
+                    code=getattr(error, "code", None) or "upstream_stream_interrupted",
+                    retryable=False,
+                ) from error
+            raise
+        raise_if_stopped(signal)
         if finish_reason is None:
             raise ModelGatewayError(
                 "response model stream ended without a finish reason",
                 code="upstream_stream_interrupted",
-                retryable=True,
+                retryable=not (intent is AgentOutputIntent.FINAL_PUBLIC and content),
             )
         termination = classify_model_termination(
             finish_reason,

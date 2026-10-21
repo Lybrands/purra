@@ -9,8 +9,8 @@ The application supplies its models, tools, data sources, and access rules.
 
 ## 1.0 release line
 
-This source targets 1.0.2. Install matching Core and integration versions; see
-the [changelog](CHANGELOG.md) for the Python Child cancellation fix and its scope.
+This source targets 1.0.3. Install matching Core and integration versions; see
+the [changelog](CHANGELOG.md) for Python execution and public-presentation outcomes and their scope.
 The [durable approval contract](conformance/durable-approval.md) describes the
 work in progress. Both SDKs have deterministic approval recovery tests for Reactive,
 Planned and Auto Root Runs, plus host-authorized MCP writes with durable receipts.

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import re
 from typing import Any, Literal, Mapping
 
 from purra.contracts.enums import (
@@ -271,6 +272,7 @@ class AgentRunResult:
     error: str | None = None
     model: str | None = None
     validated_result: str | None = None
+    presentation: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         run_id = required_text(self.run_id, "agent run result run id")
@@ -282,6 +284,17 @@ class AgentRunResult:
         object.__setattr__(self, "final_response", str(self.final_response or ""))
         object.__setattr__(self, "error", _optional_text(self.error))
         object.__setattr__(self, "model", _optional_text(self.model))
+        if self.presentation is not None:
+            metadata = dict(self.presentation)
+            if (status is not RunStatus.DONE
+                    or set(metadata) - {"status", "errorCode"}
+                    or metadata.get("status") not in {"completed", "failed"}
+                    or (metadata["status"] == "completed" and "errorCode" in metadata)
+                    or (metadata["status"] == "failed" and not (
+                        isinstance(metadata.get("errorCode"), str)
+                        and re.fullmatch(r"[a-z][a-z0-9_.:-]{0,159}", metadata["errorCode"])))):
+                raise ValueError("invalid run presentation result")
+            object.__setattr__(self, "presentation", freeze_json_mapping(metadata))
         object.__setattr__(
             self,
             "validated_result",

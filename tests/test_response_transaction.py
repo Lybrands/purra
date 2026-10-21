@@ -92,7 +92,8 @@ class _Manager:
                 and self.presentation_failures > 0
             ):
                 self.presentation_failures -= 1
-                raise RuntimeError("presentation failed")
+                from purra.errors import ModelGatewayError
+                raise ModelGatewayError("presentation failed", retryable=True)
             content = (
                 "公开结论"
                 if call.output_intent.value == "final_public"

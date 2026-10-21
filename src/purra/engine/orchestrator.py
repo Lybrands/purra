@@ -56,6 +56,7 @@ from purra.cancellation import (
     OperationCanceled,
     await_with_cancellation,
     is_canceled as _is_canceled,
+    raise_if_stopped,
     stop_reason,
 )
 from purra.context_budget import (
@@ -1593,60 +1594,88 @@ class AgentCore:
             await controller.fail(result.error_code or "runtime_failed")
             return
         try:
+            raise_if_stopped(signal)
             await self._require_root_agent_tree_quiescent(controller.run_id)
             await self._require_parent_delivery_settled(controller.run_id)
             final_response = result.final_response
             validated_result: str | None = None
+            presentation = None
             policy = options.resolved_response_transaction_policy
             if policy.mode is ResponseTransactionMode.VALIDATED_RESULT:
                 validated_result = final_response
                 final_response = ""
                 if policy.public_presentation is PublicPresentationMode.MODEL_LIVE:
-                    transaction = AgentResponseTransaction(
-                        create_model_invocation_manager(
-                            self._model_gateway,
-                            output_observer=self._root_output_observer(),
+                    try:
+                        transaction = AgentResponseTransaction(
+                            create_model_invocation_manager(
+                                self._model_gateway,
+                                output_observer=self._root_output_observer(),
+                                operation_controller=self._operations,
+                                runtime_limits=self._runtime_limits,
+                                max_tool_argument_chars=(
+                                    self._tool_execution_limits.max_argument_chars
+                                ),
+                                budget_repository=self._repository,
+                                evidence_validator=self._evidence_validator,
+                            ),
+                            policy=policy,
+                            facts_provider=options.committed_result_facts_provider,
                             operation_controller=self._operations,
-                            runtime_limits=self._runtime_limits,
-                            max_tool_argument_chars=(
-                                self._tool_execution_limits.max_argument_chars
+                        )
+                        final_response = await transaction.present(
+                            AgentRunResult(
+                                run_id=controller.run_id,
+                                status=RunStatus.DONE,
+                                final_response=result.final_response,
+                                model=result.model,
                             ),
-                            budget_repository=self._repository,
-                            evidence_validator=self._evidence_validator,
-                        ),
-                        policy=policy,
-                        facts_provider=options.committed_result_facts_provider,
-                        operation_controller=self._operations,
-                    )
-                    final_response = await transaction.present(
-                        AgentRunResult(
-                            run_id=controller.run_id,
-                            status=RunStatus.DONE,
-                            final_response=result.final_response,
-                            model=result.model,
-                        ),
-                        request=request.model,
-                        context=ModelInvocationContext(
-                            run_id=controller.run_id,
-                            turn_id=options.turn_id,
-                            requested_reasoning_mode=options.reasoning_mode,
-                            deadline_at_ms=options.deadline_at_ms,
-                            context_window_tokens=(
-                                _selected_context_window_tokens(request, options)
+                            request=request.model,
+                            context=ModelInvocationContext(
+                                run_id=controller.run_id,
+                                turn_id=options.turn_id,
+                                requested_reasoning_mode=options.reasoning_mode,
+                                deadline_at_ms=options.deadline_at_ms,
+                                context_window_tokens=(
+                                    _selected_context_window_tokens(request, options)
+                                ),
+                                safety_reserve_tokens=options.safety_reserve_tokens,
+                                runtime_reserve_tokens=options.runtime_reserve_tokens,
                             ),
-                            safety_reserve_tokens=options.safety_reserve_tokens,
-                            runtime_reserve_tokens=options.runtime_reserve_tokens,
-                        ),
-                        output_budget=output_budget,
-                        signal=signal,
-                    )
+                            output_budget=output_budget,
+                            signal=signal,
+                        )
+                    except (OperationCanceled, ExecutionDeadlineExceeded):
+                        raise
+                    except Exception as error:
+                        raise_if_stopped(signal)
+                        # The atomic lifecycle receipt below is authoritative;
+                        # a diagnostic write must not prevent recording the
+                        # completed execution and its presentation failure.
+                        with suppress(Exception):
+                            await _record_safe_exception(
+                                controller, stage="public_presentation", outcome="failed", error=error,
+                            )
+                        presentation = {"status": "failed", "errorCode": "completion_projection_failed"}
+                        try:
+                            presentation = AgentRunResult(
+                                run_id=controller.run_id, status=RunStatus.DONE,
+                                presentation={"status": "failed", "errorCode": getattr(error, "code", None)},
+                            ).presentation
+                        except ValueError:
+                            pass
+                    else:
+                        presentation = {"status": "completed"}
+            raise_if_stopped(signal)
             if validated_result is None:
                 await controller.complete(final_response)
             else:
                 await controller.complete_validated_result(
                     validated_result,
                     final_response=final_response,
+                    presentation=presentation,
                 )
+        except (OperationCanceled, ExecutionDeadlineExceeded):
+            raise
         except Exception as error:
             await _record_safe_exception(
                 controller,

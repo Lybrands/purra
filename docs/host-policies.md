@@ -85,6 +85,20 @@ model-live presentation from a host facts provider. Direct-live output cannot
 also require full-text validation. These are distinct result contracts, not a
 switch that republishes private text.
 
+In Python model-live presentation, `AgentRunResult.presentation` is an optional
+receipt: `{"status": "completed"}` or `{"status": "failed", "errorCode": ...}`.
+It describes public reply delivery independently of `RunStatus`. After successful
+execution, a presentation failure commits the validated private result and a
+`done` lifecycle receipt together, leaves `final_response` empty, and records
+presentation failure in public lifecycle metadata. Hosts should display that
+state without retrying business execution or substituting private result text.
+No receipt is inferred for historical Runs or other presentation modes.
+
+Output truncation, contract errors, and interruption after public content do not
+retry the same presentation. Explicitly retryable failures before public content
+retain bounded retries. Cancellation and execution deadlines retain their
+existing execution outcomes and do not become presentation success or failure.
+
 TypeScript exposes `Agent({ responsePresentation: "none", ... })` to return a
 host-only result without the extra public-presentation round. The default
 `"model_live"` preserves existing behavior. `responseValidation` still runs;

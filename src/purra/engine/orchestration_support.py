@@ -65,6 +65,7 @@ def _run_result(
         final_response=snapshot.final_response,
         error=snapshot.error,
         model=model,
+        presentation=controller.presentation,
     )
 
 

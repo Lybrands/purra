@@ -8,7 +8,7 @@ PurrA 是面向 Python 和 TypeScript 的 Agent 运行时，负责在应用中�
 
 ## 1.0 发布线
 
-当前源码版本为 1.0.2。请安装版本一致的 Core 与集成包；Python Child 取消修复及覆盖范围见[更新日志](CHANGELOG.md)。
+当前源码版本为 1.0.3。请安装版本一致的 Core 与集成包；Python 执行与回复呈现状态及覆盖范围见[更新日志](CHANGELOG.md)。
 [持久化审批契约](conformance/durable-approval.zh-CN.md)记录本版开发中的能力；双端已通过 Reactive、Planned、Auto Root 审批恢复，以及宿主授权 MCP 写工具和持久回执的确定性验证。已提供只读审批诊断；扩展恢复、真实服务及下游验收仍未完成。
 已有能力及 1.x 兼容承诺见[1.0 支持说明](conformance/release-1.0.zh-CN.md)。
 
