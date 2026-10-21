@@ -9,10 +9,10 @@ the components your application uses, together with a matching Core version.
 | --- | --- | --- |
 | `purra-openai` | OpenAI Responses and Chat Completions | [Python](openai/python/README.md) · [TypeScript](openai/typescript/README.md) |
 | `purra-anthropic` | Anthropic Messages | [Python](anthropic/python/README.md) · [TypeScript](anthropic/typescript/README.md) |
-| `purra-sqlite` | Persistent Runs, events, checkpoints, and tool receipts | [Python](sqlite/python/README.md) · [TypeScript](sqlite/typescript/README.md) |
+| `purra-sqlite` | Persistent Runs, events, checkpoints, approvals, and recovery scheduling | [Python](sqlite/python/README.md) · [TypeScript](sqlite/typescript/README.md) |
 | `purra-interaction` | Structured user questions and resumable input waits | [Python](interaction/python/README.md) · [TypeScript](interaction/typescript/README.md) |
 | `purra-compaction` | Model-assisted conversation compression | [Python](compaction/python/README.md) · [TypeScript](compaction/typescript/README.md) |
-| `purra-mcp` | Host-owned read-only MCP tools | [Python](mcp/python/README.md) · [TypeScript](mcp/typescript/README.md) |
+| `purra-mcp` | Host-owned MCP reads and explicitly authorized writes | [Python](mcp/python/README.md) · [TypeScript](mcp/typescript/README.md) |
 | `purra-mem0` | Scoped long-term memory and retrieval | [Python](mem0/python/README.md) · [TypeScript](mem0/typescript/README.md) |
 
 Model adapters support native OpenAI and Anthropic APIs. Applications handle
@@ -54,6 +54,10 @@ capabilities, and storage paths. They also own client lifecycles, backups, and
 retention. Components use Core's execution and budget interfaces; installing a
 package does not enable it on an Agent.
 
-[1.0.0 candidate service evidence and upgrade boundaries](../conformance/release-1.0.md): live protocol/capability/service-model evidence and downstream acceptance are recorded separately; first-party model credentials are not required.
+MCP writes require explicit host bindings, durable approval and receipt gateways.
+Supported approval recovery is limited to one approval-bearing write per selected
+batch in a Root Run; see the [execution and recovery boundary](../conformance/runtime-extension-acceptance.md).
+
+[1.0 service evidence and upgrade boundaries](../conformance/release-1.0.md): live protocol/capability/service-model evidence and downstream acceptance are recorded separately; first-party model credentials are not required.
 
 [Upgrade notes](../docs/migrations/1.0.md). Validate each selected protocol, capability and service/model combination separately; adapter installation does not establish live support.

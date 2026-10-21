@@ -6,20 +6,26 @@ PurrA is an Agent runtime for Python and TypeScript. It coordinates model calls,
 tool execution, planning, context, and recoverable Runs inside your application.
 The application supplies its models, tools, data sources, and access rules.
 
-
 ## 1.0 release line
 
-This source targets 1.0.3. Install matching Core and integration versions; see
-the [changelog](CHANGELOG.md) for Python execution and public-presentation outcomes and their scope.
-The [durable approval contract](conformance/durable-approval.md) describes the
-work in progress. Both SDKs have deterministic approval recovery tests for Reactive,
-Planned and Auto Root Runs, plus host-authorized MCP writes with durable receipts.
-Read-only approval observations are available. Extended recovery and real
-service/downstream acceptance remain unfinished.
-Existing capabilities and 1.x compatibility are documented in the
-[1.0 support guide](conformance/release-1.0.md).
+The current source version is **1.0.3**. Install matching Core and integration
+versions. This update separates Python execution results from public-presentation
+outcomes; TypeScript runtime behavior is unchanged. See the [changelog](CHANGELOG.md)
+for the changes and their scope.
 
-See the [upgrade notes](docs/migrations/1.0.md) and [public compatibility](ARCHITECTURE.md#public-compatibility) before upgrading.
+Both SDKs implement persistent approval waits and recovery for Reactive, Planned
+and Auto Root Runs, host-authorized MCP writes, durable receipts, and read-only
+recovery inspection. Storage and effect recovery are implemented within the
+supported Root single-write boundary. Child write approvals, mixed/multiple-call
+approval batches, and general distributed effect recovery are outside that
+boundary. See the [approval contract](conformance/durable-approval.md) and
+[implementation and acceptance boundaries](conformance/runtime-extension-acceptance.md).
+
+Deterministic tests and selected service checks do not establish real business
+MCP, downstream application, cross-platform migration, or production-load
+acceptance. Validate the actual model, protocol, tools, and host configuration
+used by your application. Review the [upgrade notes](docs/migrations/1.0.md) and
+[public compatibility](ARCHITECTURE.md#public-compatibility) before upgrading.
 
 ## Install
 
@@ -88,8 +94,12 @@ after restart. For a complete example that runs without API credentials, see
 - **Runs:** submit work, subscribe to committed events, cancel execution, and replay output.
 - **Tools:** validate arguments, enforce access and effect policies, and record results.
 - **Planning:** select Auto, Reactive, or Planned execution when a planner is configured.
+- **Structured output:** run schema-bound object tasks with local validation or explicitly supported native constraints.
 - **Context:** allocate input budgets, retrieve external data, and compress conversation history.
 - **Agent trees and long tasks:** delegate work and persist execution progress through repository ports.
+- **Model selection:** select an authorized compatible binding before Run creation and retain it through recovery.
+- **Memory:** use the optional Mem0 integration for scoped memory, authorized capture, explicit relations, and host-selected context.
+- **Static images:** supply inline PNG, JPEG, or WebP input for text responses through a compatible, explicitly enabled model transport.
 
 The application chooses models and their limits, authorizes data access and tool
 side effects, and manages persistent storage. Retrieval sources and tool results
@@ -110,20 +120,40 @@ Recovery continues from committed checkpoints. The application must restore the
 same model and tool configuration and reconcile interrupted external writes
 before retrying them. Persistent storage alone does not make those writes replayable.
 
+The optional SQLite integration stores Runs, output, checkpoints, leases, and
+receipts. A host-driven recovery worker can discover and inspect persisted Runs
+before calling public resume APIs; discovery does not authorize execution or
+clear unknown effects. SQLite v4-to-v5 approval activation is an explicit offline
+operation, and Python and TypeScript databases are not interchangeable. See
+[recovery workers](conformance/recovery-worker.md) and
+[SQLite upgrade and rollback](conformance/sqlite-upgrade.md).
+
+## Execution and public replies
+
+In Python's `validated_result` mode with `model_live` presentation,
+`AgentRunResult.presentation` records an optional `completed` or `failed` receipt
+separately from execution status. If execution succeeds but public presentation
+fails, the validated result remains committed, the Run is `done`, and
+`final_response` is empty. Hosts should inspect both outcomes and avoid repeating
+business execution just to regenerate a reply. Cancellation and execution
+deadlines retain their execution semantics; historical Runs and other presentation
+modes do not acquire an inferred receipt.
+
+Hosts can also omit public presentation. Python and TypeScript expose different
+result APIs, and host-only results must not be forwarded directly to a public
+chat UI. The [host policy guide](docs/host-policies.md) documents composition,
+defaults, and output visibility.
+
 ## Documentation
 
-- Capability guides: [planning output](docs/planning-output.md), [structured output](docs/structured-output.md), [tool concurrency](docs/tool-concurrency.md), [integration and recovery inspection](docs/integration-inspection.md).
-- [Upgrade from 0.x to 1.0](docs/migrations/1.0.md).
-
-- [TypeScript guide](typescript/README.md)
-- [Examples](examples/README.md)
-- [Optional packages](integrations/README.md)
-- [Architecture](ARCHITECTURE.md)
-- [Cross-language conformance](conformance/README.md)
-- [Changelog](CHANGELOG.md)
+- Getting started: [TypeScript guide](typescript/README.md), [local examples](examples/README.md), [optional packages](integrations/README.md).
+- Execution: [host policies and output](docs/host-policies.md), [planning output](docs/planning-output.md), [structured output](docs/structured-output.md), [tool concurrency](docs/tool-concurrency.md).
+- Recovery: [durable approvals](conformance/durable-approval.md), [recovery workers](conformance/recovery-worker.md), [integration and recovery inspection](docs/integration-inspection.md), [acceptance boundaries](conformance/runtime-extension-acceptance.md).
+- Models and input: [model routing](conformance/model-routing.md), [static images](docs/static-images.md).
+- Memory: [capture and relation contracts](conformance/memory-capture-relations.md), [context selection](integrations/mem0/selection.md), [relation proposals](integrations/mem0/relations.md).
+- Upgrades: [0.x to 1.0](docs/migrations/1.0.md), [SQLite v4 to v5](conformance/sqlite-upgrade.md).
+- Reference: [architecture and compatibility](ARCHITECTURE.md), [cross-language conformance](conformance/README.md), [changelog](CHANGELOG.md).
 
 ## License
 
 [MIT](LICENSE)
-
-Host policy composition and limits: [guide](docs/host-policies.md).
