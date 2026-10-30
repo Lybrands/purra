@@ -31,10 +31,10 @@ test('Reactive Root waits, reopens, stays pending without model work, then dispa
   await approve(second, id);
   const result = await (await second.agent.resume(id, request)).result;
   assert.equal(result.output, 'done');
-  assert.equal(second.counts.tool, 1);
+  assert.deepEqual(second.counts, { model: 1, tool: 1 });
   const final = await second.storage.runs.get(id);
   assert.equal(final.status, 'completed'); assert.equal(final.toolExecutionCheckpoint, undefined);
-  assert.equal(final.usage.modelAttempts, 3);
+  assert.equal(final.usage.modelAttempts, 2);
   const events = await second.storage.runs.listEvents(id, 0);
   assert.equal(events.filter(event => event.kind === 'approval.required').length, 1);
   assert.equal(events.filter(event => event.kind === 'tool.started').length, 1);
