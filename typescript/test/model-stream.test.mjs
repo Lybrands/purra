@@ -21,6 +21,7 @@ test("Agent consumes model chunks, tool deltas, usage, and output limits", async
   const requests = [];
   let closed = 0;
   const agent = new Agent({
+    responsePresentation: 'model_live',
     model: {
       capabilities: capabilities(1000),
       async invoke() {

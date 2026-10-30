@@ -21,6 +21,8 @@ export interface RunResult {
   readonly messages: readonly Message[];
   readonly rounds: number;
   readonly durable?: DurableRunResult;
+  /** Exact Provider candidate selected after final-response validation. */
+  readonly outputReference?: Readonly<{ runId: string; invocationId: string; contentDigest: string }>;
 }
 
 export interface PromptSection {

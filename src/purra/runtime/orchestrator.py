@@ -107,7 +107,7 @@ from purra.runtime.model_round import (
 from purra.runtime.response_finalization import (
     ResponseFinalizationDisposition,
     exact_item_count_repair_guidance as _exact_item_count_repair_guidance,
-    public_presentation_messages,
+    final_output_reference,
     resolve_response_constraint_recovery,
     resolve_response_recovery,
     top_level_numbered_items as _top_level_numbered_items,
@@ -1358,23 +1358,10 @@ class AgentRuntime:
                 return
 
         final_response = accumulator.content
-        presentation_messages = public_presentation_messages(
-            content=final_response,
-            reasoning=accumulator.reasoning,
-            invocation_had_tools=any(
-                tool.name != AUTO_PLANNING_TOOL_NAME
-                for tool in attempt.invocation.tools
-            ),
-            buffered_model_content=loop.buffer_model_content,
-            transaction_mode=loop.transaction_mode,
-            already_pending=loop.public_presentation_pending,
-        )
-        if presentation_messages:
-            loop.public_presentation_pending = True
-            loop.round_limit += 1
-            loop.messages.extend(accumulator.continuation(presentation_messages))
-            loop.retry_round = True
-            return
+        # A tool-capable round with no tool calls can already contain the final
+        # answer. Keep its Provider identity; the owning terminal transaction
+        # publishes these exact bytes after validation and Root barriers.
+        reference = final_output_reference(loop.stream.receipt, run_id, final_response)
         if loop.buffer_model_content:
             if self._observer is not None:
                 await self._observer.on_model_delta()
@@ -1387,6 +1374,7 @@ class AgentRuntime:
             loop.used_model,
             loop.round_number,
             final_response=final_response,
+            output_reference=reference,
         )
 
     async def _execute_provider_stream(
@@ -2204,6 +2192,7 @@ def _runtime_result(
     *,
     final_response: str = "",
     error_code: str | None = None,
+    output_reference=None,
 ) -> AgentRuntimeResult:
     return AgentRuntimeResult(
         run_id=run_id,
@@ -2212,4 +2201,5 @@ def _runtime_result(
         model=model,
         round_count=round_count,
         error_code=error_code,
+        output_reference=output_reference,
     )

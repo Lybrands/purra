@@ -655,7 +655,7 @@ async def test_non_writing_host_keeps_identity_context_and_tool_authority_separa
     assert result.status is RunStatus.DONE
     assert result.final_response.startswith("Status: degraded.")
     assert observed_arguments == [{"serviceId": "payments"}]
-    assert len(gateway.rounds) == 3
+    assert len(gateway.rounds) == 2
     snapshot = events[0].payload["agentPreset"]
     assert snapshot["id"] == "operations"
     assert snapshot["revision"] == "1"
@@ -684,7 +684,6 @@ async def test_non_writing_host_keeps_identity_context_and_tool_authority_separa
     assert json.loads(tool_result.content)["online"] is True
 
     assert gateway.rounds[1][1].tools
-    assert gateway.rounds[2][1].tools == ()
     assert [
         (event.payload["outputIntent"], event.payload["commitMode"])
         for event in events
@@ -692,7 +691,6 @@ async def test_non_writing_host_keeps_identity_context_and_tool_authority_separa
     ] == [
         ("structured_private", "private"),
         ("structured_private", "private"),
-        ("final_public", "live"),
     ]
 
 
@@ -743,7 +741,7 @@ async def test_agent_tree_delegation_executes_a_canonical_child_run():
 
     assert result.status is RunStatus.DONE
     assert result.final_response.startswith("Status: degraded")
-    assert len(gateway.rounds) == 4  # No implicit presentation model call.
+    assert len(gateway.rounds) == 3  # No implicit presentation model call.
     assert len(descendants) == 1
     assert descendants[0].status.value == "done"
     assert descendants[0].run_id != handle.run_id

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
 from purra.contracts import (
+    OutputTextReference,
     ModelTokenUsage,
     RunCreateParams,
     ExecutionPlan,
@@ -71,6 +72,7 @@ class RunCommit:
     error: str | None = None
     execution_checkpoint: AgentExecutionCheckpoint | None = None
     events: tuple[AgentEvent, ...] = ()
+    final_output: OutputTextReference | None = None
 
     def __post_init__(self) -> None:
         replacement = self.replace_plan
@@ -105,6 +107,13 @@ class RunCommit:
                 "run commit validated_result is only valid for completed runs"
             )
         checkpoint = self.execution_checkpoint
+        if self.final_output is not None:
+            if not isinstance(self.final_output, OutputTextReference):
+                raise TypeError('run commit final output reference is invalid')
+            if terminal is not RunStatus.DONE or self.final_response is None:
+                raise ValueError('final output publication requires a completed response')
+            if self.validated_result is not None and self.validated_result != self.final_response:
+                raise ValueError('verbatim publication must equal the validated result')
         if checkpoint is not None and not isinstance(
             checkpoint,
             AgentExecutionCheckpoint,

@@ -317,10 +317,10 @@ class AgentRunController:
             state = self._require_started()
             await self._apply(RunStateMachine.on_tool_round_failed(state, error))
 
-    async def complete(self, final_response: str = "") -> None:
+    async def complete(self, final_response: str = "", *, final_output=None) -> None:
         async with self._mutation_lock:
             state = self._require_started()
-            await self._apply(RunStateMachine.complete(state, final_response))
+            await self._apply(RunStateMachine.complete(state, final_response), final_output=final_output)
 
     async def complete_validated_result(
         self,
@@ -328,6 +328,7 @@ class AgentRunController:
         *,
         final_response: str = "",
         presentation: Mapping[str, object] | None = None,
+        final_output=None,
     ) -> None:
         """Commit a private validated result without publishing it as text."""
 
@@ -337,6 +338,7 @@ class AgentRunController:
                 RunStateMachine.complete(state, final_response),
                 validated_result=str(validated_result),
                 presentation=presentation,
+                final_output=final_output,
             )
 
     async def complete_durable_execution(
@@ -402,6 +404,7 @@ class AgentRunController:
         *,
         validated_result: str | None = None,
         presentation: Mapping[str, object] | None = None,
+        final_output=None,
     ) -> None:
         if not transition.changed:
             return
@@ -410,6 +413,15 @@ class AgentRunController:
             raise RuntimeError("stale run transition")
 
         events = _transition_events(transition)
+        if final_output is not None:
+            # The canonical text frames carry the answer. Duplicating it in a
+            # lifecycle frame would defeat bounded transport for long prose.
+            events = tuple(
+                replace(event, payload={key: value for key, value in event.payload.items()
+                    if key != "final_response"})
+                if event.type == CoreEventType.RUN_COMPLETED else event
+                for event in events
+            )
         if presentation is not None:
             # The public lifecycle receipt carries only presentation status;
             # the independently validated execution result stays private.
@@ -441,6 +453,7 @@ class AgentRunController:
                             else None
                         ),
                         validated_result=validated_result,
+                        final_output=final_output,
                         error=(
                             transition.after.error
                             if terminal_status is RunStatus.FAILED

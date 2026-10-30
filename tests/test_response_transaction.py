@@ -416,3 +416,26 @@ def test_run_options_reject_incompatible_response_transactions():
         committed_result_facts_provider=Facts(),
     )
     assert configured.committed_result_facts_provider is not None
+
+
+@pytest.mark.asyncio
+async def test_verbatim_transaction_commits_selected_source_without_facts_or_rephrasing():
+    from types import SimpleNamespace
+    from purra.contracts import OutputTextReference
+    from purra.output import AgentResponseTransaction, PublicPresentationMode, ResponseTransactionMode, ResponseTransactionPolicy
+    class Manager(_Manager):
+        async def stream(self, *args, **kwargs):
+            stream = await super().stream(*args, **kwargs)
+            stream.receipt = SimpleNamespace(output_stream_id='selected-stream', invocation_id='selected-invocation')
+            return stream
+    class Committer(_Committer):
+        async def commit_public_candidate(self, run_id, candidate, reference):
+            assert reference == OutputTextReference.for_text(run_id, 'selected-stream', 'selected-invocation', candidate)
+            return await super().commit_candidate(run_id, candidate)
+    manager, committer = Manager(), Committer()
+    transaction = AgentResponseTransaction(manager, policy=ResponseTransactionPolicy(
+        mode=ResponseTransactionMode.VALIDATED_RESULT, public_presentation=PublicPresentationMode.VERBATIM))
+    result = await transaction.execute_validated((AgentMessage(role='user', content='synthetic'),), committer,
+        request=_model_request(), context=ModelInvocationContext(run_id='run-1'))
+    assert result.final_response == '私有候选'
+    assert len(manager.calls) == 1 and committer.calls == [('run-1','私有候选')]

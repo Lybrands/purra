@@ -11,6 +11,7 @@ from purra.cancellation import ExecutionDeadlineExceeded, OperationCanceled, rai
 from purra.contracts import (
     AgentMessage,
     AgentRunResult,
+    OutputTextReference,
     MessageRole,
     ModelRequest,
     ModelFinishReason,
@@ -153,8 +154,12 @@ class AgentResponseTransaction:
         self._require_mode(ResponseTransactionMode.VALIDATED_RESULT)
         if not callable(getattr(committer, "commit_candidate", None)):
             raise TypeError("validated response requires a result committer")
+        verbatim = self._policy.public_presentation is PublicPresentationMode.VERBATIM
+        if verbatim and not callable(getattr(committer, 'commit_public_candidate', None)):
+            raise TypeError('verbatim response requires an atomic public candidate committer')
         candidate_messages = tuple(messages)
         candidate = ""
+        references = []
         for attempt in range(self._max_candidate_attempts):
             candidate = await self._invoke_and_collect(
                 candidate_messages,
@@ -164,6 +169,7 @@ class AgentResponseTransaction:
                 commit_mode=OutputCommitMode.GATED,
                 output_budget=output_budget,
                 signal=signal,
+                references=references if verbatim else None,
             )
             try:
                 await self._validate_candidate(
@@ -187,7 +193,9 @@ class AgentResponseTransaction:
                         content=_candidate_repair_instruction(error),
                     ),
                 )
-        committed = await committer.commit_candidate(context.run_id, candidate)
+        raise_if_stopped(signal)
+        committed = (await committer.commit_public_candidate(context.run_id, candidate, references[-1])
+                     if verbatim else await committer.commit_candidate(context.run_id, candidate))
         if not isinstance(committed, AgentRunResult):
             raise ContractViolationError(
                 "validated result committer returned an invalid result"
@@ -196,6 +204,10 @@ class AgentResponseTransaction:
             raise ContractViolationError(
                 "validated result committer did not commit a successful result"
             )
+        if verbatim:
+            if committed.final_response != candidate:
+                raise ContractViolationError('verbatim committer changed the validated answer')
+            return committed
         if self._policy.public_presentation is PublicPresentationMode.NONE:
             return committed
         public_response = await self.present(
@@ -218,6 +230,8 @@ class AgentResponseTransaction:
         self._require_mode(ResponseTransactionMode.VALIDATED_RESULT)
         if self._policy.public_presentation is PublicPresentationMode.NONE:
             return ""
+        if self._policy.public_presentation is PublicPresentationMode.VERBATIM:
+            raise ContractViolationError('verbatim answers must publish in their candidate commit')
         if not isinstance(committed, AgentRunResult):
             raise TypeError("public presentation requires an AgentRunResult")
         if committed.run_id != context.run_id:
@@ -305,6 +319,7 @@ class AgentResponseTransaction:
         commit_mode: OutputCommitMode,
         output_budget: InvocationOutputBudget | None,
         signal: CancellationSignal | None,
+        references=None,
     ) -> str:
         raise_if_stopped(signal)
         stream = await self._models.stream(
@@ -370,7 +385,11 @@ class AgentResponseTransaction:
                 code=termination.error_code or "model_output_truncated",
                 retryable=False,
             )
-        return "".join(content)
+        answer = "".join(content)
+        if references is not None:
+            references.append(OutputTextReference.for_text(context.run_id,
+                stream.receipt.output_stream_id, stream.receipt.invocation_id, answer))
+        return answer
 
     def _require_mode(self, expected: ResponseTransactionMode) -> None:
         if self._policy.mode is not expected:

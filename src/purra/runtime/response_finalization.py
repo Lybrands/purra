@@ -9,8 +9,8 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Mapping
 
-from purra.contracts import AgentMessage, MessageRole, TraceRecord
-from purra.output.contracts import ResponseTransactionMode
+from purra.contracts import AgentMessage, MessageRole, TraceRecord, OutputTextReference
+from purra.output.contracts import AgentOutputIntent
 from purra.recovery import (
     RecoveryAction,
     RecoveryCause,
@@ -22,7 +22,6 @@ from purra.recovery import (
 from purra.recovery.guidance import (
     EMPTY_RESPONSE_RETRY_GUIDANCE,
     FAILED_TOOL_OUTPUT_RETRY_GUIDANCE,
-    FINAL_PUBLIC_PRESENTATION_GUIDANCE,
     TEXTUAL_TOOL_CALL_RETRY_GUIDANCE,
 )
 
@@ -377,34 +376,11 @@ def resolve_response_constraint_recovery(
     )
 
 
-def public_presentation_messages(
-    *,
-    content: str,
-    reasoning: str,
-    invocation_had_tools: bool,
-    buffered_model_content: bool,
-    transaction_mode: ResponseTransactionMode,
-    already_pending: bool,
-) -> tuple[AgentMessage, ...]:
-    """Return the tool-free round that turns private working output public."""
-
-    if (
-        not (invocation_had_tools or buffered_model_content)
-        or transaction_mode is not ResponseTransactionMode.DIRECT_LIVE
-        or already_pending
-    ):
-        return ()
-    return (
-        AgentMessage(
-            role=MessageRole.ASSISTANT,
-            content=content,
-            reasoning=reasoning or None,
-        ),
-        AgentMessage(
-            role=MessageRole.DEVELOPER,
-            content=FINAL_PUBLIC_PRESENTATION_GUIDANCE,
-        ),
-    )
+def final_output_reference(receipt, run_id, content):
+    """Select complete tool-free working prose without generating it again."""
+    if not run_id or receipt.output_intent is not AgentOutputIntent.STRUCTURED_PRIVATE:
+        return None
+    return OutputTextReference.for_text(run_id, receipt.output_stream_id, receipt.invocation_id, content)
 
 
 def declined_final_response(messages: Sequence[AgentMessage]) -> str:
@@ -470,7 +446,7 @@ __all__ = [
     "failed_tool_final_response",
     "is_textual_tool_call",
     "is_unstructured_tool_output",
-    "public_presentation_messages",
+    "final_output_reference",
     "resolve_response_constraint_recovery",
     "resolve_response_recovery",
     "response_constraint_repair_guidance",

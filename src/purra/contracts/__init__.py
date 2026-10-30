@@ -106,6 +106,7 @@ from purra.contracts.approval import (
     ApprovalResult,
 )
 from purra.contracts.run import (
+    OutputTextReference,
     AgentRunResult,
     AgentRuntimeResult,
     RunCreateParams,
@@ -119,6 +120,7 @@ from purra.contracts.run import (
 from purra.structured import StructuredOutputContract
 
 __all__ = [
+    "OutputTextReference",
     "AgentMessage",
     "AgentRunRequest",
     "AgentRunResult",

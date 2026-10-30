@@ -271,7 +271,7 @@ def test_response_finalization_policy_stays_out_of_runtime_orchestrator():
     )
     assert "resolve_response_recovery(" in source
     assert "resolve_response_constraint_recovery(" in source
-    assert "public_presentation_messages(" in source
+    assert "final_output_reference(" in source
     for cause in (
         "RecoveryCause.UNSTRUCTURED_TOOL_PROTOCOL",
         "RecoveryCause.EMPTY_MODEL_RESPONSE",

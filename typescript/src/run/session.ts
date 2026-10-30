@@ -81,6 +81,7 @@ export class RunSession {
   #parentFeedbackStreaming = false;
   readonly #publicReleases = new Map<string, () => void>();
   readonly #receipts = new Map<string, ModelInvocationReceipt>();
+  readonly #finalCandidates = new Map<string, string>();
 
   private constructor(
     repository: RunRepository,
@@ -397,6 +398,11 @@ export class RunSession {
     if (settled.budgetError !== undefined) {
       throw new AgentError(settled.budgetError, "Run token budget is exhausted");
     }
+    if (status === "completed" && turn?.finishReason === "stop"
+        && !turn.message.toolCalls?.length && typeof turn.message.content === "string"
+        && receipt.outputProtocol === undefined) {
+      this.#finalCandidates.set(receipt.invocationId, turn.message.content);
+    }
   }
 
   public async persistPlanningProgress(receipt: ModelInvocationReceipt, progress: PlanningProgress): Promise<boolean> {
@@ -687,20 +693,32 @@ export class RunSession {
     });
   }
 
-  public async complete(result: RunResult, presentation: "model_live" | "none" = "model_live"): Promise<void> {
+  public async complete(result: RunResult, presentation: "verbatim" | "model_live" | "none" = "verbatim"): Promise<void> {
     if (this.#deadlineExceeded) {
       throw new AgentError("run_deadline_exceeded", "Run deadline has elapsed");
     }
     await this.#flushAllBatches();
+    const source = presentation === "verbatim" ? result.outputReference : undefined;
+    if (source !== undefined && (source.runId !== this.#runId
+        || this.#finalCandidates.get(source.invocationId) !== result.output
+        || source.contentDigest !== await stableFingerprint(result.output))) {
+      throw new AgentError("final_output_mismatch", "Final output must match its completed Provider invocation");
+    }
     const finalEvent = await this.#authorize({
       sourceKey: `run:${this.#runId}:final`,
       kind: "final",
       channel: "final",
       visibility: presentation === "none" ? "private" : this.#outwardVisibility,
-      payload: { output: result.output, rounds: result.rounds },
+      payload: { output: result.output, rounds: result.rounds,
+        ...(source === undefined ? {} : { invocationId: source.invocationId,
+          contentDigest: source.contentDigest }) },
     });
     if (finalEvent === null) {
       throw new AgentError("output_policy_violation", "Output policy cannot remove final output");
+    }
+    if (presentation === "verbatim" && typeof result.output === "string"
+        && finalEvent.payload?.output !== result.output) {
+      throw new AgentError("final_output_mismatch", "Verbatim output cannot rewrite the validated answer");
     }
     const settled = await this.#repository.settleRun(this.#runId, "completed", {
       relatedEvents: [finalEvent],

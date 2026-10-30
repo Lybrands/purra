@@ -323,6 +323,7 @@ test("oversized tool results are replaced with a bounded receipt", async () => {
 test("Agent.stream emits public deltas, tool lifecycle, and one final result", async () => {
   let round = 0;
   const agent = new Agent({
+    responsePresentation: 'model_live',
     model: testGateway({
       async invoke() { throw new Error("stream should be used"); },
       async *stream() {
@@ -364,6 +365,7 @@ test("public presentation disables tools and rejects a forged tool call", async 
   const requests = [];
   let executions = 0;
   const agent = new Agent({
+    responsePresentation: 'model_live',
     model: testGateway({
       async invoke(request) {
         requests.push(request);

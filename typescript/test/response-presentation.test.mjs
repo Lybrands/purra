@@ -24,13 +24,13 @@ function host(presentation, extra = {}) {
   return { agent, counts: () => ({ calls, writes }) };
 }
 
-for (const presentation of [undefined, "model_live", "none"]) {
+for (const presentation of [undefined, "verbatim", "model_live", "none"]) {
   test(`presentation ${presentation} preserves tool execution and chooses publication`, async () => {
     const repository = new InMemoryRunRepository();
     const { agent, counts } = host(presentation, { runRepository: repository });
     const handle = await agent.submit(request, options);
     assert.equal((await handle.result).output, candidate);
-    assert.deepEqual(counts(), { calls: presentation === "none" ? 2 : 3, writes: 1 });
+    assert.deepEqual(counts(), { calls: presentation === "model_live" ? 3 : 2, writes: 1 });
     const events = [];
     for await (const e of handle.events()) events.push(e);
     const all = [];
@@ -86,9 +86,9 @@ test("output policy cannot promote the host-only final result", async () => {
   await assert.rejects(handle.result, { code: "output_policy_violation" });
 });
 
-test("default and explicit model presentation retain the same saved identity", async () => {
+test("default and explicit verbatim presentation retain the same saved identity", async () => {
   const fingerprints = [];
-  for (const presentation of [undefined, "model_live", "none"]) {
+  for (const presentation of [undefined, "verbatim", "model_live", "none"]) {
     const { agent } = host(presentation, { tools: [] });
     const handle = await agent.submit(request, options);
     await handle.result;
@@ -96,6 +96,7 @@ test("default and explicit model presentation retain the same saved identity", a
   }
   assert.equal(fingerprints[0], fingerprints[1]);
   assert.notEqual(fingerprints[0], fingerprints[2]);
+  assert.notEqual(fingerprints[0], fingerprints[3]);
 });
 
 test("invalid presentation mode fails at composition time", () => {
@@ -111,4 +112,44 @@ test("host-only result still settles actual usage against the Run budget", async
   const handle = await agent.submit(request, { budgets: { maxRunGenerationTokens: 1 } });
   await assert.rejects(handle.result, { code: "runtime_budget_exceeded" });
   assert.equal((await handle.snapshot()).usage.generationTokens, 3);
+});
+
+for (const presentation of [undefined, "verbatim"]) {
+  test(`long validated Unicode is unchanged with presentation ${presentation}`, async () => {
+    const answer = "合成大纲🙂\n".repeat(20000);
+    let calls = 0, checked = 0;
+    const { agent } = host(presentation, { tools: [],
+      responseValidation: { validators: [{ validate({ content }) {
+        assert.equal(content, answer);
+        checked++;
+        return {};
+      } }], maxAttempts: 1 },
+      model: testGateway({ async invoke() { calls++;
+        return { message: { role: "assistant", content: answer, reasoning: "PRIVATE_REASONING" }, finishReason: "stop" };
+      } }),
+    });
+    const handle = await agent.submit(request, options);
+    assert.equal((await handle.result).output, answer);
+    assert.equal(calls, 1);
+    assert.equal(checked, 1);
+    const events = [];
+    for await (const e of handle.events()) events.push(e);
+    const final = events.find(e => e.kind === "final");
+    assert.equal(final.payload.output, answer);
+    assert.ok(final.payload.invocationId);
+    assert.match(final.payload.contentDigest, /^[a-f0-9]{64}$/);
+    assert.ok(!JSON.stringify(events).includes("PRIVATE_REASONING"));
+  });
+}
+
+test("verbatim publication cannot rewrite an accepted candidate through output policy", async () => {
+  const { agent } = host("verbatim", { tools: [], outputPolicy: {
+    authorize(event) { return event.kind === "final"
+      ? { ...event, payload: { ...event.payload, output: "rewritten" } } : event; },
+  } });
+  const handle = await agent.submit(request, options);
+  await assert.rejects(handle.result, { code: "final_output_mismatch" });
+  const events = [];
+  for await (const e of handle.events()) events.push(e);
+  assert.ok(!events.some(e => e.kind === "final"));
 });

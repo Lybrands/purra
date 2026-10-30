@@ -164,7 +164,7 @@ export interface AgentOptions {
   readonly planning?: PlanningOptions;
   readonly responseValidation?: ResponseValidationOptions;
   /** `none` returns a host-only result without a public response presentation. */
-  readonly responsePresentation?: "model_live" | "none";
+  readonly responsePresentation?: "verbatim" | "model_live" | "none";
   readonly durable?: DurableOptions;
   readonly agentTree?: AgentTreeOptions;
   readonly recovery?: RecoveryPolicy;
@@ -232,7 +232,7 @@ export class Agent {
   readonly #runRepository: RunRepository;
   readonly #outputPublisher: OutputPublisher;
   readonly #outputPolicy: OutputPolicy;
-  readonly #responsePresentation: "model_live" | "none";
+  readonly #responsePresentation: "verbatim" | "model_live" | "none";
   readonly #context: ContextOptions | undefined;
   readonly #planning: PlanningOptions | undefined;
   readonly #responseValidationOptions: ResponseValidationOptions;
@@ -365,10 +365,10 @@ export class Agent {
     this.#outputPublisher = options.outputPublisher ?? new InMemoryOutputPublisher();
     this.#outputPolicy = options.outputPolicy ?? allowAllOutput;
     if (options.responsePresentation !== undefined
-      && options.responsePresentation !== "model_live" && options.responsePresentation !== "none") {
-      throw new TypeError("responsePresentation must be model_live or none");
+      && options.responsePresentation !== "verbatim" && options.responsePresentation !== "model_live" && options.responsePresentation !== "none") {
+      throw new TypeError("responsePresentation must be verbatim, model_live or none");
     }
-    this.#responsePresentation = options.responsePresentation ?? "model_live";
+    this.#responsePresentation = options.responsePresentation ?? "verbatim";
     this.#planning = copyPlanningOptions(options.planning);
     this.#durable = copyDurableOptions(options.durable, this.#planning, options.preset);
 
@@ -532,7 +532,7 @@ export class Agent {
         contextStrategy: this.#context?.strategy ?? "single_pass",
         planningBinding: this.#planning?.binding ?? null,
         ...(this.#capabilities.protocol.imageInput === undefined ? {} : { imageInput: this.#capabilities.protocol.imageInput }),
-        ...(this.#responsePresentation === "none" ? { responsePresentation: "none" } : {}),
+        responsePresentation: this.#responsePresentation,
         durableBinding: this.#durable?.binding ?? null,
         agentTree: agentTreeSnapshot,
         recovery: this.#recoveryPolicy.snapshot(),
@@ -1223,7 +1223,7 @@ export class Agent {
     let autoPlanningPhase: "initial" | "remaining" | undefined = (
       autoPlanning !== undefined && planning === undefined
     ) ? (resumeCheckpoint?.initialPlanningOpen === false ? "remaining" : "initial") : undefined;
-    const validatedResultMode = this.#responsePresentation === "none"
+    const validatedResultMode = this.#responsePresentation === "none" || this.#responsePresentation === "verbatim"
       || (session !== undefined && this.#agentTreeRoots.has(session.rootRunId));
     const recovery = new RecoveryLedger(this.#recoveryPolicy);
     if (resumeCheckpoint !== undefined) {
@@ -1515,8 +1515,16 @@ export class Agent {
           continue;
         }
         planning?.state?.completeFinal();
+        if (this.#responsePresentation === 'verbatim' && typeof assistant.content === 'string'
+            && (tools.length > 0 || responseValidation.enabled)) {
+          emit?.({ type: 'model_delta', delta: assistant.content });
+        }
         return Object.freeze({
           output: assistant.content,
+          ...(session === undefined || receipt === undefined || typeof assistant.content !== "string" ? {} : {
+            outputReference: Object.freeze({ runId: session.runId, invocationId: receipt.invocationId,
+              contentDigest: await stableFingerprint(assistant.content) }),
+          }),
           messages: publicMessages(messages),
           rounds: round,
         });

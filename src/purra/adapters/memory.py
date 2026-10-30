@@ -47,6 +47,7 @@ from purra.output import (
     TERMINAL_STREAM_ABORT_ERROR_CODE,
 )
 from purra.output.ports import AgentOutputPublisher, AgentOutputRepository
+from purra.output.verbatim import verbatim_publication_drafts
 from purra.ports.run_lifecycle import (
     RunBeginResult,
     RunCommit,
@@ -813,6 +814,16 @@ class _InMemoryAgentOutputRepository:
 
     def _prepare_run_lifecycle(self, run_id, commit, draft, related_drafts=(), *, control_cancellation=False):
         validate_run_commit_lifecycle(commit)
+        final_drafts = ()
+        if commit.final_output is not None:
+            stream = self._require_stream(commit.final_output.output_stream_id)
+            if commit.final_output.run_id != run_id:
+                raise ContractViolationError('final publication belongs to another Run')
+            final_drafts = verbatim_publication_drafts(commit.final_output,
+                spec=stream.spec, status=stream.status, finish_reason=stream.finish_reason,
+                events=tuple(event for event in self._state.output_events.get(run_id, ())
+                    if event.output_stream_id == stream.spec.output_stream_id),
+                text=commit.final_response, occurred_at=draft.occurred_at)
         expected_status = commit.terminal_status or RunStatus.RUNNING
         if draft.status != expected_status:
             raise ContractViolationError(
@@ -879,6 +890,7 @@ class _InMemoryAgentOutputRepository:
             replay_drafts = (
                 *related_drafts,
                 *((validated_draft,) if validated_draft is not None else ()),
+                *final_drafts,
             )
             replay = tuple(
                 _existing_event(self._state, item) for item in replay_drafts
@@ -935,6 +947,7 @@ class _InMemoryAgentOutputRepository:
             *operation_aborts,
             *related_drafts,
             *((validated_draft,) if validated_draft is not None else ()),
+            *final_drafts,
             *terminal_abort_drafts,
             lifecycle_draft,
         )
@@ -946,11 +959,15 @@ class _InMemoryAgentOutputRepository:
                 "partial canonical lifecycle commit already exists"
             )
         for item in atomic_drafts:
-            _validate_new_event(self._state, item, allow_committed_stream=False, control_cancellation=control_cancellation)
+            _validate_new_event(self._state, item, allow_committed_stream=item in final_drafts, control_cancellation=control_cancellation)
+        costs = tuple(_provider_output_cost(item) for item in atomic_drafts)
+        _require_provider_output_budget(self._state, run_id, record,
+            sum(count for count, _ in costs), sum(size for _, size in costs))
         def apply():
             _apply_commit(record, commit)
             events = tuple(
-                _append_event(self._state, item, control_cancellation=control_cancellation) for item in atomic_drafts
+                _append_event(self._state, item, allow_committed_stream=item in final_drafts,
+                    budget_prechecked=True, control_cancellation=control_cancellation) for item in atomic_drafts
             )
             for terminal_abort in terminal_abort_drafts:
                 stream = self._require_stream(terminal_abort.output_stream_id or "")

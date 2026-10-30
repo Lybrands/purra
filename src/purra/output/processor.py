@@ -25,8 +25,10 @@ from purra.events import AgentEvent
 from purra.output.contracts import (
     AgentOutputEvent,
     AgentOutputEventDraft,
+    AgentOutputIntent,
     DomainEffectOutput,
     OutputChannel,
+    OutputCommitMode,
     OutputEventKind,
     OutputSource,
     OutputStreamSpec,
@@ -86,11 +88,15 @@ class AgentOutputProcessor:
         policy: AgentOutputPolicy | None = None,
         recovery_observer: OutputRecoveryObserver | None = None,
         batch_limits: OutputBatchLimits | None = None,
+        publish_provider_progress: bool = True,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         self._repository = repository
         self._publisher = publisher
         self._policy = policy or _AllowProviderChunks()
+        if type(publish_provider_progress) is not bool:
+            raise TypeError('publish_provider_progress must be a boolean')
+        self._publish_provider_progress = publish_provider_progress
         self._recovery = recovery_observer
         self._buffer = ProviderOutputBuffer(
             limits=batch_limits or OutputBatchLimits(), sleep=sleep,
@@ -285,7 +291,7 @@ class AgentOutputProcessor:
                     },
                     occurred_at=occurred_at,
                 )))
-            if authorized.progress_delta:
+            if authorized.progress_delta and self._publish_provider_progress:
                 events.append(await self._append(AgentOutputEventDraft(
                     run_id=spec.run_id,
                     turn_id=spec.turn_id,
@@ -455,6 +461,19 @@ class AgentOutputProcessor:
                 "run lifecycle commit requires one bound run id"
             )
         run_id = next(iter(run_ids))
+        if commit.final_output is not None:
+            from purra.output.verbatim import _text_frames
+            spec = self._require_stream(commit.final_output.output_stream_id)
+            public_spec = replace(spec, intent=AgentOutputIntent.FINAL_PUBLIC,
+                commit_mode=OutputCommitMode.LIVE)
+            # Private collection permission is not permission to disclose.
+            # Gate every outward frame before the atomic terminal write.
+            for text in _text_frames(commit.final_response):
+                chunk = ModelStreamChunk(content_delta=text)
+                authorized = await self._policy.authorize_provider_chunk(public_spec, chunk)
+                if authorized != chunk:
+                    raise ContractViolationError('verbatim publication requires unchanged public authorization',
+                        code='output_policy_violation')
         event = replace(event, turn_id=self._run_turn_ids.get(run_id))
         related_drafts = tuple(
             AgentOutputEventDraft(

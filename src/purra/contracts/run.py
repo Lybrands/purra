@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import hashlib
 import re
 from typing import Any, Literal, Mapping
 
@@ -387,6 +388,27 @@ class RuntimeLimits:
 
 
 @dataclass(frozen=True, slots=True)
+class OutputTextReference:
+    """Identity of a complete Provider-authored answer selected for publication."""
+
+    run_id: str
+    output_stream_id: str
+    invocation_id: str
+    content_digest: str
+
+    def __post_init__(self) -> None:
+        for name in ('run_id', 'output_stream_id', 'invocation_id'):
+            object.__setattr__(self, name, required_text(getattr(self, name), name))
+        if not re.fullmatch(r'sha256:[0-9a-f]{64}', self.content_digest):
+            raise ValueError('output text reference requires a SHA-256 digest')
+
+    @classmethod
+    def for_text(cls, run_id: str, output_stream_id: str, invocation_id: str, text: str) -> OutputTextReference:
+        return cls(run_id, output_stream_id, invocation_id,
+                   'sha256:' + hashlib.sha256(text.encode('utf-8')).hexdigest())
+
+
+@dataclass(frozen=True, slots=True)
 class AgentRuntimeResult:
     run_id: RunId | None
     outcome: RuntimeOutcome
@@ -394,6 +416,7 @@ class AgentRuntimeResult:
     model: str
     round_count: int
     error_code: str | None = None
+    output_reference: OutputTextReference | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "outcome", RuntimeOutcome(self.outcome))

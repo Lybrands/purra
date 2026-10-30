@@ -7,6 +7,7 @@ import { testGateway } from "./support/model-gateway.mjs";
 test("Agent completes one validated model/tool loop", async () => {
   const requests = [];
   const agent = new Agent({
+    responsePresentation: 'model_live',
     model: testGateway({
       async invoke(request) {
         requests.push(request);

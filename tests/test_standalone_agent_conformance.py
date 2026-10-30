@@ -508,7 +508,7 @@ async def test_reactive_run_bypasses_configured_planner_and_staged_context():
 
 
 @pytest.mark.asyncio
-async def test_auto_direct_answer_uses_tool_free_live_presentation():
+async def test_auto_direct_answer_publishes_original_without_presentation_call():
     async def lookup(state, arguments, signal=None):
         del state, arguments, signal
         return ToolHandlerResult(content="found", effect_state="not_started")
@@ -554,19 +554,17 @@ async def test_auto_direct_answer_uses_tool_free_live_presentation():
     assert result.status is RunStatus.DONE
     assert result.final_response == "portable direct answer"
     assert planner.calls == 0
-    assert len(gateway.invocations) == 2
+    assert len(gateway.invocations) == 1
     assert {tool.name for tool in gateway.invocations[0].tools} == {
         "lookup",
         "request_plan",
     }
-    assert gateway.invocations[1].tools == ()
     assert [
         (event.payload["outputIntent"], event.payload["commitMode"])
         for event in events
         if event.kind.value == "stream.opened"
     ] == [
         ("structured_private", "private"),
-        ("final_public", "live"),
     ]
     assert (context.single_pass_calls, context.planning_calls) == (1, 0)
     assert [
@@ -1029,7 +1027,7 @@ async def test_open_ended_rounds_continue_past_six_while_evidence_changes():
 
     assert result.status is RunStatus.DONE
     assert call_count == 7
-    assert len(gateway.invocations) == 9
+    assert len(gateway.invocations) == 8
 
 
 @pytest.mark.asyncio

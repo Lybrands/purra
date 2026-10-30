@@ -105,6 +105,7 @@ class ResponseTransactionMode(StrEnum):
 class PublicPresentationMode(StrEnum):
     NONE = "none"
     MODEL_LIVE = "model_live"
+    VERBATIM = "verbatim"
 
 
 @dataclass(frozen=True, slots=True)

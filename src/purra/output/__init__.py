@@ -33,7 +33,9 @@ from purra.output.ports import (
     AgentOutputRepository,
     CommittedResultFactsProvider,
     ValidatedResultCommitter,
+    VerbatimResultCommitter,
 )
+from purra.output.verbatim import verbatim_publication_drafts
 _LAZY_EXPORT_MODULES = {
     "AgentOutputProcessor": "processor",
     "OutputBatchLimits": "processor",
@@ -57,6 +59,7 @@ def __getattr__(name: str):
 
 
 __all__ = [
+    "verbatim_publication_drafts",
     "AgentOutputEvent",
     "AgentOutputEventDraft",
     "AgentOutputIntent",
@@ -92,4 +95,5 @@ __all__ = [
     "ToolOutputEvent",
     "provider_delta_batch_digest",
     "ValidatedResultCommitter",
+    "VerbatimResultCommitter",
 ]

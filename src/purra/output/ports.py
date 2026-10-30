@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from purra.contracts import (
+    OutputTextReference,
     AgentRunResult,
     ModelFinishReason,
     ModelStreamChunk,
@@ -175,6 +176,14 @@ class ValidatedResultCommitter(Protocol):
         run_id: RunId,
         candidate: str,
     ) -> AgentRunResult: ...
+
+
+@runtime_checkable
+class VerbatimResultCommitter(ValidatedResultCommitter, Protocol):
+    async def commit_public_candidate(self, run_id: RunId, candidate: str,
+                                     reference: OutputTextReference) -> AgentRunResult:
+        """Atomically commit the validated result and referenced public bytes."""
+        ...
 
 
 __all__ = [name for name in globals() if not name.startswith("_")]

@@ -1600,10 +1600,18 @@ class AgentCore:
             final_response = result.final_response
             validated_result: str | None = None
             presentation = None
+            final_output = result.output_reference
             policy = options.resolved_response_transaction_policy
             if policy.mode is ResponseTransactionMode.VALIDATED_RESULT:
                 validated_result = final_response
                 final_response = ""
+                final_output = None
+                if policy.public_presentation is PublicPresentationMode.VERBATIM:
+                    if result.output_reference is None:
+                        raise ContractViolationError('verbatim publication requires its Provider output reference')
+                    final_response = result.final_response
+                    final_output = result.output_reference
+                    presentation = {'status': 'completed'}
                 if policy.public_presentation is PublicPresentationMode.MODEL_LIVE:
                     try:
                         transaction = AgentResponseTransaction(
@@ -1667,12 +1675,13 @@ class AgentCore:
                         presentation = {"status": "completed"}
             raise_if_stopped(signal)
             if validated_result is None:
-                await controller.complete(final_response)
+                await controller.complete(final_response, final_output=final_output)
             else:
                 await controller.complete_validated_result(
                     validated_result,
                     final_response=final_response,
                     presentation=presentation,
+                    final_output=final_output,
                 )
         except (OperationCanceled, ExecutionDeadlineExceeded):
             raise
