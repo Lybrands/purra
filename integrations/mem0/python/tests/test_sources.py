@@ -126,21 +126,27 @@ async def test_explicit_correction_uses_new_source_and_invalidates_old_evidence(
 async def test_revocation_does_not_wait_for_or_release_unknown_writer(setup):
     sdk, create, _ = setup
     memory = create(timeout_seconds=0.02)
+    control = create(timeout_seconds=1)
     sdk.gate = threading.Event()
     try:
+        pending = asyncio.create_task(memory.add("late", source=SOURCE, key="late"))
+        assert await asyncio.to_thread(sdk.started.wait, 1)
         with pytest.raises(MemoryError, match="memory_timeout"):
-            await memory.add("late", source=SOURCE, key="late")
-        assert sdk.started.is_set()
-        await memory.revoke_source(SOURCE.id, key="withdraw")
+            await pending
+        # Only the blocked write has a tiny timeout. Revocation must complete
+        # while its gate is closed, without a 20 ms scheduler-speed assertion.
+        await control.revoke_source(SOURCE.id, key="withdraw")
+        assert not sdk.gate.is_set()
         assert memory.operation("late").state == "running"
         with pytest.raises(MemoryError, match="memory_write_busy"):
-            await memory.add("other", source=MemorySource("other", "1"), key="busy")
+            await control.add("other", source=MemorySource("other", "1"), key="busy")
     finally:
         sdk.gate.set()
+        await asyncio.gather(pending, return_exceptions=True)
         await memory.drain()
     result = memory.operation("late")
-    assert result.state == "complete" and await memory.get(result.ids[0]) is None
-    assert await memory.retrieve(REQUEST) == ()
+    assert result.state == "complete" and await control.get(result.ids[0]) is None
+    assert await control.retrieve(REQUEST) == ()
 
 
 @pytest.mark.asyncio

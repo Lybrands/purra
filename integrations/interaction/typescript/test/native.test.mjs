@@ -44,8 +44,8 @@ test("question restart answer resume retains Run id, budget and canonical output
     assert.equal(resumed.runId, handle.runId);
     assert.equal((await resumed.result).output, "Finished with the answer");
     const saved = await resumed.snapshot();
-    assert.equal(saved.usage.modelAttempts, 3);
-    assert.equal(saved.usage.generationTokens, 34);
+    assert.equal(saved.usage.modelAttempts, 2);
+    assert.equal(saved.usage.generationTokens, 27);
     const events = await host.storage.runs.listEvents(handle.runId, 0);
     assert.deepEqual(events.slice(0, before.length), before);
     assert.equal(events.filter(e => e.kind === "input.required").length, 1);
@@ -95,7 +95,7 @@ test("concurrent resume cannot borrow another execution's lease", async () => {
     await assert.rejects(second.result, { code: "run_lease_conflict" });
     release();
     assert.equal((await first.result).output, "Finished with the answer");
-    assert.equal(host.calls.length, 3);
+    assert.equal(host.calls.length, 2);
   } finally {
     release();
     if (first) await first.result.catch(() => {});

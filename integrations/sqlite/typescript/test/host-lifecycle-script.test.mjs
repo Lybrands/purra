@@ -14,7 +14,7 @@ test("host lifecycle script reconstructs request state and stops worker", t => {
   assert.equal(result.status, 0, result.stderr);
   const report = JSON.parse(result.stdout);
   assert.deepEqual(report, {
-    schemaVersion: 1, runStatus: "completed", toolCalls: 1, modelCalls: 2,
+    schemaVersion: 1, runStatus: "completed", toolCalls: 1, modelCalls: 1,
     workerScans: report.workerScans, workerStopped: true,
     hostConfigurationReconstructed: true, syntheticOnly: true,
   });

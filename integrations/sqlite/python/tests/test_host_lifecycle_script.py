@@ -14,7 +14,7 @@ def test_host_lifecycle_script_reconstructs_and_stops(tmp_path):
     report = json.loads(result.stdout)
     assert report == {
         "schemaVersion": 1, "runStatus": "done", "toolCalls": 1,
-        "modelCalls": 2, "workerScans": report["workerScans"],
+        "modelCalls": 1, "workerScans": report["workerScans"],
         "workerStopped": True, "hostConfigurationReconstructed": True,
         "syntheticOnly": True,
     }

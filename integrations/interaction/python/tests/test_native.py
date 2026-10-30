@@ -64,12 +64,12 @@ async def test_question_restart_answer_resume_preserves_budget_and_output(tmp_pa
         resumed = await interaction.resume(core, identifier)
         result = await resumed.wait()
         assert resumed.run_id == run_id and result.final_response == "Finished with the answer", result
-        assert len(gateway.calls) == 2
+        assert len(gateway.calls) == 1  # no second call merely to publish the answer
         assert all(any("Answers to requested" in m.content for m in call) for call in gateway.calls)
         async with storage.transaction() as adapters:
             run = adapters.runs._state.runs[run_id]
-            assert len(run.model_attempt_ids) == 3
-            assert sum(u.generation_tokens for u in run.model_usage_by_invocation.values() if u) == 34
+            assert len(run.model_attempt_ids) == 2
+            assert sum(u.generation_tokens for u in run.model_usage_by_invocation.values() if u) == 27
         events = await storage.outputs.list_events(run_id, after_sequence=0)
         assert events[:len(before)] == before
         assert sum(e.payload.get("type") == "input.required" for e in events) == 1

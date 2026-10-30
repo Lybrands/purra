@@ -232,8 +232,10 @@ test('Agent parallel dispatch shares one host MCP session', {timeout:3000}, asyn
   }});
   const running = agent.invoke({messages:[{role:'user',content:'Read three documents'}]});
   while(f.calls.length<2)await new Promise(resolve=>setImmediate(resolve));
-  assert.equal(f.calls.length,2);f.state.gate.resolve();await running;
-  assert.deepEqual(toolIds,[[],['0','1','2'],['0','1','2']]);assert.equal(round,3);assert.equal(f.lists.length,1);assert.equal(f.calls.length,3);
+  assert.equal(f.calls.length,2);f.state.gate.resolve();
+  assert.equal((await running).output,'done');
+  // The validated answer is published directly; no presentation-only round.
+  assert.deepEqual(toolIds,[[],['0','1','2']]);assert.equal(round,2);assert.equal(f.lists.length,1);assert.equal(f.calls.length,3);
 });
 
 for (const row of fixture.schemaCases) test(`selected schema metadata: ${row.id}`, async t => {
