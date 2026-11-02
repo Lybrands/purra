@@ -667,7 +667,14 @@ class AgentRuntime:
         loop.evidence_store = RunEvidenceStore.from_checkpoint_mapping(
             thaw_json_mapping(checkpoint.evidence_state)
         )
-        loop.recovery_ledger.restore(checkpoint.recovery_attempts)
+        current_attempts = loop.recovery_ledger.snapshot()
+        if current_attempts:
+            # A live host checkpoint callback round-trips the same ledger.
+            # It must not restore a used ledger or reset consumed attempts.
+            if current_attempts != checkpoint.recovery_attempts:
+                raise ValueError("checkpoint changed consumed recovery attempts")
+        else:
+            loop.recovery_ledger.restore(checkpoint.recovery_attempts)
         loop.round_limit = checkpoint.round_limit
         loop.logical_round_number = checkpoint.logical_round_number
         loop.progress_rounds = checkpoint.progress_rounds
