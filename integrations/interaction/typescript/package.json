@@ -1,6 +1,6 @@
 {
   "name": "purra-interaction",
-  "version": "1.0.5",
+  "version": "1.0.6",
   "type": "module",
   "license": "MIT",
   "description": "Durable pre-execution user clarification for PurrA",
@@ -19,8 +19,8 @@
     }
   },
   "peerDependencies": {
-    "purra": "1.0.5",
-    "purra-sqlite": "1.0.5"
+    "purra": "1.0.6",
+    "purra-sqlite": "1.0.6"
   },
   "devDependencies": {
     "@types/node": "22.20.1",

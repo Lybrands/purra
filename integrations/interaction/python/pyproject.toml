@@ -4,15 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "purra-interaction"
-version = "1.0.5"
+version = "1.0.6"
 description = "Durable pre-execution user clarification for PurrA"
 requires-python = ">=3.11"
-dependencies = ["purra==1.0.5"]
+dependencies = ["purra==1.0.6"]
 readme = "README.md"
 license = "MIT"
 
 [project.optional-dependencies]
-sqlite = ["purra-sqlite==1.0.5"]
+sqlite = ["purra-sqlite==1.0.6"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

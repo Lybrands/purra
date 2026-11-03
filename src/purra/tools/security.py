@@ -21,6 +21,7 @@ _WINDOWS_PATH = re.compile(r"[A-Za-z]:\\[^\r\n\"']+")
 _POSIX_PATH = re.compile(
     r"(?<![:/A-Za-z0-9])/(?:[^/\s\"'\\]+/)+[^/\s\"'\\]*"
 )
+_JSON_STRING = re.compile(r'"(?:[^"\\]|\\.)*"')
 
 
 @dataclass(frozen=True, slots=True)
@@ -463,6 +464,24 @@ def summarize_tool_arguments(
 
 
 def _redact_sensitive(text: str) -> str:
+    text = str(text or "")
+    try:
+        json.loads(text)
+    except (ValueError, RecursionError):
+        return _redact_sensitive_plain(text)
+
+    # Match paths in decoded JSON strings, never against syntax escapes:
+    # e.g. the tail of "metadata:\\n..." is not a Windows drive path.
+    # Replacing only changed tokens also preserves formatting and numbers.
+    def redact_string(match: re.Match[str]) -> str:
+        value = json.loads(match[0])
+        redacted = _redact_sensitive_plain(value)
+        return match[0] if value == redacted else json.dumps(redacted, ensure_ascii=False)
+
+    return _JSON_STRING.sub(redact_string, text)
+
+
+def _redact_sensitive_plain(text: str) -> str:
     value = _BEARER.sub("Bearer [REDACTED]", str(text or ""))
     value = _API_KEY.sub("[REDACTED_KEY]", value)
     value = _WINDOWS_PATH.sub("[REDACTED_PATH]", value)
