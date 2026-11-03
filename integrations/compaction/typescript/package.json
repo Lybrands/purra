@@ -1,6 +1,6 @@
 {
   "name": "purra-compaction",
-  "version": "1.0.6",
+  "version": "1.0.7",
   "type": "module",
   "license": "MIT",
   "description": "Managed semantic conversation compaction for PurrA",
@@ -16,7 +16,7 @@
     }
   },
   "peerDependencies": {
-    "purra": "1.0.6"
+    "purra": "1.0.7"
   },
   "devDependencies": {
     "purra": "file:../../../typescript",

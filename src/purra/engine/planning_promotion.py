@@ -212,11 +212,9 @@ async def _prepare_runtime_phase(
         "selectedToolCount": len(selected_names),
     }
     events: tuple[AgentEvent, ...] = ()
-    if (
-        planned
-        and conversation_compactor is not None
-        and context_capability.uses_staged_context
-    ):
+    # Persistent public-history compaction is independent of retrieval strategy.
+    # Single-pass and reactive hosts need the same validated summary lifecycle.
+    if conversation_compactor is not None:
         request, diagnostics, events = await compact_after_planning(
             compactor=conversation_compactor,
             source_request=compaction_source_request,

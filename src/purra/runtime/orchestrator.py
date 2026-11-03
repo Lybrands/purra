@@ -441,6 +441,42 @@ class AgentRuntime:
                     yield loop.terminal_result
                     return
 
+                # Snapshot the exact invocation, including retries and lazy-loaded
+                # tool schemas. Later calls replace earlier occupancy; usage is
+                # never accumulated as if it occupied one context window.
+                attempt = loop.provider_attempt
+                if context_budget is not None and attempt is not None:
+                    messages_tokens = estimate_agent_messages_tokens(attempt.messages)
+                    schema_tokens = estimate_tool_schema_tokens(attempt.invocation.tools)
+                    runtime_reserve = (
+                        context_budget.runtime_reserve_tokens
+                        if attempt.logical_round == 1 else 0
+                    )
+                    projected_total = (
+                        messages_tokens + schema_tokens
+                        + context_budget.output_reserve_tokens
+                        + context_budget.safety_reserve_tokens + runtime_reserve
+                    )
+                    yield AgentEvent(
+                        type=CoreEventType.CONTEXT_BUDGETED,
+                        run_id=run_id,
+                        payload={
+                            "windowTokens": context_budget.window_tokens,
+                            "estimatedInputTokens": messages_tokens,
+                            "toolSchemaTokens": schema_tokens,
+                            "outputReserveTokens": context_budget.output_reserve_tokens,
+                            "safetyReserveTokens": context_budget.safety_reserve_tokens,
+                            "runtimeReserveTokens": runtime_reserve,
+                            "projectedTotalTokens": projected_total,
+                            "overflowTokens": max(0, projected_total - context_budget.window_tokens),
+                            "droppedMessages": max(0, len(loop.messages) - len(attempt.messages)),
+                            "modelName": request.model.model,
+                            "contextRound": loop.round_number,
+                            "contextAttempt": attempt.attempt,
+                            "usageScope": "invocation_input",
+                        },
+                    )
+
                 async for event in self._execute_provider_stream(
                     loop,
                     run_id=run_id,
@@ -1612,34 +1648,36 @@ class AgentRuntime:
                     "localInputEstimate": local_input_estimate,
                 },
             )
-            if attempt.logical_round == 1:
-                yield AgentEvent(
-                    type=CoreEventType.CONTEXT_USAGE_RECORDED,
-                    run_id=run_id,
-                    payload={
-                        "actualInputTokens": usage.input_tokens,
-                        "actualGenerationTokens": usage.generation_tokens,
-                        "actualTotalTokens": usage.total_tokens,
-                        "cachedInputTokens": usage.cached_input_tokens,
-                        "reasoningTokens": usage.reasoning_tokens,
-                        "actualUsageRound": attempt.logical_round,
-                        "inputTokenEstimateAtUsage": local_input_estimate,
-                        "usageSource": "provider",
-                        "requestedGenerationTokens": (
-                            invocation.max_generation_tokens
-                        ),
-                        "finishReason": (
-                            finish_reason.value
-                            if finish_reason is not None
-                            else None
-                        ),
-                        "outputBudget": (
-                            invocation.output_budget.to_mapping()
-                            if invocation.output_budget is not None
-                            else None
-                        ),
-                    },
-                )
+            yield AgentEvent(
+                type=CoreEventType.CONTEXT_USAGE_RECORDED,
+                run_id=run_id,
+                payload={
+                    "actualInputTokens": usage.input_tokens,
+                    "actualGenerationTokens": usage.generation_tokens,
+                    "actualTotalTokens": usage.total_tokens,
+                    "cachedInputTokens": usage.cached_input_tokens,
+                    "reasoningTokens": usage.reasoning_tokens,
+                    "actualUsageRound": attempt.logical_round,
+                    "contextRound": loop.round_number,
+                    "contextAttempt": attempt.attempt,
+                    "usageScope": "invocation_input",
+                    "inputTokenEstimateAtUsage": local_input_estimate,
+                    "usageSource": "provider",
+                    "requestedGenerationTokens": (
+                        invocation.max_generation_tokens
+                    ),
+                    "finishReason": (
+                        finish_reason.value
+                        if finish_reason is not None
+                        else None
+                    ),
+                    "outputBudget": (
+                        invocation.output_budget.to_mapping()
+                        if invocation.output_budget is not None
+                        else None
+                    ),
+                },
+            )
         await self._trace(
             "tool_dispatch" if host_planned_dispatch else "model_round",
             (
