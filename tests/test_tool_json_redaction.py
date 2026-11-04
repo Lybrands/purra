@@ -35,3 +35,31 @@ def test_plain_text_redaction_and_result_size_limit_still_apply():
     assert sanitize_tool_result(r'error at C:\Users\Author\private.txt') == 'error at [REDACTED_PATH]'
     assert '[REDACTED_PATH]' in sanitize_tool_result('error at /Users/author/private/file.txt')
     assert 'tool_result_too_large' in sanitize_tool_result('x'*20, max_chars=10)
+
+
+@pytest.mark.parametrize('path', [
+    '../workspace/materials.md', '../../SKILL.md#检查与修正',
+    './references/methods/prose.md', 'references/methods/prose.md',
+])
+@pytest.mark.parametrize('ensure_ascii', [True, False])
+def test_relative_markdown_links_survive_all_text_boundaries(path, ensure_ascii):
+    document = '[method](' + path + ')'
+    payload = json.dumps({'file': {'content': document}}, ensure_ascii=ensure_ascii)
+    assert sanitize_tool_result(document) == document
+    assert sanitize_tool_result(payload) == payload
+    assert sanitize_error_message(payload) == payload
+    assert json.loads(summarize_tool_arguments({'text': document})) == {'text': document}
+
+
+@pytest.mark.parametrize('path', ['/Users/author/private/file.md', '/tmp/.private/file.md',
+                                 '/./Users/author/private/file.md', r'C:\Users\Author\private.md'])
+def test_relative_link_does_not_exempt_absolute_paths_or_credentials(path):
+    document = '[method](../workspace/materials.md)\nprivate: ' + path
+    payload = {'file': {'content': document}, 'secret': 'Bearer synthetic_token_123',
+               'key': 'sk-syntheticsecret123'}
+    sanitized = json.loads(sanitize_tool_result(json.dumps(payload)))
+    assert '[method](../workspace/materials.md)' in sanitized['file']['content']
+    assert path not in sanitized['file']['content']
+    assert '[REDACTED_PATH]' in sanitized['file']['content']
+    assert sanitized['secret'] == 'Bearer [REDACTED]'
+    assert sanitized['key'] == '[REDACTED_KEY]'

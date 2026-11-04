@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "purra-compaction"
-version = "1.0.7"
+version = "1.0.8"
 description = "Managed semantic conversation compaction for PurrA"
 requires-python = ">=3.11"
-dependencies = ["purra==1.0.7"]
+dependencies = ["purra==1.0.8"]
 readme = "README.md"
 license = "MIT"
 

@@ -19,7 +19,7 @@ _BEARER = re.compile(r"(?i)bearer\s+[a-z0-9._~+/=-]+")
 _API_KEY = re.compile(r"(?i)\b(?:sk|key)-[a-z0-9_-]{8,}\b")
 _WINDOWS_PATH = re.compile(r"[A-Za-z]:\\[^\r\n\"']+")
 _POSIX_PATH = re.compile(
-    r"(?<![:/A-Za-z0-9])/(?:[^/\s\"'\\]+/)+[^/\s\"'\\]*"
+    r"(?<![:/.A-Za-z0-9])/(?:[^/\s\"'\\]+/)+[^/\s\"'\\]*"
 )
 _JSON_STRING = re.compile(r'"(?:[^"\\]|\\.)*"')
 
