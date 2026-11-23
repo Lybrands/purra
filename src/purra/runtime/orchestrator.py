@@ -448,10 +448,7 @@ class AgentRuntime:
                 if context_budget is not None and attempt is not None:
                     messages_tokens = estimate_agent_messages_tokens(attempt.messages)
                     schema_tokens = estimate_tool_schema_tokens(attempt.invocation.tools)
-                    runtime_reserve = (
-                        context_budget.runtime_reserve_tokens
-                        if attempt.logical_round == 1 else 0
-                    )
+                    runtime_reserve = attempt.context.runtime_reserve_tokens or 0
                     projected_total = (
                         messages_tokens + schema_tokens
                         + context_budget.output_reserve_tokens
@@ -1457,7 +1454,7 @@ class AgentRuntime:
                         ),
                     ),
                     replace(
-                        loop.invocation_context,
+                        attempt.context,
                         attempt_source_key=(
                             f"runtime:{loop.invocation_context.run_id}:"
                             f"round:{loop.round_number}:request:{request_fingerprint}"
@@ -2045,6 +2042,15 @@ class AgentRuntime:
         loop.logical_round_number += 1
         loop.provider_attempt = _PendingProviderAttempt(
             messages=round_messages,
+            # Freeze the same per-round reserve for reporting, invocation fitting
+            # and physical retries. Growth headroom is consumed after round one.
+            context=replace(
+                loop.invocation_context,
+                runtime_reserve_tokens=(
+                    loop.invocation_context.runtime_reserve_tokens
+                    if loop.logical_round_number == 1 else 0
+                ),
+            ),
             invocation=ModelInvocation(
                 request=request.model,
                 tools=visible_tools,

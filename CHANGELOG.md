@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.0.9 — 2026-11-24: consistent Python per-round context reserves
+
+- Freeze the effective invocation context with each logical model round so
+  context-budget reporting and the final generation-capacity check use the same
+  runtime reserve. The first round keeps its growth reserve; later rounds release
+  it instead of incorrectly rejecting inputs that fit the later-round budget.
+- Physical retries retain that logical round's frozen budget and do not replay
+  completed tools. Safety reserves and genuine context-overflow checks remain.
+- Add integrated coverage for growing tool context, first/later-round opening
+  retries, effective output ceilings, and fail-closed initial/later overflow.
+- Python runtime fix only; TypeScript runtime behavior is unchanged. Core and
+  integration release metadata remain aligned. Storage and checkpoint formats
+  are unchanged; no offline data migration or automatic task replay is performed.
+  Existing history uses the same format. Running processes keep their loaded
+  code until restarted; this release does not hot-patch active runs.
+
 ## 1.0.3 — 2026-10-21: independent Python presentation outcomes
 
 - Python model-live presentation records an optional `AgentRunResult.presentation`

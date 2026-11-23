@@ -24,7 +24,7 @@ from purra.errors import (
     UnsupportedModelFeatureError,
 )
 from purra.json_values import thaw_json_mapping
-from purra.model_invocation.contracts import AgentModelCall
+from purra.model_invocation.contracts import AgentModelCall, ModelInvocationContext
 from purra.output import AgentOutputIntent, OutputCommitMode
 from purra.recovery import (
     RecoveryAction,
@@ -42,6 +42,7 @@ class PendingProviderAttempt:
 
     messages: tuple[AgentMessage, ...]
     invocation: ModelInvocation
+    context: ModelInvocationContext
     allowed_names: frozenset[str]
     future_names: frozenset[str]
     require_tool: bool

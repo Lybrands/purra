@@ -1,6 +1,6 @@
 {
   "name": "purra-sqlite",
-  "version": "1.0.8",
+  "version": "1.0.9",
   "type": "module",
   "license": "MIT",
   "description": "SQLite persistence for PurrA",
@@ -19,7 +19,7 @@
     }
   },
   "peerDependencies": {
-    "purra": "1.0.8"
+    "purra": "1.0.9"
   },
   "devDependencies": {
     "@types/node": "22.20.1",
