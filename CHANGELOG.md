@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.0.11 — 2026-11-25: public Python execution-fence context query
+
+- Expose `purra.execution.current_execution_claim()` as a read-only query for the
+  supervised Run's identity, execution owner, and attempt. Host repositories can
+  retain attempt fencing without importing SDK implementation modules or gaining
+  a public context mutation API. The query does not prove lease liveness or
+  replace authoritative lease, expiration, or cancellation checks.
+- Preserve the existing execution context and its task-local propagation; no
+  lease behavior, cancellation policy, checkpoint format, or stored data changes.
+- Includes 1.0.10's bounded precondition recovery. Python only; TypeScript runtime
+  behavior is unchanged. Core and integration release metadata stay aligned.
+  No task replay or data migration is performed.
+
 ## 1.0.10 — 2026-11-25: bounded Python tool-precondition recovery
 
 - Add an opt-in, side-effect-free `ToolPreconditionFailure` contract and optional
