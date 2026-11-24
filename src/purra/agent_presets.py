@@ -675,6 +675,7 @@ def _tool_registration_mapping(
         "argumentContract": thaw_json_mapping(registration.argument_contract.identity()) if registration.argument_contract is not None else None,
         "cancellationLinearizable": registration.cancellation_linearizable,
         "hostManagedDurability": registration.host_managed_durability,
+        **({"preconditionValidator": True} if registration.precondition_validator is not None else {}),
         "maxArgumentChars": registration.max_argument_chars,
         "planningCapability": (
             _tool_schema_mapping(registration.planning_capability)

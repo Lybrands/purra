@@ -921,7 +921,13 @@ class AgentRuntime:
                 await _close_async_iterator(batch_stream)
             if batch_result is None:
                 raise RuntimeError("tool gateway returned no result")
-            loop.pending_tool_input_retries = ()
+            # Repair may need intervening read tools. Consume only links for
+            # tool names actually attempted, retaining the rest in checkpoints.
+            attempted_names = {call.name for call in loop.calls}
+            loop.pending_tool_input_retries = tuple(
+                pair for pair in loop.pending_tool_input_retries
+                if pair[1] not in attempted_names
+            )
         except OperationCanceled:
             await self._trace(
                 "tool_round",
@@ -1072,12 +1078,16 @@ class AgentRuntime:
                 trace.outcome,
                 details=dict(trace.details),
             )
-        if recovery.disposition is ToolRecoveryDisposition.RETRY_MODEL:
-            loop.pending_tool_input_retries = tuple(
+        if recovery.disposition is ToolRecoveryDisposition.RETRY_MODEL or (
+            recovery.disposition is ToolRecoveryDisposition.REPLAN
+            and batch_result.error == "tool_precondition_failed"
+        ):
+            loop.pending_tool_input_retries += tuple(
                 (result.tool_call_id, result.tool_name)
                 for result in batch_result.results
                 if result.error == batch_result.error
             )
+        if recovery.disposition is ToolRecoveryDisposition.RETRY_MODEL:
             loop.messages.extend(recovery.messages)
             return
         if recovery.disposition is ToolRecoveryDisposition.REJECT:
@@ -1090,6 +1100,7 @@ class AgentRuntime:
             )
             return
         if recovery.disposition is ToolRecoveryDisposition.REPLAN:
+            loop.messages.extend(recovery.messages)
             loop.last_tool_outcome = outcome
             code = (
                 recovery.error_code

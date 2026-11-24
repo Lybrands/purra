@@ -26,6 +26,7 @@ from purra.contracts import (
     RunId,
     RunStatus,
     ToolCall,
+    ToolEffectState,
     ToolHandlerResult,
     TraceRecord,
 )
@@ -655,6 +656,20 @@ class _InMemoryRunRepository:
 class _InMemoryToolIdempotencyGateway:
     def __init__(self, state: RunState) -> None:
         self._state = state
+
+    async def inspect_effect_state(self, run_id: RunId, tool_call: ToolCall) -> ToolEffectState:
+        key = (run_id, tool_call.id)
+        async with self._state.lock:
+            _require_run_write(self._state, run_id)
+            receipt = self._state.tool_receipts.get(key)
+            if receipt is not None:
+                self._require_same_call(receipt[0], tool_call)
+                return receipt[1].effect_state
+            inflight = self._state.tool_inflight.get(key)
+            if inflight is not None:
+                self._require_same_call(inflight[0], tool_call)
+                return ToolEffectState.UNKNOWN
+            return ToolEffectState.NOT_STARTED
 
     async def execute_once(
         self,

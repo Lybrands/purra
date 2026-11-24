@@ -24,6 +24,7 @@ _STANDARD_LIMITS: Mapping[RecoveryCause, int] = MappingProxyType({
     RecoveryCause.UNAUTHORIZED_TOOL: 1,
     RecoveryCause.UNAUTHORIZED_TOOL_REPLAN: 1,
     RecoveryCause.TOOL_INPUT_INVALID: 1,
+    RecoveryCause.TOOL_PRECONDITION_FAILED: 2,
     RecoveryCause.TOOL_EXECUTION_FAILED_REPLAN: 1,
 })
 

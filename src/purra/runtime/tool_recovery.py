@@ -22,7 +22,7 @@ from purra.recovery import (
     RecoveryLedger,
     RecoveryRequest,
 )
-from purra.recovery.guidance import TOOL_INPUT_RETRY_GUIDANCE
+from purra.recovery.guidance import TOOL_INPUT_RETRY_GUIDANCE, TOOL_PRECONDITION_RETRY_GUIDANCE
 
 
 _RECOVERABLE_TOOL_INPUT_ERROR_CODES = frozenset({
@@ -77,14 +77,19 @@ def resolve_tool_recovery(
     )
     traces: list[TraceRecord] = []
 
+    precondition_failed = batch_result.error == "tool_precondition_failed"
     if (
         outcome is ToolBatchOutcome.FAILED
-        and _is_recoverable_tool_input_error(batch_result.error)
+        and (precondition_failed or _is_recoverable_tool_input_error(batch_result.error))
     ):
         input_decision = recovery_ledger.decide(RecoveryRequest(
-            cause=RecoveryCause.TOOL_INPUT_INVALID,
-            action=RecoveryAction.RETRY_MODEL,
-            scope=f"tool-input-sequence:{input_recovery_epoch}",
+            cause=(RecoveryCause.TOOL_PRECONDITION_FAILED if precondition_failed
+                   else RecoveryCause.TOOL_INPUT_INVALID),
+            action=(RecoveryAction.REPLAN if precondition_failed and planning_available
+                    else RecoveryAction.RETRY_MODEL),
+            # Successful prerequisite reads must not reset this Run-wide budget.
+            scope=("tool-preconditions:run" if precondition_failed
+                   else f"tool-input-sequence:{input_recovery_epoch}"),
             remaining_model_rounds=remaining_model_rounds,
             cancellation_requested=cancellation_requested,
             effect_state=RecoveryEffectState(batch_result.effect_state.value),
@@ -98,7 +103,8 @@ def resolve_tool_recovery(
         if input_decision.allowed:
             traces.append(TraceRecord(
                 stage="tool_recovery",
-                outcome="input_retry_scheduled",
+                outcome=("precondition_retry_scheduled" if precondition_failed
+                         else "input_retry_scheduled"),
                 details={
                     "round": round_number,
                     "errorCode": batch_result.error,
@@ -108,13 +114,27 @@ def resolve_tool_recovery(
                 },
             ))
             return ToolRecoveryResolution(
-                disposition=ToolRecoveryDisposition.RETRY_MODEL,
+                # A planned write may expose no read tools in its current
+                # step. Insert prerequisites through the canonical planner;
+                # never widen that step's immutable authorization in place.
+                disposition=(ToolRecoveryDisposition.REPLAN if precondition_failed and planning_available
+                             else ToolRecoveryDisposition.RETRY_MODEL),
+                error_code=batch_result.error if precondition_failed and planning_available else None,
                 next_input_recovery_epoch=next_epoch,
                 messages=(AgentMessage(
                     role=MessageRole.DEVELOPER,
-                    content=TOOL_INPUT_RETRY_GUIDANCE,
+                    content=(TOOL_PRECONDITION_RETRY_GUIDANCE if precondition_failed
+                             else TOOL_INPUT_RETRY_GUIDANCE),
                 ),),
                 traces=tuple(traces),
+            )
+        if precondition_failed:
+            # A denied repair cannot acquire a fresh budget via a planning pass.
+            return ToolRecoveryResolution(
+                disposition=ToolRecoveryDisposition.REJECT,
+                next_input_recovery_epoch=next_epoch,
+                traces=tuple(traces),
+                error_code=batch_result.error,
             )
 
     if outcome is ToolBatchOutcome.FAILED:

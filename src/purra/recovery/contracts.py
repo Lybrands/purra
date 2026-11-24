@@ -35,6 +35,7 @@ class RecoveryCause(StrEnum):
     UNAUTHORIZED_TOOL = "unauthorized_tool"
     UNAUTHORIZED_TOOL_REPLAN = "unauthorized_tool_replan"
     TOOL_INPUT_INVALID = "tool_input_invalid"
+    TOOL_PRECONDITION_FAILED = "tool_precondition_failed"
     TOOL_EXECUTION_FAILED_REPLAN = "tool_execution_failed_replan"
 
 

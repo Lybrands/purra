@@ -22,8 +22,10 @@ from purra.contracts import (
     ToolCall,
     ToolContextContract,
     ToolDataContract,
+    ToolEffectState,
     ToolHandlerResult,
     ToolPolicy,
+    ToolPreconditionFailure,
     ToolPlanningRequirement,
     ToolSchema,
     TraceRecord,
@@ -66,6 +68,23 @@ class ScopeValidator(Protocol):
         arguments: Mapping[str, Any],
         signal: CancellationSignal | None = None,
     ) -> str | None: ...
+
+
+@runtime_checkable
+class ToolPreconditionValidator(Protocol):
+    """Read-only business validation after authorization, before any execution.
+
+    Return an explicit failure to request bounded prerequisite repair, or None
+    when ready. Authorization belongs exclusively in the scope validator.
+    Core rechecks this gate after approval; validators must not commit effects.
+    """
+
+    async def __call__(
+        self,
+        state: ExecutionState,
+        arguments: Mapping[str, Any],
+        signal: CancellationSignal | None = None,
+    ) -> ToolPreconditionFailure | None: ...
 
 
 @runtime_checkable
@@ -113,6 +132,7 @@ class ToolRegistration:
     argument_contract: StructuredOutputContract | None = None
     concurrency_safe: bool = False
     approval_binding: Mapping[str, Any] | None = None
+    precondition_validator: ToolPreconditionValidator | None = None
 
     def __post_init__(self) -> None:
         if self.approval_binding is not None:
@@ -270,6 +290,20 @@ class ToolIdempotencyGateway(Protocol):
         tool_call: ToolCall,
         operation: Callable[[], Awaitable[ToolHandlerResult]],
     ) -> ToolHandlerResult: ...
+
+
+@runtime_checkable
+class ToolIdempotencyEffectProbe(Protocol):
+    """Optional, read-only evidence for business repair of an unexecuted call.
+
+    Return UNKNOWN when a prior dispatch cannot be ruled out. A missing receipt
+    alone is not proof that a recovered attempt never started. This capability
+    does not alter or replay the idempotency gateway's execution path.
+    """
+
+    async def inspect_effect_state(
+        self, run_id: RunId, tool_call: ToolCall,
+    ) -> ToolEffectState: ...
 
 
 __all__ = [name for name in globals() if not name.startswith("_")]

@@ -27,6 +27,7 @@ from purra.contracts import (
     ToolExecutionMode,
     ToolEffectState,
     ToolHandlerResult,
+    ToolPreconditionFailure,
     ToolPlanningDisposition,
     ToolStepDisposition,
 )
@@ -70,6 +71,12 @@ from purra.tools.security import (
     summarize_tool_arguments,
     validate_tool_arguments_schema,
 )
+
+
+_TERMINAL_VALIDATION_CODES = frozenset({
+    "tool_scope_violation", "tool_precondition_rejected",
+    "tool_precondition_validation_failed", "tool_precondition_effect_unresolved",
+})
 
 
 class CoreToolExecutor:
@@ -239,14 +246,17 @@ class CoreToolExecutor:
         )
         if parallel:
             # Admission is complete and ordered before any operation or handler starts.
-            for parsed in parsed_calls:
-                failure = await self._validate_scope(self._registrations[parsed.call.name], request, parsed, signal, preserve_control_errors=True)
-                if failure is not None:
-                    code, message, canceled = failure
-                    return _whole_batch_failure(request.calls,
-                        outcome=(ToolBatchOutcome.CANCELED if canceled else ToolBatchOutcome.REJECTED
-                            if code == "tool_scope_violation" else ToolBatchOutcome.FAILED),
-                        code=code, message=message)
+            # Reject any unauthorized member before considering business
+            # repair for another member. No handler starts during admission.
+            for validate in (self._validate_scope, self._validate_precondition):
+                for parsed in parsed_calls:
+                    failure = await validate(self._registrations[parsed.call.name], request, parsed, signal, preserve_control_errors=True)
+                    if failure is not None:
+                        code, message, canceled, diagnostics = failure
+                        return _whole_batch_failure(request.calls,
+                            outcome=(ToolBatchOutcome.CANCELED if canceled else ToolBatchOutcome.REJECTED
+                                if code in _TERMINAL_VALIDATION_CODES else ToolBatchOutcome.FAILED),
+                            code=code, message=message, diagnostics=diagnostics)
             return await self._execute_parallel(request, event_sink, signal, parsed_calls)
         return await self._execute_calls(request, event_sink, signal, parsed_calls)
 
@@ -285,7 +295,7 @@ class CoreToolExecutor:
                 registration,
             )
 
-            scope_failure = await self._validate_scope(
+            scope_failure = await self._validate_call(
                 registration,
                 request,
                 parsed,
@@ -294,13 +304,13 @@ class CoreToolExecutor:
             )
             if scope_failure is not None:
                 halt()
-                code, message, canceled = scope_failure
+                code, message, canceled, diagnostics = scope_failure
                 outcome = (
                     ToolBatchOutcome.CANCELED
                     if canceled
                     else (
                         ToolBatchOutcome.REJECTED
-                        if code == "tool_scope_violation"
+                        if code in _TERMINAL_VALIDATION_CODES
                         else ToolBatchOutcome.FAILED
                     )
                 )
@@ -320,10 +330,11 @@ class CoreToolExecutor:
                     outcome=outcome,
                     code=code,
                     message=message,
+                    diagnostics=diagnostics,
                     approval_status=(
                         ApprovalStatus.CANCELED if canceled else None
                     ),
-                    effect_state=ToolEffectState.NOT_STARTED,
+                    effect_state=_gate_effect_state(diagnostics),
                 )
 
             # Defense in depth: authorization never comes from mutable state.
@@ -422,24 +433,24 @@ class CoreToolExecutor:
                     continue
 
             if approval_status is ApprovalStatus.APPROVED:
-                scope_failure = await self._validate_scope(
+                scope_failure = await self._validate_call(
                     registration, request, parsed, signal,
                     preserve_control_errors=True,
                 )
                 if scope_failure is not None:
                     halt()
-                    code, message, canceled = scope_failure
+                    code, message, canceled, diagnostics = scope_failure
                     outcome = (
                         ToolBatchOutcome.CANCELED if canceled else
-                        ToolBatchOutcome.REJECTED if code == "tool_scope_violation" else
+                        ToolBatchOutcome.REJECTED if code in _TERMINAL_VALIDATION_CODES else
                         ToolBatchOutcome.FAILED
                     )
                     await self._finish_tool_operation(operation_id, outcome, code)
                     return await _failed_call_batch(
                         request, event_sink, parsed, index, results, cache_hits,
                         remaining=parsed_calls[position + 1:], outcome=outcome,
-                        code=code, message=message, approval_status=approval_status,
-                        effect_state=ToolEffectState.NOT_STARTED,
+                        code=code, message=message, diagnostics=diagnostics, approval_status=approval_status,
+                        effect_state=_gate_effect_state(diagnostics),
                     )
                 if _is_canceled(signal):
                     halt()
@@ -783,6 +794,92 @@ class CoreToolExecutor:
             return
         await self._operations.fail(operation_id, code)
 
+    async def _validate_call(
+        self,
+        registration: ToolRegistration,
+        request: ToolBatchRequest,
+        parsed: ParsedToolCall,
+        signal: CancellationSignal | None,
+        *, preserve_control_errors: bool = False,
+    ) -> tuple[str, str, bool, Mapping[str, Any] | None] | None:
+        # Business repair never downgrades an authorization rejection. These
+        # read-only checks run both before approval and after it is granted.
+        scope_failure = await self._validate_scope(
+            registration, request, parsed, signal,
+            preserve_control_errors=preserve_control_errors,
+        )
+        if scope_failure is not None:
+            return scope_failure
+        return await self._validate_precondition(
+            registration, request, parsed, signal,
+            preserve_control_errors=preserve_control_errors,
+        )
+
+    async def _validate_precondition(
+        self,
+        registration: ToolRegistration,
+        request: ToolBatchRequest,
+        parsed: ParsedToolCall,
+        signal: CancellationSignal | None,
+        *, preserve_control_errors: bool = False,
+    ) -> tuple[str, str, bool, Mapping[str, Any] | None] | None:
+        if registration.precondition_validator is None:
+            return None
+        try:
+            failure = await await_with_cancellation(
+                registration.precondition_validator(request.state, parsed.arguments, signal),
+                signal,
+            )
+            prior_effect = ToolEffectState.NOT_STARTED
+            if (isinstance(failure, ToolPreconditionFailure) and failure.retryable
+                    and registration.policy.mode is not ToolExecutionMode.READ):
+                prior_effect = await self._precondition_prior_effect(registration, request, parsed, signal)
+        except OperationCanceled:
+            return "tool_execution_canceled", "Tool execution was canceled.", True, None
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            if preserve_control_errors and _is_control_failure(error):
+                raise
+            return "tool_precondition_validation_failed", "Tool precondition validation failed.", False, None
+        if failure is None:
+            return None
+        if not isinstance(failure, ToolPreconditionFailure):
+            return "tool_precondition_validation_failed", "Invalid tool precondition result.", False, None
+        code = "tool_precondition_failed" if failure.retryable else "tool_precondition_rejected"
+        diagnostics = {
+            "sourceErrorCode": normalize_error_code(failure.code),
+            "retryable": failure.retryable,
+        }
+        if prior_effect is not ToolEffectState.NOT_STARTED:
+            diagnostics.update(retryable=False, priorEffectState=prior_effect.value)
+            return ("tool_precondition_effect_unresolved",
+                "A prior execution is committed or cannot be ruled out; automatic repair is unsafe.",
+                False, diagnostics)
+        if failure.recovery_hint:
+            diagnostics["recoveryHint"] = sanitize_error_message(failure.recovery_hint)
+        return code, sanitize_error_message(failure.message), False, diagnostics
+
+    async def _precondition_prior_effect(
+        self, registration: ToolRegistration, request: ToolBatchRequest,
+        parsed: ParsedToolCall, signal: CancellationSignal | None,
+    ) -> ToolEffectState:
+        if registration.host_managed_durability:
+            return ToolEffectState.UNKNOWN
+        if self._idempotency_gateway is None:
+            return ToolEffectState.NOT_STARTED
+        probe = getattr(self._idempotency_gateway, "inspect_effect_state", None)
+        if request.run_id is None or not callable(probe):
+            return ToolEffectState.UNKNOWN
+        try:
+            return ToolEffectState(await await_with_cancellation(probe(request.run_id, parsed.call), signal))
+        except (OperationCanceled, asyncio.CancelledError):
+            raise
+        except Exception as error:
+            if _is_control_failure(error):
+                raise
+            return ToolEffectState.UNKNOWN
+
     async def _validate_scope(
         self,
         registration: ToolRegistration,
@@ -790,7 +887,7 @@ class CoreToolExecutor:
         parsed: ParsedToolCall,
         signal: CancellationSignal | None,
         *, preserve_control_errors: bool = False,
-    ) -> tuple[str, str, bool] | None:
+    ) -> tuple[str, str, bool, Mapping[str, Any] | None] | None:
         if registration.scope_validator is None:
             return None
         try:
@@ -799,7 +896,7 @@ class CoreToolExecutor:
                 signal,
             )
         except OperationCanceled:
-            return "tool_execution_canceled", "Tool execution was canceled.", True
+            return "tool_execution_canceled", "Tool execution was canceled.", True, None
         except asyncio.CancelledError:
             raise
         except Exception as error:
@@ -809,9 +906,10 @@ class CoreToolExecutor:
                 "tool_scope_validation_failed",
                 "Tool scope validation failed.",
                 False,
+                None,
             )
         if message:
-            return "tool_scope_violation", sanitize_error_message(message), False
+            return "tool_scope_violation", sanitize_error_message(message), False, None
         return None
 
     async def _request_approval(
@@ -937,6 +1035,7 @@ async def _emit_completed(
     *,
     exception_type: str | None = None,
     normalized_argument_paths: tuple[str, ...] = (),
+    source_error_code: str | None = None,
 ) -> None:
     payload: dict[str, Any] = {
         "index": index,
@@ -947,6 +1046,8 @@ async def _emit_completed(
     }
     if result.error:
         payload["errorCode"] = result.error
+    if source_error_code:
+        payload["sourceErrorCode"] = normalize_error_code(source_error_code)
     if result.approval_status is not None:
         payload["approvalStatus"] = result.approval_status.value
     if exception_type:
@@ -986,6 +1087,15 @@ def _whole_batch_failure(
     )
 
 
+def _gate_effect_state(diagnostics: Mapping[str, Any] | None) -> ToolEffectState:
+    if diagnostics is None or "priorEffectState" not in diagnostics:
+        return ToolEffectState.NOT_STARTED
+    try:
+        return ToolEffectState(diagnostics["priorEffectState"])
+    except (TypeError, ValueError):
+        return ToolEffectState.UNKNOWN
+
+
 async def _failed_call_batch(
     request: ToolBatchRequest,
     event_sink: EventSink,
@@ -998,6 +1108,7 @@ async def _failed_call_batch(
     outcome: ToolBatchOutcome,
     code: str,
     message: str,
+    diagnostics: Mapping[str, Any] | None = None,
     approval_status: ApprovalStatus | None = None,
     exception_type: str | None = None,
     effect_state: ToolEffectState = ToolEffectState.UNKNOWN,
@@ -1007,6 +1118,7 @@ async def _failed_call_batch(
         code,
         message,
         approval_status=approval_status,
+        diagnostics=diagnostics,
     )
     results.append(result)
     if len(cache_hits) < len(results):
@@ -1019,6 +1131,7 @@ async def _failed_call_batch(
         outcome,
         exception_type=exception_type,
         normalized_argument_paths=parsed.normalized_argument_paths,
+        source_error_code=diagnostics.get("sourceErrorCode") if diagnostics else None,
     )
     await _append_unexecuted_results(
         request,

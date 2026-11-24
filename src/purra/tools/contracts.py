@@ -156,6 +156,11 @@ def inspect_tool_contract(
             and not _is_async_callable(registration.scope_validator)
         ):
             violations.append(f"{label}: scope validator must be async callable")
+        if (
+            registration.precondition_validator is not None
+            and not _is_async_callable(registration.precondition_validator)
+        ):
+            violations.append(f"{label}: precondition validator must be async callable")
         if registration.cache_probe is not None:
             probe = getattr(registration.cache_probe, "will_hit", None)
             if probe is None or not callable(probe) or inspect.iscoroutinefunction(probe):

@@ -233,6 +233,31 @@ class DomainEffect:
 
 
 @dataclass(frozen=True, slots=True)
+class ToolPreconditionFailure:
+    """A side-effect-free host validation failure, never an authorization grant.
+
+    Recoverability is opt-in and requires actionable guidance. Core checks the
+    immutable tool allow-list and the scope validator before invoking this gate.
+    A retry asks the model to repair prerequisites; it never replays a tool.
+    """
+
+    code: str
+    message: str
+    recovery_hint: str = ""
+    retryable: bool = False
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "code", required_text(self.code, "precondition code"))
+        object.__setattr__(self, "message", required_text(self.message, "precondition message"))
+        if type(self.retryable) is not bool:
+            raise TypeError("precondition retryable must be boolean")
+        hint = str(self.recovery_hint or "").strip()
+        if self.retryable and not hint:
+            raise ValueError("recoverable preconditions require recovery guidance")
+        object.__setattr__(self, "recovery_hint", hint)
+
+
+@dataclass(frozen=True, slots=True)
 class ToolHandlerResult:
     content: str
     from_cache: bool = False

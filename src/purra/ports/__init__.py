@@ -47,6 +47,8 @@ from purra.ports.tools import (
     ToolExecutionGateway,
     ToolHandler,
     ToolIdempotencyGateway,
+    ToolIdempotencyEffectProbe,
+    ToolPreconditionValidator,
     ToolRegistration,
 )
 from purra.output.ports import (
@@ -97,6 +99,8 @@ __all__ = [
     "ToolExecutionGateway",
     "ToolHandler",
     "ToolIdempotencyGateway",
+    "ToolIdempotencyEffectProbe",
+    "ToolPreconditionValidator",
     "ToolRegistration",
     "WorkPlanner",
     "WorkPlanningConstraintProvider",

@@ -53,6 +53,15 @@ TOOL_INPUT_RETRY_GUIDANCE = (
     "the same currently exposed tool exactly once. Return a real structured "
     "tool call, not a textual imitation, and do not invent a successful result."
 )
+TOOL_PRECONDITION_RETRY_GUIDANCE = (
+    "The preceding tool was not executed because a host-validated prerequisite "
+    "was not satisfied. Follow diagnostics.recoveryHint in its structured result "
+    "to repair prerequisites using only currently authorized tools, then create "
+    "a fresh proposal from current evidence. Do not blindly repeat unchanged "
+    "arguments, replay the whole task, repeat committed operations, weaken "
+    "authorization, or bypass required approval. If repair is not possible, "
+    "stop and explain the unmet prerequisite without claiming success."
+)
 MALFORMED_TOOL_CALL_RETRY_GUIDANCE = (
     "The preceding structured tool-call envelope was malformed and was rejected "
     "before any tool handler ran. Retry the current step exactly once using the "

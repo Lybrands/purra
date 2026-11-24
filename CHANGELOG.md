@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.0.10 — 2026-11-25: bounded Python tool-precondition recovery
+
+- Add an opt-in, side-effect-free `ToolPreconditionFailure` contract and optional
+  async tool precondition validator, separate from immutable tool authorization.
+  Recheck authorization and prerequisites after approval; refusal, cancellation,
+  permanent failures, and invalid validators remain terminal.
+- Route repairable prerequisite failures through the existing recovery ledger,
+  with two attempts shared across the Run. Reads and progress do not reset that
+  budget. Reactive execution requests a fresh model proposal; planned execution
+  uses the canonical replan hook without widening the current step's tool scope.
+- Preserve retry correlation across intervening reads and durable checkpoints.
+  Preflight parallel-batch authorization before any prerequisite repair checks.
+- Add an optional read-only idempotency effect probe. Already committed writes,
+  uncertain prior effects, unavailable durability evidence, and host-managed
+  writes cannot be reclassified as unstarted repairs or automatically replayed.
+- Existing registrations without the optional validator retain their behavior.
+  Python only; TypeScript runtime behavior is unchanged. Core and integration
+  release metadata remain aligned. No storage migration or historical task
+  replay is performed, and running processes must restart to load the new code.
+
 ## 1.0.9 — 2026-11-24: consistent Python per-round context reserves
 
 - Freeze the effective invocation context with each logical model round so
